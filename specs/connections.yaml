@@ -1,0 +1,203 @@
+version: "1.0"
+name: "Connection Tests"
+description: "Connection management and pooling tests"
+
+tests:
+  - name: "basic-connection"
+    description: "Establish and close a basic connection"
+    steps:
+      - type: connect
+      - type: query
+        text: "RETURN 1 AS x"
+        expect:
+          rows: 1
+      - type: disconnect
+    timeout_ms: 10000
+
+  - name: "reconnection"
+    description: "Reconnect after disconnect"
+    steps:
+      - type: connect
+      - type: query
+        text: "RETURN 1 AS x"
+        expect:
+          rows: 1
+      - type: disconnect
+      - type: connect
+      - type: query
+        text: "RETURN 2 AS x"
+        expect:
+          rows: 1
+      - type: disconnect
+    timeout_ms: 15000
+
+  - name: "multiple-queries-same-connection"
+    description: "Execute multiple queries on the same connection"
+    steps:
+      - type: connect
+      - type: query
+        text: "RETURN 1 AS x"
+        expect:
+          rows: 1
+      - type: query
+        text: "RETURN 2 AS x"
+        expect:
+          rows: 1
+      - type: query
+        text: "RETURN 3 AS x"
+        expect:
+          rows: 1
+      - type: disconnect
+    timeout_ms: 15000
+
+  - name: "connection-reuse"
+    description: "Reuse connection for multiple operations"
+    steps:
+      - type: connect
+      - type: begin
+      - type: query
+        text: "RETURN 1 AS x"
+        expect:
+          rows: 1
+      - type: commit
+      - type: query
+        text: "RETURN 2 AS x"
+        expect:
+          rows: 1
+      - type: disconnect
+    timeout_ms: 15000
+
+  - name: "query-after-disconnect"
+    description: "Verify error when querying after disconnect"
+    steps:
+      - type: connect
+      - type: disconnect
+      - type: query
+        text: "RETURN 1 AS x"
+        expect_error: true
+    timeout_ms: 10000
+
+  - name: "concurrent-connections"
+    description: "Multiple concurrent connections (requires pooling support)"
+    parallel: true
+    steps:
+      - type: connect
+        connection_id: "conn1"
+      - type: connect
+        connection_id: "conn2"
+      - type: query
+        connection_id: "conn1"
+        text: "RETURN 1 AS x"
+        expect:
+          rows: 1
+      - type: query
+        connection_id: "conn2"
+        text: "RETURN 2 AS x"
+        expect:
+          rows: 1
+      - type: disconnect
+        connection_id: "conn1"
+      - type: disconnect
+        connection_id: "conn2"
+    timeout_ms: 20000
+
+  - name: "connection-pool-basic"
+    description: "Basic connection pooling"
+    pool:
+      min_size: 2
+      max_size: 5
+    steps:
+      - type: pool_acquire
+        connection_id: "pooled1"
+      - type: query
+        connection_id: "pooled1"
+        text: "RETURN 1 AS x"
+        expect:
+          rows: 1
+      - type: pool_release
+        connection_id: "pooled1"
+    timeout_ms: 15000
+
+  - name: "connection-pool-reuse"
+    description: "Connection pool reuses connections"
+    pool:
+      min_size: 1
+      max_size: 3
+    steps:
+      - type: pool_acquire
+        connection_id: "pooled1"
+      - type: query
+        connection_id: "pooled1"
+        text: "RETURN 1 AS x"
+        expect:
+          rows: 1
+      - type: pool_release
+        connection_id: "pooled1"
+      - type: pool_acquire
+        connection_id: "pooled2"
+      - type: query
+        connection_id: "pooled2"
+        text: "RETURN 2 AS x"
+        expect:
+          rows: 1
+      - type: pool_release
+        connection_id: "pooled2"
+    timeout_ms: 20000
+
+  - name: "connection-pool-concurrent"
+    description: "Concurrent pool usage"
+    pool:
+      min_size: 2
+      max_size: 5
+    parallel: true
+    steps:
+      - type: pool_acquire
+        connection_id: "pooled1"
+      - type: pool_acquire
+        connection_id: "pooled2"
+      - type: pool_acquire
+        connection_id: "pooled3"
+      - type: query
+        connection_id: "pooled1"
+        text: "RETURN 1 AS x"
+        expect:
+          rows: 1
+      - type: query
+        connection_id: "pooled2"
+        text: "RETURN 2 AS x"
+        expect:
+          rows: 1
+      - type: query
+        connection_id: "pooled3"
+        text: "RETURN 3 AS x"
+        expect:
+          rows: 1
+      - type: pool_release
+        connection_id: "pooled1"
+      - type: pool_release
+        connection_id: "pooled2"
+      - type: pool_release
+        connection_id: "pooled3"
+    timeout_ms: 30000
+
+  - name: "connection-timeout"
+    description: "Connection timeout handling"
+    connection:
+      timeout_ms: 100
+    steps:
+      - type: connect
+        expect_error: true
+    timeout_ms: 5000
+    skip: true  # Skip by default as it requires server configuration
+
+  - name: "query-timeout"
+    description: "Query timeout handling"
+    steps:
+      - type: connect
+      - type: query
+        text: "RETURN 1 AS x"
+        timeout_ms: 100
+        expect:
+          rows: 1
+      - type: disconnect
+    timeout_ms: 10000
