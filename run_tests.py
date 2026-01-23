@@ -528,7 +528,7 @@ class GoRunner(ClientRunner):
             if not go_mod.exists():
                 proc = await asyncio.create_subprocess_exec(
                     "go", "mod", "init",
-                    "gitlab.com/devnw/geode/geode/clients/test-harness/runners",
+                    "gitlab.com/devnw/codepros/geode/geode/clients/test-harness/runners",
                     cwd=str(runners_dir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,

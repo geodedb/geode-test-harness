@@ -12,7 +12,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	_ "gitlab.com/devnw/geode/geode/clients/go/geode"
+	_ "gitlab.com/devnw/codepros/geode/geode/clients/go/geode"
 )
 
 type TestSpec struct {
