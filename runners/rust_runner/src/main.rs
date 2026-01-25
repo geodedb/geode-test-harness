@@ -392,6 +392,7 @@ impl Runner {
                             skip_reason: None,
                             result: Some(result),
                             duration_ms: duration,
+                            benchmark: None,
                         };
                     }
 
@@ -402,6 +403,7 @@ impl Runner {
                         skip_reason: None,
                         result: Some(result),
                         duration_ms: duration,
+                        benchmark: None,
                     }
                 }
                 Err(e) => {
@@ -414,6 +416,7 @@ impl Runner {
                             skip_reason: None,
                             result: None,
                             duration_ms: duration,
+                            benchmark: None,
                         }
                     } else {
                         TestResult {
@@ -423,6 +426,7 @@ impl Runner {
                             skip_reason: None,
                             result: None,
                             duration_ms: duration,
+                            benchmark: None,
                         }
                     }
                 }
@@ -440,6 +444,7 @@ impl Runner {
                         skip_reason: None,
                         result: None,
                         duration_ms: duration,
+                        benchmark: None,
                     }
                 }
                 Err(e) => {
@@ -452,6 +457,7 @@ impl Runner {
                             skip_reason: None,
                             result: None,
                             duration_ms: duration,
+                            benchmark: None,
                         }
                     } else {
                         TestResult {
@@ -461,6 +467,7 @@ impl Runner {
                             skip_reason: None,
                             result: None,
                             duration_ms: duration,
+                            benchmark: None,
                         }
                     }
                 }
@@ -473,6 +480,7 @@ impl Runner {
                 skip_reason: None,
                 result: None,
                 duration_ms: 0.0,
+                benchmark: None,
             }
         }
     }
@@ -812,6 +820,7 @@ async fn main() -> Result<()> {
                 skip_reason: test.skip_reason.clone(),
                 result: None,
                 duration_ms: 0.0,
+                benchmark: None,
             });
             continue;
         }
