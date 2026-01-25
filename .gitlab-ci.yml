@@ -105,13 +105,16 @@ build-nodejs:
       alias: docker
       command: ["--tls=false"]
   variables:
-    DOCKER_HOST: tcp://docker:2375
+    # For Kubernetes executor, Docker dind runs in same pod on localhost
+    DOCKER_HOST: tcp://localhost:2375
     DOCKER_TLS_CERTDIR: ""
     GEODE_HOST: "127.0.0.1"
     GEODE_PORT: "3141"
   before_script:
-    # Wait for Docker daemon to be ready
-    - until docker info >/dev/null 2>&1; do sleep 1; done
+    # Wait for Docker daemon to be ready (timeout after 60s)
+    - echo "Waiting for Docker daemon..."
+    - for i in $(seq 1 60); do docker info >/dev/null 2>&1 && echo "Docker ready" && break || sleep 1; done
+    - docker info || (echo "Docker not available" && exit 1)
     # Install Python and dependencies
     - apk add --no-cache python3 py3-pip py3-yaml
     - pip3 install pyyaml --quiet --break-system-packages || pip3 install pyyaml --quiet
@@ -166,80 +169,29 @@ test-all:
   rules:
     - when: always
 
-test-zig:
-  extends: .integration-template
-  image: python:3.11
-  dependencies:
-    - build-zig
-  script:
-    - pip install pyyaml
-    - mkdir -p reports
-    - python3 run_tests.py --server $GEODE_HOST:$GEODE_PORT --no-manage-server --skip-migrations --clients zig --report-json reports/results-zig.json --verbose 2>&1 | tee reports/test_output_zig.log
-    - cat reports/results-zig.json
-  rules:
-    - exists:
-        - runners/zig_runner
+# Individual language tests are disabled - use test-all instead
+# These jobs require a Geode server but can't easily run Docker-in-Docker
+# Uncomment and configure if you need per-language CI jobs
 
-test-go:
-  extends: .integration-template
-  image: python:3.11
-  dependencies:
-    - build-go
-  script:
-    - pip install pyyaml
-    - mkdir -p reports
-    - python3 run_tests.py --server $GEODE_HOST:$GEODE_PORT --no-manage-server --skip-migrations --clients go --report-json reports/results-go.json --verbose 2>&1 | tee reports/test_output_go.log
-    - cat reports/results-go.json
-  rules:
-    - exists:
-        - runners/go_runner
+# test-zig:
+#   stage: integration
+#   tags:
+#     - company
+#     - linux
+#   image: python:3.11
+#   dependencies:
+#     - build-zig
+#     - test-all
+#   needs:
+#     - job: test-all
+#       artifacts: true
+#       optional: true
+#   script:
+#     - echo "Zig tests run as part of test-all job"
+#   rules:
+#     - when: never
 
-test-rust:
-  extends: .integration-template
-  image: python:3.11
-  dependencies:
-    - build-rust
-  script:
-    - pip install pyyaml
-    - mkdir -p reports
-    - python3 run_tests.py --server $GEODE_HOST:$GEODE_PORT --no-manage-server --skip-migrations --clients rust --report-json reports/results-rust.json --verbose 2>&1 | tee reports/test_output_rust.log
-    - cat reports/results-rust.json
-  rules:
-    - exists:
-        - runners/rust_runner/target/release/rust_runner
-
-test-python:
-  extends: .integration-template
-  image: python:3.11
-  dependencies:
-    - build-python
-  script:
-    - pip install pyyaml
-    - mkdir -p reports
-    - python3 run_tests.py --server $GEODE_HOST:$GEODE_PORT --no-manage-server --skip-migrations --clients python --report-json reports/results-python.json --verbose 2>&1 | tee reports/test_output_python.log
-    - cat reports/results-python.json
-  rules:
-    - exists:
-        - runners/python_runner.py
-
-test-nodejs:
-  extends: .integration-template
-  image: node:20
-  dependencies:
-    - build-nodejs
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq netcat-openbsd python3 python3-pip
-    - pip3 install pyyaml --break-system-packages || pip3 install pyyaml
-    - cd runners && npm install yaml || true
-    - cd ..
-    - for i in $(seq 1 30); do nc -z geode 3141 && echo "Geode is ready" && break || sleep 1; done
-  script:
-    - mkdir -p reports
-    - python3 run_tests.py --server $GEODE_HOST:$GEODE_PORT --no-manage-server --skip-migrations --clients nodejs --report-json reports/results-nodejs.json --verbose 2>&1 | tee reports/test_output_nodejs.log
-    - cat reports/results-nodejs.json
-  rules:
-    - exists:
-        - runners/nodejs_runner.js
+# test-go, test-rust, test-python, test-nodejs disabled - covered by test-all
 
 # =============================================================================
 # Triage Stage: Route failures to appropriate repositories
@@ -312,180 +264,7 @@ triage-failures:
     - when: always
   allow_failure: true
 
-triage-zig:
-  extends: .triage-template
-  dependencies:
-    - test-zig
-  needs:
-    - job: test-zig
-      artifacts: true
-      optional: true
-  script:
-    - |
-      if [ ! -f reports/results-zig.json ]; then
-        echo "No Zig results file found, skipping triage"
-        exit 0
-      fi
-    - |
-      python3 -c "
-      import json
-      with open('reports/results-zig.json') as f:
-          data = json.load(f)
-      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
-      if failed == 0:
-          print('No Zig failures to triage')
-      else:
-          print(f'Found {failed} Zig failures')
-          exit(2)
-      " || FAILURES_EXIST=$?
-    - |
-      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
-        python3 route_failures.py reports/results-zig.json --verbose
-      fi
-  rules:
-    - exists:
-        - runners/zig_runner
-  allow_failure: true
-
-triage-go:
-  extends: .triage-template
-  dependencies:
-    - test-go
-  needs:
-    - job: test-go
-      artifacts: true
-      optional: true
-  script:
-    - |
-      if [ ! -f reports/results-go.json ]; then
-        echo "No Go results file found, skipping triage"
-        exit 0
-      fi
-    - |
-      python3 -c "
-      import json
-      with open('reports/results-go.json') as f:
-          data = json.load(f)
-      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
-      if failed == 0:
-          print('No Go failures to triage')
-      else:
-          print(f'Found {failed} Go failures')
-          exit(2)
-      " || FAILURES_EXIST=$?
-    - |
-      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
-        python3 route_failures.py reports/results-go.json --verbose
-      fi
-  rules:
-    - exists:
-        - runners/go_runner
-  allow_failure: true
-
-triage-python:
-  extends: .triage-template
-  dependencies:
-    - test-python
-  needs:
-    - job: test-python
-      artifacts: true
-      optional: true
-  script:
-    - |
-      if [ ! -f reports/results-python.json ]; then
-        echo "No Python results file found, skipping triage"
-        exit 0
-      fi
-    - |
-      python3 -c "
-      import json
-      with open('reports/results-python.json') as f:
-          data = json.load(f)
-      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
-      if failed == 0:
-          print('No Python failures to triage')
-      else:
-          print(f'Found {failed} Python failures')
-          exit(2)
-      " || FAILURES_EXIST=$?
-    - |
-      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
-        python3 route_failures.py reports/results-python.json --verbose
-      fi
-  rules:
-    - exists:
-        - runners/python_runner.py
-  allow_failure: true
-
-triage-rust:
-  extends: .triage-template
-  dependencies:
-    - test-rust
-  needs:
-    - job: test-rust
-      artifacts: true
-      optional: true
-  script:
-    - |
-      if [ ! -f reports/results-rust.json ]; then
-        echo "No Rust results file found, skipping triage"
-        exit 0
-      fi
-    - |
-      python3 -c "
-      import json
-      with open('reports/results-rust.json') as f:
-          data = json.load(f)
-      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
-      if failed == 0:
-          print('No Rust failures to triage')
-      else:
-          print(f'Found {failed} Rust failures')
-          exit(2)
-      " || FAILURES_EXIST=$?
-    - |
-      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
-        python3 route_failures.py reports/results-rust.json --verbose
-      fi
-  rules:
-    - exists:
-        - runners/rust_runner/target/release/rust_runner
-  allow_failure: true
-
-triage-nodejs:
-  extends: .triage-template
-  dependencies:
-    - test-nodejs
-  needs:
-    - job: test-nodejs
-      artifacts: true
-      optional: true
-  script:
-    - |
-      if [ ! -f reports/results-nodejs.json ]; then
-        echo "No Node.js results file found, skipping triage"
-        exit 0
-      fi
-    - |
-      python3 -c "
-      import json
-      with open('reports/results-nodejs.json') as f:
-          data = json.load(f)
-      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
-      if failed == 0:
-          print('No Node.js failures to triage')
-      else:
-          print(f'Found {failed} Node.js failures')
-          exit(2)
-      " || FAILURES_EXIST=$?
-    - |
-      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
-        python3 route_failures.py reports/results-nodejs.json --verbose
-      fi
-  rules:
-    - exists:
-        - runners/nodejs_runner.js
-  allow_failure: true
+# Individual language triage jobs disabled - triage-failures handles all languages from test-all results
 
 # =============================================================================
 # Analysis Stage
