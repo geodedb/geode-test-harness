@@ -1,0 +1,729 @@
+stages:
+  - build
+  - integration
+  - triage
+  - analyze
+  - report
+  - pages
+
+variables:
+  GEODE_IMAGE: registry.gitlab.com/devnw/geode/geode:latest
+  GEODE_PORT: "3141"
+  # Disable quic-go receive buffer warning in CI
+  QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING: "true"
+  # GitLab API token for creating issues (set in CI/CD variables)
+  # GITLAB_TOKEN should be a project access token with api scope
+
+.build-template:
+  stage: build
+  tags:
+    - company
+    - linux
+  allow_failure: true
+  artifacts:
+    paths:
+      - runners/zig_runner
+      - runners/go_runner
+      - runners/rust_runner/target/release/rust_runner
+    expire_in: 1 hour
+
+build-zig:
+  extends: .build-template
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl xz tar
+    - curl -L https://ziglang.org/download/0.15.1/zig-linux-x86_64-0.15.1.tar.xz | tar xJ
+    - export PATH="$PWD/zig-linux-x86_64-0.15.1:$PATH"
+  script:
+    - cd runners
+    - zig build -Doptimize=ReleaseSafe
+    - cp zig-out/bin/zig_runner ./zig_runner || echo "Zig build incomplete"
+  rules:
+    - exists:
+        - runners/build.zig
+
+build-go:
+  extends: .build-template
+  image: golang:1.24
+  script:
+    - cd runners
+    - go build -o go_runner go_runner.go
+  rules:
+    - exists:
+        - runners/go_runner.go
+
+build-rust:
+  extends: .build-template
+  image: rust:1.75
+  script:
+    - cd runners/rust_runner
+    - cargo build --release
+  rules:
+    - exists:
+        - runners/rust_runner/Cargo.toml
+
+build-python:
+  extends: .build-template
+  image: python:3.11
+  script:
+    - pip install pyyaml
+    - python3 -c "import yaml; print('Python dependencies installed')"
+  artifacts:
+    paths: []
+
+build-nodejs:
+  extends: .build-template
+  image: node:20
+  script:
+    - cd runners
+    - npm install yaml || echo "Node.js dependencies installed"
+  artifacts:
+    paths: []
+
+.integration-template:
+  stage: integration
+  tags:
+    - company
+    - linux
+  services:
+    - name: $GEODE_IMAGE
+      alias: geode
+      command: ["serve", "--listen", "0.0.0.0:3141"]
+  variables:
+    GEODE_HOST: geode
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq netcat-openbsd || apk add --no-cache netcat-openbsd || true
+    - echo "Waiting for Geode server..."
+    - for i in $(seq 1 30); do nc -z geode 3141 && echo "Geode is ready" && break || sleep 1; done
+  artifacts:
+    paths:
+      - reports/
+    reports:
+      junit: reports/junit-*.xml
+    expire_in: 1 week
+    when: always
+
+test-all:
+  extends: .integration-template
+  image: python:3.11
+  dependencies:
+    - build-zig
+    - build-go
+    - build-rust
+    - build-python
+    - build-nodejs
+  script:
+    - pip install pyyaml
+    - mkdir -p reports
+    - python3 run_tests.py --server geode:3141 --no-manage-server --skip-migrations --report-json reports/results.json --verbose 2>&1 | tee reports/test_output.log
+    - cat reports/results.json
+    # Check for failures
+    - |
+      python3 -c "
+      import json, sys
+      with open('reports/results.json') as f:
+          data = json.load(f)
+      summary = data.get('summary', {})
+      failed = summary.get('failed', 0)
+      errors = summary.get('errors', 0)
+      if failed > 0 or errors > 0:
+          print(f'FAILURES DETECTED: {failed} failed, {errors} errors')
+          sys.exit(1)
+      print('All tests passed')
+      "
+  rules:
+    - when: always
+
+test-zig:
+  extends: .integration-template
+  image: python:3.11
+  dependencies:
+    - build-zig
+  script:
+    - pip install pyyaml
+    - mkdir -p reports
+    - python3 run_tests.py --server geode:3141 --no-manage-server --skip-migrations --clients zig --report-json reports/results-zig.json --verbose 2>&1 | tee reports/test_output_zig.log
+    - cat reports/results-zig.json
+  rules:
+    - exists:
+        - runners/zig_runner
+
+test-go:
+  extends: .integration-template
+  image: python:3.11
+  dependencies:
+    - build-go
+  script:
+    - pip install pyyaml
+    - mkdir -p reports
+    - python3 run_tests.py --server geode:3141 --no-manage-server --skip-migrations --clients go --report-json reports/results-go.json --verbose 2>&1 | tee reports/test_output_go.log
+    - cat reports/results-go.json
+  rules:
+    - exists:
+        - runners/go_runner
+
+test-rust:
+  extends: .integration-template
+  image: python:3.11
+  dependencies:
+    - build-rust
+  script:
+    - pip install pyyaml
+    - mkdir -p reports
+    - python3 run_tests.py --server geode:3141 --no-manage-server --skip-migrations --clients rust --report-json reports/results-rust.json --verbose 2>&1 | tee reports/test_output_rust.log
+    - cat reports/results-rust.json
+  rules:
+    - exists:
+        - runners/rust_runner/target/release/rust_runner
+
+test-python:
+  extends: .integration-template
+  image: python:3.11
+  dependencies:
+    - build-python
+  script:
+    - pip install pyyaml
+    - mkdir -p reports
+    - python3 run_tests.py --server geode:3141 --no-manage-server --skip-migrations --clients python --report-json reports/results-python.json --verbose 2>&1 | tee reports/test_output_python.log
+    - cat reports/results-python.json
+  rules:
+    - exists:
+        - runners/python_runner.py
+
+test-nodejs:
+  extends: .integration-template
+  image: node:20
+  dependencies:
+    - build-nodejs
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq netcat-openbsd python3 python3-pip
+    - pip3 install pyyaml --break-system-packages || pip3 install pyyaml
+    - cd runners && npm install yaml || true
+    - cd ..
+    - for i in $(seq 1 30); do nc -z geode 3141 && echo "Geode is ready" && break || sleep 1; done
+  script:
+    - mkdir -p reports
+    - python3 run_tests.py --server geode:3141 --no-manage-server --skip-migrations --clients nodejs --report-json reports/results-nodejs.json --verbose 2>&1 | tee reports/test_output_nodejs.log
+    - cat reports/results-nodejs.json
+  rules:
+    - exists:
+        - runners/nodejs_runner.js
+
+# =============================================================================
+# Triage Stage: Route failures to appropriate repositories
+# =============================================================================
+
+.triage-template:
+  stage: triage
+  tags:
+    - company
+    - linux
+  image: python:3.11
+  before_script:
+    # Install glab CLI
+    - apt-get update -qq && apt-get install -y -qq curl
+    - curl -L "https://gitlab.com/gitlab-org/cli/-/releases/v1.36.0/downloads/glab_1.36.0_Linux_x86_64.tar.gz" | tar xz
+    - mv bin/glab /usr/local/bin/
+    - glab --version
+    # Configure glab with CI token
+    - |
+      if [ -n "$GITLAB_TOKEN" ]; then
+        glab auth login --token "$GITLAB_TOKEN" --hostname gitlab.com
+        echo "GitLab CLI authenticated"
+      else
+        echo "WARNING: GITLAB_TOKEN not set, issue creation will be skipped"
+      fi
+  artifacts:
+    paths:
+      - reports/
+    expire_in: 1 week
+
+triage-failures:
+  extends: .triage-template
+  dependencies:
+    - test-all
+  needs:
+    - job: test-all
+      artifacts: true
+  script:
+    - |
+      if [ ! -f reports/results.json ]; then
+        echo "No results file found, skipping triage"
+        exit 0
+      fi
+    - |
+      # Check if there are failures
+      python3 -c "
+      import json, sys
+      with open('reports/results.json') as f:
+          data = json.load(f)
+      summary = data.get('summary', {})
+      failed = summary.get('failed', 0)
+      errors = summary.get('errors', 0)
+      if failed == 0 and errors == 0:
+          print('No failures to triage')
+          sys.exit(0)
+      print(f'Found {failed} failures and {errors} errors to triage')
+      sys.exit(2)  # Special exit code to indicate failures exist
+      " || FAILURES_EXIST=$?
+    - |
+      if [ "$FAILURES_EXIST" = "2" ]; then
+        if [ -n "$GITLAB_TOKEN" ]; then
+          echo "Routing failures to appropriate repositories..."
+          python3 route_failures.py reports/results.json --verbose --output reports/created_issues.json
+        else
+          echo "Skipping issue creation (no GITLAB_TOKEN)"
+          python3 route_failures.py reports/results.json --dry-run --verbose
+        fi
+      fi
+  rules:
+    - when: always
+  allow_failure: true
+
+triage-zig:
+  extends: .triage-template
+  dependencies:
+    - test-zig
+  needs:
+    - job: test-zig
+      artifacts: true
+      optional: true
+  script:
+    - |
+      if [ ! -f reports/results-zig.json ]; then
+        echo "No Zig results file found, skipping triage"
+        exit 0
+      fi
+    - |
+      python3 -c "
+      import json
+      with open('reports/results-zig.json') as f:
+          data = json.load(f)
+      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
+      if failed == 0:
+          print('No Zig failures to triage')
+      else:
+          print(f'Found {failed} Zig failures')
+          exit(2)
+      " || FAILURES_EXIST=$?
+    - |
+      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
+        python3 route_failures.py reports/results-zig.json --verbose
+      fi
+  rules:
+    - exists:
+        - runners/zig_runner
+  allow_failure: true
+
+triage-go:
+  extends: .triage-template
+  dependencies:
+    - test-go
+  needs:
+    - job: test-go
+      artifacts: true
+      optional: true
+  script:
+    - |
+      if [ ! -f reports/results-go.json ]; then
+        echo "No Go results file found, skipping triage"
+        exit 0
+      fi
+    - |
+      python3 -c "
+      import json
+      with open('reports/results-go.json') as f:
+          data = json.load(f)
+      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
+      if failed == 0:
+          print('No Go failures to triage')
+      else:
+          print(f'Found {failed} Go failures')
+          exit(2)
+      " || FAILURES_EXIST=$?
+    - |
+      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
+        python3 route_failures.py reports/results-go.json --verbose
+      fi
+  rules:
+    - exists:
+        - runners/go_runner
+  allow_failure: true
+
+triage-python:
+  extends: .triage-template
+  dependencies:
+    - test-python
+  needs:
+    - job: test-python
+      artifacts: true
+      optional: true
+  script:
+    - |
+      if [ ! -f reports/results-python.json ]; then
+        echo "No Python results file found, skipping triage"
+        exit 0
+      fi
+    - |
+      python3 -c "
+      import json
+      with open('reports/results-python.json') as f:
+          data = json.load(f)
+      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
+      if failed == 0:
+          print('No Python failures to triage')
+      else:
+          print(f'Found {failed} Python failures')
+          exit(2)
+      " || FAILURES_EXIST=$?
+    - |
+      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
+        python3 route_failures.py reports/results-python.json --verbose
+      fi
+  rules:
+    - exists:
+        - runners/python_runner.py
+  allow_failure: true
+
+triage-rust:
+  extends: .triage-template
+  dependencies:
+    - test-rust
+  needs:
+    - job: test-rust
+      artifacts: true
+      optional: true
+  script:
+    - |
+      if [ ! -f reports/results-rust.json ]; then
+        echo "No Rust results file found, skipping triage"
+        exit 0
+      fi
+    - |
+      python3 -c "
+      import json
+      with open('reports/results-rust.json') as f:
+          data = json.load(f)
+      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
+      if failed == 0:
+          print('No Rust failures to triage')
+      else:
+          print(f'Found {failed} Rust failures')
+          exit(2)
+      " || FAILURES_EXIST=$?
+    - |
+      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
+        python3 route_failures.py reports/results-rust.json --verbose
+      fi
+  rules:
+    - exists:
+        - runners/rust_runner/target/release/rust_runner
+  allow_failure: true
+
+triage-nodejs:
+  extends: .triage-template
+  dependencies:
+    - test-nodejs
+  needs:
+    - job: test-nodejs
+      artifacts: true
+      optional: true
+  script:
+    - |
+      if [ ! -f reports/results-nodejs.json ]; then
+        echo "No Node.js results file found, skipping triage"
+        exit 0
+      fi
+    - |
+      python3 -c "
+      import json
+      with open('reports/results-nodejs.json') as f:
+          data = json.load(f)
+      failed = sum(1 for r in data.get('results', []) if r.get('status') in ('failed', 'error'))
+      if failed == 0:
+          print('No Node.js failures to triage')
+      else:
+          print(f'Found {failed} Node.js failures')
+          exit(2)
+      " || FAILURES_EXIST=$?
+    - |
+      if [ "$FAILURES_EXIST" = "2" ] && [ -n "$GITLAB_TOKEN" ]; then
+        python3 route_failures.py reports/results-nodejs.json --verbose
+      fi
+  rules:
+    - exists:
+        - runners/nodejs_runner.js
+  allow_failure: true
+
+# =============================================================================
+# Analysis Stage
+# =============================================================================
+
+analyze-coverage:
+  stage: analyze
+  tags:
+    - company
+    - linux
+  image: python:3.11
+  dependencies:
+    - test-all
+  needs:
+    - job: test-all
+      artifacts: true
+  script:
+    - pip install pyyaml
+    - |
+      python3 -c "
+      import json
+      with open('reports/results.json') as f:
+          data = json.load(f)
+      summary = data.get('summary', {})
+      print('Test Coverage Report')
+      print('=' * 40)
+      print(f\"Total Tests: {summary.get('total', 0)}\")
+      print(f\"Passed: {summary.get('passed', 0)}\")
+      print(f\"Failed: {summary.get('failed', 0)}\")
+      print(f\"Errors: {summary.get('errors', 0)}\")
+      print(f\"Skipped: {summary.get('skipped', 0)}\")
+      if summary.get('total', 0) > 0:
+          pass_rate = summary.get('passed', 0) / summary.get('total', 1) * 100
+          print(f\"Pass Rate: {pass_rate:.1f}%\")
+
+      # Generate detailed per-client report
+      print()
+      print('Per-Client Results')
+      print('=' * 40)
+      client_stats = {}
+      for r in data.get('results', []):
+          client = r.get('client', 'unknown')
+          if client not in client_stats:
+              client_stats[client] = {'passed': 0, 'failed': 0, 'error': 0, 'skipped': 0}
+          status = r.get('status', 'unknown')
+          if status in client_stats[client]:
+              client_stats[client][status] += 1
+
+      for client, stats in sorted(client_stats.items()):
+          total = sum(stats.values())
+          rate = stats['passed'] / total * 100 if total > 0 else 0
+          print(f\"{client.upper()}: {stats['passed']}/{total} passed ({rate:.1f}%)\")
+      "
+  artifacts:
+    paths:
+      - reports/
+  rules:
+    - when: on_success
+
+# =============================================================================
+# Report Stage
+# =============================================================================
+
+generate-html-report:
+  stage: report
+  tags:
+    - company
+    - linux
+  image: python:3.11
+  dependencies:
+    - test-all
+    - triage-failures
+  needs:
+    - job: test-all
+      artifacts: true
+    - job: triage-failures
+      artifacts: true
+      optional: true
+  script:
+    - pip install pyyaml
+    - mkdir -p public
+    - |
+      python3 << 'PYTHON_SCRIPT'
+      import json
+      import html
+      from datetime import datetime
+
+      with open('reports/results.json') as f:
+          data = json.load(f)
+
+      summary = data.get('summary', {})
+      results = data.get('results', [])
+
+      # Load created issues if available
+      created_issues = {}
+      try:
+          with open('reports/created_issues.json') as f:
+              created_issues = json.load(f)
+      except:
+          pass
+
+      # Group results by client
+      by_client = {}
+      for r in results:
+          client = r.get('client', 'unknown')
+          if client not in by_client:
+              by_client[client] = []
+          by_client[client].append(r)
+
+      html_content = '''<!DOCTYPE html>
+      <html>
+      <head>
+          <title>Geode Test Harness Report</title>
+          <style>
+              body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+              .container { max-width: 1200px; margin: 0 auto; }
+              h1 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }
+              .summary { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 20px; }
+              .stat { text-align: center; }
+              .stat-value { font-size: 2em; font-weight: bold; }
+              .stat-label { color: #666; font-size: 0.9em; }
+              .passed .stat-value { color: #4CAF50; }
+              .failed .stat-value { color: #f44336; }
+              .error .stat-value { color: #ff9800; }
+              .skipped .stat-value { color: #9e9e9e; }
+              .client-section { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+              .client-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+              .client-name { font-size: 1.3em; font-weight: bold; color: #333; }
+              .client-stats { display: flex; gap: 15px; }
+              .badge { padding: 4px 10px; border-radius: 4px; font-size: 0.85em; }
+              .badge-passed { background: #e8f5e9; color: #2e7d32; }
+              .badge-failed { background: #ffebee; color: #c62828; }
+              .badge-error { background: #fff3e0; color: #e65100; }
+              .badge-skipped { background: #f5f5f5; color: #616161; }
+              table { border-collapse: collapse; width: 100%; }
+              th, td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; }
+              th { background: #fafafa; font-weight: 600; color: #666; }
+              tr:hover { background: #fafafa; }
+              .status-passed { color: #4CAF50; }
+              .status-failed { color: #f44336; }
+              .status-error { color: #ff9800; }
+              .status-skipped { color: #9e9e9e; }
+              .error-msg { font-size: 0.85em; color: #666; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+              .issues-section { background: #fff3e0; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+              .issues-section h3 { margin-top: 0; color: #e65100; }
+              .issue-link { color: #1976d2; text-decoration: none; }
+              .issue-link:hover { text-decoration: underline; }
+              footer { text-align: center; color: #999; margin-top: 40px; padding: 20px; }
+          </style>
+      </head>
+      <body>
+          <div class="container">
+              <h1>Geode Test Harness Report</h1>
+              <p style="color: #666;">Generated: ''' + datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC') + '''</p>
+
+              <div class="summary">
+                  <div class="stat">
+                      <div class="stat-value">''' + str(summary.get('total', 0)) + '''</div>
+                      <div class="stat-label">Total Tests</div>
+                  </div>
+                  <div class="stat passed">
+                      <div class="stat-value">''' + str(summary.get('passed', 0)) + '''</div>
+                      <div class="stat-label">Passed</div>
+                  </div>
+                  <div class="stat failed">
+                      <div class="stat-value">''' + str(summary.get('failed', 0)) + '''</div>
+                      <div class="stat-label">Failed</div>
+                  </div>
+                  <div class="stat error">
+                      <div class="stat-value">''' + str(summary.get('errors', 0)) + '''</div>
+                      <div class="stat-label">Errors</div>
+                  </div>
+                  <div class="stat skipped">
+                      <div class="stat-value">''' + str(summary.get('skipped', 0)) + '''</div>
+                      <div class="stat-label">Skipped</div>
+                  </div>
+              </div>
+      '''
+
+      # Show created issues if any
+      if created_issues:
+          html_content += '''
+              <div class="issues-section">
+                  <h3>Issues Created for Failures</h3>
+                  <ul>
+          '''
+          for repo, urls in created_issues.items():
+              for url in urls:
+                  html_content += f'<li><a href="{url}" class="issue-link">{url}</a></li>'
+          html_content += '''
+                  </ul>
+              </div>
+          '''
+
+      # Results by client
+      for client, client_results in sorted(by_client.items()):
+          passed = sum(1 for r in client_results if r.get('status') == 'passed')
+          failed = sum(1 for r in client_results if r.get('status') == 'failed')
+          errors = sum(1 for r in client_results if r.get('status') == 'error')
+          skipped = sum(1 for r in client_results if r.get('status') == 'skipped')
+          total = len(client_results)
+
+          html_content += f'''
+              <div class="client-section">
+                  <div class="client-header">
+                      <span class="client-name">{client.upper()}</span>
+                      <div class="client-stats">
+                          <span class="badge badge-passed">{passed} passed</span>
+                          <span class="badge badge-failed">{failed} failed</span>
+                          <span class="badge badge-error">{errors} errors</span>
+                          <span class="badge badge-skipped">{skipped} skipped</span>
+                      </div>
+                  </div>
+                  <table>
+                      <tr><th>Test</th><th>Status</th><th>Duration</th><th>Details</th></tr>
+          '''
+
+          for r in client_results:
+              status = r.get('status', 'unknown')
+              test_name = html.escape(r.get('test', r.get('test_name', 'Unknown')))
+              duration = r.get('duration_ms', 0)
+              error = html.escape(r.get('error', r.get('error_message', r.get('skip_reason', ''))) or '')
+
+              html_content += f'''
+                      <tr>
+                          <td>{test_name}</td>
+                          <td class="status-{status}">{status}</td>
+                          <td>{duration:.1f}ms</td>
+                          <td class="error-msg" title="{error}">{error[:100]}</td>
+                      </tr>
+              '''
+
+          html_content += '''
+                  </table>
+              </div>
+          '''
+
+      html_content += '''
+              <footer>
+                  <p>Generated by Geode Test Harness CI/CD Pipeline</p>
+              </footer>
+          </div>
+      </body>
+      </html>'''
+
+      with open('public/index.html', 'w') as f:
+          f.write(html_content)
+      print('HTML report generated: public/index.html')
+      PYTHON_SCRIPT
+  artifacts:
+    paths:
+      - public/
+  rules:
+    - when: on_success
+
+# =============================================================================
+# Pages Stage
+# =============================================================================
+
+pages:
+  stage: pages
+  tags:
+    - company
+    - linux
+  dependencies:
+    - generate-html-report
+  script:
+    - echo "Publishing to GitLab Pages"
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

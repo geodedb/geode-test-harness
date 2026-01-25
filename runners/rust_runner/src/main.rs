@@ -17,8 +17,8 @@ struct Args {
     #[arg(long)]
     spec: PathBuf,
 
-    /// Server address (host:port)
-    #[arg(long, default_value = "localhost:8443")]
+    /// Server address (host:port, default: localhost:3141)
+    #[arg(long, default_value = "localhost:3141")]
     server: String,
 
     /// Output JSON format
@@ -61,9 +61,27 @@ struct Test {
     #[serde(default)]
     skip: bool,
     #[serde(default)]
+    skip_reason: Option<String>,
+    #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
     expect_error: bool,
+    #[serde(default)]
+    benchmark: Option<BenchmarkConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct BenchmarkConfig {
+    #[serde(default)]
+    iterations: Option<usize>,
+    #[serde(default)]
+    max_avg_latency_ms: Option<f64>,
+    #[serde(default)]
+    max_p95_latency_ms: Option<f64>,
+    #[serde(default)]
+    max_total_time_ms: Option<f64>,
+    #[serde(default)]
+    concurrent: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -78,6 +96,10 @@ struct StepDef {
     expect: Expectation,
     #[serde(default)]
     expect_error: bool,
+    #[serde(default)]
+    connection_id: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -101,8 +123,23 @@ struct TestResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<QueryResult>,
     duration_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    benchmark: Option<BenchmarkResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkResult {
+    iterations: usize,
+    avg_latency_ms: f64,
+    p95_latency_ms: f64,
+    min_latency_ms: f64,
+    max_latency_ms: f64,
+    total_time_ms: f64,
+    errors: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +167,7 @@ struct Output {
 struct Runner {
     client: Client,
     connection: Arc<Mutex<Option<Connection>>>,
+    connections: Arc<Mutex<HashMap<String, Connection>>>,  // Connection registry for multi-connection tests
     verbose: bool,
 }
 
@@ -144,6 +182,7 @@ impl Runner {
         Self {
             client,
             connection: Arc::new(Mutex::new(None)),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             verbose,
         }
     }
@@ -238,6 +277,104 @@ impl Runner {
     }
 
     async fn run_test(&mut self, test: &Test) -> TestResult {
+        // Check if this is a benchmark test
+        if let Some(ref benchmark) = test.benchmark {
+            return self.run_benchmark_test(test, benchmark).await;
+        }
+        self.run_single_test(test).await
+    }
+
+    async fn run_benchmark_test(&mut self, test: &Test, benchmark: &BenchmarkConfig) -> TestResult {
+        let iterations = benchmark.iterations.unwrap_or(10);
+        let mut latencies = Vec::with_capacity(iterations);
+        let mut error_count = 0;
+        let start_total = Instant::now();
+
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let result = self.run_single_test(test).await;
+            let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+            latencies.push(latency_ms);
+
+            if result.status != "passed" {
+                error_count += 1;
+            }
+        }
+
+        let total_time_ms = start_total.elapsed().as_secs_f64() * 1000.0;
+
+        if latencies.is_empty() {
+            return TestResult {
+                test: test.name.clone(),
+                status: "error".to_string(),
+                error: Some("No benchmark iterations completed".to_string()),
+                skip_reason: None,
+                result: None,
+                duration_ms: 0.0,
+                benchmark: None,
+            };
+        }
+
+        // Calculate statistics
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let avg_latency: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
+        let p95_index = ((latencies.len() as f64 * 0.95) as usize).min(latencies.len() - 1);
+        let p95_latency = latencies[p95_index];
+        let min_latency = latencies[0];
+        let max_latency = latencies[latencies.len() - 1];
+
+        let benchmark_result = BenchmarkResult {
+            iterations,
+            avg_latency_ms: avg_latency,
+            p95_latency_ms: p95_latency,
+            min_latency_ms: min_latency,
+            max_latency_ms: max_latency,
+            total_time_ms,
+            errors: error_count,
+        };
+
+        // Check thresholds
+        let mut failures = Vec::new();
+        if let Some(max_avg) = benchmark.max_avg_latency_ms {
+            if avg_latency > max_avg {
+                failures.push(format!("Average latency {:.2}ms exceeds max {:.2}ms", avg_latency, max_avg));
+            }
+        }
+        if let Some(max_p95) = benchmark.max_p95_latency_ms {
+            if p95_latency > max_p95 {
+                failures.push(format!("P95 latency {:.2}ms exceeds max {:.2}ms", p95_latency, max_p95));
+            }
+        }
+        if let Some(max_total) = benchmark.max_total_time_ms {
+            if total_time_ms > max_total {
+                failures.push(format!("Total time {:.2}ms exceeds max {:.2}ms", total_time_ms, max_total));
+            }
+        }
+
+        if !failures.is_empty() {
+            return TestResult {
+                test: test.name.clone(),
+                status: "failed".to_string(),
+                error: Some(failures.join("; ")),
+                skip_reason: None,
+                result: None,
+                duration_ms: total_time_ms,
+                benchmark: Some(benchmark_result),
+            };
+        }
+
+        TestResult {
+            test: test.name.clone(),
+            status: "passed".to_string(),
+            error: None,
+            skip_reason: None,
+            result: None,
+            duration_ms: total_time_ms,
+            benchmark: Some(benchmark_result),
+        }
+    }
+
+    async fn run_single_test(&mut self, test: &Test) -> TestResult {
         let start = Instant::now();
 
         // Simple query test
@@ -252,6 +389,7 @@ impl Runner {
                             test: test.name.clone(),
                             status: "failed".to_string(),
                             error: Some(e.to_string()),
+                            skip_reason: None,
                             result: Some(result),
                             duration_ms: duration,
                         };
@@ -261,6 +399,7 @@ impl Runner {
                         test: test.name.clone(),
                         status: "passed".to_string(),
                         error: None,
+                        skip_reason: None,
                         result: Some(result),
                         duration_ms: duration,
                     }
@@ -272,6 +411,7 @@ impl Runner {
                             test: test.name.clone(),
                             status: "passed".to_string(),
                             error: None,
+                            skip_reason: None,
                             result: None,
                             duration_ms: duration,
                         }
@@ -280,6 +420,7 @@ impl Runner {
                             test: test.name.clone(),
                             status: "error".to_string(),
                             error: Some(e.to_string()),
+                            skip_reason: None,
                             result: None,
                             duration_ms: duration,
                         }
@@ -296,6 +437,7 @@ impl Runner {
                         test: test.name.clone(),
                         status: "passed".to_string(),
                         error: None,
+                        skip_reason: None,
                         result: None,
                         duration_ms: duration,
                     }
@@ -307,6 +449,7 @@ impl Runner {
                             test: test.name.clone(),
                             status: "passed".to_string(),
                             error: None,
+                            skip_reason: None,
                             result: None,
                             duration_ms: duration,
                         }
@@ -315,6 +458,7 @@ impl Runner {
                             test: test.name.clone(),
                             status: "error".to_string(),
                             error: Some(e.to_string()),
+                            skip_reason: None,
                             result: None,
                             duration_ms: duration,
                         }
@@ -326,6 +470,7 @@ impl Runner {
                 test: test.name.clone(),
                 status: "error".to_string(),
                 error: Some("Test must have 'query' or 'steps'".to_string()),
+                skip_reason: None,
                 result: None,
                 duration_ms: 0.0,
             }
@@ -395,22 +540,63 @@ impl Runner {
     async fn execute_steps(&mut self, steps: &[StepDef]) -> Result<()> {
         for step in steps {
             let expect_error = step.expect_error;
+            let conn_id = step.connection_id.clone().or_else(|| step.id.clone());
 
             let result = match step.step_type.as_str() {
                 "connect" => {
                     let client = self.client.clone();
                     let connection = client.connect().await?;
 
-                    let mut guard = self.connection.lock().unwrap();
-                    *guard = Some(connection);
+                    if let Some(id) = &conn_id {
+                        // Store in named connections registry
+                        let mut guard = self.connections.lock().unwrap();
+                        guard.insert(id.clone(), connection);
+                    } else {
+                        let mut guard = self.connection.lock().unwrap();
+                        *guard = Some(connection);
+                    }
                     Ok(())
                 }
                 "disconnect" => {
-                    let conn_opt = {
-                        let mut guard = self.connection.lock().unwrap();
-                        guard.take()
-                    };
+                    if let Some(id) = &conn_id {
+                        // Remove from named connections registry
+                        let conn_opt = {
+                            let mut guard = self.connections.lock().unwrap();
+                            guard.remove(id)
+                        };
+                        if let Some(mut conn) = conn_opt {
+                            tokio::task::spawn_blocking(move || conn.close())
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Spawn error: {}", e))??;
+                        }
+                    } else {
+                        let conn_opt = {
+                            let mut guard = self.connection.lock().unwrap();
+                            guard.take()
+                        };
 
+                        if let Some(mut conn) = conn_opt {
+                            tokio::task::spawn_blocking(move || conn.close())
+                                .await
+                                .map_err(|e| anyhow::anyhow!("Spawn error: {}", e))??;
+                        }
+                    }
+                    Ok(())
+                }
+                "pool_acquire" => {
+                    let id = conn_id.unwrap_or_else(|| "default".to_string());
+                    let client = self.client.clone();
+                    let connection = client.connect().await?;
+                    let mut guard = self.connections.lock().unwrap();
+                    guard.insert(id, connection);
+                    Ok(())
+                }
+                "pool_release" => {
+                    let id = conn_id.unwrap_or_else(|| "default".to_string());
+                    let conn_opt = {
+                        let mut guard = self.connections.lock().unwrap();
+                        guard.remove(&id)
+                    };
                     if let Some(mut conn) = conn_opt {
                         tokio::task::spawn_blocking(move || conn.close())
                             .await
@@ -427,12 +613,7 @@ impl Runner {
                     };
 
                     if let Some(mut conn) = conn_opt {
-                        conn = tokio::task::spawn_blocking(move || {
-                            conn.begin()?;
-                            Ok::<_, anyhow::Error>(conn)
-                        })
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Spawn error: {}", e))??;
+                        conn.begin().await?;
 
                         let mut guard = self.connection.lock().unwrap();
                         *guard = Some(conn);
@@ -446,12 +627,7 @@ impl Runner {
                     };
 
                     if let Some(mut conn) = conn_opt {
-                        conn = tokio::task::spawn_blocking(move || {
-                            conn.commit()?;
-                            Ok::<_, anyhow::Error>(conn)
-                        })
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Spawn error: {}", e))??;
+                        conn.commit().await?;
 
                         let mut guard = self.connection.lock().unwrap();
                         *guard = Some(conn);
@@ -465,12 +641,7 @@ impl Runner {
                     };
 
                     if let Some(mut conn) = conn_opt {
-                        conn = tokio::task::spawn_blocking(move || {
-                            conn.rollback()?;
-                            Ok::<_, anyhow::Error>(conn)
-                        })
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Spawn error: {}", e))??;
+                        conn.rollback().await?;
 
                         let mut guard = self.connection.lock().unwrap();
                         *guard = Some(conn);
@@ -638,6 +809,7 @@ async fn main() -> Result<()> {
                 test: test.name.clone(),
                 status: "skipped".to_string(),
                 error: None,
+                skip_reason: test.skip_reason.clone(),
                 result: None,
                 duration_ms: 0.0,
             });

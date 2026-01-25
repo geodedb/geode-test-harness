@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -12,7 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	_ "gitlab.com/devnw/codepros/geode/geode/clients/go/geode"
+	_ "go.codepros.org/geode"
 )
 
 type TestSpec struct {
@@ -32,16 +33,38 @@ type Test struct {
 	Expect      map[string]interface{}   `yaml:"expect"`
 	Steps       []map[string]interface{} `yaml:"steps"`
 	Skip        bool                     `yaml:"skip"`
+	SkipReason  string                   `yaml:"skip_reason"`
 	TimeoutMS   int                      `yaml:"timeout_ms"`
 	ExpectError bool                     `yaml:"expect_error"`
+	Benchmark   *BenchmarkConfig         `yaml:"benchmark"`
+}
+
+type BenchmarkConfig struct {
+	Iterations      int     `yaml:"iterations"`
+	MaxAvgLatencyMs float64 `yaml:"max_avg_latency_ms"`
+	MaxP95LatencyMs float64 `yaml:"max_p95_latency_ms"`
+	MaxTotalTimeMs  float64 `yaml:"max_total_time_ms"`
+	Concurrent      int     `yaml:"concurrent"`
 }
 
 type TestResult struct {
 	Test       string                 `json:"test"`
 	Status     string                 `json:"status"`
 	Error      string                 `json:"error,omitempty"`
+	SkipReason string                 `json:"skip_reason,omitempty"`
 	Result     map[string]interface{} `json:"result,omitempty"`
 	DurationMS float64                `json:"duration_ms"`
+	Benchmark  *BenchmarkResult       `json:"benchmark,omitempty"`
+}
+
+type BenchmarkResult struct {
+	Iterations   int     `json:"iterations"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"`
+	P95LatencyMs float64 `json:"p95_latency_ms"`
+	MinLatencyMs float64 `json:"min_latency_ms"`
+	MaxLatencyMs float64 `json:"max_latency_ms"`
+	TotalTimeMs  float64 `json:"total_time_ms"`
+	Errors       int     `json:"errors"`
 }
 
 type Summary struct {
@@ -58,14 +81,15 @@ type Output struct {
 }
 
 type Runner struct {
-	db      *sql.DB
-	tx      *sql.Tx
-	verbose bool
+	db          *sql.DB
+	tx          *sql.Tx
+	verbose     bool
+	connections map[string]*sql.Conn // Connection registry for multi-connection tests
 }
 
 func main() {
 	specPath := flag.String("spec", "", "Test specification file")
-	server := flag.String("server", "localhost:8443", "Server address")
+	server := flag.String("server", "localhost:3141", "Server address (default: localhost:3141)")
 	jsonOutput := flag.Bool("json", false, "Output JSON")
 	verbose := flag.Bool("verbose", false, "Verbose output")
 	flag.Parse()
@@ -93,7 +117,7 @@ func main() {
 	}
 
 	// Create DSN for QUIC connection
-	dsn := fmt.Sprintf("quic:%s?skip_verify=true", *server)
+	dsn := fmt.Sprintf("%s?insecure=true", *server)
 
 	// Open database connection
 	db, err := sql.Open("geode", dsn)
@@ -104,8 +128,9 @@ func main() {
 	defer db.Close()
 
 	runner := &Runner{
-		db:      db,
-		verbose: *verbose,
+		db:          db,
+		verbose:     *verbose,
+		connections: make(map[string]*sql.Conn),
 	}
 
 	// Run setup
@@ -119,8 +144,9 @@ func main() {
 	for _, test := range spec.Tests {
 		if test.Skip {
 			results = append(results, TestResult{
-				Test:   test.Name,
-				Status: "skipped",
+				Test:       test.Name,
+				Status:     "skipped",
+				SkipReason: test.SkipReason,
 			})
 			continue
 		}
@@ -202,6 +228,95 @@ func (r *Runner) runCleanup(cleanup []map[string]interface{}) error {
 }
 
 func (r *Runner) runTest(test Test) TestResult {
+	// Check if this is a benchmark test
+	if test.Benchmark != nil {
+		return r.runBenchmarkTest(test)
+	}
+
+	return r.runSingleTest(test)
+}
+
+func (r *Runner) runBenchmarkTest(test Test) TestResult {
+	benchmark := test.Benchmark
+	iterations := benchmark.Iterations
+	if iterations <= 0 {
+		iterations = 10
+	}
+
+	latencies := make([]float64, 0, iterations)
+	errorCount := 0
+	startTotal := time.Now()
+
+	for i := 0; i < iterations; i++ {
+		start := time.Now()
+		result := r.runSingleTest(test)
+		latencyMs := float64(time.Since(start).Milliseconds())
+		latencies = append(latencies, latencyMs)
+
+		if result.Status != "passed" {
+			errorCount++
+		}
+	}
+
+	totalTimeMs := float64(time.Since(startTotal).Milliseconds())
+
+	if len(latencies) == 0 {
+		return TestResult{
+			Status: "error",
+			Error:  "No benchmark iterations completed",
+		}
+	}
+
+	// Calculate statistics
+	sort.Float64s(latencies)
+	var sum float64
+	for _, l := range latencies {
+		sum += l
+	}
+	avgLatency := sum / float64(len(latencies))
+	p95Index := int(float64(len(latencies)) * 0.95)
+	if p95Index >= len(latencies) {
+		p95Index = len(latencies) - 1
+	}
+	p95Latency := latencies[p95Index]
+
+	benchmarkResult := &BenchmarkResult{
+		Iterations:   iterations,
+		AvgLatencyMs: avgLatency,
+		P95LatencyMs: p95Latency,
+		MinLatencyMs: latencies[0],
+		MaxLatencyMs: latencies[len(latencies)-1],
+		TotalTimeMs:  totalTimeMs,
+		Errors:       errorCount,
+	}
+
+	// Check thresholds
+	var failures []string
+	if benchmark.MaxAvgLatencyMs > 0 && avgLatency > benchmark.MaxAvgLatencyMs {
+		failures = append(failures, fmt.Sprintf("Average latency %.2fms exceeds max %.2fms", avgLatency, benchmark.MaxAvgLatencyMs))
+	}
+	if benchmark.MaxP95LatencyMs > 0 && p95Latency > benchmark.MaxP95LatencyMs {
+		failures = append(failures, fmt.Sprintf("P95 latency %.2fms exceeds max %.2fms", p95Latency, benchmark.MaxP95LatencyMs))
+	}
+	if benchmark.MaxTotalTimeMs > 0 && totalTimeMs > benchmark.MaxTotalTimeMs {
+		failures = append(failures, fmt.Sprintf("Total time %.2fms exceeds max %.2fms", totalTimeMs, benchmark.MaxTotalTimeMs))
+	}
+
+	if len(failures) > 0 {
+		return TestResult{
+			Status:    "failed",
+			Error:     fmt.Sprintf("%v", failures),
+			Benchmark: benchmarkResult,
+		}
+	}
+
+	return TestResult{
+		Status:    "passed",
+		Benchmark: benchmarkResult,
+	}
+}
+
+func (r *Runner) runSingleTest(test Test) TestResult {
 	start := time.Now()
 
 	// Simple query test
@@ -320,7 +435,57 @@ func (r *Runner) executeQuery(query string, params map[string]interface{}, expec
 	}, nil
 }
 
+// executeQueryOnConn executes a query on a specific connection
+func (r *Runner) executeQueryOnConn(ctx context.Context, conn *sql.Conn, query string, params map[string]interface{}, expect map[string]interface{}) (map[string]interface{}, error) {
+	// Execute query on specific connection
+	rows, err := conn.QueryContext(ctx, query, convertParams(params)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Get column names
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	// Read all rows
+	data := []map[string]interface{}{}
+	for rows.Next() {
+		// Create slice for scanning
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, err
+		}
+
+		// Build row map
+		row := make(map[string]interface{})
+		for i, col := range columns {
+			row[col] = values[i]
+		}
+		data = append(data, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"rows":    len(data),
+		"columns": columns,
+		"data":    data,
+	}, nil
+}
+
 func (r *Runner) executeSteps(steps []map[string]interface{}) error {
+	ctx := context.Background()
+
 	for _, step := range steps {
 		stepType, ok := step["type"].(string)
 		if !ok {
@@ -331,6 +496,9 @@ func (r *Runner) executeSteps(steps []map[string]interface{}) error {
 		if ee, ok := step["expect_error"].(bool); ok {
 			expectError = ee
 		}
+
+		// Get connection_id if specified
+		connID, _ := step["connection_id"].(string)
 
 		var err error
 		switch stepType {
@@ -354,15 +522,74 @@ func (r *Runner) executeSteps(steps []map[string]interface{}) error {
 			params, _ := step["params"].(map[string]interface{})
 			expect, _ := step["expect"].(map[string]interface{})
 
-			result, qerr := r.executeQuery(text, params, expect)
+			var result map[string]interface{}
+			var qerr error
+
+			// Use named connection if specified
+			if connID != "" {
+				if conn, ok := r.connections[connID]; ok {
+					result, qerr = r.executeQueryOnConn(ctx, conn, text, params, expect)
+				} else {
+					qerr = fmt.Errorf("connection '%s' not found", connID)
+				}
+			} else {
+				result, qerr = r.executeQuery(text, params, expect)
+			}
+
 			if qerr != nil {
 				err = qerr
 			} else if expect != nil {
 				err = r.validateExpectations(result, expect)
 			}
 
-		case "connect", "disconnect":
-			// No-op for Go SQL driver (managed automatically)
+		case "connect":
+			if connID != "" {
+				// Multi-connection: create named connection
+				conn, cerr := r.db.Conn(ctx)
+				if cerr != nil {
+					err = cerr
+				} else {
+					r.connections[connID] = conn
+				}
+			}
+			// Default connect is no-op for Go SQL driver
+
+		case "disconnect":
+			if connID != "" {
+				if conn, ok := r.connections[connID]; ok {
+					err = conn.Close()
+					delete(r.connections, connID)
+				}
+			}
+			// Default disconnect is no-op for Go SQL driver
+
+		case "pool_acquire":
+			id := connID
+			if id == "" {
+				id, _ = step["id"].(string)
+			}
+			if id == "" {
+				id = "default"
+			}
+			conn, cerr := r.db.Conn(ctx)
+			if cerr != nil {
+				err = cerr
+			} else {
+				r.connections[id] = conn
+			}
+
+		case "pool_release":
+			id := connID
+			if id == "" {
+				id, _ = step["id"].(string)
+			}
+			if id == "" {
+				id = "default"
+			}
+			if conn, ok := r.connections[id]; ok {
+				err = conn.Close()
+				delete(r.connections, id)
+			}
 
 		default:
 			if r.verbose {

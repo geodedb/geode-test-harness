@@ -8,7 +8,9 @@ Executes test specifications using the Geode Python client library.
 import argparse
 import asyncio
 import json
+import statistics
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,8 +24,8 @@ try:
     from geode_client import Client, Connection
     _GEODE_CLIENT_AVAILABLE = True
 except ImportError:
-    # Try adding Python client sibling directory to path
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent / "python"))
+    # Try adding Python client from external repo sibling directory
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent / "geode-client-python"))
     try:
         from geode_client import Client, Connection
         _GEODE_CLIENT_AVAILABLE = True
@@ -49,17 +51,18 @@ class PythonTestRunner:
     def __init__(self, server: str, verbose: bool = False):
         host, port = server.split(":")
 
-        # Use CA certificate for TLS verification
-        ca_cert_path = Path(__file__).parent.parent / "certs" / "ca.crt"
-
+        # TLS Configuration:
+        # - skip_verify=True: Required for test harness since Geode server uses
+        #   self-signed certificates that may lack proper SAN (Subject Alternative Name)
+        # - No ca_cert needed when skipping verification
         self.client = Client(
             host=host,
             port=int(port),
-            ca_cert=str(ca_cert_path),
-            skip_verify=True  # MSQUIC migration: self-signed cert without proper SAN validation
+            skip_verify=True
         )
         self.verbose = verbose
         self.connection: Optional[Connection] = None
+        self.connections: Dict[str, Connection] = {}  # Connection registry for multi-connection tests
 
     async def setup(self):
         """Setup runner."""
@@ -70,8 +73,35 @@ class PythonTestRunner:
         if self.connection:
             try:
                 await self.connection.close()
-            except:
-                pass
+            except Exception:
+                pass  # Ignore connection close errors during teardown
+        # Close all pooled connections
+        for conn_id, conn in list(self.connections.items()):
+            try:
+                await conn.close()
+            except Exception:
+                pass  # Ignore connection close errors during teardown
+        self.connections.clear()
+
+    def _get_connection(self, connection_id: Optional[str] = None) -> Optional[Connection]:
+        """Get connection by ID or return default connection."""
+        if connection_id and connection_id in self.connections:
+            return self.connections[connection_id]
+        return self.connection
+
+    async def pool_acquire(self, connection_id: str):
+        """Acquire a pooled connection."""
+        conn = await self.client.connect()
+        self.connections[connection_id] = conn
+
+    async def pool_release(self, connection_id: str):
+        """Release a pooled connection."""
+        if connection_id in self.connections:
+            try:
+                await self.connections[connection_id].close()
+            except Exception:
+                pass  # Ignore connection close errors during pool release
+            del self.connections[connection_id]
 
     async def connect(self):
         """Establish connection."""
@@ -85,13 +115,17 @@ class PythonTestRunner:
             self.connection = None
 
     async def run_query(
-        self, query: str, params: Optional[Dict[str, Any]] = None
+        self, query: str, params: Optional[Dict[str, Any]] = None, connection_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Execute a query."""
-        if not self.connection:
+        """Execute a query on specified or default connection."""
+        conn = self._get_connection(connection_id)
+        if not conn:
+            if connection_id:
+                raise Exception(f"Connection '{connection_id}' not found")
             await self.connect()
+            conn = self.connection
 
-        page, pager = await self.connection.query(query, params)
+        page, pager = await conn.query(query, params)
 
         # Collect all pages if there are more
         all_rows = list(page.rows)
@@ -108,26 +142,111 @@ class PythonTestRunner:
             ],
         }
 
-    async def begin_transaction(self):
-        """Begin transaction."""
-        if not self.connection:
+    async def begin_transaction(self, connection_id: Optional[str] = None):
+        """Begin transaction on specified or default connection."""
+        conn = self._get_connection(connection_id)
+        if not conn:
+            if connection_id:
+                raise Exception(f"Connection '{connection_id}' not found")
             await self.connect()
-        await self.connection.begin()
+            conn = self.connection
+        await conn.begin()
 
-    async def commit_transaction(self):
-        """Commit transaction."""
-        if not self.connection:
-            raise Exception("No active connection")
-        await self.connection.commit()
+    async def commit_transaction(self, connection_id: Optional[str] = None):
+        """Commit transaction on specified or default connection."""
+        conn = self._get_connection(connection_id)
+        if not conn:
+            raise Exception(f"No active connection{' for ' + connection_id if connection_id else ''}")
+        await conn.commit()
 
-    async def rollback_transaction(self):
-        """Rollback transaction."""
-        if not self.connection:
-            raise Exception("No active connection")
-        await self.connection.rollback()
+    async def rollback_transaction(self, connection_id: Optional[str] = None):
+        """Rollback transaction on specified or default connection."""
+        conn = self._get_connection(connection_id)
+        if not conn:
+            raise Exception(f"No active connection{' for ' + connection_id if connection_id else ''}")
+        await conn.rollback()
 
     async def run_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
         """Run a single test."""
+        # Check if this is a benchmark test
+        benchmark = test.get("benchmark")
+        if benchmark:
+            return await self._run_benchmark_test(test, benchmark)
+
+        return await self._run_single_test(test)
+
+    async def _run_benchmark_test(self, test: Dict[str, Any], benchmark: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a benchmark test with multiple iterations."""
+        iterations = benchmark.get("iterations", 10)
+        max_avg_latency_ms = benchmark.get("max_avg_latency_ms")
+        max_p95_latency_ms = benchmark.get("max_p95_latency_ms")
+        max_total_time_ms = benchmark.get("max_total_time_ms")
+
+        latencies = []
+        errors = []
+        start_total = time.time()
+
+        for i in range(iterations):
+            start = time.time()
+            try:
+                result = await self._run_single_test(test)
+                latency_ms = (time.time() - start) * 1000
+                latencies.append(latency_ms)
+
+                if result.get("status") != "passed":
+                    errors.append(f"Iteration {i+1}: {result.get('error', 'Unknown error')}")
+            except Exception as e:
+                latencies.append((time.time() - start) * 1000)
+                errors.append(f"Iteration {i+1}: {str(e)}")
+
+        total_time_ms = (time.time() - start_total) * 1000
+
+        if not latencies:
+            return {"status": "error", "error": "No benchmark iterations completed"}
+
+        # Calculate statistics
+        avg_latency = statistics.mean(latencies)
+        sorted_latencies = sorted(latencies)
+        p95_index = int(len(sorted_latencies) * 0.95)
+        p95_latency = sorted_latencies[min(p95_index, len(sorted_latencies) - 1)]
+
+        benchmark_result = {
+            "iterations": iterations,
+            "avg_latency_ms": round(avg_latency, 2),
+            "p95_latency_ms": round(p95_latency, 2),
+            "min_latency_ms": round(min(latencies), 2),
+            "max_latency_ms": round(max(latencies), 2),
+            "total_time_ms": round(total_time_ms, 2),
+            "errors": len(errors),
+        }
+
+        # Check thresholds
+        failures = []
+        if max_avg_latency_ms and avg_latency > max_avg_latency_ms:
+            failures.append(f"Average latency {avg_latency:.2f}ms exceeds max {max_avg_latency_ms}ms")
+        if max_p95_latency_ms and p95_latency > max_p95_latency_ms:
+            failures.append(f"P95 latency {p95_latency:.2f}ms exceeds max {max_p95_latency_ms}ms")
+        if max_total_time_ms and total_time_ms > max_total_time_ms:
+            failures.append(f"Total time {total_time_ms:.2f}ms exceeds max {max_total_time_ms}ms")
+
+        if failures:
+            return {
+                "status": "failed",
+                "error": "; ".join(failures),
+                "benchmark": benchmark_result,
+            }
+
+        if errors:
+            return {
+                "status": "passed",
+                "warning": f"{len(errors)} iterations had errors",
+                "benchmark": benchmark_result,
+            }
+
+        return {"status": "passed", "benchmark": benchmark_result}
+
+    async def _run_single_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
+        """Run a single test iteration."""
         try:
             # Simple query test
             if "query" in test:
@@ -186,14 +305,28 @@ class PythonTestRunner:
                 results = []
                 for step in test["steps"]:
                     step_type = step.get("type")
+                    connection_id = step.get("connection_id")
 
                     if step_type == "connect":
-                        await self.connect()
+                        if connection_id:
+                            # Multi-connection: create named connection
+                            await self.pool_acquire(connection_id)
+                        else:
+                            await self.connect()
                     elif step_type == "disconnect":
-                        await self.disconnect()
+                        if connection_id:
+                            await self.pool_release(connection_id)
+                        else:
+                            await self.disconnect()
+                    elif step_type == "pool_acquire":
+                        conn_id = connection_id or step.get("id", "default")
+                        await self.pool_acquire(conn_id)
+                    elif step_type == "pool_release":
+                        conn_id = connection_id or step.get("id", "default")
+                        await self.pool_release(conn_id)
                     elif step_type == "query":
                         result = await self.run_query(
-                            step["text"], step.get("params", {})
+                            step["text"], step.get("params", {}), connection_id
                         )
                         results.append(result)
 
@@ -207,11 +340,11 @@ class PythonTestRunner:
                                     "results": results,
                                 }
                     elif step_type == "begin":
-                        await self.begin_transaction()
+                        await self.begin_transaction(connection_id)
                     elif step_type == "commit":
-                        await self.commit_transaction()
+                        await self.commit_transaction(connection_id)
                     elif step_type == "rollback":
-                        await self.rollback_transaction()
+                        await self.rollback_transaction(connection_id)
                     else:
                         if self.verbose:
                             print(f"Unknown step type: {step_type}", file=sys.stderr)
@@ -249,7 +382,10 @@ class PythonTestRunner:
         # Run tests
         for test in spec.get("tests", []):
             if test.get("skip", False):
-                results.append({"test": test["name"], "status": "skipped"})
+                result = {"test": test["name"], "status": "skipped"}
+                if "skip_reason" in test:
+                    result["skip_reason"] = test["skip_reason"]
+                results.append(result)
                 continue
 
             result = await self.run_test(test)
@@ -286,7 +422,7 @@ async def main():
     parser = argparse.ArgumentParser(description="Python client test runner")
     parser.add_argument("--spec", required=True, type=Path, help="Test specification")
     parser.add_argument(
-        "--server", default="localhost:8443", help="Server address"
+        "--server", default="localhost:3141", help="Server address (default: localhost:3141)"
     )
     parser.add_argument("--json", action="store_true", help="Output JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")

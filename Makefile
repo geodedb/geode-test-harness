@@ -1,6 +1,28 @@
-# Note: Go, Python, Rust clients have moved to separate repositories
-# This test harness now only supports the Zig client
-.PHONY: help setup test test-zig test-all test-comprehensive clean build-all build-zig report-html test-all-html test-auth test-perf analyze-perf analyze-coverage test-with-coverage
+# Geode Test Harness
+# Cross-language test framework for validating Geode client implementations
+#
+# Uses Docker container for Geode server management
+
+.PHONY: all help setup test test-all test-comprehensive clean build-all report-html test-all-html
+.PHONY: test-zig test-go test-python test-rust test-nodejs
+.PHONY: build-zig build-go build-python build-rust build-nodejs
+.PHONY: docker-start docker-stop docker-logs docker-status docker-clean
+.PHONY: test-transactions test-connections test-auth test-perf
+.PHONY: analyze-perf analyze-coverage test-with-coverage
+.PHONY: migrate migrate-status migrate-create test-graph
+.PHONY: route-failures route-failures-dry-run
+
+# Default target: run full test suite with Docker
+all: clean docker-start test-all docker-stop
+	@echo ""
+	@echo "Full test suite completed."
+
+# Docker settings (matching client repos)
+DOCKER ?= docker
+GEODE_IMAGE ?= registry.gitlab.com/devnw/geode/geode:latest
+GEODE_CONTAINER ?= geode-test-harness
+GEODE_HOST ?= 127.0.0.1
+GEODE_PORT ?= 3141
 
 # Python virtual environment settings
 VENV_DIR := .venv
@@ -9,11 +31,18 @@ VENV_PYTHON := $(VENV_DIR)/bin/python3
 VENV_PIP := $(VENV_DIR)/bin/pip
 ACTIVATE := . $(VENV_DIR)/bin/activate
 
+# External client repo paths (sibling directories)
+GO_CLIENT_PATH := ../geode-client-go
+PYTHON_CLIENT_PATH := ../geode-client-python
+RUST_CLIENT_PATH := ../geode-client-rust
+ZIG_CLIENT_PATH := ../geode-client-zig
+NODEJS_CLIENT_PATH := ../geode-client-nodejs
+
 # Check if we're in a venv or nix environment
 IN_VENV := $(shell python3 -c "import sys; print(1 if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix) else 0)" 2>/dev/null || echo 0)
 IN_NIX := $(shell [ -n "$$NIX_BUILD_TOP" ] || [ -n "$$GEODE_NIX_BUILD" ] && echo 1 || echo 0)
 
-# Always use venv Python if it exists, to ensure Python dependencies are available
+# Always use venv Python if it exists
 ifneq (,$(wildcard $(VENV_PYTHON)))
     RUN_PYTHON := $(VENV_PYTHON)
 else ifeq ($(IN_VENV),1)
@@ -23,54 +52,174 @@ else
 endif
 
 help:
-	@echo "Client Library Test Harness (Zig only)"
+	@echo "Geode Test Harness - Cross-Language Client Testing"
 	@echo ""
-	@echo "Note: Go, Python, Rust clients have moved to separate repositories"
+	@echo "Quick Start:"
+	@echo "  make             - Run full test suite (clean, start Docker, test, stop)"
+	@echo "  make clean && make - Clean everything and run full suite"
 	@echo ""
-	@echo "Available targets:"
-	@echo "  setup            - Install dependencies and build Zig runner"
-	@echo "  build-all        - Build Zig runner"
+	@echo "Docker Server Management:"
+	@echo "  docker-start     - Start Geode server container"
+	@echo "  docker-stop      - Stop Geode server container"
+	@echo "  docker-logs      - View container logs"
+	@echo "  docker-status    - Check container status"
+	@echo "  docker-clean     - Stop and remove test container"
+	@echo ""
+	@echo "Migration Commands:"
+	@echo "  migrate          - Run database migrations"
+	@echo "  migrate-status   - Show migration status"
+	@echo "  migrate-create   - Create a new migration (NAME=name)"
+	@echo ""
+	@echo "Build Commands:"
+	@echo "  setup            - Install dependencies and build all runners"
+	@echo "  build-all        - Build all client runners"
 	@echo "  build-zig        - Build Zig runner"
-	@echo "  test             - Run basic tests on Zig client"
-	@echo "  test-zig         - Run tests on Zig client"
+	@echo "  build-go         - Build Go runner"
+	@echo "  build-python     - Setup Python runner"
+	@echo "  build-rust       - Build Rust runner"
+	@echo "  build-nodejs     - Setup Node.js runner"
+	@echo ""
+	@echo "Test Commands:"
+	@echo "  test             - Run basic tests on all clients"
 	@echo "  test-all         - Run all test suites (JSON report)"
-	@echo "  test-comprehensive - Alias for test-all (full suite)"
 	@echo "  test-all-html    - Run all tests and generate HTML report"
+	@echo "  test-docker      - Start Docker, run all tests, stop Docker"
+	@echo ""
+	@echo "  test-zig         - Run tests on Zig client only"
+	@echo "  test-go          - Run tests on Go client only"
+	@echo "  test-python      - Run tests on Python client only"
+	@echo "  test-rust        - Run tests on Rust client only"
+	@echo "  test-nodejs      - Run tests on Node.js client only"
+	@echo ""
+	@echo "  test-transactions - Run transaction tests"
+	@echo "  test-connections  - Run connection tests"
 	@echo "  test-auth        - Run authentication tests"
 	@echo "  test-perf        - Run performance benchmarks"
-	@echo "  test-with-coverage - Run tests and generate coverage report"
-	@echo "  report-html      - Generate HTML report from existing JSON results"
-	@echo "  analyze-perf     - Analyze performance results"
-	@echo "  analyze-coverage - Analyze test coverage"
-	@echo "  clean            - Remove build artifacts"
+	@echo "  test-graph       - Run graph query tests (requires migrations)"
 	@echo ""
-	@echo "Usage:"
-	@echo "  make setup"
-	@echo "  make test SERVER=localhost:8443"
-	@echo "  make test-all-html"
-	@echo "  make test-with-coverage"
-	@echo "  make analyze-coverage REPORT=reports/results.json"
+	@echo "Analysis:"
+	@echo "  test-with-coverage - Run tests and generate coverage report"
+	@echo "  analyze-coverage   - Analyze test coverage"
+	@echo "  analyze-perf       - Analyze performance results"
+	@echo "  report-html        - Generate HTML report from JSON results"
+	@echo ""
+	@echo "Failure Routing (CI/CD):"
+	@echo "  route-failures        - Route failures to appropriate GitLab repos"
+	@echo "  route-failures-dry-run - Preview failure routing without creating issues"
+	@echo ""
+	@echo "Cleanup:"
+	@echo "  clean            - Stop containers and remove build artifacts"
+	@echo "  clean-all        - Clean everything including Docker image"
+	@echo ""
+	@echo "Configuration:"
+	@echo "  GEODE_IMAGE=$(GEODE_IMAGE)"
+	@echo "  GEODE_PORT=$(GEODE_PORT)"
+
+# ==============================================================================
+# Docker Server Management
+# ==============================================================================
+
+docker-start:
+	@echo "Starting Geode server container..."
+	@$(DOCKER) rm -f $(GEODE_CONTAINER) 2>/dev/null || true
+	@$(DOCKER) run -d --name $(GEODE_CONTAINER) \
+		-p $(GEODE_PORT):3141/udp \
+		$(GEODE_IMAGE) \
+		serve --listen 0.0.0.0:3141 --log-level info
+	@echo "Waiting for server to be ready..."
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		sleep 1; \
+		if $(DOCKER) logs $(GEODE_CONTAINER) 2>&1 | grep -q "Server ready\|accepting QUIC connections"; then \
+			echo "Geode server ready on $(GEODE_HOST):$(GEODE_PORT)"; \
+			exit 0; \
+		fi; \
+		echo "  Waiting... ($$i/10)"; \
+	done; \
+	echo "Warning: Server may not be fully ready"; \
+	$(DOCKER) logs $(GEODE_CONTAINER)
+
+docker-stop:
+	@echo "Stopping Geode server container..."
+	@$(DOCKER) stop $(GEODE_CONTAINER) 2>/dev/null || true
+	@$(DOCKER) rm $(GEODE_CONTAINER) 2>/dev/null || true
+	@echo "Container stopped"
+
+docker-logs:
+	@$(DOCKER) logs -f $(GEODE_CONTAINER)
+
+docker-status:
+	@$(DOCKER) ps -a --filter "name=$(GEODE_CONTAINER)" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+# ==============================================================================
+# Migration Management
+# ==============================================================================
+
+# Path to Geode CLI (auto-detected)
+GEODE_CLI ?= $(shell which geode 2>/dev/null || echo "../geode/zig-out/bin/geode")
+MIGRATIONS_DIR ?= migrations
+
+migrate: docker-start
+	@echo "Running migrations from $(MIGRATIONS_DIR)..."
+	@if [ -x "$(GEODE_CLI)" ]; then \
+		$(GEODE_CLI) migrate run --dir $(MIGRATIONS_DIR) --server $(GEODE_HOST):$(GEODE_PORT) --insecure; \
+	else \
+		echo "Geode CLI not found at $(GEODE_CLI)"; \
+		echo "Build it with: cd ../geode && make build"; \
+		exit 1; \
+	fi
+
+migrate-status:
+	@echo "Migration status for $(MIGRATIONS_DIR):"
+	@if [ -x "$(GEODE_CLI)" ]; then \
+		$(GEODE_CLI) migrate status --dir $(MIGRATIONS_DIR); \
+	else \
+		echo "Geode CLI not found at $(GEODE_CLI)"; \
+		exit 1; \
+	fi
+
+migrate-create:
+	@if [ -z "$(NAME)" ]; then \
+		echo "Usage: make migrate-create NAME=migration_name"; \
+		exit 1; \
+	fi
+	@echo "Creating migration: $(NAME)"
+	@if [ -x "$(GEODE_CLI)" ]; then \
+		$(GEODE_CLI) migrate create $(NAME) --dir $(MIGRATIONS_DIR); \
+	else \
+		echo "Geode CLI not found at $(GEODE_CLI)"; \
+		exit 1; \
+	fi
+
+docker-pull:
+	@echo "Pulling latest Geode image..."
+	@$(DOCKER) pull $(GEODE_IMAGE)
+
+# ==============================================================================
+# Setup & Build
+# ==============================================================================
 
 $(VENV_DIR):
 	@echo "Creating Python virtual environment..."
 	@$(PYTHON) -m venv $(VENV_DIR)
-	@echo "✓ Virtual environment created at $(VENV_DIR)"
+	@echo "Virtual environment created at $(VENV_DIR)"
 
 setup: $(VENV_DIR)
-	@echo "Setting up client test harness..."
-	@echo "Installing Python dependencies in virtual environment..."
+	@echo "Setting up test harness..."
+	@echo "Installing Python dependencies..."
 	@$(VENV_PIP) install --upgrade pip
-	@echo "Installing test harness dependencies..."
 	@$(VENV_PIP) install -r requirements.txt
-	@echo "✓ Python dependencies installed in $(VENV_DIR)"
+	@if [ -d "$(PYTHON_CLIENT_PATH)" ]; then \
+		echo "Installing Geode Python client..."; \
+		$(VENV_PIP) install -e $(PYTHON_CLIENT_PATH); \
+	fi
+	@echo "Python dependencies installed"
 	@echo "Making scripts executable..."
 	@chmod +x run_tests.py 2>/dev/null || true
 	@chmod +x generate_html_report.py 2>/dev/null || true
 	@chmod +x analyze_performance.py 2>/dev/null || true
 	@chmod +x analyze_coverage.py 2>/dev/null || true
-	@echo "Building Zig runner..."
-	@$(MAKE) build-zig || echo "⚠ Zig runner build failed"
-	@echo "✓ Setup complete!"
+	@$(MAKE) build-all
+	@echo "Setup complete!"
 	@if [ "$(IN_VENV)" = "0" ] && [ "$(IN_NIX)" = "0" ]; then \
 		echo ""; \
 		echo "To use the test harness, activate the virtual environment:"; \
@@ -79,28 +228,97 @@ setup: $(VENV_DIR)
 		echo "Or run make targets which will use the venv automatically."; \
 	fi
 
-build-all: build-zig
-	@echo "✓ Build complete"
+build-all: build-zig build-go build-python build-rust build-nodejs
+	@echo "Build complete"
 
 build-zig:
 	@echo "Building Zig runner..."
-	@command -v zig >/dev/null 2>&1 || { echo "Zig not found, skipping"; exit 1; }
-	@cd runners && zig build && cp zig-out/bin/zig_runner ./zig_runner
+	@if [ ! -d "$(ZIG_CLIENT_PATH)" ]; then \
+		echo "Warning: Zig client not found at $(ZIG_CLIENT_PATH)"; \
+		exit 0; \
+	fi
+	@command -v zig >/dev/null 2>&1 || { echo "Zig not found, skipping"; exit 0; }
+	@cd runners && zig build && cp zig-out/bin/zig_runner ./zig_runner 2>/dev/null || echo "Zig build skipped"
+
+build-go:
+	@echo "Building Go runner..."
+	@if [ ! -d "$(GO_CLIENT_PATH)" ]; then \
+		echo "Warning: Go client not found at $(GO_CLIENT_PATH)"; \
+		exit 0; \
+	fi
+	@command -v go >/dev/null 2>&1 || { echo "Go not found, skipping"; exit 0; }
+	@cd runners && go build -o go_runner go_runner.go 2>/dev/null || echo "Go build skipped"
+
+build-python:
+	@echo "Setting up Python runner..."
+	@if [ ! -d "$(PYTHON_CLIENT_PATH)" ]; then \
+		echo "Warning: Python client not found at $(PYTHON_CLIENT_PATH)"; \
+		exit 0; \
+	fi
+	@echo "Python runner ready (uses installed geode_client package)"
+
+build-rust:
+	@echo "Building Rust runner..."
+	@if [ ! -d "$(RUST_CLIENT_PATH)" ]; then \
+		echo "Warning: Rust client not found at $(RUST_CLIENT_PATH)"; \
+		exit 0; \
+	fi
+	@command -v cargo >/dev/null 2>&1 || { echo "Cargo not found, skipping"; exit 0; }
+	@cd runners/rust_runner && cargo build --release 2>/dev/null || echo "Rust build skipped"
+
+build-nodejs:
+	@echo "Setting up Node.js runner..."
+	@if [ ! -d "$(NODEJS_CLIENT_PATH)" ]; then \
+		echo "Warning: Node.js client not found at $(NODEJS_CLIENT_PATH)"; \
+		exit 0; \
+	fi
+	@command -v node >/dev/null 2>&1 || { echo "Node not found, skipping"; exit 0; }
+	@command -v npm >/dev/null 2>&1 || { echo "npm not found, skipping"; exit 0; }
+	@cd runners && npm install 2>/dev/null || echo "Node.js setup skipped"
+	@echo "Node.js runner ready"
+
+# ==============================================================================
+# Test Commands
+# ==============================================================================
 
 test: setup
-	@echo "Running basic tests on Zig client..."
-	$(RUN_PYTHON) run_tests.py --spec specs/basic.yaml --clients zig --verbose
+	@echo "Running basic tests..."
+	$(RUN_PYTHON) run_tests.py --spec specs/basic.yaml --verbose
 
+test-docker: setup docker-start
+	@echo "Running all tests with Docker..."
+	@$(MAKE) test-all || ($(MAKE) docker-stop; exit 1)
+	@$(MAKE) docker-stop
+
+test-all: setup
+	@echo "Running all test suites..."
+	@mkdir -p reports
+	$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results.json
+
+test-comprehensive: test-all
+
+# Single client tests
 test-zig: setup
 	@echo "Running tests on Zig client..."
 	$(RUN_PYTHON) run_tests.py --clients zig --verbose
 
-test-all: setup
-	@echo "Running all test suites on Zig client..."
-	$(RUN_PYTHON) run_tests.py --clients zig --verbose --report-json reports/results.json
+test-go: setup
+	@echo "Running tests on Go client..."
+	$(RUN_PYTHON) run_tests.py --clients go --verbose
 
-test-comprehensive: test-all
+test-python: setup
+	@echo "Running tests on Python client..."
+	$(RUN_PYTHON) run_tests.py --clients python --verbose
 
+test-rust: setup
+	@echo "Running tests on Rust client..."
+	$(RUN_PYTHON) run_tests.py --clients rust --verbose
+
+test-nodejs: setup
+	@echo "Running tests on Node.js client..."
+	$(RUN_PYTHON) run_tests.py --clients nodejs --verbose
+
+# Specific test suites
 test-transactions: setup
 	@echo "Running transaction tests..."
 	$(RUN_PYTHON) run_tests.py --spec specs/transactions.yaml --verbose
@@ -109,31 +327,24 @@ test-connections: setup
 	@echo "Running connection tests..."
 	$(RUN_PYTHON) run_tests.py --spec specs/connections.yaml --verbose
 
-clean:
-	@echo "Cleaning build artifacts..."
-	rm -f runners/go_runner
-	rm -f runners/zig_runner
-	rm -rf runners/rust_runner/target
-	rm -rf runners/zig-out
-	rm -rf runners/.zig-cache
-	rm -rf reports/*.json
-	rm -rf reports/*.html
-	rm -rf $(VENV_DIR)
-	@echo "Clean complete!"
+test-auth: setup
+	@echo "Running authentication tests..."
+	$(RUN_PYTHON) run_tests.py --spec specs/auth.yaml --verbose
 
-# Server management
-start-server:
-	@echo "Starting Geode server..."
-	@cd ../../.. && ./zig-out/bin/geode serve --listen 0.0.0.0:8443 &
-	@sleep 3
-	@echo "Server started on port 8443"
+test-perf: setup
+	@echo "Running performance benchmarks..."
+	@mkdir -p reports
+	$(RUN_PYTHON) run_tests.py --spec specs/performance.yaml --verbose --report-json reports/perf_results.json
 
-stop-server:
-	@echo "Stopping Geode server..."
-	@pkill -f "geode serve" || true
-	@echo "Server stopped"
+test-graph: setup
+	@echo "Running graph query tests (with migrations)..."
+	@mkdir -p reports
+	$(RUN_PYTHON) run_tests.py --spec specs/graph.yaml --verbose --report-json reports/graph_results.json
 
-# Reporting
+# ==============================================================================
+# Reporting & Analysis
+# ==============================================================================
+
 test-all-html: setup
 	@echo "Running all tests and generating HTML report..."
 	@mkdir -p reports
@@ -149,24 +360,12 @@ report-html:
 	$(RUN_PYTHON) generate_html_report.py ${REPORT:-reports/results.json} --output reports/test_report.html
 	@echo "HTML report generated: reports/test_report.html"
 
-# Authentication tests
-test-auth: setup
-	@echo "Running authentication tests..."
-	$(RUN_PYTHON) run_tests.py --spec specs/auth.yaml --verbose
-
-# Performance benchmarking
-test-perf: setup
-	@echo "Running performance benchmarks..."
-	@mkdir -p reports
-	$(RUN_PYTHON) run_tests.py --spec specs/performance.yaml --verbose --report-json reports/perf_results.json
-
 analyze-perf:
 	@echo "Analyzing performance results..."
 	$(RUN_PYTHON) analyze_performance.py reports/perf_results.json --verbose --markdown reports/perf_report.md
 	@echo "Performance analysis complete!"
 	@echo "  Report: reports/perf_report.md"
 
-# Coverage analysis
 analyze-coverage:
 	@echo "Analyzing test coverage..."
 	$(RUN_PYTHON) analyze_coverage.py ${REPORT:-reports/results.json} --verbose --markdown reports/coverage_report.md
@@ -180,3 +379,55 @@ test-with-coverage: setup
 	@$(RUN_PYTHON) analyze_coverage.py reports/results.json --verbose --markdown reports/coverage_report.md
 	@echo ""
 	@echo "Coverage report generated: reports/coverage_report.md"
+
+# ==============================================================================
+# Failure Routing (for CI/CD integration)
+# ==============================================================================
+
+route-failures:
+	@echo "Routing failures to appropriate repositories..."
+	@if [ ! -f reports/results.json ]; then \
+		echo "No results file found. Run 'make test-all' first."; \
+		exit 1; \
+	fi
+	$(RUN_PYTHON) route_failures.py reports/results.json --verbose --output reports/created_issues.json
+	@echo ""
+	@if [ -f reports/created_issues.json ]; then \
+		echo "Created issues saved to: reports/created_issues.json"; \
+	fi
+
+route-failures-dry-run:
+	@echo "Dry run: Analyzing failures for routing..."
+	@if [ ! -f reports/results.json ]; then \
+		echo "No results file found. Run 'make test-all' first."; \
+		exit 1; \
+	fi
+	$(RUN_PYTHON) route_failures.py reports/results.json --dry-run --verbose
+
+# ==============================================================================
+# Cleanup
+# ==============================================================================
+
+clean: docker-clean
+	@echo "Cleaning build artifacts..."
+	rm -f runners/go_runner
+	rm -f runners/zig_runner
+	rm -rf runners/rust_runner/target
+	rm -rf runners/zig-out
+	rm -rf runners/.zig-cache
+	rm -rf runners/node_modules
+	rm -rf reports/*.json
+	rm -rf reports/*.html
+	rm -rf reports/*.md
+	rm -rf $(VENV_DIR)
+	@echo "Clean complete!"
+
+docker-clean:
+	@echo "Stopping any running test containers..."
+	@$(DOCKER) stop $(GEODE_CONTAINER) 2>/dev/null || true
+	@$(DOCKER) rm $(GEODE_CONTAINER) 2>/dev/null || true
+
+clean-all: clean
+	@echo "Removing Docker image..."
+	@$(DOCKER) rmi $(GEODE_IMAGE) 2>/dev/null || true
+	@echo "Full cleanup complete!"

@@ -40,8 +40,28 @@ const Test = struct {
     expect: Expectation = .{},
     steps: []Step = &[_]Step{},
     skip: bool = false,
+    skip_reason: ?[]const u8 = null,
     timeout_ms: ?u64 = null,
     expect_error: bool = false,
+    benchmark: ?BenchmarkConfig = null,
+};
+
+const BenchmarkConfig = struct {
+    iterations: ?usize = null,
+    max_avg_latency_ms: ?f64 = null,
+    max_p95_latency_ms: ?f64 = null,
+    max_total_time_ms: ?f64 = null,
+    concurrent: ?usize = null,
+};
+
+const BenchmarkResult = struct {
+    iterations: usize,
+    avg_latency_ms: f64,
+    p95_latency_ms: f64,
+    min_latency_ms: f64,
+    max_latency_ms: f64,
+    total_time_ms: f64,
+    errors: usize,
 };
 
 const Step = struct {
@@ -50,6 +70,8 @@ const Step = struct {
     params: ?JsonValue = null,
     expect: Expectation = .{},
     expect_error: bool = false,
+    connection_id: ?[]const u8 = null,
+    id: ?[]const u8 = null,
 };
 
 const Expectation = struct {
@@ -239,17 +261,31 @@ fn valuesEqual(a: JsonValue, b: JsonValue) bool {
     }
 }
 
+// Helper to lookup a key in yaml map (which is []ValueKVPair)
+fn yamlMapGet(map: []const yaml.ValueKVPair, key: []const u8) ?yaml.Value {
+    for (map) |kv| {
+        if (kv.k == .str and std.mem.eql(u8, kv.k.str, key)) {
+            return kv.v;
+        }
+    }
+    return null;
+}
+
 fn yamlToJsonValue(allocator: Allocator, node: yaml.Value) !JsonValue {
     return switch (node) {
-        .null_value => JsonValue{ .null = {} },
-        .bool_value => |b| JsonValue{ .bool = b },
-        .int_value => |i| JsonValue{ .integer = i },
-        .float_value => |f| JsonValue{ .float = f },
-        .string_value => |s| JsonValue{ .string = try allocator.dupe(u8, s) },
-        .list => |list| blk: {
+        .null => JsonValue{ .null = {} },
+        .bool => |b| JsonValue{ .bool = b },
+        .int => |i| JsonValue{ .integer = i },
+        .big_int => |s| JsonValue{ .number_string = try allocator.dupe(u8, s) },
+        .float => |f| JsonValue{ .float = f },
+        .inf_pos => JsonValue{ .float = std.math.inf(f64) },
+        .inf_neg => JsonValue{ .float = -std.math.inf(f64) },
+        .nan => JsonValue{ .float = std.math.nan(f64) },
+        .str => |s| JsonValue{ .string = try allocator.dupe(u8, s) },
+        .seq => |seq| blk: {
             var arr = JsonArray.init(allocator);
             errdefer arr.deinit();
-            for (list.items) |item| {
+            for (seq) |item| {
                 const v = try yamlToJsonValue(allocator, item);
                 try arr.append(v);
             }
@@ -258,10 +294,14 @@ fn yamlToJsonValue(allocator: Allocator, node: yaml.Value) !JsonValue {
         .map => |map| blk: {
             var obj = JsonObject.init(allocator);
             errdefer obj.deinit();
-            var it = map.iterator();
-            while (it.next()) |entry| {
-                const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
-                const v = try yamlToJsonValue(allocator, entry.value_ptr.*);
+            for (map) |kv| {
+                // Keys should be strings
+                const key_str = switch (kv.k) {
+                    .str => |s| s,
+                    else => continue, // Skip non-string keys
+                };
+                const key_copy = try allocator.dupe(u8, key_str);
+                const v = try yamlToJsonValue(allocator, kv.v);
                 try obj.put(key_copy, v);
             }
             break :blk JsonValue{ .object = obj };
@@ -274,22 +314,23 @@ fn parseExpectation(allocator: Allocator, value: ?yaml.Value) !Expectation {
     if (value == null) return expect;
     const v = value.?;
     if (v != .map) return expect;
+    const map = v.map;
 
-    if (v.map.get("rows")) |rows_val| {
-        if (rows_val == .int_value) expect.rows = @intCast(rows_val.int_value);
+    if (yamlMapGet(map, "rows")) |rows_val| {
+        if (rows_val == .int) expect.rows = @intCast(rows_val.int);
     }
-    if (v.map.get("min_rows")) |rows_val| {
-        if (rows_val == .int_value) expect.min_rows = @intCast(rows_val.int_value);
+    if (yamlMapGet(map, "min_rows")) |rows_val| {
+        if (rows_val == .int) expect.min_rows = @intCast(rows_val.int);
     }
-    if (v.map.get("max_rows")) |rows_val| {
-        if (rows_val == .int_value) expect.max_rows = @intCast(rows_val.int_value);
+    if (yamlMapGet(map, "max_rows")) |rows_val| {
+        if (rows_val == .int) expect.max_rows = @intCast(rows_val.int);
     }
-    if (v.map.get("columns")) |cols_val| {
-        if (cols_val == .list) {
-            var cols = try allocator.alloc([]u8, cols_val.list.items.len);
-            for (cols_val.list.items, 0..) |*col_val, idx| {
-                if (col_val.* == .string_value) {
-                    cols[idx] = try allocator.dupe(u8, col_val.string_value);
+    if (yamlMapGet(map, "columns")) |cols_val| {
+        if (cols_val == .seq) {
+            var cols = try allocator.alloc([]u8, cols_val.seq.len);
+            for (cols_val.seq, 0..) |col_val, idx| {
+                if (col_val == .str) {
+                    cols[idx] = try allocator.dupe(u8, col_val.str);
                 } else {
                     cols[idx] = try allocator.dupe(u8, "");
                 }
@@ -297,15 +338,15 @@ fn parseExpectation(allocator: Allocator, value: ?yaml.Value) !Expectation {
             expect.columns = cols;
         }
     }
-    if (v.map.get("values")) |vals_val| {
-        if (vals_val == .list) {
-            var rows = try allocator.alloc(JsonValue, vals_val.list.items.len);
+    if (yamlMapGet(map, "values")) |vals_val| {
+        if (vals_val == .seq) {
+            var rows = try allocator.alloc(JsonValue, vals_val.seq.len);
             var i: usize = 0;
             errdefer {
                 while (i > 0) : (i -= 1) freeJsonValue(allocator, &rows[i - 1]);
                 allocator.free(rows);
             }
-            for (vals_val.list.items) |row_val| {
+            for (vals_val.seq) |row_val| {
                 rows[i] = try yamlToJsonValue(allocator, row_val);
                 i += 1;
             }
@@ -316,8 +357,8 @@ fn parseExpectation(allocator: Allocator, value: ?yaml.Value) !Expectation {
 }
 
 fn parseSteps(allocator: Allocator, value: ?yaml.Value) ![]Step {
-    if (value == null or value.? != .list) return try allocator.alloc(Step, 0);
-    const list = value.?.list.items;
+    if (value == null or value.? != .seq) return try allocator.alloc(Step, 0);
+    const list = value.?.seq;
     var steps = try allocator.alloc(Step, list.len);
     var idx: usize = 0;
     errdefer {
@@ -327,24 +368,31 @@ fn parseSteps(allocator: Allocator, value: ?yaml.Value) ![]Step {
         allocator.free(steps);
     }
 
-    for (list) |*step_val| {
+    for (list) |step_val| {
         var step = Step{
             .type = "",
         };
-        if (step_val.* == .map) {
-            if (step_val.map.get("type")) |t| {
-                if (t == .string_value) step.type = try allocator.dupe(u8, t.string_value);
+        if (step_val == .map) {
+            const step_map = step_val.map;
+            if (yamlMapGet(step_map, "type")) |t| {
+                if (t == .str) step.type = try allocator.dupe(u8, t.str);
             }
-            if (step_val.map.get("text")) |txt| {
-                if (txt == .string_value) step.text = try allocator.dupe(u8, txt.string_value);
+            if (yamlMapGet(step_map, "text")) |txt| {
+                if (txt == .str) step.text = try allocator.dupe(u8, txt.str);
             }
-            if (step_val.map.get("params")) |p| {
+            if (yamlMapGet(step_map, "params")) |p| {
                 step.params = try yamlToJsonValue(allocator, p);
             }
-            if (step_val.map.get("expect_error")) |ee| {
-                if (ee == .bool_value) step.expect_error = ee.bool_value;
+            if (yamlMapGet(step_map, "expect_error")) |ee| {
+                if (ee == .bool) step.expect_error = ee.bool;
             }
-            step.expect = try parseExpectation(allocator, step_val.map.get("expect"));
+            if (yamlMapGet(step_map, "connection_id")) |cid| {
+                if (cid == .str) step.connection_id = try allocator.dupe(u8, cid.str);
+            }
+            if (yamlMapGet(step_map, "id")) |sid| {
+                if (sid == .str) step.id = try allocator.dupe(u8, sid.str);
+            }
+            step.expect = try parseExpectation(allocator, yamlMapGet(step_map, "expect"));
         }
         steps[idx] = step;
         idx += 1;
@@ -353,30 +401,39 @@ fn parseSteps(allocator: Allocator, value: ?yaml.Value) ![]Step {
 }
 
 fn parseSpec(allocator: Allocator, yaml_content: []const u8) !TestSpec {
-    var parser = yaml.Parser.init(allocator, yaml_content);
-    var root_value = try parser.parse();
-    defer root_value.deinit(allocator);
+    // Load and resolve YAML to values
+    var docs = try yaml.loadAll(allocator, yaml_content, .{});
+    defer {
+        for (docs) |*d| d.deinit();
+        allocator.free(docs);
+    }
+
+    if (docs.len == 0) return error.InvalidSpec;
+
+    const root_value = try yaml.resolveToValue(allocator, &docs[0], .{});
+    defer yaml.freeValue(allocator, &root_value);
 
     if (root_value != .map) return error.InvalidSpec;
+    const root_map = root_value.map;
 
     var spec = TestSpec{};
 
-    if (root_value.map.get("version")) |ver| {
-        if (ver == .string_value) spec.version = try allocator.dupe(u8, ver.string_value);
+    if (yamlMapGet(root_map, "version")) |ver| {
+        if (ver == .str) spec.version = try allocator.dupe(u8, ver.str);
     }
-    if (root_value.map.get("name")) |n| {
-        if (n == .string_value) spec.name = try allocator.dupe(u8, n.string_value);
+    if (yamlMapGet(root_map, "name")) |n| {
+        if (n == .str) spec.name = try allocator.dupe(u8, n.str);
     }
-    if (root_value.map.get("description")) |d| {
-        if (d == .string_value) spec.description = try allocator.dupe(u8, d.string_value);
+    if (yamlMapGet(root_map, "description")) |d| {
+        if (d == .str) spec.description = try allocator.dupe(u8, d.str);
     }
 
-    spec.setup = try parseSteps(allocator, root_value.map.get("setup"));
-    spec.cleanup = try parseSteps(allocator, root_value.map.get("cleanup"));
+    spec.setup = try parseSteps(allocator, yamlMapGet(root_map, "setup"));
+    spec.cleanup = try parseSteps(allocator, yamlMapGet(root_map, "cleanup"));
 
-    if (root_value.map.get("tests")) |tests_val| {
-        if (tests_val == .list) {
-            spec.tests = try allocator.alloc(Test, tests_val.list.items.len);
+    if (yamlMapGet(root_map, "tests")) |tests_val| {
+        if (tests_val == .seq) {
+            spec.tests = try allocator.alloc(Test, tests_val.seq.len);
             var idx: usize = 0;
             errdefer {
                 while (idx > 0) : (idx -= 1) {
@@ -384,37 +441,62 @@ fn parseSpec(allocator: Allocator, yaml_content: []const u8) !TestSpec {
                 }
                 allocator.free(spec.tests);
             }
-            for (tests_val.list.items) |*test_val| {
+            for (tests_val.seq) |test_val| {
                 var tcase = Test{
                     .name = "",
                 };
-                if (test_val.* != .map) {
+                if (test_val != .map) {
                     spec.tests[idx] = tcase;
                     idx += 1;
                     continue;
                 }
-                if (test_val.map.get("name")) |n| {
-                    if (n == .string_value) tcase.name = try allocator.dupe(u8, n.string_value);
+                const test_map = test_val.map;
+                if (yamlMapGet(test_map, "name")) |n| {
+                    if (n == .str) tcase.name = try allocator.dupe(u8, n.str);
                 }
-                if (test_val.map.get("description")) |d| {
-                    if (d == .string_value) tcase.description = try allocator.dupe(u8, d.string_value);
+                if (yamlMapGet(test_map, "description")) |d| {
+                    if (d == .str) tcase.description = try allocator.dupe(u8, d.str);
                 }
-                if (test_val.map.get("query")) |q| {
-                    if (q == .string_value) tcase.query = try allocator.dupe(u8, q.string_value);
+                if (yamlMapGet(test_map, "query")) |q| {
+                    if (q == .str) tcase.query = try allocator.dupe(u8, q.str);
                 }
-                if (test_val.map.get("params")) |p| {
+                if (yamlMapGet(test_map, "params")) |p| {
                     tcase.params = try yamlToJsonValue(allocator, p);
                 }
-                tcase.expect = try parseExpectation(allocator, test_val.map.get("expect"));
-                tcase.steps = try parseSteps(allocator, test_val.map.get("steps"));
-                if (test_val.map.get("skip")) |s| {
-                    if (s == .bool_value) tcase.skip = s.bool_value;
+                tcase.expect = try parseExpectation(allocator, yamlMapGet(test_map, "expect"));
+                tcase.steps = try parseSteps(allocator, yamlMapGet(test_map, "steps"));
+                if (yamlMapGet(test_map, "skip")) |s| {
+                    if (s == .bool) tcase.skip = s.bool;
                 }
-                if (test_val.map.get("timeout_ms")) |t| {
-                    if (t == .int_value) tcase.timeout_ms = @intCast(t.int_value);
+                if (yamlMapGet(test_map, "skip_reason")) |sr| {
+                    if (sr == .str) tcase.skip_reason = try allocator.dupe(u8, sr.str);
                 }
-                if (test_val.map.get("expect_error")) |ee| {
-                    if (ee == .bool_value) tcase.expect_error = ee.bool_value;
+                if (yamlMapGet(test_map, "timeout_ms")) |t| {
+                    if (t == .int) tcase.timeout_ms = @intCast(t.int);
+                }
+                if (yamlMapGet(test_map, "expect_error")) |ee| {
+                    if (ee == .bool) tcase.expect_error = ee.bool;
+                }
+                if (yamlMapGet(test_map, "benchmark")) |bench_val| {
+                    if (bench_val == .map) {
+                        var bench_cfg = BenchmarkConfig{};
+                        if (yamlMapGet(bench_val.map, "iterations")) |iter| {
+                            if (iter == .int) bench_cfg.iterations = @intCast(iter.int);
+                        }
+                        if (yamlMapGet(bench_val.map, "max_avg_latency_ms")) |val| {
+                            if (val == .float) bench_cfg.max_avg_latency_ms = val.float;
+                            if (val == .int) bench_cfg.max_avg_latency_ms = @floatFromInt(val.int);
+                        }
+                        if (yamlMapGet(bench_val.map, "max_p95_latency_ms")) |val| {
+                            if (val == .float) bench_cfg.max_p95_latency_ms = val.float;
+                            if (val == .int) bench_cfg.max_p95_latency_ms = @floatFromInt(val.int);
+                        }
+                        if (yamlMapGet(bench_val.map, "max_total_time_ms")) |val| {
+                            if (val == .float) bench_cfg.max_total_time_ms = val.float;
+                            if (val == .int) bench_cfg.max_total_time_ms = @floatFromInt(val.int);
+                        }
+                        tcase.benchmark = bench_cfg;
+                    }
                 }
                 spec.tests[idx] = tcase;
                 idx += 1;
@@ -591,6 +673,39 @@ const ClientContext = struct {
     host: []const u8,
     port: u16,
     client: ?GeodeClient = null,
+    connections: std.StringHashMap(GeodeClient) = undefined,  // Connection registry for multi-connection tests
+
+    fn initConnections(self: *ClientContext) void {
+        self.connections = std.StringHashMap(GeodeClient).init(self.allocator);
+    }
+
+    fn deinitConnections(self: *ClientContext) void {
+        var it = self.connections.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.connections.deinit();
+    }
+
+    fn poolAcquire(self: *ClientContext, conn_id: []const u8, verbose: bool) !void {
+        var cli = GeodeClient.init(self.allocator, self.host, self.port, true);
+        if (verbose) {
+            std.debug.print("  Acquiring pool connection: {s}\n", .{conn_id});
+        }
+        try cli.connect();
+        try cli.openStream();
+        try cli.sendHello("geode-zig-runner", "1.0.0");
+        _ = cli.receiveMessage(2000) catch {};
+        try self.connections.put(try self.allocator.dupe(u8, conn_id), cli);
+    }
+
+    fn poolRelease(self: *ClientContext, conn_id: []const u8) void {
+        if (self.connections.fetchRemove(conn_id)) |kv| {
+            var client = kv.value;
+            client.deinit();
+            self.allocator.free(kv.key);
+        }
+    }
 
     fn ensureConnected(self: *ClientContext, verbose: bool) !void {
         if (self.client != null) return;
@@ -753,8 +868,10 @@ const TestResult = struct {
     test_name: []const u8,
     status: []const u8,
     error_msg: ?[]const u8 = null,
+    skip_reason: ?[]const u8 = null,
     result: ?QueryResult = null,
     duration_ms: f64,
+    benchmark: ?BenchmarkResult = null,
 };
 
 fn runSetup(allocator: Allocator, ctx: *ClientContext, steps: []Step, verbose: bool) void {
@@ -778,6 +895,111 @@ fn runCleanup(allocator: Allocator, ctx: *ClientContext, steps: []Step, verbose:
 }
 
 fn runTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, verbose: bool) TestResult {
+    // Check if this is a benchmark test
+    if (test_case.benchmark) |benchmark| {
+        return runBenchmarkTest(allocator, ctx, test_case, benchmark, verbose);
+    }
+    return runSingleTest(allocator, ctx, test_case, verbose);
+}
+
+fn runBenchmarkTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, benchmark: BenchmarkConfig, verbose: bool) TestResult {
+    const iterations = benchmark.iterations orelse 10;
+    var latencies = std.ArrayList(f64).initCapacity(allocator, iterations) catch {
+        return TestResult{
+            .test_name = test_case.name,
+            .status = "error",
+            .error_msg = "Failed to allocate latencies buffer",
+            .duration_ms = 0.0,
+        };
+    };
+    defer latencies.deinit(allocator);
+    var error_count: usize = 0;
+    const start_total = std.time.milliTimestamp();
+
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const start = std.time.milliTimestamp();
+        const result = runSingleTest(allocator, ctx, test_case, verbose);
+        const latency_ms: f64 = @floatFromInt(std.time.milliTimestamp() - start);
+        latencies.append(allocator, latency_ms) catch {};
+
+        if (!std.mem.eql(u8, result.status, "passed")) {
+            error_count += 1;
+        }
+    }
+
+    const total_time_ms: f64 = @floatFromInt(std.time.milliTimestamp() - start_total);
+
+    if (latencies.items.len == 0) {
+        return TestResult{
+            .test_name = test_case.name,
+            .status = "error",
+            .error_msg = "No benchmark iterations completed",
+            .duration_ms = 0.0,
+        };
+    }
+
+    // Sort latencies for percentile calculation
+    std.mem.sort(f64, latencies.items, {}, std.sort.asc(f64));
+
+    // Calculate statistics
+    var sum: f64 = 0.0;
+    for (latencies.items) |lat| {
+        sum += lat;
+    }
+    const avg_latency = sum / @as(f64, @floatFromInt(latencies.items.len));
+    const p95_index = @min(@as(usize, @intFromFloat(@as(f64, @floatFromInt(latencies.items.len)) * 0.95)), latencies.items.len - 1);
+    const p95_latency = latencies.items[p95_index];
+    const min_latency = latencies.items[0];
+    const max_latency = latencies.items[latencies.items.len - 1];
+
+    const bench_result = BenchmarkResult{
+        .iterations = iterations,
+        .avg_latency_ms = avg_latency,
+        .p95_latency_ms = p95_latency,
+        .min_latency_ms = min_latency,
+        .max_latency_ms = max_latency,
+        .total_time_ms = total_time_ms,
+        .errors = error_count,
+    };
+
+    // Check thresholds
+    var failure_msg: ?[]const u8 = null;
+    if (benchmark.max_avg_latency_ms) |max_avg| {
+        if (avg_latency > max_avg) {
+            failure_msg = "Average latency exceeds threshold";
+        }
+    }
+    if (benchmark.max_p95_latency_ms) |max_p95| {
+        if (p95_latency > max_p95) {
+            failure_msg = "P95 latency exceeds threshold";
+        }
+    }
+    if (benchmark.max_total_time_ms) |max_total| {
+        if (total_time_ms > max_total) {
+            failure_msg = "Total time exceeds threshold";
+        }
+    }
+
+    if (failure_msg != null) {
+        return TestResult{
+            .test_name = test_case.name,
+            .status = "failed",
+            .error_msg = failure_msg,
+            .duration_ms = total_time_ms,
+            .benchmark = bench_result,
+        };
+    }
+
+    return TestResult{
+        .test_name = test_case.name,
+        .status = "passed",
+        .duration_ms = total_time_ms,
+        .benchmark = bench_result,
+    };
+}
+
+fn runSingleTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, verbose: bool) TestResult {
     const start = std.time.milliTimestamp();
 
     var status: []const u8 = "passed";
@@ -811,9 +1033,16 @@ fn runTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, verbose: 
             var had_error = false;
 
             if (std.mem.eql(u8, step.type, "connect")) {
-                ctx.ensureConnected(verbose) catch {
-                    had_error = true;
-                };
+                if (step.connection_id) |conn_id| {
+                    // Multi-connection: create named connection
+                    ctx.poolAcquire(conn_id, verbose) catch {
+                        had_error = true;
+                    };
+                } else {
+                    ctx.ensureConnected(verbose) catch {
+                        had_error = true;
+                    };
+                }
             } else if (std.mem.eql(u8, step.type, "commit")) {
                 ctx.commit() catch {
                     had_error = true;
@@ -827,7 +1056,19 @@ fn runTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, verbose: 
                     had_error = true;
                 };
             } else if (std.mem.eql(u8, step.type, "disconnect")) {
-                ctx.close();
+                if (step.connection_id) |conn_id| {
+                    ctx.poolRelease(conn_id);
+                } else {
+                    ctx.close();
+                }
+            } else if (std.mem.eql(u8, step.type, "pool_acquire")) {
+                const conn_id = step.connection_id orelse step.id orelse "default";
+                ctx.poolAcquire(conn_id, verbose) catch {
+                    had_error = true;
+                };
+            } else if (std.mem.eql(u8, step.type, "pool_release")) {
+                const conn_id = step.connection_id orelse step.id orelse "default";
+                ctx.poolRelease(conn_id);
             } else if (std.mem.eql(u8, step.type, "query")) {
                 const res_opt = ctx.runQuery(step.text, step.params, verbose) catch null;
                 if (res_opt) |res| {
@@ -888,6 +1129,20 @@ fn outputJson(allocator: Allocator, summary: Summary, results: []TestResult) !vo
         try writer.print("{{\"test\":\"{s}\",\"status\":\"{s}\"", .{ result.test_name, result.status });
         if (result.error_msg) |err| {
             try writer.print(",\"error\":\"{s}\"", .{err});
+        }
+        if (result.skip_reason) |reason| {
+            try writer.print(",\"skip_reason\":\"{s}\"", .{reason});
+        }
+        if (result.benchmark) |bench| {
+            try writer.print(",\"benchmark\":{{\"iterations\":{d},\"avg_latency_ms\":{d:.2},\"p95_latency_ms\":{d:.2},\"min_latency_ms\":{d:.2},\"max_latency_ms\":{d:.2},\"total_time_ms\":{d:.2},\"errors\":{d}}}", .{
+                bench.iterations,
+                bench.avg_latency_ms,
+                bench.p95_latency_ms,
+                bench.min_latency_ms,
+                bench.max_latency_ms,
+                bench.total_time_ms,
+                bench.errors,
+            });
         }
         try writer.print(",\"duration_ms\":{d}}}", .{result.duration_ms});
     }
@@ -957,7 +1212,11 @@ pub fn main() !void {
     defer freeSpec(allocator, spec);
 
     var ctx = ClientContext{ .allocator = allocator, .host = config.host, .port = config.port };
-    defer ctx.close();
+    ctx.initConnections();
+    defer {
+        ctx.deinitConnections();
+        ctx.close();
+    }
 
     // Run setup
     runSetup(allocator, &ctx, spec.setup, config.verbose);
@@ -975,6 +1234,7 @@ pub fn main() !void {
             try results.append(allocator, TestResult{
                 .test_name = test_case.name,
                 .status = "skipped",
+                .skip_reason = test_case.skip_reason,
                 .duration_ms = 0.0,
             });
             continue;

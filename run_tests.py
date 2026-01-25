@@ -2,8 +2,10 @@
 """
 Unified test runner for all Geode client libraries.
 
-Runs identical test specifications across Zig, Go, Rust, and Python clients
+Runs identical test specifications across Zig, Go, Rust, Python, and Node.js clients
 to ensure feature parity and correctness.
+
+Server management uses Docker containers for isolation and consistency.
 """
 
 import argparse
@@ -11,12 +13,9 @@ import asyncio
 import atexit
 import json
 import os
-import random
-import signal
-import socket
+import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +66,7 @@ class TestResult:
     duration_ms: float
     error_message: Optional[str] = None
     details: Dict[str, Any] = field(default_factory=dict)
+    skip_reason: Optional[str] = None
 
 
 @dataclass
@@ -83,108 +83,96 @@ class TestSummary:
 
 
 class GeodeServerManager:
-    """Manages Geode server instances with dynamic port allocation."""
+    """Manages Geode server using Docker containers."""
 
-    # Class-level tracking of used ports to prevent collisions
-    _used_ports: Set[int] = set()
+    # Docker settings
+    DEFAULT_IMAGE = "registry.gitlab.com/devnw/geode/geode:latest"
+    DEFAULT_CONTAINER_NAME = "geode-test-harness"
+    DEFAULT_PORT = 3141
+
+    # Class-level tracking
     _all_servers: List['GeodeServerManager'] = []
 
-    def __init__(self, geode_binary: Optional[Path] = None, verbose: bool = False):
-        self.geode_binary = geode_binary or self._find_geode_binary()
+    def __init__(
+        self,
+        image: Optional[str] = None,
+        container_name: Optional[str] = None,
+        port: Optional[int] = None,
+        verbose: bool = False
+    ):
+        self.image = image or os.environ.get("GEODE_IMAGE", self.DEFAULT_IMAGE)
+        self.container_name = container_name or os.environ.get("GEODE_CONTAINER", self.DEFAULT_CONTAINER_NAME)
+        self.port = port or int(os.environ.get("GEODE_PORT", self.DEFAULT_PORT))
         self.verbose = verbose
-        self.port: Optional[int] = None
-        self.process: Optional[asyncio.subprocess.Process] = None
-        self.log_file: Optional[Path] = None
-        self.data_dir: Optional[Path] = None
+        self.host = os.environ.get("GEODE_HOST", "127.0.0.1")
         self._cleanup_registered = False
 
         # Register this instance for cleanup
         GeodeServerManager._all_servers.append(self)
 
-    def _find_geode_binary(self) -> Path:
-        """Find the geode binary."""
-        # Try relative to test harness
-        candidates = [
-            Path(__file__).parent.parent.parent / "zig-out" / "bin" / "geode",
-            Path.cwd() / "zig-out" / "bin" / "geode",
-            Path.cwd().parent.parent / "zig-out" / "bin" / "geode",
-        ]
+    @staticmethod
+    def check_docker_available() -> bool:
+        """Check if Docker is installed and the daemon is running."""
+        if not shutil.which("docker"):
+            return False
+        try:
+            result = subprocess.run(
+                ["docker", "info"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            return result.returncode == 0
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
 
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-        raise FileNotFoundError("Could not find geode binary")
-
-    def _find_free_port(self) -> int:
-        """Find an available port in the ephemeral range."""
-        max_attempts = 100
-        for _ in range(max_attempts):
-            # Use ephemeral port range (49152-65535)
-            port = random.randint(49152, 65535)
-
-            # Check if port is already used by this test run
-            if port in GeodeServerManager._used_ports:
-                continue
-
-            # Try to bind to the port to verify it's available
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    s.bind(('localhost', port))
-                    # Port is available
-                    GeodeServerManager._used_ports.add(port)
-                    return port
-            except OSError:
-                # Port is in use, try another
-                continue
-
-        raise RuntimeError(f"Could not find free port after {max_attempts} attempts")
+    def _run_docker(self, *args, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+        """Run a docker command."""
+        cmd = ["docker"] + list(args)
+        if self.verbose:
+            print(f"Running: {' '.join(cmd)}")
+        return subprocess.run(
+            cmd,
+            check=check,
+            capture_output=capture,
+            text=True
+        )
 
     async def start(self) -> str:
-        """Start the Geode server and return the server address."""
-        if self.process is not None:
-            raise RuntimeError("Server is already running")
-
-        # Allocate a unique port
-        self.port = self._find_free_port()
-
-        # Create log file in temp directory
-        self.log_file = Path(tempfile.mktemp(prefix=f"geode_server_{self.port}_", suffix=".log"))
-
-        # Create temporary data directory for test isolation
-        self.data_dir = Path(tempfile.mkdtemp(prefix=f"geode_data_{self.port}_"))
-
-        listen_addr = f"localhost:{self.port}"
-
-        # Certificate paths for TLS
-        cert_dir = Path(__file__).parent / "certs"
-        cert_path = cert_dir / "server.crt"
-        key_path = cert_dir / "server.key"
+        """Start the Geode server container and return the server address."""
+        # Check Docker availability before attempting to use it
+        if not self.check_docker_available():
+            raise RuntimeError(
+                "Docker is not available. Please ensure:\n"
+                "  1. Docker is installed (https://docs.docker.com/get-docker/)\n"
+                "  2. Docker daemon is running (try 'docker info')\n"
+                "  3. Your user has permission to run Docker\n"
+                "Alternatively, use --no-manage-server with an external Geode server."
+            )
 
         if self.verbose:
-            print(f"Starting Geode server on {listen_addr}")
-            print(f"Server log: {self.log_file}")
-            print(f"Server data: {self.data_dir}")
-            print(f"Server cert: {cert_path}")
-            print(f"Server key: {key_path}")
+            print(f"Starting Geode server container: {self.container_name}")
+            print(f"  Image: {self.image}")
+            print(f"  Port: {self.port}")
 
-        # Start server process with isolated data directory
-        log_fd = open(self.log_file, 'w')
-        self.process = await asyncio.create_subprocess_exec(
-            str(self.geode_binary),
-            "serve",
-            "--listen",
-            listen_addr,
-            "--data-dir",
-            str(self.data_dir),
-            "--cert",
-            str(cert_path),
-            "--key",
-            str(key_path),
-            stdout=log_fd,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        # Remove any existing container with the same name
+        try:
+            self._run_docker("rm", "-f", self.container_name, check=False)
+        except Exception:
+            pass
+
+        # Start the container
+        # Note: QUIC uses UDP
+        try:
+            self._run_docker(
+                "run", "-d",
+                "--name", self.container_name,
+                "-p", f"{self.port}:3141/udp",
+                self.image,
+                "serve", "--listen", "0.0.0.0:3141", "--log-level", "info"
+            )
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to start Docker container: {e.stderr}")
 
         # Register cleanup on exit
         if not self._cleanup_registered:
@@ -194,90 +182,142 @@ class GeodeServerManager:
         # Wait for server to be ready
         await self._wait_for_server_ready()
 
-        return listen_addr
+        return f"{self.host}:{self.port}"
 
-    async def _wait_for_server_ready(self, timeout: float = 5.0):
-        """Wait for server to be ready to accept connections."""
+    async def _wait_for_server_ready(self, timeout: float = 30.0):
+        """Wait for server to be ready by checking container logs."""
         start_time = time.time()
 
-        # QUIC servers don't accept raw TCP connections, so we need to check the log
-        # for the "Server ready" message instead
         while time.time() - start_time < timeout:
-            # Check if server process is still alive
-            if self.process.returncode is not None:
-                # Server crashed
-                log_content = ""
-                if self.log_file and self.log_file.exists():
-                    log_content = self.log_file.read_text()
+            # Check if container is still running
+            result = self._run_docker(
+                "inspect", "-f", "{{.State.Running}}",
+                self.container_name,
+                check=False
+            )
+            if result.returncode != 0 or result.stdout.strip() != "true":
+                # Get container logs for debugging
+                logs = self._run_docker("logs", self.container_name, check=False)
                 raise RuntimeError(
-                    f"Server process exited with code {self.process.returncode}.\n"
-                    f"Last 20 lines of log:\n{chr(10).join(log_content.splitlines()[-20:])}"
+                    f"Container is not running.\n"
+                    f"Last logs:\n{logs.stdout if logs.stdout else logs.stderr}"
                 )
 
-            # Check log file for ready message
-            if self.log_file and self.log_file.exists():
-                try:
-                    log_content = self.log_file.read_text()
-                    if "Server ready" in log_content or "accepting QUIC connections" in log_content:
-                        if self.verbose:
-                            print(f"Server ready on port {self.port}")
-                        return
-                except Exception:
-                    # Log file might be being written to
-                    pass
+            # Check logs for ready message
+            logs = self._run_docker("logs", self.container_name, check=False)
+            log_content = logs.stdout + logs.stderr
+            if "Server ready" in log_content or "accepting QUIC connections" in log_content:
+                if self.verbose:
+                    print(f"Server ready on {self.host}:{self.port}")
+                return
 
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.5)
 
         raise TimeoutError(f"Server did not become ready within {timeout} seconds")
 
     async def stop(self):
-        """Stop the Geode server."""
-        if self.process is None:
-            return
+        """Stop the Geode server container."""
+        if self.verbose:
+            print(f"Stopping Geode server container: {self.container_name}")
+
+        try:
+            self._run_docker("stop", self.container_name, check=False)
+            self._run_docker("rm", self.container_name, check=False)
+        except Exception as e:
+            if self.verbose:
+                print(f"Error stopping container: {e}")
+
+    async def run_migrations(self, migrations_dir: Path, geode_cli: Optional[Path] = None) -> bool:
+        """Run database migrations using Geode CLI.
+
+        Args:
+            migrations_dir: Path to migrations directory
+            geode_cli: Path to geode CLI binary (auto-detected if not provided)
+
+        Returns:
+            True if migrations succeeded, False otherwise
+        """
+        if not migrations_dir.exists():
+            if self.verbose:
+                print(f"Migrations directory not found: {migrations_dir}")
+            return True  # No migrations to run
+
+        # Find geode CLI
+        if geode_cli is None:
+            # Try common locations
+            possible_paths = [
+                Path(__file__).parent.parent / "geode" / "zig-out" / "bin" / "geode",
+                Path.home() / ".local" / "bin" / "geode",
+                Path("/usr/local/bin/geode"),
+            ]
+            for path in possible_paths:
+                if path.exists():
+                    geode_cli = path
+                    break
+
+            # Try which
+            if geode_cli is None:
+                result = subprocess.run(["which", "geode"], capture_output=True, text=True)
+                if result.returncode == 0:
+                    geode_cli = Path(result.stdout.strip())
+
+        if geode_cli is None or not geode_cli.exists():
+            if self.verbose:
+                print("Geode CLI not found - skipping migrations")
+            return True  # Can't run migrations without CLI
 
         if self.verbose:
-            print(f"Stopping Geode server on port {self.port}")
+            print(f"Running migrations from: {migrations_dir}")
+            print(f"Using Geode CLI: {geode_cli}")
 
-        # Try graceful shutdown first
+        # Run migrations
+        server_addr = f"{self.host}:{self.port}"
+        cmd = [
+            str(geode_cli),
+            "migrate", "run",
+            "--dir", str(migrations_dir),
+            "--server", server_addr,
+            "--insecure"  # Skip TLS verification for test containers
+        ]
+
         try:
-            self.process.terminate()
-            await asyncio.wait_for(self.process.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            # Force kill if graceful shutdown times out
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60  # 60 second timeout for migrations
+            )
+
+            if result.returncode != 0:
+                print(f"Migration failed: {result.stderr}")
+                if self.verbose:
+                    print(f"Migration stdout: {result.stdout}")
+                return False
+
             if self.verbose:
-                print(f"Server did not stop gracefully, force killing...")
-            self.process.kill()
-            await self.process.wait()
+                print("Migrations applied successfully")
+                if result.stdout:
+                    print(result.stdout)
 
-        # Release the port
-        if self.port is not None:
-            GeodeServerManager._used_ports.discard(self.port)
-            self.port = None
+            return True
 
-        self.process = None
-
-        # Clean up log file if verbose is off
-        if not self.verbose and self.log_file and self.log_file.exists():
-            try:
-                self.log_file.unlink()
-            except Exception:
-                pass
-
-        # Clean up data directory
-        if self.data_dir and self.data_dir.exists():
-            try:
-                import shutil
-                shutil.rmtree(self.data_dir)
-            except Exception:
-                pass
+        except subprocess.TimeoutExpired:
+            print("Migration timed out after 60 seconds")
+            return False
+        except Exception as e:
+            print(f"Migration error: {e}")
+            return False
 
     def _emergency_cleanup(self):
         """Emergency cleanup called on exit."""
-        if self.process and self.process.returncode is None:
-            try:
-                self.process.kill()
-            except Exception:
-                pass
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", self.container_name],
+                check=False,
+                capture_output=True
+            )
+        except Exception:
+            pass
 
     @classmethod
     async def cleanup_all(cls):
@@ -288,7 +328,6 @@ class GeodeServerManager:
             except Exception as e:
                 print(f"Error stopping server: {e}", file=sys.stderr)
         cls._all_servers.clear()
-        cls._used_ports.clear()
 
     async def __aenter__(self):
         """Context manager support."""
@@ -327,7 +366,7 @@ class PythonRunner(ClientRunner):
         super().__init__("python", server)
         self.runner_path = Path(__file__).parent / "runners" / "python_runner.py"
         # Use venv Python if available
-        venv_python = Path(__file__).parent.parent / "python" / "venv" / "bin" / "python3"
+        venv_python = Path(__file__).parent / ".venv" / "bin" / "python3"
         self.python_exe = str(venv_python) if venv_python.exists() else sys.executable
 
     async def run_test(self, spec: Dict[str, Any], test: Dict[str, Any]) -> TestResult:
@@ -523,18 +562,6 @@ class GoRunner(ClientRunner):
 
         if not self.runner_path.exists() and go_file.exists():
             print(f"Building Go runner...")
-            # Initialize go.mod if needed
-            go_mod = runners_dir / "go.mod"
-            if not go_mod.exists():
-                proc = await asyncio.create_subprocess_exec(
-                    "go", "mod", "init",
-                    "gitlab.com/devnw/codepros/geode/geode/clients/test-harness/runners",
-                    cwd=str(runners_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await proc.wait()
-
             # Get dependencies
             proc = await asyncio.create_subprocess_exec(
                 "go", "mod", "tidy",
@@ -723,16 +750,23 @@ class ZigRunner(ClientRunner):
 
             duration_ms = (time.time() - start_time) * 1000
 
-            if proc.returncode == 0:
-                result = json.loads(stdout.decode())
-                return TestResult(
-                    test_name=test["name"],
-                    client="zig",
-                    status="passed",
-                    duration_ms=duration_ms,
-                    details=result,
-                )
-            else:
+            # Parse result from stdout
+            if stdout:
+                try:
+                    result = json.loads(stdout.decode())
+                    status = derive_status_from_summary(result)
+                    return TestResult(
+                        test_name=test["name"],
+                        client="zig",
+                        status=status,
+                        duration_ms=duration_ms,
+                        details=result,
+                        error_message=stderr.decode() if status != "passed" and stderr else None,
+                    )
+                except json.JSONDecodeError:
+                    pass
+
+            if proc.returncode != 0:
                 return TestResult(
                     test_name=test["name"],
                     client="zig",
@@ -740,6 +774,14 @@ class ZigRunner(ClientRunner):
                     duration_ms=duration_ms,
                     error_message=stderr.decode(),
                 )
+
+            return TestResult(
+                test_name=test["name"],
+                client="zig",
+                status="error",
+                duration_ms=duration_ms,
+                error_message="Runner produced no output",
+            )
 
         except asyncio.TimeoutError:
             return TestResult(
@@ -789,6 +831,132 @@ class ZigRunner(ClientRunner):
         return self.runner_path.exists()
 
 
+class NodeJSRunner(ClientRunner):
+    """Node.js client test runner."""
+
+    def __init__(self, server: str):
+        super().__init__("nodejs", server)
+        self.runner_path = Path(__file__).parent / "runners" / "nodejs_runner.js"
+        self.node_modules = Path(__file__).parent / "runners" / "node_modules"
+
+    async def run_test(self, spec: Dict[str, Any], test: Dict[str, Any]) -> TestResult:
+        start_time = time.time()
+
+        try:
+            # Create temporary test file
+            test_spec = {
+                "setup": spec.get("setup", []),
+                "tests": [test],
+                "cleanup": spec.get("cleanup", []),
+            }
+            test_file = Path("/tmp") / f"test_{test['name']}.yaml"
+            test_file.write_text(yaml.dump(test_spec, Dumper=IndentedDumper, default_flow_style=False, sort_keys=False))
+
+            # Run Node.js runner
+            proc = await asyncio.create_subprocess_exec(
+                "node",
+                str(self.runner_path),
+                "--spec",
+                str(test_file),
+                "--server",
+                self.server,
+                "--json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=test.get("timeout_ms", 30000) / 1000
+            )
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            if stdout:
+                try:
+                    result = json.loads(stdout.decode())
+                    status = derive_status_from_summary(result)
+                    return TestResult(
+                        test_name=test["name"],
+                        client="nodejs",
+                        status=status,
+                        duration_ms=duration_ms,
+                        details=result,
+                        error_message=stderr.decode() if status != "passed" and stderr else None,
+                    )
+                except json.JSONDecodeError:
+                    pass
+
+            if proc.returncode != 0:
+                return TestResult(
+                    test_name=test["name"],
+                    client="nodejs",
+                    status="failed",
+                    duration_ms=duration_ms,
+                    error_message=stderr.decode(),
+                )
+
+            return TestResult(
+                test_name=test["name"],
+                client="nodejs",
+                status="error",
+                duration_ms=duration_ms,
+                error_message="Runner produced no output",
+            )
+
+        except asyncio.TimeoutError:
+            return TestResult(
+                test_name=test["name"],
+                client="nodejs",
+                status="error",
+                duration_ms=(time.time() - start_time) * 1000,
+                error_message="Test timed out",
+            )
+        except Exception as e:
+            return TestResult(
+                test_name=test["name"],
+                client="nodejs",
+                status="error",
+                duration_ms=(time.time() - start_time) * 1000,
+                error_message=str(e),
+            )
+
+    async def setup(self) -> bool:
+        """Check if Node.js runner is available."""
+        # Check if node is available
+        node_check = await asyncio.create_subprocess_exec(
+            "which", "node",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await node_check.wait()
+
+        if node_check.returncode != 0:
+            print(f"Node.js not found - Node.js runner unavailable (install Node.js to enable)")
+            return False
+
+        if not self.runner_path.exists():
+            print(f"Node.js runner not found at {self.runner_path}")
+            return False
+
+        # Check if node_modules exists (dependencies installed)
+        if not self.node_modules.exists():
+            print(f"Installing Node.js dependencies...")
+            runners_dir = Path(__file__).parent / "runners"
+            proc = await asyncio.create_subprocess_exec(
+                "npm", "install",
+                cwd=str(runners_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+            if proc.returncode != 0:
+                stderr = await proc.stderr.read() if proc.stderr else b''
+                print(f"npm install failed: {stderr.decode() if stderr else 'unknown error'}")
+                return False
+
+        return True
+
+
 class TestHarness:
     """Main test harness coordinator."""
 
@@ -800,8 +968,10 @@ class TestHarness:
         verbose: bool = False,
         fail_fast: bool = False,
         manage_server: bool = True,
-        restart_server_between_tests: bool = True,
-        restart_server_between_clients: bool = True,
+        restart_server_between_tests: bool = False,
+        restart_server_between_clients: bool = False,
+        migrations_dir: Optional[Path] = None,
+        skip_migrations: bool = False,
     ):
         self.server = server
         self.verbose = verbose
@@ -810,23 +980,38 @@ class TestHarness:
         self.manage_server = manage_server
         self.restart_server_between_tests = restart_server_between_tests
         self.restart_server_between_clients = restart_server_between_clients
+        self.migrations_dir = migrations_dir or Path(__file__).parent / "migrations"
+        self.skip_migrations = skip_migrations
+        self.migrations_succeeded = False  # Track if migrations ran successfully
         self.server_manager: Optional[GeodeServerManager] = None
 
         # Initialize runners (will be configured with actual server address in setup())
         self.runners: Dict[str, ClientRunner] = {}
-        self.requested_clients = clients or ["python", "go", "rust", "zig"]
+        self.requested_clients = clients or ["python", "go", "rust", "zig", "nodejs"]
 
     async def setup(self) -> bool:
         """Setup all runners."""
         # Start server if managed
         if self.manage_server:
             if self.verbose:
-                print("Starting managed Geode server...")
+                print("Starting managed Geode server (Docker)...")
             try:
                 self.server_manager = GeodeServerManager(verbose=self.verbose)
                 self.server = await self.server_manager.start()
                 if self.verbose:
                     print(f"Server started at {self.server}")
+
+                # Run migrations if not skipped
+                if not self.skip_migrations and self.migrations_dir.exists():
+                    if self.verbose:
+                        print(f"Running migrations from {self.migrations_dir}...")
+                    if await self.server_manager.run_migrations(self.migrations_dir):
+                        self.migrations_succeeded = True
+                    else:
+                        print("WARNING: Some migrations failed, specs requiring migrations will be skipped", file=sys.stderr)
+                elif self.verbose and self.skip_migrations:
+                    print("Skipping migrations (--skip-migrations)")
+
             except Exception as e:
                 print(f"ERROR: Failed to start server: {e}", file=sys.stderr)
                 return False
@@ -844,6 +1029,8 @@ class TestHarness:
             temp_runners["rust"] = RustRunner(self.server)
         if "zig" in self.requested_clients:
             temp_runners["zig"] = ZigRunner(self.server)
+        if "nodejs" in self.requested_clients:
+            temp_runners["nodejs"] = NodeJSRunner(self.server)
 
         # Setup each runner
         available_runners = {}
@@ -899,7 +1086,7 @@ class TestHarness:
         # Small delay to ensure port is released
         await asyncio.sleep(0.5)
 
-        # Start new server (reuses same port allocation)
+        # Start new server
         self.server = await self.server_manager.start()
 
         # Update all runners with new server address
@@ -909,11 +1096,65 @@ class TestHarness:
         if self.verbose:
             print(f"    Server restarted at {self.server}")
 
+    def _validate_spec(self, spec: Dict[str, Any], spec_path: Path) -> List[str]:
+        """Validate a test specification and return list of errors."""
+        errors = []
+
+        # Check required top-level fields
+        if not isinstance(spec, dict):
+            errors.append(f"{spec_path}: Spec must be a YAML mapping/dictionary")
+            return errors
+
+        if "tests" not in spec:
+            errors.append(f"{spec_path}: Missing required field 'tests'")
+
+        tests = spec.get("tests", [])
+        if not isinstance(tests, list):
+            errors.append(f"{spec_path}: 'tests' must be a list")
+            return errors
+
+        # Validate each test
+        for i, test in enumerate(tests):
+            if not isinstance(test, dict):
+                errors.append(f"{spec_path}: test[{i}] must be a mapping")
+                continue
+
+            if "name" not in test:
+                errors.append(f"{spec_path}: test[{i}] missing required field 'name'")
+
+            # Test must have either 'query', 'steps', or be skipped
+            has_query = "query" in test
+            has_steps = "steps" in test
+            is_skipped = test.get("skip", False)
+
+            if not has_query and not has_steps and not is_skipped:
+                test_name = test.get("name", f"test[{i}]")
+                errors.append(f"{spec_path}: {test_name} must have 'query' or 'steps' field")
+
+        return errors
+
     async def run_spec(self, spec_path: Path) -> List[TestResult]:
         """Run a test specification file."""
         # Load spec
         with open(spec_path) as f:
             spec = yaml.safe_load(f)
+
+        # Validate spec before running
+        validation_errors = self._validate_spec(spec, spec_path)
+        if validation_errors:
+            error_msg = "Spec validation failed:\n  " + "\n  ".join(validation_errors)
+            if self.verbose:
+                print(f"ERROR: {error_msg}")
+            # Return error results for all tests
+            return [
+                TestResult(
+                    test_name="spec-validation",
+                    client="harness",
+                    status="error",
+                    error_message=error_msg,
+                    duration_ms=0.0,
+                )
+            ]
 
         if self.verbose:
             print(f"\nRunning spec: {spec.get('name', spec_path.name)}")
@@ -921,6 +1162,23 @@ class TestHarness:
             print(f"Tests: {len(spec.get('tests', []))}")
 
         results = []
+
+        # Check if spec requires migrations and skip if migrations failed
+        if spec.get("requires_migrations", False) and not self.migrations_succeeded:
+            if self.verbose:
+                print(f"  SKIPPING: Spec requires migrations but migrations failed/skipped")
+            for test in spec.get("tests", []):
+                for client in self.runners.keys():
+                    results.append(
+                        TestResult(
+                            test_name=test["name"],
+                            client=client,
+                            status="skipped",
+                            duration_ms=0.0,
+                            skip_reason="Requires migrations but migrations failed/skipped",
+                        )
+                    )
+            return results
 
         # Run tests
         for test in spec.get("tests", []):
@@ -946,11 +1204,31 @@ class TestHarness:
                 print(f"\n  Test: {test['name']}")
                 print(f"    {test.get('description', '')}")
 
+            # Get test timeout (default 60 seconds if not specified)
+            timeout_ms = test.get("timeout_ms", 60000)
+            timeout_seconds = timeout_ms / 1000.0
+
             # Run test on all clients
             if self.parallel:
-                # Run clients in parallel
+                # Run clients in parallel with timeout
+                async def run_with_timeout(runner, name):
+                    try:
+                        return await asyncio.wait_for(
+                            runner.run_test(spec, test),
+                            timeout=timeout_seconds
+                        )
+                    except asyncio.TimeoutError:
+                        return TestResult(
+                            test_name=test["name"],
+                            client=name,
+                            status="error",
+                            error_message=f"Test timed out after {timeout_ms}ms",
+                            duration_ms=timeout_ms,
+                        )
+
                 tasks = [
-                    runner.run_test(spec, test) for runner in self.runners.values()
+                    run_with_timeout(runner, name)
+                    for name, runner in self.runners.items()
                 ]
                 test_results = await asyncio.gather(*tasks)
                 results.extend(test_results)
@@ -977,7 +1255,20 @@ class TestHarness:
                     if self.verbose:
                         print(f"    Running {name}...", end=" ", flush=True)
 
-                    result = await runner.run_test(spec, test)
+                    # Run test with timeout enforcement
+                    try:
+                        result = await asyncio.wait_for(
+                            runner.run_test(spec, test),
+                            timeout=timeout_seconds
+                        )
+                    except asyncio.TimeoutError:
+                        result = TestResult(
+                            test_name=test["name"],
+                            client=name,
+                            status="error",
+                            error_message=f"Test timed out after {timeout_ms}ms",
+                            duration_ms=timeout_ms,
+                        )
                     results.append(result)
 
                     if self.verbose:
@@ -1102,7 +1393,7 @@ async def main():
     parser.add_argument(
         "--server",
         default=None,
-        help="Geode server address (default: auto-start server on random port)",
+        help="Geode server address (default: auto-start Docker container)",
     )
     parser.add_argument(
         "--no-manage-server",
@@ -1114,8 +1405,8 @@ async def main():
     )
     parser.add_argument(
         "--clients",
-        default="python,go,rust,zig",
-        help="Comma-separated list of clients to test (default: python,go,rust,zig)",
+        default="python,go,rust,zig,nodejs",
+        help="Comma-separated list of clients to test (default: python,go,rust,zig,nodejs)",
     )
     parser.add_argument(
         "--parallel",
@@ -1131,6 +1422,14 @@ async def main():
     )
     parser.add_argument(
         "--report-html", type=Path, help="Generate HTML report to file"
+    )
+    parser.add_argument(
+        "--migrations-dir", type=Path, default=None,
+        help="Directory containing migration files (default: ./migrations)"
+    )
+    parser.add_argument(
+        "--skip-migrations", action="store_true",
+        help="Skip running migrations before tests"
     )
 
     args = parser.parse_args()
@@ -1149,8 +1448,10 @@ async def main():
         verbose=args.verbose,
         fail_fast=args.fail_fast,
         manage_server=manage_server,
-        restart_server_between_tests=False,  # Disabled: Server restart has issues
+        restart_server_between_tests=False,
         restart_server_between_clients=False,
+        migrations_dir=args.migrations_dir,
+        skip_migrations=args.skip_migrations,
     )
 
     try:
