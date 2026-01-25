@@ -50,9 +50,11 @@ build-zig:
 build-go:
   extends: .build-template
   image: golang:1.24
+  allow_failure: true
   before_script:
-    # Clone the Go client repo using CI job token for auth
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git ../geode-client-go || echo "Client clone failed - build will fail"
+    # Clone the Go client repo using CI job token
+    # Note: Requires "Allow access to this project with a CI_JOB_TOKEN" enabled in geode-client-go settings
+    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git ../geode-client-go
   script:
     - cd runners
     - go build -o go_runner go_runner.go
@@ -97,7 +99,7 @@ build-nodejs:
   tags:
     - company
     - linux
-  image: python:3.11-slim
+  image: docker:24
   services:
     - name: docker:24-dind
       alias: docker
@@ -105,18 +107,21 @@ build-nodejs:
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
-    GEODE_HOST: "docker"
+    GEODE_HOST: "127.0.0.1"
     GEODE_PORT: "3141"
   before_script:
-    - apt-get update -qq && apt-get install -y -qq docker.io netcat-openbsd curl --no-install-recommends
-    - pip install pyyaml --quiet
+    # Wait for Docker daemon to be ready
+    - until docker info >/dev/null 2>&1; do sleep 1; done
+    # Install Python and dependencies
+    - apk add --no-cache python3 py3-pip py3-yaml
+    - pip3 install pyyaml --quiet --break-system-packages || pip3 install pyyaml --quiet
     - mkdir -p reports
     # Login to GitLab registry and start Geode
     - echo "$CI_JOB_TOKEN" | docker login -u gitlab-ci-token --password-stdin $CI_REGISTRY
     - docker pull $GEODE_IMAGE
     - docker run -d --name geode-server --network host $GEODE_IMAGE serve --listen 0.0.0.0:3141 --log-level info
-    - sleep 5
-    - docker logs geode-server || true
+    - sleep 10
+    - docker logs geode-server || echo "No logs yet"
   after_script:
     - docker stop geode-server 2>/dev/null || true
     - docker rm geode-server 2>/dev/null || true
