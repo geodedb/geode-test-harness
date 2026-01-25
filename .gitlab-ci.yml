@@ -99,35 +99,25 @@ build-nodejs:
   tags:
     - company
     - linux
-  image: docker:24
+  image: python:3.11
   services:
-    - name: docker:24-dind
-      alias: docker
-      command: ["--tls=false"]
+    # Geode database service (QUIC/UDP on port 3141)
+    - name: $GEODE_IMAGE
+      alias: geode
+      # Geode serve command is the entrypoint
+      command: ["serve", "--listen", "0.0.0.0:3141", "--log-level", "info"]
   variables:
-    # For Kubernetes executor, Docker dind runs in same pod on localhost
-    DOCKER_HOST: tcp://localhost:2375
-    DOCKER_TLS_CERTDIR: ""
-    GEODE_HOST: "127.0.0.1"
+    # Connect to Geode service by alias
+    GEODE_HOST: "geode"
     GEODE_PORT: "3141"
   before_script:
-    # Wait for Docker daemon to be ready (timeout after 60s)
-    - echo "Waiting for Docker daemon..."
-    - for i in $(seq 1 60); do docker info >/dev/null 2>&1 && echo "Docker ready" && break || sleep 1; done
-    - docker info || (echo "Docker not available" && exit 1)
-    # Install Python and dependencies
-    - apk add --no-cache python3 py3-pip py3-yaml
-    - pip3 install pyyaml --quiet --break-system-packages || pip3 install pyyaml --quiet
+    # Install dependencies
+    - pip install pyyaml --quiet
     - mkdir -p reports
-    # Login to GitLab registry and start Geode
-    - echo "$CI_JOB_TOKEN" | docker login -u gitlab-ci-token --password-stdin $CI_REGISTRY
-    - docker pull $GEODE_IMAGE
-    - docker run -d --name geode-server --network host $GEODE_IMAGE serve --listen 0.0.0.0:3141 --log-level info
-    - sleep 10
-    - docker logs geode-server || echo "No logs yet"
-  after_script:
-    - docker stop geode-server 2>/dev/null || true
-    - docker rm geode-server 2>/dev/null || true
+    # Wait for Geode service to be ready (UDP doesn't have TCP-style connectivity check)
+    - echo "Waiting for Geode service..."
+    - sleep 15
+    - echo "Geode should be ready at $GEODE_HOST:$GEODE_PORT"
   artifacts:
     paths:
       - reports/
@@ -145,7 +135,7 @@ test-all:
     - build-python
     - build-nodejs
   script:
-    # Run tests against Geode server in Docker
+    # Run tests against Geode service
     - python3 run_tests.py --server $GEODE_HOST:$GEODE_PORT --no-manage-server --skip-migrations --report-json reports/results.json --verbose 2>&1 | tee reports/test_output.log || true
     - cat reports/results.json || echo '{"summary":{"total":0,"passed":0,"failed":0},"results":[]}' > reports/results.json
     # Report results (allow failures for now until CI is fully configured)
