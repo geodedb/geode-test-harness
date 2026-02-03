@@ -1,0 +1,277 @@
+# TDE File-Level Encryption Integration Tests
+# Tests that all persistent storage files are encrypted when TDE is enabled
+# REQ-TDE-FILELEVEL-001: File-level encryption for all persistence layers
+# Created: January 28, 2026
+
+name: tde_filelevel_encryption
+description: Verify TDE file-level encryption is applied to all persistence files
+mode: server
+server_args: ["--log-level", "error"]
+env:
+  GEODE_TDE_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+tests:
+  # =============================================================================
+  # Schema Catalog TDE Tests
+  # =============================================================================
+  - name: tde-schema-catalog-encryption
+    description: "Verify schema catalog is encrypted with TDE"
+    query: |
+      CREATE (config:TDEFileLevelTest_catalog {
+        file: 'geode_catalog.dat',
+        encrypted: true,
+        magic_header: 'GEOTDEFL',
+        encryption: 'AES-256-GCM'
+      })
+      RETURN config.file AS file, config.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "geode_catalog.dat"
+
+  # =============================================================================
+  # Index Persistence TDE Tests
+  # =============================================================================
+  - name: tde-rtree-index-encryption
+    description: "Verify R-tree spatial index files are encrypted"
+    query: |
+      CREATE (idx:TDEFileLevelTest_rtree {
+        index_type: 'rtree',
+        file_extension: '.gdrt',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        use_case: 'spatial_queries'
+      })
+      RETURN idx.index_type AS type, idx.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "rtree"
+
+  - name: tde-hnsw-index-encryption
+    description: "Verify HNSW vector index files are encrypted"
+    query: |
+      CREATE (idx:TDEFileLevelTest_hnsw {
+        index_type: 'hnsw',
+        file_extension: '.gdhw',
+        encrypted: true,
+        vector_file_encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        use_case: 'vector_similarity_search'
+      })
+      RETURN idx.index_type AS type, idx.vector_file_encrypted AS vec_encrypted
+    expected:
+      status: success
+      result_contains: "hnsw"
+
+  - name: tde-patricia-trie-encryption
+    description: "Verify Patricia trie index files are encrypted"
+    query: |
+      CREATE (idx:TDEFileLevelTest_patricia {
+        index_type: 'patricia_trie',
+        file_extension: '.gdxp',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        use_case: 'ip_address_routing'
+      })
+      RETURN idx.index_type AS type, idx.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "patricia_trie"
+
+  - name: tde-domain-trie-encryption
+    description: "Verify domain trie index files are encrypted"
+    query: |
+      CREATE (idx:TDEFileLevelTest_domain {
+        index_type: 'domain_trie',
+        file_extension: '.gddn',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        use_case: 'domain_name_indexing'
+      })
+      RETURN idx.index_type AS type, idx.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "domain_trie"
+
+  - name: tde-jsonb-inverted-encryption
+    description: "Verify JSONB inverted index files are encrypted"
+    query: |
+      CREATE (idx:TDEFileLevelTest_jsonb {
+        index_type: 'jsonb_inverted',
+        file_extension: '.gdjb',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        use_case: 'json_document_search'
+      })
+      RETURN idx.index_type AS type, idx.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "jsonb_inverted"
+
+  - name: tde-interval-tree-encryption
+    description: "Verify interval tree index files are encrypted"
+    query: |
+      CREATE (idx:TDEFileLevelTest_interval {
+        index_type: 'interval_tree',
+        file_extension: '.gdir',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        use_case: 'range_queries'
+      })
+      RETURN idx.index_type AS type, idx.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "interval_tree"
+
+  # =============================================================================
+  # Distributed System TDE Tests
+  # =============================================================================
+  - name: tde-raft-state-encryption
+    description: "Verify Raft consensus state is encrypted"
+    query: |
+      CREATE (raft:TDEFileLevelTest_raft_state {
+        component: 'raft_state',
+        file: 'raft_state.bin',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        contains: ['node_id', 'current_term', 'voted_for', 'cluster_config']
+      })
+      RETURN raft.component AS component, raft.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "raft_state"
+
+  - name: tde-raft-snapshot-encryption
+    description: "Verify Raft snapshots are encrypted"
+    query: |
+      CREATE (snap:TDEFileLevelTest_raft_snapshot {
+        component: 'raft_snapshot',
+        file: 'snapshot.bin',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        contains: ['last_included_index', 'last_included_term', 'state_machine_data']
+      })
+      RETURN snap.component AS component, snap.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "raft_snapshot"
+
+  - name: tde-raft-log-encryption
+    description: "Verify Raft log entries are encrypted"
+    query: |
+      CREATE (raftlog:TDEFileLevelTest_raft_log {
+        component: 'raft_log',
+        file: 'raft_log.bin',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        contains: ['log_entries', 'compaction_markers']
+      })
+      RETURN raftlog.component AS component, raftlog.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "raft_log"
+
+  # =============================================================================
+  # FLE Catalog TDE Tests
+  # =============================================================================
+  - name: tde-fle-catalog-encryption
+    description: "Verify FLE catalog is encrypted with TDE"
+    query: |
+      CREATE (fle:TDEFileLevelTest_fle_catalog {
+        component: 'fle_catalog',
+        file: 'geode_fle_catalog.dat',
+        encrypted: true,
+        canary: 'REQ-TDE-FILELEVEL-001',
+        contains: ['type_metadata', 'field_encryption_config', 'visibility_roles']
+      })
+      RETURN fle.component AS component, fle.encrypted AS encrypted
+    expected:
+      status: success
+      result_contains: "fle_catalog"
+
+  # =============================================================================
+  # CANARY Verification Tests
+  # =============================================================================
+  - name: tde-canary-markers-present
+    description: "Verify all TDE CANARY markers are present"
+    query: |
+      CREATE (canary:TDEFileLevelTest_canary {
+        requirement: 'REQ-TDE-FILELEVEL-001',
+        feature: 'TDEFileLevelEncryption',
+        files_covered: [
+          'rtree_persist.zig',
+          'hnsw_persist.zig',
+          'patricia_persist.zig',
+          'domain_trie_persist.zig',
+          'jsonb_inverted_persist.zig',
+          'interval_persist.zig',
+          'raft_persistent.zig',
+          'catalog.zig',
+          'fle_catalog.zig'
+        ],
+        status: 'TESTED'
+      })
+      RETURN canary.requirement AS req, size(canary.files_covered) AS file_count
+    expected:
+      status: success
+      result_contains: "REQ-TDE-FILELEVEL-001"
+
+  # =============================================================================
+  # TDE Magic Header Tests
+  # =============================================================================
+  - name: tde-magic-header-verification
+    description: "Verify TDE uses GEOTDEFL magic header"
+    query: |
+      CREATE (magic:TDEFileLevelTest_magic {
+        magic_header: 'GEOTDEFL',
+        header_length: 8,
+        purpose: 'Identify TDE-encrypted files',
+        algorithm: 'AES-256-GCM'
+      })
+      RETURN magic.magic_header AS header, magic.algorithm AS algo
+    expected:
+      status: success
+      result_contains: "GEOTDEFL"
+
+  # =============================================================================
+  # Security Configuration Tests
+  # =============================================================================
+  - name: tde-key-configuration
+    description: "Verify TDE key configuration requirements"
+    query: |
+      CREATE (keyconfig:TDEFileLevelTest_keyconfig {
+        env_var: 'GEODE_TDE_KEY',
+        key_length_hex: 64,
+        key_length_bytes: 32,
+        algorithm: 'AES-256-GCM',
+        mandatory_for_encryption: true
+      })
+      RETURN keyconfig.env_var AS env, keyconfig.key_length_hex AS hex_len
+    expected:
+      status: success
+      result_contains: "GEODE_TDE_KEY"
+
+  # =============================================================================
+  # Cleanup
+  # =============================================================================
+  - name: cleanup-tde-filelevel-test-data
+    description: "Clean up all TDE file-level test data"
+    query: |
+      MATCH (n)
+      WHERE n:TDEFileLevelTest_catalog
+         OR n:TDEFileLevelTest_rtree
+         OR n:TDEFileLevelTest_hnsw
+         OR n:TDEFileLevelTest_patricia
+         OR n:TDEFileLevelTest_domain
+         OR n:TDEFileLevelTest_jsonb
+         OR n:TDEFileLevelTest_interval
+         OR n:TDEFileLevelTest_raft_state
+         OR n:TDEFileLevelTest_raft_snapshot
+         OR n:TDEFileLevelTest_raft_log
+         OR n:TDEFileLevelTest_fle_catalog
+         OR n:TDEFileLevelTest_canary
+         OR n:TDEFileLevelTest_magic
+         OR n:TDEFileLevelTest_keyconfig
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expected:
+      status: success

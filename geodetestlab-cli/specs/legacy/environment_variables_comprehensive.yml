@@ -1,0 +1,296 @@
+# Comprehensive Environment Variables Test Specification
+# Tests client-side environment variable resolution with security isolation
+
+metadata:
+  version: "1.0"
+  description: "Comprehensive testing of client-side environment variable resolution with security-first design"
+  created: "2025-10-04"
+  updated: "2025-10-04"
+  category: "environment-variables"
+  priority: "high"
+
+# Test configuration
+config:
+  timeout: 20
+  retries: 2
+  setup_commands: []
+  teardown_commands: []
+
+tests:
+  # Test 1: Basic Environment Variable Substitution
+  - name: "env_var_basic_substitution"
+    description: "Test basic environment variable substitution in GQL queries"
+    command: ["sh", "-c"]
+    input: |
+      export TEST_VAR="production_db" && ./zig-out/bin/geode query 'RETURN "${TEST_VAR}" AS database_name'
+    expected_patterns:
+      - "production_db"
+      - "database_name"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 2: Environment Variable with Default Value
+  - name: "env_var_default_value"
+    description: "Test environment variable with default value when variable is undefined"
+    command: ["./zig-out/bin/geode", "query"]
+    input: 'RETURN "${UNDEFINED_VAR:fallback_value}" AS result'
+    args: []
+    expected_patterns:
+      - "fallback_value"
+      - "result"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 3: Empty Fallback for Undefined Variable
+  - name: "env_var_empty_fallback"
+    description: "Test undefined variable without default value returns empty string"
+    command: ["./zig-out/bin/geode", "query"]
+    input: 'RETURN "${COMPLETELY_UNDEFINED_VAR}" AS empty_test'
+    args: []
+    expected_patterns:
+      - '""'  # Empty string in JSON
+      - "empty_test"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 4: Multiple Environment Variables in Single Query
+  - name: "env_var_multiple_variables"
+    description: "Test multiple environment variables in a single GQL query"
+    command: ["sh", "-c"]
+    input: |
+      export USER_ID="12345" && export ROLE="admin" && ./zig-out/bin/geode query 'CREATE (u:User {id: "${USER_ID}", role: "${ROLE}"}) RETURN u.id, u.role'
+    expected_patterns:
+      - "12345"
+      - "admin"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 5: Complex Default Values with Special Characters
+  - name: "env_var_complex_defaults"
+    description: "Test complex default values containing spaces and special characters"
+    command: ["./zig-out/bin/geode", "query"]
+    input: 'RETURN "${COMPLEX_VAR:default value with spaces, colons: and commas}" AS complex_result'
+    args: []
+    expected_patterns:
+      - "default value with spaces, colons: and commas"
+      - "complex_result"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 6: Environment Variables in MATCH Queries
+  - name: "env_var_in_match_queries"
+    description: "Test environment variables used in MATCH pattern queries"
+    command: ["sh", "-c"]
+    input: |
+      export SEARCH_NAME="Alice" && ./zig-out/bin/geode query 'CREATE (p:Person {name: "Alice", age: 30}); MATCH (p:Person {name: "${SEARCH_NAME}"}) RETURN p.name, p.age'
+    expected_patterns:
+      - "Alice"
+      - "30"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 7: Mixed Defined and Undefined Variables
+  - name: "env_var_mixed_scenarios"
+    description: "Test mix of defined variables, defaults, and undefined variables"
+    command: ["sh", "-c"]
+    input: |
+      export DEFINED_VAR="defined_value" && ./zig-out/bin/geode query 'RETURN "${DEFINED_VAR}" AS defined, "${UNDEFINED:fallback}" AS default, "${EMPTY_VAR}" AS empty'
+    expected_patterns:
+      - "defined_value"
+      - "fallback"
+      - '""'  # Empty string for undefined variable
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 8: Environment Variables in CREATE Statements
+  - name: "env_var_in_create_statements"
+    description: "Test environment variables in CREATE statement properties"
+    command: ["sh", "-c"]
+    input: |
+      export COMPANY="TechCorp" && export LOCATION="San Francisco" && ./zig-out/bin/geode query 'CREATE (c:Company {name: "${COMPANY}", location: "${LOCATION}"}) RETURN c.name, c.location'
+    expected_patterns:
+      - "TechCorp"
+      - "San Francisco"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 9: Environment Variables with Unicode Content
+  - name: "env_var_unicode_support"
+    description: "Test environment variables containing Unicode characters"
+    command: ["sh", "-c"]
+    input: |
+      export UNICODE_VAR="🌍🚀 Unicode Test 中文" && ./zig-out/bin/geode query 'RETURN "${UNICODE_VAR}" AS unicode_result'
+    expected_patterns:
+      - "🌍🚀 Unicode Test 中文"
+      - "unicode_result"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 10: No Environment Variables (Pass-through)
+  - name: "env_var_no_variables"
+    description: "Test queries with no environment variables pass through unchanged"
+    command: ["./zig-out/bin/geode", "query"]
+    input: 'RETURN "static_value" AS static_result'
+    args: []
+    expected_patterns:
+      - "static_value"
+      - "static_result"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 11: Malformed Environment Variable Syntax
+  - name: "env_var_malformed_syntax"
+    description: "Test malformed syntax (missing closing brace) passes through unchanged"
+    command: ["./zig-out/bin/geode", "query"]
+    input: 'RETURN "${UNCLOSED_VAR" AS malformed_test'
+    args: []
+    expected_patterns:
+      - "${UNCLOSED_VAR"  # Should remain unchanged
+      - "malformed_test"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 12: Security Test - No Server-Side Variable Exposure
+  - name: "env_var_security_isolation"
+    description: "Test security: ensure no environment variable syntax reaches server"
+    command: ["sh", "-c"]
+    input: |
+      export SENSITIVE_DATA="secret_api_key_12345" && ./zig-out/bin/geode query 'RETURN "${SENSITIVE_DATA}" AS auth_token'
+    expected_patterns:
+      - "secret_api_key_12345"  # Value should be resolved
+      - "auth_token"
+    unexpected_patterns:
+      - "${SENSITIVE_DATA}"     # Syntax should NOT appear in output
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 13: Environment Variables in WHERE Clauses
+  - name: "env_var_in_where_clauses"
+    description: "Test environment variables used in WHERE clause filtering"
+    command: ["sh", "-c"]
+    input: |
+      export MIN_AGE="25" && ./zig-out/bin/geode query 'CREATE (p1:Person {name: "Alice", age: 30}); CREATE (p2:Person {name: "Bob", age: 20}); MATCH (p:Person) WHERE p.age > ${MIN_AGE} RETURN p.name, p.age'
+    expected_patterns:
+      - "Alice"
+      - "30"
+    unexpected_patterns:
+      - "Bob"        # Should be filtered out (age 20 < 25)
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 14: Environment Variables with JSON Output Format
+  - name: "env_var_json_output_format"
+    description: "Test environment variables work correctly with JSON output format"
+    command: ["sh", "-c"]
+    input: |
+      export FORMAT_TEST="json_value" && ./zig-out/bin/geode query 'RETURN "${FORMAT_TEST}" AS json_field' --format json
+    expected_patterns:
+      - '"json_field":"json_value"'
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 15: Environment Variables in Aggregation Queries
+  - name: "env_var_in_aggregations"
+    description: "Test environment variables in aggregation and grouping operations"
+    command: ["sh", "-c"]
+    input: |
+      export GROUP_BY_FIELD="department" && ./zig-out/bin/geode query 'CREATE (e1:Employee {name: "Alice", department: "Engineering"}); CREATE (e2:Employee {name: "Bob", department: "Engineering"}); CREATE (e3:Employee {name: "Carol", department: "Sales"}); MATCH (e:Employee) RETURN e.${GROUP_BY_FIELD} AS dept, COUNT(e) AS count ORDER BY dept'
+    expected_patterns:
+      - "Engineering"
+      - "Sales"
+      - "count"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 16: Performance Test with Large Environment Variable
+  - name: "env_var_performance_large_value"
+    description: "Test performance with large environment variable values"
+    command: ["sh", "-c"]
+    input: |
+      export LARGE_VAR="$(printf 'a%.0s' {1..1000})" && ./zig-out/bin/geode query 'RETURN LENGTH("${LARGE_VAR}") AS length_result'
+    expected_patterns:
+      - "1000"  # Length should be 1000
+      - "length_result"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 17: Environment Variables in Transaction Context
+  - name: "env_var_in_transactions"
+    description: "Test environment variables work within transaction boundaries"
+    command: ["sh", "-c"]
+    input: |
+      export TX_DATA="transaction_value" && ./zig-out/bin/geode query 'BEGIN; CREATE (t:Transaction {data: "${TX_DATA}"}); COMMIT; MATCH (t:Transaction) RETURN t.data'
+    expected_patterns:
+      - "transaction_value"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 18: Environment Variables in Complex Nested Queries
+  - name: "env_var_complex_nested_queries"
+    description: "Test environment variables in complex nested query structures"
+    command: ["sh", "-c"]
+    input: |
+      export FILTER_VALUE="target" && ./zig-out/bin/geode query 'CREATE (n1:Node {type: "target", value: 100}); CREATE (n2:Node {type: "other", value: 200}); MATCH (n:Node) WHERE n.type = "${FILTER_VALUE}" WITH n.value AS val RETURN val * 2 AS doubled_value'
+    expected_patterns:
+      - "200"  # 100 * 2
+      - "doubled_value"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+# Summary and reporting
+summary:
+  total_tests: 18
+  categories:
+    - basic_functionality: 5
+    - default_values: 3
+    - security_testing: 2
+    - complex_queries: 4
+    - edge_cases: 2
+    - performance: 2
+  estimated_runtime: "4-6 minutes"
+
+# Performance benchmarks
+benchmarks:
+  - name: "env_var_resolution_speed"
+    description: "Environment variable resolution performance"
+    target_time_ms: 50
+
+  - name: "large_env_var_handling"
+    description: "Large environment variable processing performance"
+    target_time_ms: 100
+
+  - name: "multiple_vars_resolution"
+    description: "Multiple environment variables resolution performance"
+    target_time_ms: 75
+
+# Security validation
+security_tests:
+  - name: "no_server_side_exposure"
+    description: "Verify no environment variable syntax reaches server"
+    requirement: "All ${} syntax must be resolved client-side"
+
+  - name: "sensitive_data_handling"
+    description: "Verify sensitive environment data handling"
+    requirement: "Client-only resolution prevents server exposure"
+
+  - name: "malformed_syntax_safety"
+    description: "Verify malformed syntax doesn't cause security issues"
+    requirement: "Graceful handling of invalid syntax patterns"

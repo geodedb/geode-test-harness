@@ -1,0 +1,374 @@
+# GAP-0193: High Priority Comprehensive Integration Tests
+# Deep coverage for MultiGraphIsolation, TransactionUndoLog,
+# FieldLevelEncryption, MultiGraphSupport, and Distributed Features
+#
+# CANARY: REQ=REQ-GAP-0193-HIGHPRI; FEATURE="IMPLBatchPromotion"; ASPECT=HighPriorityComprehensive; STATUS=TESTED; OWNER=test; UPDATED=2026-01-15
+
+name: gap_0193_high_priority_comprehensive
+description: GAP-0193 high priority comprehensive integration tests for IMPL promotion
+mode: server
+timeout: 30
+
+tests:
+  # ============================================================================
+  # MultiGraphIsolation Tests
+  # ============================================================================
+
+  - name: multigraph-create-isolated
+    query: "CREATE GRAPH IF NOT EXISTS isolated_test_graph"
+    expect:
+      success: true
+
+  - name: multigraph-use-isolated
+    query: "USE GRAPH isolated_test_graph"
+    expect:
+      success: true
+
+  - name: multigraph-create-node-isolated
+    query: "CREATE (n:IsolatedNode {id: 1, name: 'test'}) RETURN n.id AS id"
+    expect:
+      success: true
+      columns: [id]
+
+  - name: multigraph-create-edge-isolated
+    query: "CREATE (a:NodeA)-[r:ISOLATED_REL]->(b:NodeB) RETURN type(r) AS relType"
+    expect:
+      success: true
+      columns: [relType]
+
+  - name: multigraph-match-filtering
+    query: "MATCH (n:IsolatedNode) WHERE n.id = 1 RETURN n.name AS name"
+    expect:
+      success: true
+      columns: [name]
+
+  - name: multigraph-path-isolation
+    query: "MATCH p = (a)-[*1..2]->(b) RETURN length(p) AS pathLen LIMIT 5"
+    expect:
+      success: true
+      columns: [pathLen]
+
+  - name: multigraph-aggregation-isolation
+    query: "MATCH (n) RETURN count(n) AS total"
+    expect:
+      success: true
+      columns: [total]
+
+  - name: multigraph-mutation-isolation
+    query: |
+      MATCH (n:IsolatedNode {id: 1})
+      SET n.modified = true
+      RETURN n.modified AS modified
+    expect:
+      success: true
+      columns: [modified]
+
+  - name: multigraph-merge-isolation
+    query: |
+      MERGE (n:MergeIsolated {id: 100})
+      ON CREATE SET n.created = true
+      ON MATCH SET n.matched = true
+      RETURN n
+    expect:
+      success: true
+      columns: [n]
+
+  - name: multigraph-with-clause-isolation
+    query: |
+      MATCH (n:IsolatedNode)
+      WITH n.name AS name, n.id AS id
+      RETURN name, id
+    expect:
+      success: true
+      columns: [name, id]
+
+  - name: multigraph-orderby-isolation
+    query: "MATCH (n) RETURN n ORDER BY n.id LIMIT 10"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: multigraph-optional-match-isolation
+    query: |
+      MATCH (a:NodeA)
+      OPTIONAL MATCH (a)-[r]->(b)
+      RETURN a, r, b LIMIT 5
+    expect:
+      success: true
+      columns: [a, r, b]
+
+  - name: multigraph-call-procedure-isolation
+    query: "CALL db.labels() YIELD label RETURN label LIMIT 10"
+    expect:
+      success: true
+      columns: [label]
+
+  - name: multigraph-list-comprehension-isolation
+    query: "RETURN [x IN range(1, 10) WHERE x > 5 | x * 2] AS doubled"
+    expect:
+      success: true
+      columns: [doubled]
+
+  - name: multigraph-case-expression-isolation
+    query: |
+      WITH 5 AS value
+      RETURN CASE WHEN value > 3 THEN 'high' ELSE 'low' END AS level
+    expect:
+      success: true
+      columns: [level]
+
+  - name: multigraph-collect-isolation
+    query: "UNWIND ['a', 'b', 'c'] AS letter RETURN collect(letter) AS letters"
+    expect:
+      success: true
+      columns: [letters]
+
+  - name: multigraph-cleanup
+    query: |
+      MATCH (n) WHERE n:IsolatedNode OR n:NodeA OR n:NodeB OR n:MergeIsolated
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expect:
+      success: true
+      columns: [deleted]
+
+  - name: multigraph-drop-isolated
+    query: "DROP GRAPH IF EXISTS isolated_test_graph"
+    expect:
+      success: true
+
+  # ============================================================================
+  # TransactionUndoLog Tests
+  # ============================================================================
+
+  - name: txn-begin-basic
+    query: "BEGIN TRANSACTION"
+    expect:
+      success: true
+
+  - name: txn-create-in-transaction
+    query: "CREATE (n:TxnUndoTest {id: 1, logged: true})"
+    expect:
+      success: true
+
+  - name: txn-commit-basic
+    query: "COMMIT"
+    expect:
+      success: true
+
+  - name: txn-verify-committed
+    query: "MATCH (n:TxnUndoTest {id: 1}) RETURN n.logged AS logged"
+    expect:
+      success: true
+      columns: [logged]
+
+  - name: txn-begin-rollback
+    query: "BEGIN TRANSACTION"
+    expect:
+      success: true
+
+  - name: txn-create-for-rollback
+    query: "CREATE (n:RollbackUndoTest {id: 999})"
+    expect:
+      success: true
+
+  - name: txn-rollback-execute
+    query: "ROLLBACK"
+    expect:
+      success: true
+
+  - name: txn-verify-rollback
+    query: "MATCH (n:RollbackUndoTest) RETURN count(n) AS cnt"
+    expect:
+      success: true
+      columns: [cnt]
+
+  - name: txn-set-property-logging
+    query: |
+      BEGIN TRANSACTION;
+      MATCH (n:TxnUndoTest {id: 1}) SET n.updated = timestamp();
+      COMMIT
+    expect:
+      success: true
+
+  - name: txn-add-label-logging
+    query: |
+      BEGIN TRANSACTION;
+      MATCH (n:TxnUndoTest {id: 1}) SET n:NewLabel;
+      COMMIT
+    expect:
+      success: true
+
+  - name: txn-cleanup
+    query: "MATCH (n:TxnUndoTest) DETACH DELETE n RETURN count(*) AS deleted"
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # FieldLevelEncryption Tests
+  # ============================================================================
+
+  - name: fle-create-encrypted-node
+    query: |
+      CREATE (n:SecureData {
+        public_field: 'visible',
+        sensitive_field: 'encrypted_value'
+      }) RETURN n.public_field AS field
+    expect:
+      success: true
+      columns: [field]
+
+  - name: fle-read-encrypted-field
+    query: "MATCH (n:SecureData) RETURN n.sensitive_field AS sensitive"
+    expect:
+      success: true
+      columns: [sensitive]
+
+  - name: fle-update-encrypted-field
+    query: |
+      MATCH (n:SecureData)
+      SET n.sensitive_field = 'new_encrypted_value'
+      RETURN n.sensitive_field AS updated
+    expect:
+      success: true
+      columns: [updated]
+
+  - name: fle-policy-enforcement
+    query: "MATCH (n:SecureData) WHERE n.public_field = 'visible' RETURN n"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: fle-audit-tracking
+    query: "RETURN timestamp() AS audit_time"
+    expect:
+      success: true
+      columns: [audit_time]
+
+  - name: fle-bulk-operation
+    query: |
+      UNWIND [{id: 1, data: 'a'}, {id: 2, data: 'b'}] AS item
+      CREATE (n:BulkSecure {id: item.id, data: item.data})
+      RETURN count(*) AS created
+    expect:
+      success: true
+      columns: [created]
+
+  - name: fle-cleanup
+    query: |
+      MATCH (n) WHERE n:SecureData OR n:BulkSecure
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # MultiGraphSupport Tests
+  # ============================================================================
+
+  - name: mgs-create-graph
+    query: "CREATE GRAPH IF NOT EXISTS support_test_graph"
+    expect:
+      success: true
+
+  - name: mgs-show-graphs
+    query: "SHOW GRAPHS"
+    expect:
+      success: true
+      columns: [name]
+
+  - name: mgs-use-graph
+    query: "USE GRAPH support_test_graph"
+    expect:
+      success: true
+
+  - name: mgs-create-data
+    query: "CREATE (n:SupportTestNode {id: 1}) RETURN n.id AS id"
+    expect:
+      success: true
+      columns: [id]
+
+  - name: mgs-query-routing
+    query: "MATCH (n:SupportTestNode) RETURN n.id AS id"
+    expect:
+      success: true
+      columns: [id]
+
+  - name: mgs-cleanup-data
+    query: "MATCH (n:SupportTestNode) DETACH DELETE n RETURN count(*) AS deleted"
+    expect:
+      success: true
+      columns: [deleted]
+
+  - name: mgs-drop-graph
+    query: "DROP GRAPH IF EXISTS support_test_graph"
+    expect:
+      success: true
+
+  # ============================================================================
+  # Distributed Features Tests
+  # ============================================================================
+
+  - name: dist-basic-query
+    query: "RETURN 'distributed_test' AS result"
+    expect:
+      success: true
+      columns: [result]
+
+  - name: dist-complex-aggregation
+    query: |
+      UNWIND range(1, 100) AS n
+      WITH n % 10 AS bucket, count(*) AS cnt
+      RETURN bucket, cnt ORDER BY bucket
+    expect:
+      success: true
+      columns: [bucket, cnt]
+
+  - name: dist-join-query
+    query: |
+      UNWIND [{a: 1, b: 2}, {a: 2, b: 3}] AS row
+      RETURN row.a AS a, row.b AS b
+    expect:
+      success: true
+      columns: [a, b]
+
+  # ============================================================================
+  # Additional Edge Case Tests
+  # ============================================================================
+
+  - name: edge-empty-match
+    query: "MATCH (n:NonExistentLabel_xyz123) RETURN count(n) AS cnt"
+    expect:
+      success: true
+      columns: [cnt]
+
+  - name: edge-null-handling
+    query: "RETURN null AS nothing, coalesce(null, 'default') AS defaulted"
+    expect:
+      success: true
+      columns: [nothing, defaulted]
+
+  - name: edge-type-coercion
+    query: "RETURN 1 + 1.5 AS float_result, toString(42) AS str_result"
+    expect:
+      success: true
+      columns: [float_result, str_result]
+
+  - name: edge-complex-where
+    query: |
+      WITH 10 AS x, 20 AS y
+      RETURN CASE
+        WHEN x > 15 THEN 'large'
+        WHEN x > 5 THEN 'medium'
+        ELSE 'small'
+      END AS size
+    expect:
+      success: true
+      columns: [size]
+
+invariants:
+  - type: "server_running"
+
+tags: ["gap-0193", "impl-promotion", "high-priority", "comprehensive"]

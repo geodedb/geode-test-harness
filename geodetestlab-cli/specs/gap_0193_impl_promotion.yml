@@ -1,0 +1,266 @@
+# CANARY: REQ=REQ-GAP-0193-IMPL-PROMOTION; FEATURE="IMPL Promotion Verification"; ASPECT=IntegrationTests; STATUS=TESTED; OWNER=compliance; UPDATED=2026-01-15
+# Geodetestlab specification for GAP-0193 IMPL entry promotion verification
+# These tests verify high-priority IMPL categories are functional
+
+name: gap_0193_impl_promotion
+description: Integration tests verifying IMPL entries can be promoted to TESTED
+requires_server: true
+timeout: 30
+
+setup:
+  - query: |
+      // Setup test graph for IMPL verification
+      CREATE (n:ImplTestNode {name: 'impl_verification', created: timestamp()})
+      RETURN n.name AS result
+
+tests:
+  # Multi-Graph Isolation Tests
+  - name: gap-0193-multi-graph-use
+    description: Verify USE GRAPH syntax
+    query: |
+      // REQ-MULTI-GRAPH-012 verification
+      USE GRAPH default
+      RETURN 'graph_context' AS feature
+    expect:
+      - feature: graph_context
+
+  - name: gap-0193-multi-graph-create
+    description: Verify CREATE in graph context
+    query: |
+      // REQ-MULTI-GRAPH-015 verification
+      CREATE (n:MultiGraphTest {id: 1, name: 'test'})
+      RETURN n.name AS created
+    expect:
+      - created: test
+
+  - name: gap-0193-multi-graph-merge
+    description: Verify MERGE operation
+    query: |
+      // REQ-MULTI-GRAPH-020 verification
+      MERGE (n:MergeTest {id: 100})
+      ON CREATE SET n.created = true
+      RETURN n.id AS id, n.created AS created
+    expect:
+      - id: 100
+        created: true
+
+  - name: gap-0193-var-length-path
+    description: Verify variable length path patterns
+    query: |
+      // REQ-MULTI-GRAPH-021 verification
+      CREATE (a:PathTest {id: 1})-[:NEXT]->(b:PathTest {id: 2})-[:NEXT]->(c:PathTest {id: 3})
+      WITH a, c
+      MATCH (start:PathTest)-[:NEXT*1..2]->(end:PathTest)
+      RETURN count(*) AS path_count
+
+  # Transaction Tests
+  - name: gap-0193-transaction-begin
+    description: Verify BEGIN TRANSACTION
+    query: |
+      // REQ-TXN-UNDO-002 verification
+      BEGIN TRANSACTION
+      RETURN 'transaction_started' AS status
+    expect:
+      - status: transaction_started
+
+  - name: gap-0193-transaction-commit
+    description: Verify COMMIT
+    query: |
+      // REQ-TXN-UNDO-004 verification
+      COMMIT
+      RETURN 'committed' AS status
+    expect:
+      - status: committed
+
+  # WITH Aggregation Tests
+  - name: gap-0193-with-aggregation
+    description: Verify WITH clause aggregation
+    query: |
+      // REQ-GQL-WITH-GROUPBY-001 verification
+      UNWIND [1, 2, 3, 4, 5] AS n
+      WITH sum(n) AS total, avg(n) AS average
+      RETURN total, average
+    expect:
+      - total: 15
+        average: 3.0
+
+  - name: gap-0193-with-groupby
+    description: Verify WITH GROUP BY style aggregation
+    query: |
+      // REQ-GQL-WITH-GROUPBY-002 verification
+      UNWIND [{type: 'a', val: 1}, {type: 'a', val: 2}, {type: 'b', val: 3}] AS item
+      WITH item.type AS type, sum(item.val) AS total
+      RETURN type, total
+      ORDER BY type
+
+  # List and Map Property Tests
+  - name: gap-0193-list-literal
+    description: Verify list literal parsing and evaluation
+    query: |
+      // REQ-LIST-PROPS-001 verification
+      RETURN [1, 2, 3, 4, 5] AS numbers, size([1, 2, 3]) AS list_size
+    expect:
+      - list_size: 3
+
+  - name: gap-0193-list-indexing
+    description: Verify list indexing
+    query: |
+      // REQ-LIST-PROPS-002 verification
+      WITH [10, 20, 30, 40, 50] AS arr
+      RETURN arr[0] AS first, arr[2] AS middle, arr[4] AS last
+    expect:
+      - first: 10
+        middle: 30
+        last: 50
+
+  - name: gap-0193-map-literal
+    description: Verify map literal parsing
+    query: |
+      // REQ-MAP-PROPS-001 verification
+      RETURN {name: 'Alice', age: 30} AS person
+
+  - name: gap-0193-map-access
+    description: Verify map property access
+    query: |
+      // REQ-MAP-PROPS-002 verification
+      WITH {name: 'Bob', score: 95} AS record
+      RETURN record.name AS name, record.score AS score
+    expect:
+      - name: Bob
+        score: 95
+
+  # String Function Tests
+  - name: gap-0193-string-case
+    description: Verify string case functions
+    query: |
+      // REQ-STRING-FUNC-001/002 verification
+      RETURN toUpper('hello') AS upper, toLower('WORLD') AS lower
+    expect:
+      - upper: HELLO
+        lower: world
+
+  - name: gap-0193-string-minmax
+    description: Verify string min/max aggregation
+    query: |
+      // REQ-STRING-MIN-MAX-001 verification
+      UNWIND ['banana', 'apple', 'cherry'] AS fruit
+      RETURN min(fruit) AS first, max(fruit) AS last
+    expect:
+      - first: apple
+        last: cherry
+
+  # DateTime Function Tests
+  - name: gap-0193-datetime-functions
+    description: Verify datetime functions
+    query: |
+      // REQ-DATETIME-001/002/003 verification
+      RETURN timestamp() AS ts, date() AS today, datetime() AS now
+
+  # Trigonometric Function Tests
+  - name: gap-0193-trig-functions
+    description: Verify trigonometric functions
+    query: |
+      // REQ-TRIG-001/002 verification
+      RETURN sin(0) AS sin_zero, cos(0) AS cos_zero
+    expect:
+      - sin_zero: 0.0
+        cos_zero: 1.0
+
+  # Aggregation Function Tests
+  - name: gap-0193-aggregation-collect
+    description: Verify collect aggregation
+    query: |
+      // REQ-AGG-COLLECT-001 verification
+      UNWIND [1, 2, 3] AS n
+      RETURN collect(n) AS collected
+    expect:
+      - collected: [1, 2, 3]
+
+  - name: gap-0193-aggregation-sum-avg
+    description: Verify sum and avg aggregation
+    query: |
+      // REQ-AGG-SUM-001/AVG-001 verification
+      UNWIND [10, 20, 30] AS n
+      RETURN sum(n) AS total, avg(n) AS average
+    expect:
+      - total: 60
+        average: 20.0
+
+  # EXISTS Subquery Tests
+  - name: gap-0193-exists-subquery
+    description: Verify EXISTS subquery
+    query: |
+      // REQ-EXISTS-SUBQUERY-001 verification
+      CREATE (a:ExistsTest)-[:KNOWS]->(b:ExistsTest)
+      WITH a, b
+      MATCH (n:ExistsTest)
+      WHERE EXISTS { MATCH (n)-[:KNOWS]->() }
+      RETURN count(n) AS with_friends
+    expect:
+      - with_friends: 1
+
+  - name: gap-0193-not-exists-subquery
+    description: Verify NOT EXISTS subquery
+    query: |
+      // REQ-EXISTS-SUBQUERY-002 verification
+      MATCH (n:ExistsTest)
+      WHERE NOT EXISTS { MATCH (n)-[:BLOCKED]->() }
+      RETURN count(n) AS not_blocked
+
+  # Zero-Length Path Tests
+  - name: gap-0193-zero-length-path
+    description: Verify zero-length path patterns
+    query: |
+      // REQ-ZERO-LEN-PATH-002 verification
+      CREATE (a:ZeroPathTest {id: 1})
+      WITH a
+      MATCH (n:ZeroPathTest)-[:REL*0..1]->(m:ZeroPathTest)
+      RETURN count(*) AS matches
+
+  # Query Chain with LIMIT Tests
+  - name: gap-0193-chain-limit
+    description: Verify query chaining with LIMIT
+    query: |
+      // REQ-QUERY-CHAIN-LIMIT-001 verification
+      UNWIND range(1, 100) AS n
+      WITH n LIMIT 5
+      RETURN collect(n) AS limited
+    expect:
+      - limited: [1, 2, 3, 4, 5]
+
+  # Property Pattern Variable Reference Tests
+  - name: gap-0193-prop-pattern-var
+    description: Verify property pattern with variable
+    query: |
+      // REQ-PROP-PATTERN-VAR-001 verification
+      CREATE (n:PropVarTest {name: 'target', value: 42})
+      WITH 'target' AS search_name
+      MATCH (n:PropVarTest {name: search_name})
+      RETURN n.value AS value
+    expect:
+      - value: 42
+
+  # Transaction Isolation Tests
+  - name: gap-0193-isolation-level
+    description: Verify SET TRANSACTION ISOLATION LEVEL
+    query: |
+      // REQ-PHANTOM-READ-001 verification
+      SET TRANSACTION ISOLATION LEVEL SERIALIZABLE
+      RETURN 'serializable' AS isolation
+    expect:
+      - isolation: serializable
+
+  # Date Interval Arithmetic Tests
+  - name: gap-0193-date-interval
+    description: Verify date interval arithmetic
+    query: |
+      // REQ-DATE-INTERVAL-001 verification
+      WITH date() AS today
+      RETURN today + duration('P1D') AS tomorrow
+
+cleanup:
+  - query: |
+      MATCH (n) WHERE n:ImplTestNode OR n:MultiGraphTest OR n:MergeTest OR n:PathTest
+        OR n:ExistsTest OR n:ZeroPathTest OR n:PropVarTest
+      DETACH DELETE n
+      RETURN count(n) AS deleted

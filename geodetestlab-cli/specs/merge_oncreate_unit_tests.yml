@@ -1,0 +1,209 @@
+description: "Unit tests for MERGE with ON CREATE and ON MATCH clauses"
+binary: geode
+timeout: 10
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    startup_timeout_ms: 30000
+    args: ["--log-level", "error"]
+
+tests:
+  # ===============================
+  # MERGE ON CREATE TESTS
+  # ===============================
+  - name: "merge-on-create-string-property"
+    description: "Test MERGE ON CREATE with string property"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (p:Person {email: 'test@example.com'})
+      ON CREATE SET p.name = 'TestUser', p.created = true
+      RETURN p.name AS name, p.email AS email, p.created AS created
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        row_count: 1
+        columns: ["name", "email", "created"]
+        rows:
+          - ["TestUser", "test@example.com", true]
+    tags: ["merge", "on_create"]
+
+  - name: "merge-on-create-integer-property"
+    description: "Test MERGE ON CREATE with integer property"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (u:User {id: 123})
+      ON CREATE SET u.count = 1, u.active = true
+      RETURN u.id AS id, u.count AS count
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        row_count: 1
+    tags: ["merge", "on_create"]
+
+  - name: "merge-on-create-boolean-property"
+    description: "Test MERGE ON CREATE with boolean property"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (d:Document {path: '/test'})
+      ON CREATE SET d.published = false, d.draft = true
+      RETURN d.published AS published
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - [false]
+    tags: ["merge", "on_create"]
+
+  - name: "merge-on-create-multiple-properties"
+    description: "Test MERGE ON CREATE with multiple properties of different types"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (n:Node {key: 'abc'})
+      ON CREATE SET n.name = 'NewNode', n.count = 42, n.enabled = true
+      RETURN n.name AS name, n.count AS count, n.enabled AS enabled
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        columns: ["name", "count", "enabled"]
+    tags: ["merge", "on_create"]
+
+  # ===============================
+  # MERGE ON MATCH TESTS
+  # ===============================
+  - name: "merge-on-match-existing-node"
+    description: "Test MERGE ON MATCH with existing node"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (p:Person {email: 'existing@example.com', name: 'Original'})
+      MERGE (p:Person {email: 'existing@example.com'})
+      ON MATCH SET p.accessed = true, p.count = 1
+      RETURN p.name AS name, p.accessed AS accessed
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - ["Original", true]
+    tags: ["merge", "on_match"]
+
+  - name: "merge-on-match-update-string"
+    description: "Test MERGE ON MATCH updating string property"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (u:User {id: 1, status: 'inactive'})
+      MERGE (u:User {id: 1})
+      ON MATCH SET u.status = 'active'
+      RETURN u.status AS status
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - ["active"]
+    tags: ["merge", "on_match"]
+
+  # ===============================
+  # MERGE ON CREATE + ON MATCH TESTS
+  # ===============================
+  - name: "merge-on-create-and-match-new-node"
+    description: "Test MERGE with both ON CREATE and ON MATCH (new node)"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (p:Person {email: 'new@example.com'})
+      ON CREATE SET p.name = 'NewPerson', p.created = true
+      ON MATCH SET p.accessed = true
+      RETURN p.name AS name, p.created AS created, p.accessed AS accessed
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - ["NewPerson", true, null]
+    tags: ["merge", "integration"]
+
+  - name: "merge-on-create-and-match-existing-node"
+    description: "Test MERGE with both ON CREATE and ON MATCH (existing node)"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (p:Person {email: 'exist@example.com', name: 'Existing'})
+      MERGE (p:Person {email: 'exist@example.com'})
+      ON CREATE SET p.created = true
+      ON MATCH SET p.accessed = true
+      RETURN p.name AS name, p.created AS created, p.accessed AS accessed
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - ["Existing", null, true]
+    tags: ["merge", "integration"]
+
+  - name: "merge-double-execution-check"
+    description: "Test MERGE executed twice shows ON MATCH on second run"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (p:Person {email: 'double@example.com'})
+      ON CREATE SET p.create_count = 1
+      ON MATCH SET p.match_count = 1
+      RETURN p.create_count AS c1, p.match_count AS m1
+      MERGE (p:Person {email: 'double@example.com'})
+      ON CREATE SET p.create_count = 2
+      ON MATCH SET p.match_count = 2
+      RETURN p.create_count AS c2, p.match_count AS m2
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["merge", "integration"]
+
+  # ===============================
+  # EDGE CASES
+  # ===============================
+  - name: "merge-without-on-clauses"
+    description: "Test MERGE without ON CREATE or ON MATCH"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (p:Person {email: 'simple@example.com'})
+      RETURN p.email AS email
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - ["simple@example.com"]
+    tags: ["merge", "edge_cases"]
+
+  - name: "merge-with-return-clause"
+    description: "Test MERGE with RETURN clause"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (p:Person {email: 'return@example.com'})
+      ON CREATE SET p.new_field = 'created'
+      RETURN p.email AS email, p.new_field AS field
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        columns: ["email", "field"]
+    tags: ["merge", "edge_cases"]
+
+  - name: "merge-property-expressions"
+    description: "Test MERGE evaluates property expressions correctly"
+    args: ["query", "-"]
+    stdin: |
+      MERGE (n:Node {id: 1})
+      ON CREATE SET n.str = 'hello', n.num = 42, n.bool = false
+      RETURN n.str AS s, n.num AS n, n.bool AS b
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - ["hello", 42, false]
+    tags: ["merge", "expressions"]

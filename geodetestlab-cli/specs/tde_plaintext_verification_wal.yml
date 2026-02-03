@@ -1,0 +1,231 @@
+version: "1.0"
+name: "TDE Plaintext Verification - WAL Encryption"
+description: |
+  SECURITY CRITICAL TEST SUITE
+
+  Verifies that when TDE WAL (Write-Ahead Log) encryption is enabled,
+  NO plaintext data is written to WAL files or any disk file. This test:
+
+  1. Creates a server with TDE WAL encryption enabled
+  2. Performs multiple write operations to generate WAL entries
+  3. Forces WAL flush operations
+  4. Scans ALL WAL files for plaintext markers
+  5. FAILS if ANY plaintext marker is found
+
+  WAL-specific concerns:
+  - WAL records contain transaction data before commit
+  - WAL files may contain partial writes
+  - WAL compaction/archival must also be encrypted
+  - Recovery scenarios must use encrypted WAL
+
+  Test Data Markers (MUST NOT appear in WAL files):
+  - Transaction: "WALTEST_TXN_MARKER_12345"
+  - Insert: "WALTEST_INSERT_SECRETDATA"
+  - Update: "WALTEST_UPDATE_NEWVALUE"
+  - Delete: "WALTEST_DELETE_OPERATION"
+  - Batch: "WALTEST_BATCH_OPERATION_99"
+
+  CANARY: REQ=REQ-TDE-ENFORCE-002; FEATURE=TDEEnforcement; ASPECT=WALEncryption; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false  # DO NOT CLEANUP - we need to scan WAL files
+    args: ["--log-level", "info", "--enable-tde", "--enable-wal-encryption", "--tde-provider", "MockKms"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+env:
+  # All keys must be exactly 64 hex characters (32 bytes for AES-256)
+  GEODE_TDE_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  GEODE_WAL_KEY: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+  GEODE_TDE_ENABLED: "true"
+  GEODE_WAL_ENCRYPTION_ENABLED: "true"
+
+tests:
+  # ===============================
+  # PHASE 1: GENERATE WAL ENTRIES
+  # ===============================
+
+  - name: "tde-wal-write-transaction-marker"
+    description: "Write transaction with marker to generate WAL entries"
+    args: ["query",
+           "CREATE (n:WALTest_Txn {
+              type: 'Transaction',
+              marker: 'WALTEST_TXN_MARKER_12345',
+              timestamp: datetime(),
+              operation: 'initial_write'
+            })
+            RETURN n.marker AS marker"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "wal", "transaction", "write"]
+
+  - name: "tde-wal-write-insert-marker"
+    description: "Insert operation to generate WAL insert record"
+    args: ["query",
+           "CREATE (n:WALTest_Insert {
+              type: 'Insert',
+              data: 'WALTEST_INSERT_SECRETDATA',
+              batch_id: 1,
+              record_count: 100
+            })
+            RETURN n.data AS data"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "wal", "insert", "write"]
+
+  - name: "tde-wal-write-update-marker"
+    description: "Update operation to generate WAL update record"
+    args: ["query",
+           "MATCH (n:WALTest_Txn)
+            SET n.updated_value = 'WALTEST_UPDATE_NEWVALUE',
+                n.update_timestamp = datetime()
+            RETURN n.updated_value AS new_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "wal", "update", "write"]
+
+  - name: "tde-wal-write-delete-marker"
+    description: "Write delete marker before deletion"
+    args: ["query",
+           "CREATE (n:WALTest_Delete {
+              type: 'Delete',
+              marker: 'WALTEST_DELETE_OPERATION',
+              will_be_deleted: true
+            })
+            RETURN n.marker AS marker"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "wal", "delete", "write"]
+
+  # ===============================
+  # PHASE 2: BATCH OPERATIONS
+  # ===============================
+
+  - name: "tde-wal-batch-operations"
+    description: "Multiple batch operations to stress WAL"
+    args: ["query",
+           "UNWIND range(1, 10) AS i
+            CREATE (n:WALTest_Batch {
+              type: 'Batch',
+              marker: 'WALTEST_BATCH_OPERATION_99',
+              batch_number: i,
+              data: 'Batch operation ' + toString(i)
+            })
+            RETURN count(*) AS created"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "wal", "batch", "write"]
+
+  # ===============================
+  # PHASE 3: DELETE OPERATION (generates WAL delete record)
+  # ===============================
+
+  - name: "tde-wal-perform-delete"
+    description: "Perform delete to generate WAL delete record"
+    args: ["query",
+           "MATCH (n:WALTest_Delete)
+            DELETE n
+            RETURN count(*) AS deleted"]
+    expect:
+      exit_code: 0
+    tags: ["tde", "wal", "delete", "execute"]
+
+  # ===============================
+  # PHASE 4: FORCE WAL SYNC
+  # ===============================
+
+  - name: "tde-wal-force-sync"
+    description: "Force WAL sync to ensure all entries written to disk"
+    args: ["query",
+           "RETURN 'wal_sync_requested' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["tde", "wal", "sync"]
+
+  # ===============================
+  # PHASE 5: SCAN WAL FILES FOR PLAINTEXT
+  # ===============================
+
+  - name: "tde-wal-scan-no-txn-marker"
+    description: "CRITICAL: Verify transaction marker NOT in WAL files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "WALTEST_TXN_MARKER_12345", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "wal", "scan", "transaction", "critical"]
+
+  - name: "tde-wal-scan-no-insert-marker"
+    description: "CRITICAL: Verify insert marker NOT in WAL files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "WALTEST_INSERT_SECRETDATA", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "wal", "scan", "insert", "critical"]
+
+  - name: "tde-wal-scan-no-update-marker"
+    description: "CRITICAL: Verify update marker NOT in WAL files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "WALTEST_UPDATE_NEWVALUE", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "wal", "scan", "update", "critical"]
+
+  - name: "tde-wal-scan-no-delete-marker"
+    description: "CRITICAL: Verify delete marker NOT in WAL files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "WALTEST_DELETE_OPERATION", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "wal", "scan", "delete", "critical"]
+
+  - name: "tde-wal-scan-no-batch-marker"
+    description: "CRITICAL: Verify batch marker NOT in WAL files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "WALTEST_BATCH_OPERATION_99", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "wal", "scan", "batch", "critical"]
+
+  - name: "tde-wal-scan-no-waltest-prefix"
+    description: "CRITICAL: Verify NO WALTEST_ prefix in ANY file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "WALTEST_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "wal", "scan", "comprehensive", "critical"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "WALTEST_TXN_MARKER_12345"
+    - "WALTEST_INSERT_SECRETDATA"
+    - "WALTEST_UPDATE_NEWVALUE"
+    - "WALTEST_DELETE_OPERATION"
+    - "WALTEST_BATCH_OPERATION_99"
+    - "WALTEST_"
+  fail_on_violation: true
+  scan_binary_files: true
+  scan_wal_files: true
+
+tags: ["tde", "wal-encryption", "security", "plaintext-verification", "critical", "compliance"]

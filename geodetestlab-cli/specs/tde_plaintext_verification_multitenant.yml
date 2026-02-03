@@ -1,0 +1,369 @@
+version: "1.0"
+name: "TDE Plaintext Verification - Multi-Tenant Isolation"
+description: |
+  SECURITY CRITICAL TEST SUITE - MULTI-TENANT
+
+  Verifies that TDE maintains proper encryption isolation in multi-tenant scenarios.
+  Each tenant's data must be encrypted with tenant-specific keys and no tenant
+  data should appear in plaintext.
+
+  This test ensures:
+  1. Tenant A's data is encrypted
+  2. Tenant B's data is encrypted
+  3. No cross-tenant data leakage
+  4. Tenant-specific markers don't appear in any files
+  5. Shared infrastructure doesn't expose tenant data
+
+  Multi-tenant considerations:
+  - Separate key hierarchies per tenant
+  - Proper key isolation
+  - No plaintext in shared logs
+  - No plaintext in system metadata
+
+  CANARY: REQ=REQ-TDE-ENFORCE-007; FEATURE=TDEEnforcement; ASPECT=MultiTenant; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false
+    args: ["--log-level", "info", "--enable-tde", "--enable-wal-encryption", "--tde-provider", "MockKms"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+env:
+  # All keys must be exactly 64 hex characters (32 bytes for AES-256)
+  GEODE_TDE_KEY: "aaaaaaaaaaaaaaaa1111111111111111bbbbbbbbbbbbbbbb2222222222222222"
+  GEODE_WAL_KEY: "cccccccccccccccc3333333333333333dddddddddddddddd4444444444444444"
+  GEODE_TDE_ENABLED: "true"
+  GEODE_WAL_ENCRYPTION_ENABLED: "true"
+
+tests:
+  # ===============================
+  # PHASE 1: TENANT A DATA
+  # ===============================
+
+  - name: "tde-multitenant-tenant-a-pii"
+    description: "Write Tenant A PII data"
+    args: ["query",
+           "CREATE (n:TenantA_Customer {
+              tenant_id: 'tenant_a',
+              customer_id: 'TENANT_A_CUST_001',
+              ssn: 'TENANT_A_SSN_111223333',
+              email: 'TENANT_A_EMAIL_secret@tenanta.com',
+              credit_card: 'TENANT_A_CC_4111111111111111',
+              balance: 50000.00
+            })
+            RETURN n.customer_id AS customer"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "tenant-a", "pii", "write"]
+
+  - name: "tde-multitenant-tenant-a-financial"
+    description: "Write Tenant A financial data"
+    args: ["query",
+           "CREATE (n:TenantA_Account {
+              tenant_id: 'tenant_a',
+              account_number: 'TENANT_A_ACCT_987654321',
+              routing_number: 'TENANT_A_RTN_021000021',
+              secret_notes: 'TENANT_A_NOTES_Confidential_Account_Info'
+            })
+            RETURN n.account_number AS account"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "tenant-a", "financial", "write"]
+
+  - name: "tde-multitenant-tenant-a-api-keys"
+    description: "Write Tenant A API credentials"
+    args: ["query",
+           "CREATE (n:TenantA_Credentials {
+              tenant_id: 'tenant_a',
+              api_key: 'TENANT_A_APIKEY_sk_live_abc123def456',
+              api_secret: 'TENANT_A_APISECRET_whsec_xyz789',
+              webhook_secret: 'TENANT_A_WEBHOOK_wh_secret_123'
+            })
+            RETURN n.api_key AS key"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "tenant-a", "credentials", "write"]
+
+  # ===============================
+  # PHASE 2: TENANT B DATA
+  # ===============================
+
+  - name: "tde-multitenant-tenant-b-pii"
+    description: "Write Tenant B PII data"
+    args: ["query",
+           "CREATE (n:TenantB_Customer {
+              tenant_id: 'tenant_b',
+              customer_id: 'TENANT_B_CUST_001',
+              ssn: 'TENANT_B_SSN_444556666',
+              email: 'TENANT_B_EMAIL_private@tenantb.com',
+              credit_card: 'TENANT_B_CC_5500000000000004',
+              balance: 75000.00
+            })
+            RETURN n.customer_id AS customer"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "tenant-b", "pii", "write"]
+
+  - name: "tde-multitenant-tenant-b-financial"
+    description: "Write Tenant B financial data"
+    args: ["query",
+           "CREATE (n:TenantB_Account {
+              tenant_id: 'tenant_b',
+              account_number: 'TENANT_B_ACCT_123456789',
+              routing_number: 'TENANT_B_RTN_071000013',
+              secret_notes: 'TENANT_B_NOTES_Private_Business_Data'
+            })
+            RETURN n.account_number AS account"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "tenant-b", "financial", "write"]
+
+  - name: "tde-multitenant-tenant-b-api-keys"
+    description: "Write Tenant B API credentials"
+    args: ["query",
+           "CREATE (n:TenantB_Credentials {
+              tenant_id: 'tenant_b',
+              api_key: 'TENANT_B_APIKEY_pk_test_999888777',
+              api_secret: 'TENANT_B_APISECRET_sk_test_aaa111',
+              webhook_secret: 'TENANT_B_WEBHOOK_endpoint_secret_xyz'
+            })
+            RETURN n.api_key AS key"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "tenant-b", "credentials", "write"]
+
+  # ===============================
+  # PHASE 3: CROSS-TENANT RELATIONSHIPS
+  # ===============================
+
+  - name: "tde-multitenant-shared-service"
+    description: "Write shared service data (system-level)"
+    args: ["query",
+           "CREATE (n:SharedService {
+              service_type: 'audit_log',
+              tenant_a_action: 'TENANT_A_AUDIT_LOGIN_USER_XYZ',
+              tenant_b_action: 'TENANT_B_AUDIT_QUERY_SENSITIVE_DATA',
+              system_note: 'SHARED_SYSTEM_NOTE_INTERNAL_ONLY'
+            })
+            RETURN n.service_type AS service"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "shared", "write"]
+
+  # ===============================
+  # PHASE 4: VERIFY DATA ISOLATION
+  # ===============================
+
+  - name: "tde-multitenant-verify-tenant-a-only"
+    description: "Verify Tenant A data query isolation"
+    args: ["query",
+           "MATCH (n)
+            WHERE n.tenant_id = 'tenant_a'
+            RETURN count(*) AS tenant_a_count"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "verify", "isolation"]
+
+  - name: "tde-multitenant-verify-tenant-b-only"
+    description: "Verify Tenant B data query isolation"
+    args: ["query",
+           "MATCH (n)
+            WHERE n.tenant_id = 'tenant_b'
+            RETURN count(*) AS tenant_b_count"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "multitenant", "verify", "isolation"]
+
+  # ===============================
+  # PHASE 5: COMPREHENSIVE SCANS - TENANT A
+  # ===============================
+
+  - name: "tde-multitenant-scan-no-tenant-a-ssn"
+    description: "CRITICAL: Verify Tenant A SSN NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_A_SSN_111223333", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-a", "ssn", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-a-email"
+    description: "CRITICAL: Verify Tenant A email NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_A_EMAIL_secret@tenanta.com", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-a", "email", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-a-cc"
+    description: "CRITICAL: Verify Tenant A credit card NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_A_CC_4111111111111111", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-a", "cc", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-a-acct"
+    description: "CRITICAL: Verify Tenant A account NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_A_ACCT_987654321", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-a", "account", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-a-apikey"
+    description: "CRITICAL: Verify Tenant A API key NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_A_APIKEY_sk_live_abc123def456", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-a", "apikey", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-a-prefix"
+    description: "CRITICAL: Verify NO TENANT_A_ prefix in ANY file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_A_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-a", "comprehensive", "critical"]
+
+  # ===============================
+  # PHASE 6: COMPREHENSIVE SCANS - TENANT B
+  # ===============================
+
+  - name: "tde-multitenant-scan-no-tenant-b-ssn"
+    description: "CRITICAL: Verify Tenant B SSN NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_B_SSN_444556666", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-b", "ssn", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-b-email"
+    description: "CRITICAL: Verify Tenant B email NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_B_EMAIL_private@tenantb.com", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-b", "email", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-b-cc"
+    description: "CRITICAL: Verify Tenant B credit card NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_B_CC_5500000000000004", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-b", "cc", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-b-acct"
+    description: "CRITICAL: Verify Tenant B account NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_B_ACCT_123456789", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-b", "account", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-b-apikey"
+    description: "CRITICAL: Verify Tenant B API key NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_B_APIKEY_pk_test_999888777", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-b", "apikey", "critical"]
+
+  - name: "tde-multitenant-scan-no-tenant-b-prefix"
+    description: "CRITICAL: Verify NO TENANT_B_ prefix in ANY file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_B_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "tenant-b", "comprehensive", "critical"]
+
+  # ===============================
+  # PHASE 7: SHARED SERVICE SCANS
+  # ===============================
+
+  - name: "tde-multitenant-scan-no-shared-audit-a"
+    description: "CRITICAL: Verify shared audit (tenant A) NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_A_AUDIT_LOGIN_USER_XYZ", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "shared", "audit", "critical"]
+
+  - name: "tde-multitenant-scan-no-shared-audit-b"
+    description: "CRITICAL: Verify shared audit (tenant B) NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TENANT_B_AUDIT_QUERY_SENSITIVE_DATA", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "shared", "audit", "critical"]
+
+  - name: "tde-multitenant-scan-no-shared-system"
+    description: "CRITICAL: Verify shared system note NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "SHARED_SYSTEM_NOTE_INTERNAL_ONLY", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "multitenant", "scan", "shared", "system", "critical"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "TENANT_A_CUST_"
+    - "TENANT_A_SSN_"
+    - "TENANT_A_EMAIL_"
+    - "TENANT_A_CC_"
+    - "TENANT_A_ACCT_"
+    - "TENANT_A_RTN_"
+    - "TENANT_A_NOTES_"
+    - "TENANT_A_APIKEY_"
+    - "TENANT_A_APISECRET_"
+    - "TENANT_A_WEBHOOK_"
+    - "TENANT_A_AUDIT_"
+    - "TENANT_B_CUST_"
+    - "TENANT_B_SSN_"
+    - "TENANT_B_EMAIL_"
+    - "TENANT_B_CC_"
+    - "TENANT_B_ACCT_"
+    - "TENANT_B_RTN_"
+    - "TENANT_B_NOTES_"
+    - "TENANT_B_APIKEY_"
+    - "TENANT_B_APISECRET_"
+    - "TENANT_B_WEBHOOK_"
+    - "TENANT_B_AUDIT_"
+    - "SHARED_SYSTEM_NOTE_"
+    - "TENANT_A_"
+    - "TENANT_B_"
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags: ["tde", "multi-tenant", "isolation", "security", "plaintext-verification", "critical", "compliance"]

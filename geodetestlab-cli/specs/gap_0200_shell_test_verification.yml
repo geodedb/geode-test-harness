@@ -1,0 +1,157 @@
+# CANARY: REQ=REQ-GAP-0200-SHELL-TESTS; FEATURE="Shell Test Verification"; ASPECT=IntegrationTests; STATUS=TESTED; OWNER=testing; UPDATED=2026-01-15
+# Geodetestlab specification for GAP-0200 shell test requirement verification
+# These tests provide integration-level verification for shell test requirements
+
+name: gap_0200_shell_test_verification
+description: Integration tests verifying shell test requirements from SHELL_TEST_ISSUES.md
+requires_server: true
+timeout: 30
+
+setup:
+  - query: |
+      // Setup test graph for shell verification
+      CREATE (n:ShellTestNode {name: 'shell_verification', created: timestamp()})
+      RETURN n.name AS result
+
+tests:
+  # Aggregation Tests
+  - name: gap-0200-aggregation-no-groupby
+    description: Verify aggregation without GROUP BY clause
+    query: |
+      // REQ-GQL-AGG-NO-GROUPBY-001 verification
+      CREATE (a:Counter {value: 1}), (b:Counter {value: 2}), (c:Counter {value: 3})
+      WITH a, b, c
+      MATCH (n:Counter)
+      RETURN count(n) AS total
+    expect:
+      - total: 3
+
+  - name: gap-0200-chain-aggregation
+    description: Verify chained aggregation with WITH clause
+    query: |
+      // REQ-GQL-CHAIN-WITH-AGG-001 verification
+      MATCH (n:Counter)
+      WITH count(n) AS cnt
+      RETURN cnt AS aggregated_count
+
+  - name: gap-0200-count-distinct
+    description: Verify COUNT DISTINCT functionality
+    query: |
+      // REQ-COUNT-DISTINCT-BINDING-001 verification
+      UNWIND ['a', 'b', 'a', 'c', 'b'] AS val
+      RETURN count(DISTINCT val) AS unique_count
+    expect:
+      - unique_count: 3
+
+  # WITH Clause Tests
+  - name: gap-0200-with-where-filter
+    description: Verify WITH clause with WHERE filter
+    query: |
+      // REQ-GQL-WITH-WHERE-POST-002 verification
+      MATCH (n:Counter)
+      WITH n WHERE n.value > 1
+      RETURN count(n) AS filtered_count
+
+  - name: gap-0200-with-chain
+    description: Verify chained WITH clauses
+    query: |
+      // REQ-GQL-WITH-CHAIN-001 verification
+      WITH 1 AS x
+      WITH x + 1 AS y
+      RETURN y AS result
+    expect:
+      - result: 2
+
+  - name: gap-0200-chain-limit
+    description: Verify LIMIT in chain
+    query: |
+      // REQ-GQL-CHAIN-LIMIT-001 verification
+      UNWIND range(1, 10) AS n
+      WITH n LIMIT 5
+      RETURN count(n) AS limited_count
+    expect:
+      - limited_count: 5
+
+  # OPTIONAL MATCH Tests
+  - name: gap-0200-optional-match-basic
+    description: Verify basic OPTIONAL MATCH
+    query: |
+      // REQ-GQL-OPTIONAL-WHERE-001 verification
+      MATCH (a:ShellTestNode)
+      OPTIONAL MATCH (a)-[:KNOWS]->(b)
+      RETURN a.name AS node, b.name AS friend
+    expect:
+      - node: shell_verification
+
+  - name: gap-0200-multiple-optional
+    description: Verify multiple OPTIONAL MATCH clauses
+    query: |
+      // REQ-GQL-MULTI-OPTIONAL-MATCH-001 verification
+      MATCH (a:ShellTestNode)
+      OPTIONAL MATCH (a)-[:KNOWS]->(b)
+      OPTIONAL MATCH (a)-[:WORKS_AT]->(c)
+      RETURN a.name AS node
+
+  # ORDER BY Tests
+  - name: gap-0200-order-by-expression
+    description: Verify ORDER BY with expression
+    query: |
+      // REQ-GQL-ORDERBY-EXPR-001 verification
+      MATCH (n:Counter)
+      RETURN n.value AS val
+      ORDER BY n.value DESC
+
+  - name: gap-0200-order-by-multi-column
+    description: Verify ORDER BY with multiple columns
+    query: |
+      // REQ-GQL-ORDER-MULTINODE-001 verification
+      WITH [{a: 1, b: 2}, {a: 1, b: 1}, {a: 2, b: 1}] AS rows
+      UNWIND rows AS row
+      RETURN row.a AS a, row.b AS b
+      ORDER BY a, b
+
+  # Path Tests
+  - name: gap-0200-variable-length-path
+    description: Verify variable length path pattern
+    query: |
+      // REQ-GQL-ZERO-LEN-PATH-001 verification
+      CREATE (a:PathNode {id: 1})-[:NEXT]->(b:PathNode {id: 2})-[:NEXT]->(c:PathNode {id: 3})
+      WITH a, b, c
+      MATCH (start:PathNode)-[:NEXT*1..2]->(end:PathNode)
+      RETURN start.id AS start_id, end.id AS end_id
+
+  # Expression Tests
+  - name: gap-0200-null-semantics
+    description: Verify NULL semantics
+    query: |
+      // REQ-GQL-NULL-SEMANTICS-001 verification
+      WITH null AS val
+      RETURN val IS NULL AS is_null, val IS NOT NULL AS is_not_null
+    expect:
+      - is_null: true
+        is_not_null: false
+
+  - name: gap-0200-boolean-logic
+    description: Verify boolean logic expressions
+    query: |
+      // REQ-GQL-BOOL-INT-COERCE-001 verification
+      RETURN true AND true AS both_true, true AND false AS mixed, NOT false AS negated
+    expect:
+      - both_true: true
+        mixed: false
+        negated: true
+
+  # Set Operations Test
+  - name: gap-0200-set-union
+    description: Verify UNION set operation
+    query: |
+      // REQ-SET-RETURN-FIX-001 verification
+      RETURN 'a' AS letter
+      UNION
+      RETURN 'b' AS letter
+
+cleanup:
+  - query: |
+      MATCH (n) WHERE n:ShellTestNode OR n:Counter OR n:PathNode
+      DETACH DELETE n
+      RETURN count(n) AS deleted

@@ -1,0 +1,413 @@
+version: "1.0"
+name: "Shell Node and Relationship Tests"
+description: "Tests for node and relationship CRUD operations in the shell"
+
+# NOTE ON CYPHER COMPATIBILITY:
+# This file tests data manipulation features. Some features are:
+# - GQL Standard: MATCH, SET, DELETE, DETACH DELETE, CREATE (for patterns)
+# - Cypher-Specific: MERGE, ON CREATE/ON MATCH, shortestPath()
+#
+# Tests for Cypher-specific features are marked with "cypher_compat:" in their name
+# to indicate they are NOT part of ISO/IEC 39075:2024 GQL standard.
+
+manage_server: true
+
+tests:
+  # ============================================
+  # NODE CREATION
+  # ============================================
+
+  - name: "shell-node-create-simple"
+    type: shell_steps
+    description: "Create a simple node"
+    steps:
+      - type: query
+        text: "CREATE (n:SimpleNode {id: 1})"
+        expect:
+          success: true
+      - type: query
+        text: "MATCH (n:SimpleNode {id: 1}) RETURN n.id AS id"
+        expect:
+          contains:
+            - "1"
+
+  - name: "shell-node-create-with-properties"
+    type: shell_steps
+    description: "Create node with multiple properties"
+    steps:
+      - type: query
+        text: "CREATE (n:Person {name: 'Alice', age: 30, active: true})"
+        expect:
+          success: true
+      - type: query
+        text: "MATCH (n:Person {name: 'Alice'}) RETURN n.name AS name, n.age AS age"
+        expect:
+          contains:
+            - "Alice"
+            - "30"
+
+  - name: "shell-node-create-multiple-labels"
+    type: shell_steps
+    description: "Create node with multiple labels"
+    steps:
+      - type: query
+        text: "CREATE (n:Employee:Manager {id: 100, title: 'Director'})"
+        expect:
+          success: true
+      - type: query
+        text: "MATCH (n:Employee:Manager {id: 100}) RETURN n.title AS title"
+        expect:
+          contains:
+            - "Director"
+
+  - name: "shell-node-create-return"
+    type: shell_steps
+    description: "Create and return node"
+    steps:
+      - type: query
+        text: "CREATE (n:ReturnNode {value: 42}) RETURN n.value AS v"
+        expect:
+          contains:
+            - "42"
+
+  # ============================================
+  # NODE MATCHING
+  # ============================================
+
+  - name: "shell-node-match-by-label"
+    type: shell_steps
+    description: "Match nodes by label"
+    steps:
+      - type: query
+        text: "CREATE (n:LabelMatch {id: 1})"
+      - type: query
+        text: "CREATE (n:LabelMatch {id: 2})"
+      - type: query
+        text: "MATCH (n:LabelMatch) RETURN count(n) AS cnt"
+        expect:
+          contains:
+            - "2"
+
+  - name: "shell-node-match-by-property"
+    type: shell_steps
+    description: "Match nodes by property"
+    steps:
+      - type: query
+        text: "CREATE (n:PropMatch {status: 'active', id: 1})"
+      - type: query
+        text: "CREATE (n:PropMatch {status: 'inactive', id: 2})"
+      - type: query
+        text: "MATCH (n:PropMatch {status: 'active'}) RETURN n.id AS id"
+        expect:
+          contains:
+            - "1"
+
+  - name: "shell-node-match-with-where"
+    type: shell_steps
+    description: "Match nodes with WHERE clause"
+    steps:
+      - type: query
+        text: "CREATE (n:WhereMatch {score: 85})"
+      - type: query
+        text: "CREATE (n:WhereMatch {score: 45})"
+      - type: query
+        text: "CREATE (n:WhereMatch {score: 92})"
+      - type: query
+        text: "MATCH (n:WhereMatch) WHERE n.score > 80 RETURN n.score AS score ORDER BY n.score"
+        expect:
+          rows: 2
+          contains:
+            - "85"
+            - "92"
+
+  # ============================================
+  # NODE UPDATE (SET)
+  # ============================================
+
+  - name: "shell-node-set-property"
+    type: shell_steps
+    description: "Update node property with SET"
+    steps:
+      - type: query
+        text: "CREATE (n:SetTest {id: 1, value: 10})"
+      - type: query
+        text: "MATCH (n:SetTest {id: 1}) SET n.value = 20"
+      - type: query
+        text: "MATCH (n:SetTest {id: 1}) RETURN n.value AS value"
+        expect:
+          contains:
+            - "20"
+
+  - name: "shell-node-set-add-property"
+    type: shell_steps
+    description: "Add new property with SET"
+    steps:
+      - type: query
+        text: "CREATE (n:AddPropTest {id: 1})"
+      - type: query
+        text: "MATCH (n:AddPropTest {id: 1}) SET n.newProp = 'added'"
+      - type: query
+        text: "MATCH (n:AddPropTest {id: 1}) RETURN n.newProp AS prop"
+        expect:
+          contains:
+            - "added"
+
+  - name: "shell-node-set-multiple-properties"
+    type: shell_steps
+    description: "Set multiple properties"
+    steps:
+      - type: query
+        text: "CREATE (n:MultiSetTest {id: 1})"
+      - type: query
+        text: "MATCH (n:MultiSetTest {id: 1}) SET n.a = 1, n.b = 2, n.c = 3"
+      - type: query
+        text: "MATCH (n:MultiSetTest {id: 1}) RETURN n.a AS a, n.b AS b, n.c AS c"
+        expect:
+          contains:
+            - "1"
+            - "2"
+            - "3"
+
+  # ============================================
+  # NODE DELETE
+  # ============================================
+
+  - name: "shell-node-delete-simple"
+    type: shell_steps
+    description: "Delete a node"
+    steps:
+      - type: query
+        text: "CREATE (n:DeleteTest {id: 1})"
+      - type: query
+        text: "MATCH (n:DeleteTest {id: 1}) DELETE n"
+      - type: query
+        text: "MATCH (n:DeleteTest {id: 1}) RETURN count(n) AS cnt"
+        expect:
+          contains:
+            - "0"
+
+  - name: "shell-node-delete-detach"
+    type: shell_steps
+    description: "Delete node with relationships using DETACH DELETE"
+    steps:
+      - type: query
+        text: "CREATE (a:DetachTest {id: 1})-[:RELATED]->(b:DetachTest {id: 2})"
+      - type: query
+        text: "MATCH (n:DetachTest {id: 1}) DETACH DELETE n"
+      - type: query
+        text: "MATCH (n:DetachTest {id: 1}) RETURN count(n) AS cnt"
+        expect:
+          contains:
+            - "0"
+
+  # ============================================
+  # MERGE OPERATIONS (Cypher Compatibility)
+  # NOTE: MERGE is NOT in ISO GQL standard - it is Cypher-specific
+  # ============================================
+
+  - name: "shell-cypher_compat-merge-create"
+    type: shell_steps
+    description: "MERGE creates node when not exists (Cypher compatibility)"
+    steps:
+      - type: query
+        text: "MERGE (n:MergeTest {id: 1}) RETURN n.id AS id"
+        expect:
+          contains:
+            - "1"
+
+  - name: "shell-cypher_compat-merge-match"
+    type: shell_steps
+    description: "MERGE matches existing node (Cypher compatibility)"
+    steps:
+      - type: query
+        text: "CREATE (n:MergeMatchTest {id: 1, value: 'original'})"
+      - type: query
+        text: "MERGE (n:MergeMatchTest {id: 1}) RETURN n.value AS value"
+        expect:
+          contains:
+            - "original"
+
+  - name: "shell-cypher_compat-merge-on-create"
+    type: shell_steps
+    description: "MERGE with ON CREATE (Cypher compatibility)"
+    steps:
+      - type: query
+        text: "MERGE (n:MergeOnCreate {id: 100}) ON CREATE SET n.created = true RETURN n.created AS created"
+        expect:
+          success: true
+
+  - name: "shell-cypher_compat-merge-on-match"
+    type: shell_steps
+    description: "MERGE with ON MATCH (Cypher compatibility)"
+    steps:
+      - type: query
+        text: "CREATE (n:MergeOnMatch {id: 1, updated: false})"
+      - type: query
+        text: "MERGE (n:MergeOnMatch {id: 1}) ON MATCH SET n.updated = true RETURN n.updated AS updated"
+        expect:
+          success: true
+
+  # ============================================
+  # RELATIONSHIP CREATION
+  # ============================================
+
+  - name: "shell-rel-create-simple"
+    type: shell_steps
+    description: "Create a simple relationship"
+    steps:
+      - type: query
+        text: "CREATE (a:RelNode {id: 'a'}), (b:RelNode {id: 'b'})"
+      - type: query
+        text: "MATCH (a:RelNode {id: 'a'}), (b:RelNode {id: 'b'}) CREATE (a)-[:KNOWS]->(b)"
+      - type: query
+        text: "MATCH (a:RelNode)-[:KNOWS]->(b:RelNode) RETURN a.id AS from, b.id AS to"
+        expect:
+          contains:
+            - "a"
+            - "b"
+
+  - name: "shell-rel-create-with-properties"
+    type: shell_steps
+    description: "Create relationship with properties"
+    steps:
+      - type: query
+        text: "CREATE (a:RelPropNode {id: 1}), (b:RelPropNode {id: 2})"
+      - type: query
+        text: "MATCH (a:RelPropNode {id: 1}), (b:RelPropNode {id: 2}) CREATE (a)-[:FRIENDS_WITH {since: 2020, strength: 'strong'}]->(b)"
+      - type: query
+        text: "MATCH (a)-[r:FRIENDS_WITH]->(b) RETURN r.since AS since, r.strength AS strength"
+        expect:
+          contains:
+            - "2020"
+            - "strong"
+
+  - name: "shell-rel-create-inline"
+    type: shell_steps
+    description: "Create nodes and relationship inline"
+    steps:
+      - type: query
+        text: "CREATE (a:InlineNode {name: 'Alice'})-[:WORKS_WITH]->(b:InlineNode {name: 'Bob'})"
+      - type: query
+        text: "MATCH (a:InlineNode)-[:WORKS_WITH]->(b:InlineNode) RETURN a.name AS a, b.name AS b"
+        expect:
+          contains:
+            - "Alice"
+            - "Bob"
+
+  # ============================================
+  # RELATIONSHIP MATCHING
+  # ============================================
+
+  - name: "shell-rel-match-any-direction"
+    type: shell_steps
+    description: "Match relationship in any direction"
+    steps:
+      - type: query
+        text: "CREATE (a:DirTest {id: 1})-[:LINKED]->(b:DirTest {id: 2})"
+      - type: query
+        text: "MATCH (a:DirTest)-[:LINKED]-(b:DirTest) WHERE a.id = 2 RETURN b.id AS other"
+        expect:
+          contains:
+            - "1"
+
+  - name: "shell-rel-match-outgoing"
+    type: shell_steps
+    description: "Match outgoing relationship"
+    steps:
+      - type: query
+        text: "CREATE (a:OutTest {id: 1})-[:POINTS_TO]->(b:OutTest {id: 2})"
+      - type: query
+        text: "MATCH (a:OutTest {id: 1})-[:POINTS_TO]->(b) RETURN b.id AS target"
+        expect:
+          contains:
+            - "2"
+
+  - name: "shell-rel-match-incoming"
+    type: shell_steps
+    description: "Match incoming relationship"
+    steps:
+      - type: query
+        text: "CREATE (a:InTest {id: 1})-[:FROM]->(b:InTest {id: 2})"
+      - type: query
+        text: "MATCH (b:InTest {id: 2})<-[:FROM]-(a) RETURN a.id AS source"
+        expect:
+          contains:
+            - "1"
+
+  - name: "shell-rel-match-multiple-types"
+    type: shell_steps
+    description: "Match multiple relationship types"
+    steps:
+      - type: query
+        text: "CREATE (a:MultiRelTest {id: 1})-[:TYPE_A]->(b:MultiRelTest {id: 2})"
+      - type: query
+        text: "CREATE (c:MultiRelTest {id: 3})-[:TYPE_B]->(d:MultiRelTest {id: 4})"
+      - type: query
+        text: "MATCH (a)-[:TYPE_A|TYPE_B]->(b) RETURN a.id AS from, b.id AS to ORDER BY a.id"
+        expect:
+          rows: 2
+
+  # ============================================
+  # PATH QUERIES
+  # ============================================
+
+  - name: "shell-path-variable-length"
+    type: shell_steps
+    description: "Variable length path query (GQL standard)"
+    steps:
+      - type: query
+        text: "CREATE (a:PathNode {id: 1})-[:NEXT]->(b:PathNode {id: 2})-[:NEXT]->(c:PathNode {id: 3})"
+      - type: query
+        text: "MATCH (a:PathNode {id: 1})-[:NEXT*1..2]->(c) RETURN c.id AS reached ORDER BY c.id"
+        expect:
+          contains:
+            - "2"
+            - "3"
+
+  # NOTE: shortestPath() is Cypher-specific, NOT in ISO GQL standard
+  # GQL has different path semantics (SHORTEST path patterns) but not this function syntax
+  - name: "shell-cypher_compat-path-shortest"
+    type: shell_steps
+    description: "Shortest path query (Cypher compatibility - not GQL standard)"
+    steps:
+      - type: query
+        text: |
+          CREATE (a:ShortPath {id: 1})-[:STEP]->(b:ShortPath {id: 2})-[:STEP]->(c:ShortPath {id: 3}),
+                 (a)-[:STEP]->(c)
+      - type: query
+        text: "MATCH p = shortestPath((a:ShortPath {id: 1})-[:STEP*]->(c:ShortPath {id: 3})) RETURN length(p) AS len"
+        expect:
+          contains:
+            - "1"
+
+  # ============================================
+  # RELATIONSHIP UPDATE AND DELETE
+  # ============================================
+
+  - name: "shell-rel-set-property"
+    type: shell_steps
+    description: "Update relationship property"
+    steps:
+      - type: query
+        text: "CREATE (a:RelSetTest {id: 1})-[:HAS {weight: 1}]->(b:RelSetTest {id: 2})"
+      - type: query
+        text: "MATCH (a:RelSetTest)-[r:HAS]->(b:RelSetTest) SET r.weight = 10"
+      - type: query
+        text: "MATCH (a)-[r:HAS]->(b) RETURN r.weight AS weight"
+        expect:
+          contains:
+            - "10"
+
+  - name: "shell-rel-delete"
+    type: shell_steps
+    description: "Delete a relationship"
+    steps:
+      - type: query
+        text: "CREATE (a:RelDelTest {id: 1})-[:TO_DELETE]->(b:RelDelTest {id: 2})"
+      - type: query
+        text: "MATCH (a:RelDelTest)-[r:TO_DELETE]->(b:RelDelTest) DELETE r"
+      - type: query
+        text: "MATCH (a:RelDelTest)-[:TO_DELETE]->(b:RelDelTest) RETURN count(*) AS cnt"
+        expect:
+          contains:
+            - "0"

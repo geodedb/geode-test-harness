@@ -11,7 +11,7 @@ The harness uses Docker containers for Geode server management, parses test spec
 ## External Dependencies
 
 Client libraries are located in sibling directories:
-- `../geode-client-go/` - Go client (module: go.codepros.org/geode)
+- `../geode-client-go/` - Go client (module: geodedb.com/geode)
 - `../geode-client-python/` - Python client (package: geode_client)
 - `../geode-client-rust/` - Rust client (crate: geode-client)
 - `../geode-client-zig/` - Zig client (module: geode_client)

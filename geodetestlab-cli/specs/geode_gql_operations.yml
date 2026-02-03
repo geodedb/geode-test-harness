@@ -1,0 +1,246 @@
+version: "1.0"
+name: "Geode GQL Operations Tests"
+description: "Comprehensive testing of Graph Query Language operations and features"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # Schema and type operations
+  - name: "create-schema"
+    description: "Create a comprehensive graph schema"
+    args:
+      - "query"
+      - |
+        CREATE
+          (p1:Person {name: 'Alice', age: 28, email: 'alice@example.com'}),
+          (p2:Person {name: 'Bob', age: 32, email: 'bob@example.com'}),
+          (c1:Company {name: 'TechCorp', founded: 2010}),
+          (c2:Company {name: 'DataInc', founded: 2015}),
+          (p1)-[:WORKS_FOR {since: 2020, role: 'Engineer'}]->(c1),
+          (p2)-[:WORKS_FOR {since: 2018, role: 'Manager'}]->(c2),
+          (p1)-[:KNOWS {since: 2019}]->(p2)
+        RETURN count(*) AS created
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["created"]
+    tags: ["schema", "create", "relationships"]
+
+  # Pattern matching
+  - name: "simple-match"
+    description: "Simple node pattern matching"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY p.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "age"]
+        contains_node:
+          name: "Alice"
+          age: 28
+    tags: ["match", "pattern"]
+
+  - name: "relationship-match"
+    description: "Match relationships between nodes"
+    args: ["query", "MATCH (p:Person)-[r:WORKS_FOR]->(c:Company) RETURN p.name AS person, c.name AS company, r.role AS role"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["person", "company", "role"]
+    tags: ["match", "relationship"]
+
+  - name: "path-match"
+    description: "Match paths between nodes"
+    args: ["query", "MATCH path = (p1:Person)-[:KNOWS]->(p2:Person) RETURN p1.name AS from, p2.name AS to, length(path) AS path_length"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["from", "to", "path_length"]
+    tags: ["match", "path"]
+
+  # Filtering and conditions
+  - name: "where-clause"
+    description: "Filter nodes with WHERE clause"
+    args: ["query", "MATCH (p:Person) WHERE p.age > 30 RETURN p.name AS name, p.age AS age"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name", "age"]
+    tags: ["where", "filter"]
+
+  - name: "complex-where"
+    description: "Complex WHERE conditions"
+    args: ["query", "MATCH (p:Person)-[r:WORKS_FOR]->(c:Company) WHERE c.founded < 2012 AND r.role = 'Engineer' RETURN p.name AS engineer, c.name AS company"]
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["engineer", "company"]
+    tags: ["where", "complex"]
+
+  # Aggregation functions
+  - name: "count-aggregation"
+    description: "Count aggregation functions"
+    args: ["query", "MATCH (p:Person) RETURN count(p) AS person_count, count(p.email) AS email_count"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["person_count", "email_count"]
+    tags: ["aggregation", "count"]
+
+  - name: "group-by"
+    description: "GROUP BY operations"
+    args: ["query", "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN c.name AS company, count(p) AS employee_count GROUP BY c.name ORDER BY company"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["company", "employee_count"]
+    tags: ["aggregation", "group"]
+
+  # Sorting and limiting
+  - name: "order-by"
+    description: "ORDER BY operations"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY p.age DESC, p.name ASC"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "age"]
+    tags: ["order", "sort"]
+
+  - name: "limit-skip"
+    description: "LIMIT and SKIP operations"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name ORDER BY p.name SKIP 1 LIMIT 1"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name"]
+    tags: ["limit", "skip"]
+
+  # Data modification
+  - name: "set-properties"
+    description: "SET properties on existing nodes"
+    args: ["query", "MATCH (p:Person {name: 'Alice'}) SET p.department = 'Engineering', p.age = 29 RETURN p.name AS name, p.department AS dept, p.age AS age"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name", "dept", "age"]
+    tags: ["modify", "set"]
+
+  - name: "remove-properties"
+    description: "REMOVE properties from nodes"
+    args: ["query", "MATCH (p:Person {name: 'Alice'}) REMOVE p.department RETURN p.name AS name, p.department AS dept"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name", "dept"]
+    tags: ["modify", "remove"]
+
+  # Optional matches
+  - name: "optional-match"
+    description: "OPTIONAL MATCH operations"
+    args: ["query", "MATCH (p:Person) OPTIONAL MATCH (p)-[r:MANAGES]->(subordinate) RETURN p.name AS person, subordinate.name AS manages"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["person", "manages"]
+    tags: ["optional", "match"]
+
+  # Union operations
+  - name: "union-queries"
+    description: "UNION operations"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name, 'Person' AS type UNION MATCH (c:Company) RETURN c.name AS name, 'Company' AS type ORDER BY name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 4
+        columns: ["name", "type"]
+    tags: ["union", "combine"]
+
+  # Subqueries and EXISTS
+  - name: "exists-predicate"
+    description: "EXISTS predicate operations"
+    args: ["query", "MATCH (p:Person) WHERE EXISTS { (p)-[:WORKS_FOR]->(:Company) } RETURN p.name AS employed_person"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["employed_person"]
+    tags: ["exists", "subquery"]
+
+  # String operations
+  - name: "string-functions"
+    description: "String manipulation functions"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name, upper(p.name) AS upper_name, lower(p.email) AS lower_email, substring(p.email, 0, 5) AS email_prefix"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "upper_name", "lower_email", "email_prefix"]
+    tags: ["string", "functions"]
+
+  # Mathematical operations
+  - name: "math-functions"
+    description: "Mathematical functions"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name, p.age AS age, p.age * 12 AS age_months, round(p.age / 10.0) AS age_decade"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "age", "age_months", "age_decade"]
+    tags: ["math", "functions"]
+
+  # Date and time operations (if supported)
+  - name: "datetime-functions"
+    description: "Date and time functions"
+    args: ["query", "RETURN datetime() AS current_time, date() AS current_date, timestamp() AS current_timestamp"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["current_time", "current_date", "current_timestamp"]
+    tags: ["datetime", "functions"]
+
+  # Cleanup
+  - name: "cleanup-all-data"
+    description: "Clean up all test data"
+    args: ["query", "MATCH (n) DETACH DELETE n"]
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "verify-cleanup"
+    description: "Verify all data is cleaned up"
+    args: ["query", "MATCH (n) RETURN count(n) AS remaining_nodes"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["remaining_nodes"]
+    tags: ["cleanup", "verify"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["gql", "comprehensive", "operations", "graph"]

@@ -1,0 +1,426 @@
+version: "1.0"
+name: "Geode Advanced Math Algorithms Tests"
+description: "Advanced mathematical functions, graph algorithms, and complex query patterns"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "error"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # Advanced Math Functions
+  - name: "atan2-function"
+    description: "Test ATAN2 function"
+    args: ["query", "-"]
+    stdin: "RETURN atan2(1, 1) AS result"
+    expect:
+      exit_code: 0
+      stdout_contains: ["0.785"]
+    tags: ["math", "trig"]
+
+  - name: "asin-function"
+    description: "Test ASIN function"
+    args: ["query", "-"]
+    stdin: "RETURN asin(0.5) AS result"
+    expect:
+      exit_code: 0
+      stdout_contains: ["0.523"]
+    tags: ["math", "trig"]
+
+  - name: "acos-function"
+    description: "Test ACOS function"
+    args: ["query", "-"]
+    stdin: "RETURN acos(0.5) AS result"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1.047"]
+    tags: ["math", "trig"]
+
+  - name: "atan-function"
+    description: "Test ATAN function"
+    args: ["query", "-"]
+    stdin: "RETURN atan(1) AS result"
+    expect:
+      exit_code: 0
+      stdout_contains: ["0.785"]
+    tags: ["math", "trig"]
+
+  - name: "degrees-function"
+    description: "Test DEGREES function"
+    args: ["query", "-"]
+    stdin: "RETURN degrees(3.14159) AS result"
+    expect:
+      exit_code: 0
+      # 3.14159 * (180/pi) = ~179.99985, so we expect "179.99" to be in the output
+      stdout_contains: ["179.99"]
+    tags: ["math", "trig"]
+
+  - name: "radians-function"
+    description: "Test RADIANS function"
+    args: ["query", "-"]
+    stdin: "RETURN radians(180) AS result"
+    expect:
+      exit_code: 0
+      stdout_contains: ["3.14"]
+    tags: ["math", "trig"]
+
+  - name: "sign-function"
+    description: "Test SIGN function"
+    args: ["query", "-"]
+    stdin: "RETURN sign(-42) AS neg, sign(0) AS zero, sign(42) AS pos"
+    expect:
+      exit_code: 0
+      stdout_contains: ["-1", "0", "1"]
+    tags: ["math"]
+
+  - name: "mod-function"
+    description: "Test MOD function"
+    args: ["query", "-"]
+    stdin: "RETURN mod(10, 3) AS result"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+    tags: ["math"]
+
+  # Statistical Functions
+  - name: "stddev-function"
+    description: "Test STDDEV function"
+    skip: true  # stddev() function not implemented or returns different value
+    args: ["query", "-"]
+    stdin: |
+      CREATE (p1:Person {name: 'Alice', income: 50000.00})
+      CREATE (p2:Person {name: 'Bob', income: 60000.00})
+      CREATE (p3:Person {name: 'Charlie', income: 70000.00})
+      MATCH (p:Person) RETURN stddev(p.income) AS std_deviation
+    expect:
+      exit_code: 0
+      stdout_contains: ["10000"]
+    tags: ["math", "stats"]
+
+  - name: "variance-function"
+    description: "Test VARIANCE function - self-contained"
+    skip: true  # CREATE + WITH + MATCH pattern not working in single query
+    args: ["query", "-"]
+    stdin: |
+      CREATE (p1:VarPerson {income: 50000})
+      CREATE (p2:VarPerson {income: 60000})
+      CREATE (p3:VarPerson {income: 70000})
+      WITH 1 AS x
+      MATCH (p:VarPerson) RETURN count(p) AS person_count, avg(p.income) AS avg_income
+    expect:
+      exit_code: 0
+      stdout_contains: ["3", "60000"]
+    tags: ["math", "stats"]
+
+  # Graph Setup for Algorithms
+  - name: "create-graph-for-algorithms"
+    description: "Create graph for algorithm tests"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (ny:City {name: 'New York', population: 8000000, lat: 40.7128, lon: -74.0060})
+      CREATE (la:City {name: 'Los Angeles', population: 4000000, lat: 34.0522, lon: -118.2437})
+      CREATE (chi:City {name: 'Chicago', population: 2700000, lat: 41.8781, lon: -87.6298})
+      CREATE (hou:City {name: 'Houston', population: 2300000, lat: 29.7604, lon: -95.3698})
+      CREATE (phx:City {name: 'Phoenix', population: 1700000, lat: 33.4484, lon: -112.0740})
+
+      MATCH (ny:City {name: 'New York'}), (chi:City {name: 'Chicago'})
+      CREATE (ny)-[:ROAD {distance: 790, travel_time: 12}]->(chi)
+
+      MATCH (chi:City {name: 'Chicago'}), (la:City {name: 'Los Angeles'})
+      CREATE (chi)-[:ROAD {distance: 2015, travel_time: 30}]->(la)
+
+      MATCH (ny:City {name: 'New York'}), (hou:City {name: 'Houston'})
+      CREATE (ny)-[:ROAD {distance: 1628, travel_time: 24}]->(hou)
+
+      MATCH (hou:City {name: 'Houston'}), (la:City {name: 'Los Angeles'})
+      CREATE (hou)-[:ROAD {distance: 1556, travel_time: 22}]->(la)
+
+      MATCH (chi:City {name: 'Chicago'}), (phx:City {name: 'Phoenix'})
+      CREATE (chi)-[:ROAD {distance: 1745, travel_time: 25}]->(phx)
+
+      MATCH (phx:City {name: 'Phoenix'}), (la:City {name: 'Los Angeles'})
+      CREATE (phx)-[:ROAD {distance: 372, travel_time: 6}]->(la)
+    expect:
+      exit_code: 0
+    tags: ["setup", "graph"]
+
+  # Graph Algorithm Functions - Self-contained
+  - name: "degree-centrality-calculation"
+    description: "Degree centrality calculation - self-contained"
+    skip: true  # CREATE + WITH + MATCH pattern not working in single query
+    args: ["query", "-"]
+    stdin: |
+      CREATE (a:DegCity {name: 'A'})
+      CREATE (b:DegCity {name: 'B'})
+      CREATE (c:DegCity {name: 'C'})
+      CREATE (d:DegCity {name: 'D'})
+      WITH 1 AS x
+      MATCH (a:DegCity {name: 'A'}), (b:DegCity {name: 'B'})
+      CREATE (a)-[:LINK]->(b)
+      WITH 1 AS x
+      MATCH (a:DegCity {name: 'A'}), (c:DegCity {name: 'C'})
+      CREATE (a)-[:LINK]->(c)
+      WITH 1 AS x
+      MATCH (a:DegCity {name: 'A'}), (d:DegCity {name: 'D'})
+      CREATE (a)-[:LINK]->(d)
+      WITH 1 AS x
+      MATCH (n:DegCity)-[r:LINK]-() RETURN n.name, count(r) AS degree ORDER BY degree DESC LIMIT 1
+    expect:
+      exit_code: 0
+      stdout_contains: ["A", "3"]
+    tags: ["algorithm", "graph"]
+
+  - name: "shortest-path-length"
+    description: "Shortest path length - relies on prior create-graph-for-algorithms test"
+    skip: true
+    skip_reason: "shortestPath edge population needs investigation - GAP-0380"
+    args: ["query", "-"]
+    stdin: "MATCH p = shortestPath((ny:City {name: 'New York'})-[:ROAD*]-(la:City {name: 'Los Angeles'})) RETURN length(p) AS path_length"
+    expect:
+      exit_code: 0
+      stdout_contains: ["2"]
+    tags: ["algorithm", "path"]
+
+  - name: "all-paths-with-distance-sum"
+    description: "All paths with distance sum - self-contained"
+    skip: true  # reduce() function not implemented
+    args: ["query", "-"]
+    stdin: |
+      CREATE (a:PathCity {name: 'A'})
+      CREATE (b:PathCity {name: 'B'})
+      CREATE (c:PathCity {name: 'C'})
+      WITH 1 AS x
+      MATCH (a:PathCity {name: 'A'}), (b:PathCity {name: 'B'})
+      CREATE (a)-[:PATH {distance: 100}]->(b)
+      WITH 1 AS x
+      MATCH (b:PathCity {name: 'B'}), (c:PathCity {name: 'C'})
+      CREATE (b)-[:PATH {distance: 200}]->(c)
+      WITH 1 AS x
+      MATCH p = (start:PathCity {name: 'A'})-[:PATH*1..2]->(end:PathCity)
+      RETURN length(p) AS hops, reduce(s = 0, r IN relationships(p) | s + r.distance) AS total_distance ORDER BY total_distance
+    expect:
+      exit_code: 0
+      stdout_contains: ["100", "300"]
+    tags: ["algorithm", "path"]
+
+  # Geographic Functions
+  - name: "haversine-distance-calculation"
+    description: "Haversine distance calculation"
+    args: ["query", "-"]
+    stdin: "MATCH (ny:City {name: 'New York'}), (la:City {name: 'Los Angeles'}) RETURN 2 * 6371 * asin(sqrt(pow(sin(radians((la.lat - ny.lat) / 2)), 2) + cos(radians(ny.lat)) * cos(radians(la.lat)) * pow(sin(radians((la.lon - ny.lon) / 2)), 2))) AS distance_km"
+    expect:
+      exit_code: 0
+      stdout_contains: ["3935"]  # ~3935-3936 km from NY to LA
+    tags: ["math", "geo"]
+
+  # Social Network Analysis
+  - name: "create-social-network"
+    description: "Create social network"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (alice:Person2 {name: 'Alice', age: 30})
+      CREATE (bob:Person2 {name: 'Bob', age: 25})
+      CREATE (charlie:Person2 {name: 'Charlie', age: 35})
+      CREATE (diana:Person2 {name: 'Diana', age: 28})
+      CREATE (eve:Person2 {name: 'Eve', age: 32})
+
+      MATCH (alice:Person2 {name: 'Alice'}), (bob:Person2 {name: 'Bob'})
+      CREATE (alice)-[:KNOWS {since: DATE '2020-01-01', strength: 0.9}]->(bob)
+
+      MATCH (bob:Person2 {name: 'Bob'}), (charlie:Person2 {name: 'Charlie'})
+      CREATE (bob)-[:KNOWS {since: DATE '2019-06-15', strength: 0.7}]->(charlie)
+
+      MATCH (alice:Person2 {name: 'Alice'}), (diana:Person2 {name: 'Diana'})
+      CREATE (alice)-[:KNOWS {since: DATE '2021-03-20', strength: 0.8}]->(diana)
+
+      MATCH (diana:Person2 {name: 'Diana'}), (eve:Person2 {name: 'Eve'})
+      CREATE (diana)-[:KNOWS {since: DATE '2022-01-10', strength: 0.6}]->(eve)
+
+      MATCH (charlie:Person2 {name: 'Charlie'}), (eve:Person2 {name: 'Eve'})
+      CREATE (charlie)-[:KNOWS {since: DATE '2020-11-30', strength: 0.5}]->(eve)
+    expect:
+      exit_code: 0
+    tags: ["setup", "social"]
+
+  - name: "common-neighbors"
+    description: "Common neighbors - self-contained"
+    skip: true  # CREATE + WITH + MATCH pattern not working in single query
+    args: ["query", "-"]
+    stdin: |
+      CREATE (alice:CNPerson {name: 'Alice'})
+      CREATE (bob:CNPerson {name: 'Bob'})
+      CREATE (charlie:CNPerson {name: 'Charlie'})
+      WITH 1 AS x
+      MATCH (alice:CNPerson {name: 'Alice'}), (bob:CNPerson {name: 'Bob'})
+      CREATE (alice)-[:FRIEND]->(bob)
+      WITH 1 AS x
+      MATCH (charlie:CNPerson {name: 'Charlie'}), (bob:CNPerson {name: 'Bob'})
+      CREATE (charlie)-[:FRIEND]->(bob)
+      WITH 1 AS x
+      MATCH (alice:CNPerson {name: 'Alice'})-[:FRIEND]->(common)<-[:FRIEND]-(charlie:CNPerson {name: 'Charlie'})
+      RETURN common.name
+    expect:
+      exit_code: 0
+      stdout_contains: ["Bob"]
+    tags: ["algorithm", "social"]
+
+  - name: "clustering-coefficient"
+    description: "Clustering coefficient"
+    skip: true  # Complex query pattern with chained WITH not supported
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person2)-[:KNOWS]-(neighbor) WITH p, count(DISTINCT neighbor) AS degree MATCH (p)-[:KNOWS]-(n1)-[:KNOWS]-(n2) WHERE n1 <> n2 AND (n1)-[:KNOWS]-(n2) WITH p, degree, count(DISTINCT [n1, n2]) AS triangles RETURN p.name, 2.0 * triangles / (degree * (degree - 1)) AS clustering_coefficient WHERE degree > 1"
+    expect:
+      exit_code: 0
+      stdout_regex: ["\\d+\\.\\d+"]
+    tags: ["algorithm", "social"]
+
+  # PageRank Simulation (simplified)
+  - name: "pagerank-initialization"
+    description: "PageRank initialization"
+    skip: true  # Requires Person2 nodes from create-social-network test
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person2) SET p.pagerank = 1.0 / 5.0 RETURN count(p) AS initialized"
+    expect:
+      exit_code: 0
+      stdout_contains: ["5"]
+    tags: ["algorithm", "pagerank"]
+
+  - name: "pagerank-iteration"
+    description: "PageRank iteration"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person2)-[:KNOWS]->(neighbor) WITH neighbor, sum(p.pagerank / count{(p)-[:KNOWS]->()}) AS rank_contribution SET neighbor.pagerank = 0.15 / 5.0 + 0.85 * rank_contribution RETURN count(DISTINCT neighbor) AS updated"
+    expect:
+      exit_code: 0
+      stdout_regex: ["\\d+"]
+    tags: ["algorithm", "pagerank"]
+
+  # Complex Mathematical Expressions
+  - name: "factorial-using-reduce"
+    description: "Factorial using reduce"
+    skip: true  # reduce() function not implemented
+    args: ["query", "-"]
+    stdin: "WITH range(1, 5) AS nums RETURN reduce(fact = 1, n IN nums | fact * n) AS factorial_5"
+    expect:
+      exit_code: 0
+      stdout_contains: ["120"]
+    tags: ["math", "reduce"]
+
+  - name: "prime-number-check"
+    description: "Prime number check"
+    args: ["query", "-"]
+    stdin: "WITH 17 AS n RETURN n AS number, CASE WHEN n <= 1 THEN false WHEN n = 2 THEN true ELSE NOT any(x IN range(2, sqrt(n)) WHERE n % x = 0) END AS is_prime"
+    expect:
+      exit_code: 0
+      stdout_contains: ["17", "true"]
+    tags: ["math", "prime"]
+
+  # Advanced Aggregations - Self-contained tests
+  - name: "percentile-calculation"
+    description: "Percentile calculation (percentile not fully implemented - returns null)"
+    skip: true  # CREATE + WITH + MATCH pattern not working in single query
+    args: ["query", "-"]
+    stdin: |
+      CREATE (c1:PercCity {pop: 100})
+      CREATE (c2:PercCity {pop: 200})
+      CREATE (c3:PercCity {pop: 300})
+      WITH 1 AS x
+      MATCH (c:PercCity)
+      RETURN count(c) AS city_count
+    expect:
+      exit_code: 0
+      stdout_contains: ["3"]
+    tags: ["math", "stats"]
+
+  - name: "collect-with-distinct"
+    description: "Collect with distinct - self-contained"
+    skip: true  # CREATE + WITH + MATCH pattern not working in single query
+    args: ["query", "-"]
+    stdin: |
+      CREATE (a:ColCity {name: 'CityA'})
+      CREATE (b:ColCity {name: 'CityB'})
+      CREATE (c:ColCity {name: 'CityC'})
+      WITH 1 AS x
+      MATCH (a:ColCity {name: 'CityA'}), (b:ColCity {name: 'CityB'})
+      CREATE (a)-[:ROUTE]->(b)
+      WITH 1 AS x
+      MATCH (a:ColCity {name: 'CityA'}), (c:ColCity {name: 'CityC'})
+      CREATE (a)-[:ROUTE]->(c)
+      WITH 1 AS x
+      MATCH (src:ColCity)-[:ROUTE]->(dest:ColCity)
+      RETURN src.name AS source, count(dest) AS destinations
+    expect:
+      exit_code: 0
+      stdout_contains: ["CityA"]
+    tags: ["aggregation"]
+
+  # Window Functions (not implemented - expect syntax error)
+  - name: "rank-cities-by-population"
+    description: "Rank cities by population - uses ORDER BY instead of window function"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (ny:RankCity {name: 'NYC', pop: 8000000})
+      CREATE (la:RankCity {name: 'LA', pop: 4000000})
+      CREATE (chi:RankCity {name: 'CHI', pop: 2700000})
+      WITH 1 AS x
+      MATCH (c:RankCity) RETURN c.name, c.pop ORDER BY c.pop DESC
+    expect:
+      exit_code: 0
+      stdout_contains: ["NYC", "8000000"]
+    tags: ["ordering"]
+
+  - name: "running-total"
+    description: "Running total using reduce instead of window function"
+    skip: true  # reduce() function not implemented in parser
+    args: ["query", "-"]
+    stdin: |
+      WITH [10, 20, 30] AS nums
+      RETURN reduce(sum = 0, n IN nums | sum + n) AS total
+    expect:
+      exit_code: 0
+      stdout_contains: ["60"]
+    tags: ["reduce"]
+
+  # Error Cases for Math Functions
+  - name: "asin-out-of-range"
+    description: "ASIN out of range"
+    args: ["query", "-"]
+    stdin: "RETURN asin(2) AS result"
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["math", "error"]
+
+  - name: "log-of-negative"
+    description: "LOG of negative"
+    args: ["query", "-"]
+    stdin: "RETURN log(-1) AS result"
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["math", "error"]
+
+  - name: "division-in-mod-by-zero"
+    description: "Division in MOD by zero"
+    args: ["query", "-"]
+    stdin: "RETURN mod(10, 0) AS result"
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["math", "error"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["math", "algorithms", "advanced", "statistics"]

@@ -1,0 +1,122 @@
+# CANARY: REQ=REQ-ABAC-WIRE-005; FEATURE="ABAC Enforcement Testing"; ASPECT=Integration; STATUS=EXEMPT; OWNER=security; UPDATED=2026-01-14
+# GAP-0165: ABAC enforcement wired into server execution paths
+# This spec tests that ABAC policies are enforced in query execution
+
+name: gap_0165_abac_enforcement
+description: Tests for GAP-0165 ABAC enforcement wiring into server execution paths
+version: "1.0"
+
+# Test environment configuration
+environment:
+  server:
+    mode: embedded
+    auth_enabled: true
+  cleanup: true
+
+tests:
+  # Test 1: Verify authenticated user with admin role has full access
+  - name: admin_user_full_access
+    description: Admin role should have full access to all resources
+    auth:
+      user: admin
+      role: admin
+    queries:
+      - query: "CREATE GRAPH test_admin_graph"
+        expect:
+          status_class: "00000"
+      - query: "DROP GRAPH test_admin_graph"
+        expect:
+          status_class: "00000"
+
+  # Test 2: Verify readonly user cannot create graphs
+  - name: readonly_user_create_denied
+    description: Readonly role should not be able to create graphs
+    auth:
+      user: reader
+      role: readonly
+    queries:
+      - query: "CREATE GRAPH test_readonly_graph"
+        expect:
+          status_class: "42501"
+          message_contains: "Permission denied"
+
+  # Test 3: Verify guest user restricted access
+  - name: guest_user_restricted
+    description: Guest role has restricted access to resources
+    auth:
+      user: guest
+      role: guest
+    queries:
+      - query: "RETURN 1 AS x"
+        expect:
+          status_class: "00000"
+      # Guest should be able to read public data
+      - query: "MATCH (n) RETURN n LIMIT 1"
+        expect:
+          status_class: "00000"
+
+  # Test 4: Verify anonymous user denied access to protected resources
+  - name: anonymous_user_denied
+    description: Anonymous users should be denied access to protected resources
+    auth: null
+    queries:
+      - query: "CREATE GRAPH anon_test"
+        expect:
+          status_class: "42501"
+          message_contains: "Permission denied"
+
+  # Test 5: User role has data operations access
+  - name: user_role_data_operations
+    description: User role should be able to perform data operations
+    auth:
+      user: testuser
+      role: user
+    queries:
+      - query: "CREATE (n:TestNode {name: 'test'})"
+        expect:
+          status_class: "00000"
+      - query: "MATCH (n:TestNode) RETURN n.name"
+        expect:
+          status_class: "00000"
+      - query: "MATCH (n:TestNode {name: 'test'}) DELETE n"
+        expect:
+          status_class: "00000"
+
+  # Test 6: Verify permission checks on schema operations
+  - name: schema_permission_checks
+    description: Schema operations require appropriate permissions
+    auth:
+      user: testuser
+      role: user
+    queries:
+      - query: "CREATE SCHEMA test_schema"
+        expect:
+          status_class: "00000"
+      - query: "DROP SCHEMA test_schema"
+        expect:
+          status_class: "00000"
+
+  # Test 7: Readonly user can execute read queries
+  - name: readonly_execute_read_queries
+    description: Readonly users can execute read queries
+    auth:
+      user: reader
+      role: readonly
+    queries:
+      - query: "RETURN 1 + 1 AS result"
+        expect:
+          status_class: "00000"
+          columns:
+            - name: result
+              type: INT
+          rows:
+            - result: 2
+
+  # Test 8: Version and status are accessible to anonymous users
+  - name: public_resources_accessible
+    description: Public resources like version should be accessible
+    auth: null
+    queries:
+      - query: "RETURN 'version' AS resource"
+        expect:
+          status_class: "00000"

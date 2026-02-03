@@ -1,0 +1,287 @@
+name: "Geode Backup Comprehensive Test Suite"
+description: "Comprehensive testing of WAL-based backup manager with full/incremental backups, point-in-time recovery, and enterprise features"
+version: "1.0.0"
+timeout: 300
+environment:
+  - name: GEODE_DATA_DIR
+    value: "./test_data"
+  - name: GEODE_BACKUP_DIR
+    value: "./test_backups"
+  - name: GEODE_LOG_LEVEL
+    value: "INFO"
+
+setup:
+  - description: "Setup test environment"
+    command: ["rm", "-rf", "./test_data", "./test_backups"]
+  - description: "Create directories"
+    command: ["mkdir", "-p", "./test_data", "./test_backups"]
+
+tests:
+  # Basic Backup Operations
+  - name: "create_full_backup"
+    description: "Test creation of full backup"
+    steps:
+      - description: "Start embedded Geode instance and create initial data"
+        command: ["./zig-out/bin/geode", "query", "--data-dir", "./test_data", "CREATE (n:TestNode {id: 1, name: 'backup_test'})", "--format", "json"]
+        expected_output:
+          contains: ["TestNode"]
+
+      - description: "Create full backup"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--path", "./test_backups/full_001.backup"]
+        expected_output:
+          contains: ["Backup created successfully"]
+          status_code: 0
+
+      - description: "Verify backup file exists"
+        command: ["ls", "-la", "./test_backups/"]
+        expected_output:
+          contains: ["full_001.backup"]
+
+  - name: "create_incremental_backup"
+    description: "Test creation of incremental backup"
+    depends_on: ["create_full_backup"]
+    steps:
+      - description: "Add more data for incremental backup"
+        command: ["./zig-out/bin/geode", "query", "--data-dir", "./test_data", "CREATE (n:TestNode {id: 2, name: 'incremental_test'})", "--format", "json"]
+        expected_output:
+          contains: ["TestNode"]
+
+      - description: "Create incremental backup"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "incremental", "--base", "./test_backups/full_001.backup", "--path", "./test_backups/incr_001.backup"]
+        expected_output:
+          contains: ["Incremental backup created"]
+          status_code: 0
+
+  - name: "list_backups"
+    description: "Test listing available backups"
+    depends_on: ["create_incremental_backup"]
+    steps:
+      - description: "List all backups"
+        command: ["./zig-out/bin/geode", "backup", "list"]
+        expected_output:
+          contains: ["full_001.backup", "incr_001.backup"]
+          status_code: 0
+
+      - description: "List only full backups"
+        command: ["./zig-out/bin/geode", "backup", "list", "--type", "full"]
+        expected_output:
+          contains: ["full_001.backup"]
+          not_contains: ["incr_001.backup"]
+
+  - name: "verify_backup_integrity"
+    description: "Test backup verification and integrity checks"
+    depends_on: ["create_incremental_backup"]
+    steps:
+      - description: "Verify full backup"
+        command: ["./zig-out/bin/geode", "backup", "verify", "./test_backups/full_001.backup"]
+        expected_output:
+          contains: ["Backup verification successful"]
+          status_code: 0
+
+      - description: "Verify incremental backup"
+        command: ["./zig-out/bin/geode", "backup", "verify", "./test_backups/incr_001.backup"]
+        expected_output:
+          contains: ["Backup verification successful"]
+          status_code: 0
+
+      - description: "Verify non-existent backup (should fail)"
+        command: ["./zig-out/bin/geode", "backup", "verify", "./test_backups/nonexistent.backup"]
+        expected_output:
+          contains: ["Backup not found", "Error"]
+          status_code: 1
+
+  # Point-in-Time Recovery
+  - name: "point_in_time_recovery"
+    description: "Test point-in-time recovery functionality"
+    depends_on: ["verify_backup_integrity"]
+    steps:
+      - description: "Create test data with timestamps"
+        command: ["./zig-out/bin/geode", "query", "--data-dir", "./test_data", "CREATE (n:TimestampNode {id: 3, created: datetime('2025-10-04T10:00:00')})", "--format", "json"]
+        expected_output:
+          contains: ["TimestampNode"]
+
+      - description: "Create snapshot backup after timestamp data"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--path", "./test_backups/snapshot_001.backup"]
+        expected_output:
+          contains: ["Backup created successfully"]
+
+      - description: "Restore to previous point in time"
+        command: ["./zig-out/bin/geode", "restore", "--backup", "./test_backups/incr_001.backup", "--target-dir", "./test_data_restored"]
+        expected_output:
+          contains: ["Restore completed successfully"]
+          status_code: 0
+
+      - description: "Verify restored data"
+        command: ["./zig-out/bin/geode", "query", "--data-dir", "./test_data_restored", "MATCH (n:TestNode) RETURN count(n) AS node_count", "--format", "json"]
+        expected_output:
+          contains: ["node_count", "2"] # Should have 2 nodes from before the timestamp
+
+  # Backup Compression
+  - name: "backup_compression_options"
+    description: "Test different backup compression options"
+    steps:
+      - description: "Create uncompressed backup"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--compression", "none", "--path", "./test_backups/uncompressed.backup"]
+        expected_output:
+          contains: ["Backup created successfully"]
+
+      - description: "Create gzip compressed backup"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--compression", "gzip", "--path", "./test_backups/gzip.backup"]
+        expected_output:
+          contains: ["Backup created successfully"]
+
+      - description: "Create lz4 compressed backup"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--compression", "lz4", "--path", "./test_backups/lz4.backup"]
+        expected_output:
+          contains: ["Backup created successfully"]
+
+      - description: "Compare backup sizes"
+        command: ["ls", "-lh", "./test_backups/uncompressed.backup", "./test_backups/gzip.backup", "./test_backups/lz4.backup"]
+        expected_output:
+          # Compressed backups should be smaller
+          regex: [".*uncompressed\\.backup.*", ".*gzip\\.backup.*", ".*lz4\\.backup.*"]
+
+  # Backup Retention Policy
+  - name: "backup_retention_policy"
+    description: "Test backup retention and cleanup policies"
+    steps:
+      - description: "Set retention policy"
+        command: ["./zig-out/bin/geode", "backup", "policy", "--max-full", "3", "--max-incremental", "10", "--retention-days", "30"]
+        expected_output:
+          contains: ["Retention policy updated"]
+
+      - description: "Create multiple backups to test retention"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--path", "./test_backups/retention_test_1.backup"]
+        expected_output:
+          contains: ["Backup created successfully"]
+
+      - description: "Create another backup"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--path", "./test_backups/retention_test_2.backup"]
+        expected_output:
+          contains: ["Backup created successfully"]
+
+      - description: "Apply retention policy cleanup"
+        command: ["./zig-out/bin/geode", "backup", "cleanup", "--dry-run"]
+        expected_output:
+          contains: ["Cleanup policy"]
+          status_code: 0
+
+  # S3 Backup Integration (if available)
+  - name: "s3_backup_integration"
+    description: "Test S3 backup functionality"
+    optional: true
+    environment:
+      - name: AWS_ACCESS_KEY_ID
+        value: "test_key"
+      - name: AWS_SECRET_ACCESS_KEY
+        value: "test_secret"
+      - name: AWS_REGION
+        value: "us-west-2"
+    steps:
+      - description: "Configure S3 backup destination"
+        command: ["./zig-out/bin/geode", "backup", "config", "--s3-bucket", "geode-test-backups", "--s3-prefix", "test/"]
+        expected_output:
+          contains: ["S3 configuration updated"]
+        optional: true
+
+      - description: "Create backup to S3"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--destination", "s3", "--path", "s3_full_001.backup"]
+        expected_output:
+          contains: ["Backup uploaded to S3"]
+        optional: true
+
+      - description: "List S3 backups"
+        command: ["./zig-out/bin/geode", "backup", "list", "--destination", "s3"]
+        expected_output:
+          contains: ["s3_full_001.backup"]
+        optional: true
+
+  # Performance Testing
+  # DISABLED: backup_performance_large_dataset test uses UNWIND which is not in ISO/IEC 39075:2024 GQL
+  # Original: UNWIND range(1, 1000) AS i CREATE (n:PerfNode {id: i, data: 'performance_test_' + toString(i)})
+  # TODO: Replace with GQL-compliant bulk data creation method or external script
+  - name: "backup_performance_large_dataset"
+    description: "Test backup performance with large dataset (DISABLED - needs GQL-compliant bulk insert)"
+    skip: true
+    timeout: 600
+    steps:
+      - description: "Create large dataset for performance testing"
+        command: ["./zig-out/bin/geode", "query", "--data-dir", "./test_data", "CREATE (n:PerfNode {id: 1, data: 'test'}) RETURN n", "--format", "json"]
+        expected_output:
+          contains: ["PerfNode"]
+
+      - description: "Time full backup creation"
+        command: ["time", "./zig-out/bin/geode", "backup", "create", "--type", "full", "--path", "./test_backups/perf_full.backup"]
+        expected_output:
+          contains: ["Backup created successfully"]
+          # Should complete within reasonable time
+          not_contains: ["timeout", "failed"]
+
+      - description: "Time incremental backup creation"
+        command: ["time", "./zig-out/bin/geode", "backup", "create", "--type", "incremental", "--base", "./test_backups/perf_full.backup", "--path", "./test_backups/perf_incr.backup"]
+        expected_output:
+          contains: ["Incremental backup created"]
+
+      - description: "Time restore operation"
+        command: ["time", "./zig-out/bin/geode", "restore", "--backup", "./test_backups/perf_incr.backup", "--target-dir", "./test_data_perf_restored"]
+        expected_output:
+          contains: ["Restore completed successfully"]
+
+  # Error Handling and Edge Cases
+  - name: "backup_error_handling"
+    description: "Test backup error handling and edge cases"
+    steps:
+      - description: "Try to create backup with invalid path"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--path", "/invalid/path/backup.backup"]
+        expected_output:
+          contains: ["Error", "Permission denied", "Invalid path"]
+          status_code: 1
+
+      - description: "Try to create incremental backup without base"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "incremental", "--path", "./test_backups/invalid_incr.backup"]
+        expected_output:
+          contains: ["Error", "Base backup required"]
+          status_code: 1
+
+      - description: "Try to restore from non-existent backup"
+        command: ["./zig-out/bin/geode", "restore", "--backup", "./test_backups/nonexistent.backup", "--target-dir", "./test_invalid"]
+        expected_output:
+          contains: ["Error", "Backup not found"]
+          status_code: 1
+
+      - description: "Try to restore to existing directory (should warn or fail)"
+        command: ["./zig-out/bin/geode", "restore", "--backup", "./test_backups/full_001.backup", "--target-dir", "./test_data"]
+        expected_output:
+          contains: ["Warning", "Error", "Directory exists"]
+
+  # Concurrent Operations
+  - name: "concurrent_backup_operations"
+    description: "Test concurrent backup operations and locking"
+    steps:
+      - description: "Start backup operation in background"
+        command: ["sh", "-c", "./zig-out/bin/geode backup create --type full --path ./test_backups/concurrent1.backup &"]
+        expected_output:
+          status_code: 0
+
+      - description: "Try to start another backup (should queue or fail gracefully)"
+        command: ["./zig-out/bin/geode", "backup", "create", "--type", "full", "--path", "./test_backups/concurrent2.backup"]
+        expected_output:
+          # Should either queue or fail gracefully
+          regex: ["Backup created successfully|Backup in progress|Error: Another backup operation"]
+
+      - description: "Wait for background operations to complete"
+        command: ["sleep", "5"]
+        expected_output:
+          status_code: 0
+
+cleanup:
+  - description: "Clean up test environment"
+    command: ["rm", "-rf", "./test_data", "./test_backups", "./test_data_restored", "./test_data_perf_restored", "./test_invalid"]
+    expected_output:
+      status_code: 0
+
+reporting:
+  format: "junit"
+  output_file: "backup_test_results.xml"
+  include_timing: true
+  include_system_info: true

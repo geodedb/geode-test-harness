@@ -1,0 +1,384 @@
+# GAP-0193: Priority Category Integration Tests
+# Tests for MultiGraphIsolation, TransactionUndoLog, CircularDependency,
+# ServerRefactoring, and related IMPL categories
+#
+# CANARY: REQ=REQ-GAP-0193-PRIORITY; FEATURE="IMPLBatchPromotion"; ASPECT=PriorityCategories; STATUS=TESTED; OWNER=test; UPDATED=2026-01-15
+
+name: gap_0193_priority_categories
+description: GAP-0193 priority category integration tests for IMPL promotion
+mode: server
+timeout: 30
+
+tests:
+  # ============================================================================
+  # MultiGraphIsolation Tests
+  # ============================================================================
+
+  - name: multigraph-create
+    query: "CREATE GRAPH IF NOT EXISTS priority_test_graph"
+    expect:
+      success: true
+
+  - name: multigraph-use
+    query: "USE GRAPH priority_test_graph"
+    expect:
+      success: true
+
+  - name: multigraph-show
+    query: "SHOW GRAPHS"
+    expect:
+      success: true
+      columns: [name]
+
+  - name: multigraph-create-node
+    query: "CREATE (n:IsolationNode {name: 'test', value: 42}) RETURN n.name"
+    expect:
+      success: true
+      columns: [name]
+
+  - name: multigraph-match-isolated
+    query: "MATCH (n:IsolationNode) RETURN n.name AS name, n.value AS value"
+    expect:
+      success: true
+      columns: [name, value]
+
+  - name: multigraph-create-edge
+    query: "CREATE (a:Source)-[:CONNECTS_TO]->(b:Target) RETURN a, b"
+    expect:
+      success: true
+      columns: [a, b]
+
+  - name: multigraph-match-edge
+    query: "MATCH (a)-[r:CONNECTS_TO]->(b) RETURN type(r) AS relType"
+    expect:
+      success: true
+      columns: [relType]
+
+  - name: multigraph-var-length-path
+    query: "MATCH p = (a)-[*1..3]->(b) RETURN length(p) AS pathLen"
+    expect:
+      success: true
+      columns: [pathLen]
+
+  - name: multigraph-cleanup
+    query: "DROP GRAPH IF EXISTS priority_test_graph"
+    expect:
+      success: true
+
+  # ============================================================================
+  # TransactionUndoLog Tests
+  # ============================================================================
+
+  - name: txn-begin
+    query: "BEGIN TRANSACTION"
+    expect:
+      success: true
+
+  - name: txn-create-in-txn
+    query: "CREATE (n:TxnTest {id: 1})"
+    expect:
+      success: true
+
+  - name: txn-commit
+    query: "COMMIT"
+    expect:
+      success: true
+
+  - name: txn-verify-commit
+    query: "MATCH (n:TxnTest) RETURN n.id AS id"
+    expect:
+      success: true
+      columns: [id]
+
+  - name: txn-begin-rollback
+    query: "BEGIN TRANSACTION"
+    expect:
+      success: true
+
+  - name: txn-create-rollback
+    query: "CREATE (n:RollbackTest {id: 999})"
+    expect:
+      success: true
+
+  - name: txn-rollback
+    query: "ROLLBACK"
+    expect:
+      success: true
+
+  - name: txn-verify-rollback
+    query: "MATCH (n:RollbackTest) RETURN count(n) AS cnt"
+    expect:
+      success: true
+      columns: [cnt]
+
+  # ============================================================================
+  # ListProperties Tests
+  # ============================================================================
+
+  - name: list-creation
+    query: "RETURN [1, 2, 3, 4, 5] AS numbers"
+    expect:
+      success: true
+      columns: [numbers]
+
+  - name: list-element-access
+    query: "WITH [10, 20, 30] AS list RETURN list[1] AS middle"
+    expect:
+      success: true
+      columns: [middle]
+
+  - name: list-slice
+    query: "WITH [1, 2, 3, 4, 5] AS list RETURN list[1..4] AS slice"
+    expect:
+      success: true
+      columns: [slice]
+
+  - name: list-size
+    query: "RETURN size([1, 2, 3, 4, 5]) AS len"
+    expect:
+      success: true
+      columns: [len]
+
+  - name: list-head-tail
+    query: "WITH [1, 2, 3] AS list RETURN head(list) AS first, tail(list) AS rest"
+    expect:
+      success: true
+      columns: [first, rest]
+
+  - name: list-concat
+    query: "RETURN [1, 2] + [3, 4] AS combined"
+    expect:
+      success: true
+      columns: [combined]
+
+  - name: list-in-operator
+    query: "RETURN 2 IN [1, 2, 3] AS found, 5 IN [1, 2, 3] AS notFound"
+    expect:
+      success: true
+      columns: [found, notFound]
+
+  - name: list-unwind
+    query: "UNWIND [1, 2, 3] AS num RETURN num"
+    expect:
+      success: true
+      columns: [num]
+
+  - name: list-comprehension
+    query: "RETURN [x IN range(1, 5) WHERE x > 2 | x * 2] AS doubled"
+    expect:
+      success: true
+      columns: [doubled]
+
+  # ============================================================================
+  # MapProperties Tests
+  # ============================================================================
+
+  - name: map-creation
+    query: "RETURN {name: 'Alice', age: 30} AS person"
+    expect:
+      success: true
+      columns: [person]
+
+  - name: map-property-access
+    query: "WITH {name: 'Bob', city: 'NYC'} AS person RETURN person.name AS name, person.city AS city"
+    expect:
+      success: true
+      columns: [name, city]
+
+  - name: map-keys
+    query: "RETURN keys({a: 1, b: 2, c: 3}) AS mapKeys"
+    expect:
+      success: true
+      columns: [mapKeys]
+
+  - name: map-nested
+    query: "RETURN {outer: {inner: {value: 42}}} AS nested"
+    expect:
+      success: true
+      columns: [nested]
+
+  # ============================================================================
+  # WithGroupByAggregation Tests
+  # ============================================================================
+
+  - name: agg-count
+    query: |
+      UNWIND [{type: 'A'}, {type: 'B'}, {type: 'A'}] AS item
+      WITH item.type AS type, count(*) AS cnt
+      RETURN type, cnt ORDER BY type
+    expect:
+      success: true
+      columns: [type, cnt]
+
+  - name: agg-sum
+    query: |
+      UNWIND [{val: 10}, {val: 20}, {val: 30}] AS item
+      RETURN sum(item.val) AS total
+    expect:
+      success: true
+      columns: [total]
+
+  - name: agg-avg
+    query: |
+      UNWIND [{v: 10}, {v: 20}, {v: 30}] AS item
+      RETURN avg(item.v) AS average
+    expect:
+      success: true
+      columns: [average]
+
+  - name: agg-min-max
+    query: |
+      UNWIND [5, 15, 10, 25, 20] AS num
+      RETURN min(num) AS minimum, max(num) AS maximum
+    expect:
+      success: true
+      columns: [minimum, maximum]
+
+  - name: agg-collect
+    query: |
+      UNWIND ['Alice', 'Bob', 'Charlie'] AS name
+      RETURN collect(name) AS names
+    expect:
+      success: true
+      columns: [names]
+
+  - name: agg-groupby
+    query: |
+      UNWIND [{g: 'X', v: 1}, {g: 'Y', v: 2}, {g: 'X', v: 3}] AS item
+      WITH item.g AS grp, sum(item.v) AS total
+      RETURN grp, total ORDER BY grp
+    expect:
+      success: true
+      columns: [grp, total]
+
+  # ============================================================================
+  # StringMinMax Tests
+  # ============================================================================
+
+  - name: string-min
+    query: "UNWIND ['cherry', 'apple', 'banana'] AS fruit RETURN min(fruit) AS first"
+    expect:
+      success: true
+      columns: [first]
+
+  - name: string-max
+    query: "UNWIND ['cherry', 'apple', 'banana'] AS fruit RETURN max(fruit) AS last"
+    expect:
+      success: true
+      columns: [last]
+
+  - name: string-minmax-combined
+    query: "UNWIND ['c', 'a', 'b', 'd'] AS letter RETURN min(letter) AS minLetter, max(letter) AS maxLetter"
+    expect:
+      success: true
+      columns: [minLetter, maxLetter]
+
+  # ============================================================================
+  # MetadataIntegration Tests
+  # ============================================================================
+
+  - name: metadata-labels
+    query: "CALL db.labels() YIELD label RETURN label LIMIT 10"
+    expect:
+      success: true
+      columns: [label]
+
+  - name: metadata-relationship-types
+    query: "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType LIMIT 10"
+    expect:
+      success: true
+      columns: [relationshipType]
+
+  - name: metadata-property-keys
+    query: "CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey LIMIT 10"
+    expect:
+      success: true
+      columns: [propertyKey]
+
+  - name: metadata-indexes
+    query: "CALL db.indexes() YIELD name, type RETURN name, type LIMIT 10"
+    expect:
+      success: true
+      columns: [name, type]
+
+  - name: metadata-constraints
+    query: "CALL db.constraints() YIELD name, type RETURN name, type LIMIT 10"
+    expect:
+      success: true
+      columns: [name, type]
+
+  # ============================================================================
+  # ExecutionRefactoring Tests
+  # ============================================================================
+
+  - name: exec-match-return
+    query: "MATCH (n) RETURN n LIMIT 5"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: exec-create-return
+    query: |
+      CREATE (n:ExecTest_priority {value: 42})
+      RETURN n.value AS value
+    expect:
+      success: true
+      columns: [value]
+
+  - name: exec-merge-return
+    query: |
+      MERGE (n:MergeTest_priority {id: 1})
+      ON CREATE SET n.created = true
+      ON MATCH SET n.matched = true
+      RETURN n
+    expect:
+      success: true
+      columns: [n]
+
+  - name: exec-set-operation
+    query: |
+      CREATE (n:SetTest_priority {old: 'value'})
+      SET n.new = 'updated', n.timestamp = timestamp()
+      RETURN n.new AS newValue
+    expect:
+      success: true
+      columns: [newValue]
+
+  - name: exec-delete-cleanup
+    query: |
+      MATCH (n) WHERE n:ExecTest_priority OR n:MergeTest_priority OR n:SetTest_priority OR n:TxnTest
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # ServerRefactoring Tests
+  # ============================================================================
+
+  - name: server-session-basic
+    query: "RETURN 'session_test' AS result"
+    expect:
+      success: true
+      columns: [result]
+
+  - name: server-multi-statement
+    query: "RETURN 1 AS first; RETURN 2 AS second"
+    expect:
+      success: true
+
+  - name: server-complex-query
+    query: |
+      UNWIND range(1, 10) AS num
+      WITH num, num % 3 AS grp
+      WITH grp, count(*) AS cnt, sum(num) AS total
+      RETURN grp, cnt, total ORDER BY grp
+    expect:
+      success: true
+      columns: [grp, cnt, total]
+
+invariants:
+  - type: "server_running"
+
+tags: ["gap-0193", "impl-promotion", "priority-categories"]

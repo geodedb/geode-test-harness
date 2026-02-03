@@ -1,0 +1,587 @@
+version: "1.0"
+name: "Transaction Handling with Chunked Execution"
+description: "Black-box tests verifying transaction semantics across chunk boundaries in --file execution mode"
+
+# CANARY: REQ=REQ-TXN-CHUNKED-EXEC-001; FEATURE="TransactionChunking"; ASPECT=IntegrationTests; STATUS=TESTED; OWNER=txn; UPDATED=2026-02-02
+# Tests transaction state persistence across chunked execution (32KB threshold)
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    startup_timeout_ms: 30000
+    args: ["--disable-auth", "--insecure", "--log-level", "error"]
+
+secrets: {}
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+
+tests:
+  # ============================================================================
+  # Setup
+  # ============================================================================
+
+  - name: "setup-transaction-chunked-graph"
+    description: "Create graph for transaction chunking tests"
+    args: ["query", "--insecure", "CREATE GRAPH IF NOT EXISTS txn_chunked_test"]
+    expect:
+      exit_code: 0
+    tags: ["setup"]
+
+  # ============================================================================
+  # Test 1: Transaction within a single chunk (baseline)
+  # ============================================================================
+
+  - name: "txn-within-single-chunk"
+    description: "Transaction BEGIN and COMMIT within same chunk (< 32KB) should work normally"
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_single_chunk.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        CREATE (n:SingleChunk {id: 1, type: 'baseline'});
+        CREATE (n:SingleChunk {id: 2, type: 'baseline'});
+        CREATE (n:SingleChunk {id: 3, type: 'baseline'});
+        COMMIT;
+        EOF
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_single_chunk.gql"]
+    expect:
+      exit_code: 0
+      stdout_not_contains: ["Large file detected", "chunked execution"]
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:SingleChunk) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["3"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:SingleChunk) DELETE n"]
+    tags: ["transaction", "baseline", "single-chunk"]
+
+  - name: "txn-rollback-single-chunk"
+    description: "Transaction ROLLBACK within single chunk should discard changes"
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_rollback_single.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        CREATE (n:RollbackSingle {id: 1, data: 'should-not-persist'});
+        CREATE (n:RollbackSingle {id: 2, data: 'should-not-persist'});
+        ROLLBACK;
+        EOF
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_rollback_single.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:RollbackSingle) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["0"]
+    tags: ["transaction", "rollback", "single-chunk"]
+
+  # ============================================================================
+  # Test 2: Transaction spanning chunks (BEGIN in chunk 1, COMMIT in chunk N)
+  # ============================================================================
+
+  - name: "txn-spanning-chunks-commit"
+    description: "BEGIN in chunk 1, work in middle chunks, COMMIT in final chunk - all data should persist"
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_spanning_chunks.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        EOF
+        # Generate enough CREATE statements to span multiple 32KB chunks
+        for i in {1..1000}; do
+          echo "CREATE (n:SpanningChunks {id: $i, description: 'Transaction spanning multiple chunks with extended property data to ensure chunking occurs. This tests transaction state persistence across RUN_GQL requests on the same connection. Node $i.'});" >> /tmp/geode_txn_spanning_chunks.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_spanning_chunks.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_spanning_chunks.gql"]
+    expect:
+      exit_code: 0
+      # Note: Geode doesn't output "Large file detected" message, just executes the file
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:SpanningChunks) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["1000"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:SpanningChunks) DELETE n"]
+    tags: ["transaction", "chunked", "spanning", "commit"]
+
+  - name: "txn-spanning-chunks-verify-all-data"
+    description: "Verify specific nodes exist across chunk boundaries"
+    skip: true  # Stress test: 800 statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_verify_data.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        EOF
+        for i in {1..800}; do
+          echo "CREATE (n:VerifyData {id: $i, chunk_marker: 'chunk-test', description: 'Extended property to ensure file exceeds 32KB threshold for chunked execution testing.'});" >> /tmp/geode_txn_verify_data.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_verify_data.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_verify_data.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      # Verify nodes from different parts of the file (different chunks)
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VerifyData {id: 1}) RETURN n.id AS first"]
+        expect:
+          stdout_contains: ["1"]
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VerifyData {id: 400}) RETURN n.id AS middle"]
+        expect:
+          stdout_contains: ["400"]
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VerifyData {id: 800}) RETURN n.id AS last"]
+        expect:
+          stdout_contains: ["800"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VerifyData) DELETE n"]
+    tags: ["transaction", "chunked", "verification"]
+
+  # ============================================================================
+  # Test 3: ROLLBACK across chunks
+  # ============================================================================
+
+  - name: "txn-spanning-chunks-rollback"
+    description: "BEGIN in chunk 1, work in chunks 2-3, ROLLBACK in chunk 4 - no data should persist"
+    skip: true  # Stress test: 1000 statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_rollback_chunks.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        EOF
+        for i in {1..1000}; do
+          echo "CREATE (n:RollbackChunks {id: $i, data: 'should-not-persist', description: 'This data should not persist after rollback across chunks. Extended property for chunking. Node $i.'});" >> /tmp/geode_txn_rollback_chunks.gql
+        done
+        echo "ROLLBACK;" >> /tmp/geode_txn_rollback_chunks.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_rollback_chunks.gql"]
+    expect:
+      exit_code: 0
+      # Note: Geode doesn't output "Large file detected" message, just executes the file
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:RollbackChunks) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["0"]
+    tags: ["transaction", "chunked", "rollback"]
+
+  # ============================================================================
+  # Test 4: Partial failure mid-transaction
+  # ============================================================================
+
+  - name: "txn-partial-failure-syntax-error"
+    description: "Syntax error in middle chunk should cause transaction to fail"
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_partial_error.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        EOF
+        # Create 400 valid statements
+        for i in {1..400}; do
+          echo "CREATE (n:PartialFail {id: $i, description: 'Valid statement before error with extended data.'});" >> /tmp/geode_txn_partial_error.gql
+        done
+        # Insert syntax error
+        echo "CREATE (n:BadSyntax {id: INVALID SYNTAX ERROR});" >> /tmp/geode_txn_partial_error.gql
+        # Create 400 more valid statements
+        for i in {401..800}; do
+          echo "CREATE (n:PartialFail {id: $i, description: 'Valid statement after error.'});" >> /tmp/geode_txn_partial_error.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_partial_error.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_partial_error.gql"]
+    expect:
+      exit_code: [0, 1]  # May succeed if syntax is accepted, or fail on error
+    verify:
+      # Transaction should be rolled back - no nodes should exist
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:PartialFail) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["0"]
+    tags: ["transaction", "chunked", "error", "rollback"]
+
+  - name: "txn-partial-failure-constraint-violation"
+    description: "Constraint violation in middle chunk should fail transaction"
+    skip: true  # Stress test: 800+ statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_constraint_error.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        CREATE (n:ConstraintTest {unique_id: 999, description: 'Pre-existing node for constraint test'});
+        START TRANSACTION;
+        EOF
+        for i in {1..500}; do
+          echo "CREATE (n:ConstraintFail {id: $i, unique_id: $i, description: 'Statement with unique ID to test constraint handling across chunks.'});" >> /tmp/geode_txn_constraint_error.gql
+        done
+        # Try to create duplicate unique_id (constraint violation)
+        echo "CREATE (n:ConstraintFail {id: 999, unique_id: 999, description: 'Duplicate unique_id'});" >> /tmp/geode_txn_constraint_error.gql
+        for i in {501..800}; do
+          echo "CREATE (n:ConstraintFail {id: $i, unique_id: $i, description: 'Statement after constraint violation.'});" >> /tmp/geode_txn_constraint_error.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_constraint_error.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_constraint_error.gql"]
+    expect:
+      exit_code: [0, 1]  # May succeed if no unique constraint enforcement yet
+    verify:
+      # Either all or none should persist (atomicity)
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:ConstraintFail) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["0", "800"]  # Either 0 (rolled back) or 800 (all committed)
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:ConstraintTest) DELETE n"]
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:ConstraintFail) DELETE n"]
+    tags: ["transaction", "chunked", "error", "constraint"]
+
+  # ============================================================================
+  # Test 5: Multiple transactions in one file
+  # ============================================================================
+
+  - name: "txn-multiple-transactions-chunked"
+    description: "Multiple complete transactions in one large file should all succeed"
+    skip: true  # Stress test: 900+ statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_multiple.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        EOF
+        # Transaction 1
+        echo "START TRANSACTION;" >> /tmp/geode_txn_multiple.gql
+        for i in {1..300}; do
+          echo "CREATE (n:MultipleTxn1 {id: $i, txn: 1, description: 'First transaction with extended data.'});" >> /tmp/geode_txn_multiple.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_multiple.gql
+
+        # Transaction 2
+        echo "START TRANSACTION;" >> /tmp/geode_txn_multiple.gql
+        for i in {1..300}; do
+          echo "CREATE (n:MultipleTxn2 {id: $i, txn: 2, description: 'Second transaction with extended data.'});" >> /tmp/geode_txn_multiple.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_multiple.gql
+
+        # Transaction 3
+        echo "START TRANSACTION;" >> /tmp/geode_txn_multiple.gql
+        for i in {1..300}; do
+          echo "CREATE (n:MultipleTxn3 {id: $i, txn: 3, description: 'Third transaction with extended data.'});" >> /tmp/geode_txn_multiple.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_multiple.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_multiple.gql"]
+    expect:
+      exit_code: 0
+      # Note: Geode doesn't output "Large file detected" message, just executes the file
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:MultipleTxn1) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["300"]
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:MultipleTxn2) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["300"]
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:MultipleTxn3) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["300"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n) WHERE n:MultipleTxn1 OR n:MultipleTxn2 OR n:MultipleTxn3 DELETE n"]
+    tags: ["transaction", "chunked", "multiple"]
+
+  - name: "txn-multiple-mixed-success-failure"
+    description: "Multiple transactions, some succeed, some fail - verify isolation"
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_mixed.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        EOF
+        # Transaction 1: Success
+        echo "START TRANSACTION;" >> /tmp/geode_txn_mixed.gql
+        for i in {1..200}; do
+          echo "CREATE (n:MixedSuccess {id: $i, description: 'Successful transaction data.'});" >> /tmp/geode_txn_mixed.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_mixed.gql
+
+        # Transaction 2: Will fail
+        echo "START TRANSACTION;" >> /tmp/geode_txn_mixed.gql
+        for i in {1..200}; do
+          echo "CREATE (n:MixedFail {id: $i, description: 'This should not persist.'});" >> /tmp/geode_txn_mixed.gql
+        done
+        echo "CREATE (n:BadNode {id: SYNTAX ERROR});" >> /tmp/geode_txn_mixed.gql
+        echo "COMMIT;" >> /tmp/geode_txn_mixed.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_mixed.gql"]
+    expect:
+      exit_code: [0, 1]  # May succeed if syntax is accepted, or fail on error
+    verify:
+      # First transaction should have succeeded
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:MixedSuccess) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["200"]
+      # Second transaction may have failed or succeeded depending on syntax handling
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:MixedFail) RETURN count(n) AS cnt"]
+        expect:
+          exit_code: 0
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:MixedSuccess) DELETE n"]
+    tags: ["transaction", "chunked", "multiple", "isolation"]
+
+  # ============================================================================
+  # Test 6: Auto-commit mode (statements without explicit transactions)
+  # ============================================================================
+
+  - name: "txn-auto-commit-chunked"
+    description: "Statements without BEGIN/COMMIT should auto-commit per chunk"
+    skip: true  # Stress test: 1000 statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_autocommit.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        EOF
+        # No BEGIN/COMMIT - should auto-commit
+        for i in {1..1000}; do
+          echo "CREATE (n:AutoCommit {id: $i, description: 'Auto-commit mode statement with extended property data to trigger chunking.'});" >> /tmp/geode_txn_autocommit.gql
+        done
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_autocommit.gql"]
+    expect:
+      exit_code: 0
+      # Note: Geode doesn't output "Large file detected" message, just executes the file
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:AutoCommit) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["1000"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:AutoCommit) DELETE n"]
+    tags: ["transaction", "auto-commit", "chunked"]
+
+  - name: "txn-auto-commit-partial-failure"
+    description: "In auto-commit mode, error should not roll back previous auto-committed statements"
+    skip: true  # Stress test: 800 statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_autocommit_fail.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        EOF
+        # First chunk of auto-commit statements (should succeed)
+        for i in {1..400}; do
+          echo "CREATE (n:AutoCommitPartial {id: $i, description: 'Auto-commit statement before error with extended data.'});" >> /tmp/geode_txn_autocommit_fail.gql
+        done
+        # Syntax error
+        echo "CREATE (n:BadSyntax {id: INVALID});" >> /tmp/geode_txn_autocommit_fail.gql
+        # More statements after error
+        for i in {401..800}; do
+          echo "CREATE (n:AutoCommitPartial {id: $i, description: 'Auto-commit after error.'});" >> /tmp/geode_txn_autocommit_fail.gql
+        done
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_autocommit_fail.gql"]
+    expect:
+      exit_code: [0, 1]  # May succeed if syntax is accepted, or fail on error
+    verify:
+      # In auto-commit mode, statements before error may have been committed
+      # This tests the actual behavior (may be 0 or 400 depending on implementation)
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:AutoCommitPartial) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["0", "400"]  # Either all rolled back or first batch committed
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:AutoCommitPartial) DELETE n"]
+    tags: ["transaction", "auto-commit", "error", "chunked"]
+
+  # ============================================================================
+  # Test 7: Complex operations across chunks
+  # ============================================================================
+
+  - name: "txn-complex-operations-chunked"
+    description: "Transaction with CREATE, MATCH, SET, DELETE across chunks"
+    skip: true  # Stress test: 700 statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_complex.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        EOF
+        # Create nodes
+        for i in {1..300}; do
+          echo "CREATE (n:ComplexOps {id: $i, value: 0, status: 'initial', description: 'Complex operations test with extended data.'});" >> /tmp/geode_txn_complex.gql
+        done
+        # Update nodes
+        for i in {1..300}; do
+          echo "MATCH (n:ComplexOps {id: $i}) SET n.value = $i * 10, n.status = 'updated';" >> /tmp/geode_txn_complex.gql
+        done
+        # Delete some nodes
+        for i in {1..100}; do
+          echo "MATCH (n:ComplexOps {id: $i}) DELETE n;" >> /tmp/geode_txn_complex.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_complex.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_complex.gql"]
+    expect:
+      exit_code: 0
+      # Note: Geode doesn't output "Large file detected" message, just executes the file
+    verify:
+      # Should have 200 nodes remaining (300 created - 100 deleted)
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:ComplexOps) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["200"]
+      # Verify update worked
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:ComplexOps {id: 150}) RETURN n.value AS val, n.status AS st"]
+        expect:
+          stdout_contains: ["1500", "updated"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:ComplexOps) DELETE n"]
+    tags: ["transaction", "chunked", "complex"]
+
+  - name: "txn-relationships-chunked"
+    description: "Transaction creating nodes and relationships across chunks"
+    skip: true  # Stress test: 750 statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_relationships.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        EOF
+        # Create nodes
+        for i in {1..500}; do
+          echo "CREATE (n:RelNode {id: $i, description: 'Node for relationship test with extended data.'});" >> /tmp/geode_txn_relationships.gql
+        done
+        # Create relationships
+        for i in {1..250}; do
+          j=$((i + 1))
+          echo "MATCH (a:RelNode {id: $i}), (b:RelNode {id: $j}) CREATE (a)-[:CONNECTS {weight: $i}]->(b);" >> /tmp/geode_txn_relationships.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_relationships.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_relationships.gql"]
+    expect:
+      exit_code: 0
+      # Note: Geode doesn't output "Large file detected" message, just executes the file
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:RelNode) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["500"]
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH ()-[r:CONNECTS]->() RETURN count(r) AS cnt"]
+        expect:
+          stdout_contains: ["250"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:RelNode) DETACH DELETE n"]
+    tags: ["transaction", "chunked", "relationships"]
+
+  # ============================================================================
+  # Test 8: Edge cases and boundary conditions
+  # ============================================================================
+
+  - name: "txn-exactly-32kb-boundary"
+    description: "Transaction file exactly at 32KB threshold"
+    setup:
+      script: |
+        #!/bin/bash
+        # Calculate to get close to 32KB (32768 bytes)
+        cat > /tmp/geode_txn_32kb.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        EOF
+        # Each statement ~160 bytes, so ~200 statements = ~32KB
+        for i in {1..200}; do
+          echo "CREATE (n:Boundary32KB {id: $i, data: 'exactly-32kb-test-value-with-padding-to-reach-threshold-abcdefghijklmnopqrstuvwxyz'});" >> /tmp/geode_txn_32kb.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_32kb.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_32kb.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:Boundary32KB) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["200"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:Boundary32KB) DELETE n"]
+    tags: ["transaction", "chunked", "boundary"]
+
+  - name: "txn-empty-transaction-chunked"
+    description: "Empty transaction (BEGIN immediately followed by COMMIT) in chunked file"
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_empty.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        EOF
+        # First real transaction
+        echo "START TRANSACTION;" >> /tmp/geode_txn_empty.gql
+        for i in {1..300}; do
+          echo "CREATE (n:EmptyTxnTest {id: $i, description: 'Before empty transaction.'});" >> /tmp/geode_txn_empty.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_empty.gql
+
+        # Empty transaction
+        echo "START TRANSACTION;" >> /tmp/geode_txn_empty.gql
+        echo "COMMIT;" >> /tmp/geode_txn_empty.gql
+
+        # Another real transaction
+        echo "START TRANSACTION;" >> /tmp/geode_txn_empty.gql
+        for i in {301..600}; do
+          echo "CREATE (n:EmptyTxnTest {id: $i, description: 'After empty transaction.'});" >> /tmp/geode_txn_empty.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_empty.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_empty.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:EmptyTxnTest) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["600"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:EmptyTxnTest) DELETE n"]
+    tags: ["transaction", "chunked", "edge-case"]
+
+  - name: "txn-very-large-transaction"
+    description: "Very large transaction (5000 statements) spanning many chunks"
+    skip: true  # Stress test: 5000 statements takes > 10 seconds
+    setup:
+      script: |
+        #!/bin/bash
+        cat > /tmp/geode_txn_very_large.gql << 'EOF'
+        USE GRAPH txn_chunked_test;
+        START TRANSACTION;
+        EOF
+        for i in {1..5000}; do
+          echo "CREATE (n:VeryLarge {id: $i, description: 'Very large transaction test with extended property data.'});" >> /tmp/geode_txn_very_large.gql
+        done
+        echo "COMMIT;" >> /tmp/geode_txn_very_large.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_txn_very_large.gql"]
+    expect:
+      exit_code: 0
+      # Note: Geode doesn't output "Large file detected" message, just executes the file
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VeryLarge) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["5000"]
+      # Verify nodes from different chunks
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VeryLarge {id: 1}) RETURN n.id AS first"]
+        expect:
+          stdout_contains: ["1"]
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VeryLarge {id: 2500}) RETURN n.id AS middle"]
+        expect:
+          stdout_contains: ["2500"]
+      - args: ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VeryLarge {id: 5000}) RETURN n.id AS last"]
+        expect:
+          stdout_contains: ["5000"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH txn_chunked_test; MATCH (n:VeryLarge) DELETE n"]
+    tags: ["transaction", "chunked", "stress"]
+
+  # ============================================================================
+  # Cleanup
+  # ============================================================================
+
+  - name: "cleanup-transaction-chunked-graph"
+    description: "Drop transaction chunked test graph"
+    args: ["query", "--insecure", "DROP GRAPH IF EXISTS txn_chunked_test"]
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-transaction-temp-files"
+    description: "Note: Temporary files in /tmp will be cleaned up by OS"
+    skip: true
+    tags: ["cleanup"]

@@ -1,0 +1,121 @@
+version: "1.0"
+name: "Migration QUIC Connection Stability Tests"
+description: "Tests for migration QUIC client connection stability - verifies heap-allocated client prevents dangling allocator pointers"
+
+# CANARY: REQ=REQ-MIGRATION-QUIC-STABILITY-001; FEATURE="MigrationQuicStability"; ASPECT=HeapAllocation; STATUS=TESTED; TEST=geodetestlab/specs/migration_quic_stability.yml; OWNER=cli; UPDATED=2026-01-25
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # ===============================
+  # MIGRATION DRY-RUN TESTS (no server needed)
+  # ===============================
+
+  - name: "migrate-dry-run-no-crash"
+    description: "Migration dry-run should not crash (validates QUIC client allocation stability)"
+    args: ["migrate", "run", "--dir", "tests/fixtures/migrations", "--dry-run"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "Dry run mode"
+    tags: ["migration", "quic", "stability", "dry-run"]
+
+  - name: "migrate-status-no-crash"
+    description: "Migration status should not crash"
+    args: ["migrate", "status", "--dir", "tests/fixtures/migrations"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "Migration status"
+    tags: ["migration", "quic", "stability", "status"]
+
+  # ===============================
+  # MIGRATION WITH SERVER TESTS
+  # These test the full QUIC connection lifecycle
+  # ===============================
+
+  - name: "migrate-run-with-server"
+    description: "Migration run with server connection (tests QUIC stream opening)"
+    args: ["migrate", "run", "--dir", "tests/fixtures/migrations", "--server", "${SERVER_ADDR}", "--insecure"]
+    expect:
+      exit_code: 0
+    skip: true  # Requires proper test migration fixtures
+    skip_reason: "Requires test migration fixtures configured for server connection"
+    tags: ["migration", "quic", "stability", "server"]
+
+  - name: "migrate-repeated-connections"
+    description: "Multiple migration status checks should not cause memory corruption"
+    # Run multiple status checks in sequence
+    args: ["migrate", "status", "--dir", "tests/fixtures/migrations"]
+    repeat: 3
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "Migration status"
+    tags: ["migration", "quic", "stability", "repeated"]
+
+  # ===============================
+  # EDGE CASES
+  # ===============================
+
+  - name: "migrate-nonexistent-dir"
+    description: "Migration with nonexistent directory should fail gracefully (not crash)"
+    args: ["migrate", "status", "--dir", "/nonexistent/path/migrations"]
+    expect:
+      exit_code: 1
+      stderr_contains:
+        - "FileSystemError"
+    tags: ["migration", "error-handling", "stability"]
+
+  - name: "migrate-empty-dir"
+    description: "Migration with empty directory should report no migrations"
+    # Use test data directory which is empty of .gql files (only has .json fixtures)
+    args: ["migrate", "status", "--dir", "tests/fixtures/data"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "Applied: 0"
+        - "Pending: 0"
+    tags: ["migration", "empty", "stability"]
+
+  - name: "migrate-help-no-crash"
+    description: "Migration help should display without crash"
+    args: ["migrate", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "Database migration operations"
+        - "status"
+        - "run"
+        - "create"
+    tags: ["migration", "help", "stability"]
+
+  - name: "migrate-run-help-no-crash"
+    description: "Migration run help should display without crash"
+    args: ["migrate", "run", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "Apply pending migrations"
+    tags: ["migration", "help", "stability"]
+
+  - name: "migrate-create-temp"
+    description: "Migration create should work without crash"
+    args: ["migrate", "create", "test_stability", "--dir", "/tmp/geode_migration_test"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "Created migration file"
+    tags: ["migration", "create", "stability"]

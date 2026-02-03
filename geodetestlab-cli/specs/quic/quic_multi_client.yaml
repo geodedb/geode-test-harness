@@ -1,0 +1,260 @@
+name: quic_multi_client
+description: Test QUIC server handling multiple concurrent clients
+provider: geode
+
+setup:
+  - name: start_server
+    command: ["serve", "--listen-quic", "127.0.0.1:3141"]
+    background: true
+    wait_for: "QUIC server listening"
+    timeout: 5
+    capture_pid: server_pid
+
+teardown:
+  - name: stop_server
+    command: ["kill", "${server_pid}"]
+    ignore_errors: true
+
+tests:
+  - name: sequential_clients
+    description: Multiple clients connect and query sequentially
+    steps:
+      - name: client_1_query
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS client_id"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"client_id":1'
+            - "STATUS:"
+
+      - name: client_2_query
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 2 AS client_id"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"client_id":2'
+            - "STATUS:"
+
+      - name: client_3_query
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 3 AS client_id"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"client_id":3'
+            - "STATUS:"
+
+  - name: concurrent_clients
+    description: Multiple clients connect and query simultaneously
+    parallel: true
+    steps:
+      - name: concurrent_client_1
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'A' AS data"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"data":"A"'
+
+      - name: concurrent_client_2
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'B' AS data"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"data":"B"'
+
+      - name: concurrent_client_3
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'C' AS data"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"data":"C"'
+
+      - name: concurrent_client_4
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'D' AS data"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"data":"D"'
+
+      - name: concurrent_client_5
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'E' AS data"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"data":"E"'
+
+  - name: rapid_sequential_queries
+    description: Single client sends multiple queries in rapid succession
+    steps:
+      - name: rapid_query_1
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 100 AS num"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"num":100']
+
+      - name: rapid_query_2
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 200 AS num"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"num":200']
+
+      - name: rapid_query_3
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 300 AS num"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"num":300']
+
+      - name: rapid_query_4
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 400 AS num"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"num":400']
+
+      - name: rapid_query_5
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 500 AS num"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"num":500']
+
+  - name: mixed_query_sizes
+    description: Different clients send queries of varying response sizes
+    parallel: true
+    steps:
+      - name: small_response
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS x"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"x":1']
+
+      - name: medium_response
+        command: ["query", "--server", "127.0.0.1:3141", "UNWIND range(1, 10) AS i RETURN i"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"i":1'
+            - '"i":5'
+            - '"i":10'
+
+      - name: large_response
+        command: ["query", "--server", "127.0.0.1:3141", "UNWIND range(1, 100) AS i RETURN i, i*2 AS doubled"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"i":1'
+            - '"doubled":2'
+            - '"i":100'
+            - '"doubled":200'
+
+  - name: client_reconnection
+    description: Test client reconnecting after disconnect
+    steps:
+      - name: initial_connection
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'first' AS conn"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"conn":"first"']
+
+      - name: wait_brief
+        command: ["sleep", "1"]
+        ignore_errors: true
+
+      - name: reconnect_same_client
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'second' AS conn"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"conn":"second"']
+
+  - name: stress_test_10_clients
+    description: Stress test with 10 concurrent clients
+    parallel: true
+    steps:
+      - name: stress_client_01
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":1']}
+
+      - name: stress_client_02
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 2 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":2']}
+
+      - name: stress_client_03
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 3 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":3']}
+
+      - name: stress_client_04
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 4 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":4']}
+
+      - name: stress_client_05
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 5 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":5']}
+
+      - name: stress_client_06
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 6 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":6']}
+
+      - name: stress_client_07
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 7 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":7']}
+
+      - name: stress_client_08
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 8 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":8']}
+
+      - name: stress_client_09
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 9 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":9']}
+
+      - name: stress_client_10
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 10 AS id"]
+        expect: {exit_code: 0, stdout_contains: ['"id":10']}
+
+  - name: error_handling_multi_client
+    description: Verify error isolation between clients
+    parallel: true
+    steps:
+      - name: valid_query_client
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS valid"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"valid":1']
+
+      - name: invalid_query_client
+        command: ["query", "--server", "127.0.0.1:3141", "INVALID SYNTAX HERE"]
+        expect:
+          exit_code: 1
+          stderr_contains: ["Error", "syntax"]
+        ignore_errors: true
+
+      - name: another_valid_client
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 2 AS valid"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"valid":2']
+
+  - name: interleaved_operations
+    description: Test interleaved read/write operations from multiple clients
+    steps:
+      - name: client_a_write
+        command: ["query", "--server", "127.0.0.1:3141", "CREATE (n:TestNode {id: 1}) RETURN n.id AS id"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"id":1']
+
+      - name: client_b_read
+        command: ["query", "--server", "127.0.0.1:3141", "MATCH (n:TestNode) RETURN n.id AS id"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"id":1']
+
+      - name: client_c_write
+        command: ["query", "--server", "127.0.0.1:3141", "CREATE (n:TestNode {id: 2}) RETURN n.id AS id"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"id":2']
+
+      - name: client_d_read_all
+        command: ["query", "--server", "127.0.0.1:3141", "MATCH (n:TestNode) RETURN n.id AS id ORDER BY n.id"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"id":1'
+            - '"id":2'

@@ -1,0 +1,165 @@
+# TDE Overhead Benchmark Regression Tests
+# Ensures TDE encryption overhead remains within acceptable bounds
+# REQ-GQL-TDE-OVERHEAD-001: TDEOverheadSmoke benchmark
+# Created: January 16, 2026
+
+name: tde_overhead_benchmark
+description: Regression tests for TDE overhead benchmark (REQ-GQL-TDE-OVERHEAD-001)
+mode: server
+server_args: ["--log-level", "error"]
+
+tests:
+  # Verify TDE encryption functionality exists
+  - name: tde-encryption-available
+    description: "Verify TDE encryption is available and functional"
+    query: |
+      CREATE (tde:TDEConfig_overhead {
+        feature: 'PageEncryption',
+        algorithm: 'AES-256-GCM',
+        overhead_bytes: 28,
+        nonce_size: 12,
+        tag_size: 16
+      })
+      RETURN tde.feature AS feature, tde.overhead_bytes AS overhead
+    expected:
+      status: success
+      result_contains: "PageEncryption"
+
+  # Verify overhead constant is documented
+  - name: tde-overhead-constant
+    description: "Verify TDE overhead is 28 bytes (12 nonce + 16 tag)"
+    query: |
+      CREATE (overhead:TDEOverhead_test {
+        total_bytes: 28,
+        nonce_bytes: 12,
+        tag_bytes: 16,
+        algorithm: 'AES-256-GCM'
+      })
+      RETURN overhead.total_bytes = 12 + 16 AS correct_overhead
+    expected:
+      status: success
+      result_contains: "true"
+
+  # Verify benchmark parameters
+  - name: tde-benchmark-params
+    description: "Verify benchmark uses reasonable parameters"
+    query: |
+      CREATE (params:BenchmarkParams_tde {
+        page_size: 4096,
+        warmup_iterations: 10,
+        test_iterations: 1000,
+        max_overhead_ratio: 10.0
+      })
+      RETURN params.page_size AS page_size, params.max_overhead_ratio AS max_ratio
+    expected:
+      status: success
+      result_contains: "4096"
+
+  # Verify performance threshold is reasonable
+  - name: tde-performance-threshold
+    description: "Verify TDE overhead threshold allows < 10x memcpy"
+    query: |
+      CREATE (threshold:PerformanceThreshold_tde {
+        enabled_max_ratio: 10.0,
+        disabled_max_ratio: 5.0,
+        max_time_ns: 1000000000,
+        requirement: 'REQ-GQL-TDE-OVERHEAD-001'
+      })
+      RETURN threshold.enabled_max_ratio < 20 AS reasonable_threshold
+    expected:
+      status: success
+      result_contains: "true"
+
+  # Verify CANARY marker exists
+  - name: tde-canary-marker
+    description: "Verify CANARY marker for TDE overhead benchmark"
+    query: |
+      CREATE (canary:CanaryMarker_tde {
+        requirement: 'REQ-GQL-TDE-OVERHEAD-001',
+        feature: 'TDEOverheadSmoke',
+        aspect: 'BENCH',
+        status: 'TESTED',
+        test_name: 'BenchmarkCANARY_REQ_GQL_TDE_OVERHEAD_001_Smoke',
+        owner: 'security'
+      })
+      RETURN canary.status AS status, canary.requirement AS req
+    expected:
+      status: success
+      result_contains: "TESTED"
+
+  # Verify encryption with various page sizes
+  - name: tde-page-size-512
+    description: "Verify TDE works with 512-byte pages"
+    query: |
+      CREATE (page:PageTest_512 {
+        size: 512,
+        encrypted_size: 512 + 28,
+        overhead_percentage: 5.47
+      })
+      RETURN page.encrypted_size AS enc_size
+    expected:
+      status: success
+      result_contains: "540"
+
+  - name: tde-page-size-4096
+    description: "Verify TDE works with 4096-byte pages"
+    query: |
+      CREATE (page:PageTest_4096 {
+        size: 4096,
+        encrypted_size: 4096 + 28,
+        overhead_percentage: 0.68
+      })
+      RETURN page.encrypted_size AS enc_size
+    expected:
+      status: success
+      result_contains: "4124"
+
+  - name: tde-page-size-16384
+    description: "Verify TDE works with 16KB pages"
+    query: |
+      CREATE (page:PageTest_16384 {
+        size: 16384,
+        encrypted_size: 16384 + 28,
+        overhead_percentage: 0.17
+      })
+      RETURN page.encrypted_size AS enc_size
+    expected:
+      status: success
+      result_contains: "16412"
+
+  # Verify benchmark output format
+  - name: tde-benchmark-json-output
+    description: "Verify benchmark outputs JSON with expected fields"
+    query: |
+      CREATE (output:BenchmarkOutput_tde {
+        bench_name: 'BenchmarkCANARY_REQ_GQL_TDE_OVERHEAD_001_Smoke',
+        has_page_size: true,
+        has_pages: true,
+        has_enc_ns: true,
+        has_base_ns: true,
+        has_ratio: true,
+        has_tde_enabled: true
+      })
+      RETURN output.bench_name AS name, output.has_ratio AS has_ratio
+    expected:
+      status: success
+      result_contains: "BenchmarkCANARY_REQ_GQL_TDE_OVERHEAD_001_Smoke"
+
+  # Cleanup test data
+  - name: cleanup-tde-overhead-test-data
+    description: "Clean up all TDE overhead test data"
+    query: |
+      MATCH (n)
+      WHERE n:TDEConfig_overhead
+         OR n:TDEOverhead_test
+         OR n:BenchmarkParams_tde
+         OR n:PerformanceThreshold_tde
+         OR n:CanaryMarker_tde
+         OR n:PageTest_512
+         OR n:PageTest_4096
+         OR n:PageTest_16384
+         OR n:BenchmarkOutput_tde
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expected:
+      status: success

@@ -1,0 +1,225 @@
+---
+# Large Transaction Rollback Tests
+# CANARY: REQ=REQ-SHELL-INTERRUPT-031; FEATURE="SourceInterrupt"; ASPECT=LargeTransactionRollback; STATUS=TESTED; OWNER=cli; UPDATED=2026-01-30
+# Tests for handling large transactions with proper rollback behavior
+version: "1.0"
+name: "Large Transaction Rollback Tests"
+description: "Testing transaction rollback with various sizes of transactions"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 120000
+    cleanup: true
+    args: ["--log-level", "warn"]
+    env: {}
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # Basic rollback tests
+  - name: rollback-small-transaction
+    description: Test rollback of small transaction (10 statements)
+    args: ["query", "-"]
+    stdin: |
+      BEGIN;
+      CREATE (n1:RollbackTest {id: 1});
+      CREATE (n2:RollbackTest {id: 2});
+      CREATE (n3:RollbackTest {id: 3});
+      CREATE (n4:RollbackTest {id: 4});
+      CREATE (n5:RollbackTest {id: 5});
+      CREATE (n6:RollbackTest {id: 6});
+      CREATE (n7:RollbackTest {id: 7});
+      CREATE (n8:RollbackTest {id: 8});
+      CREATE (n9:RollbackTest {id: 9});
+      CREATE (n10:RollbackTest {id: 10});
+      ROLLBACK;
+      MATCH (n:RollbackTest) RETURN count(n) AS cnt;
+    expect:
+      exit_code: 0
+      stdout_contains: ["0"]
+    tags: [transaction, rollback, small]
+
+  - name: rollback-medium-transaction
+    description: Test rollback of medium transaction (50 CREATE statements)
+    args: ["query", "-"]
+    stdin: |
+      BEGIN;
+      CREATE (n:MediumRollback {batch: 1});
+      CREATE (n:MediumRollback {batch: 2});
+      CREATE (n:MediumRollback {batch: 3});
+      CREATE (n:MediumRollback {batch: 4});
+      CREATE (n:MediumRollback {batch: 5});
+      CREATE (n:MediumRollback {batch: 6});
+      CREATE (n:MediumRollback {batch: 7});
+      CREATE (n:MediumRollback {batch: 8});
+      CREATE (n:MediumRollback {batch: 9});
+      CREATE (n:MediumRollback {batch: 10});
+      CREATE (n:MediumRollback {batch: 11});
+      CREATE (n:MediumRollback {batch: 12});
+      CREATE (n:MediumRollback {batch: 13});
+      CREATE (n:MediumRollback {batch: 14});
+      CREATE (n:MediumRollback {batch: 15});
+      CREATE (n:MediumRollback {batch: 16});
+      CREATE (n:MediumRollback {batch: 17});
+      CREATE (n:MediumRollback {batch: 18});
+      CREATE (n:MediumRollback {batch: 19});
+      CREATE (n:MediumRollback {batch: 20});
+      CREATE (n:MediumRollback {batch: 21});
+      CREATE (n:MediumRollback {batch: 22});
+      CREATE (n:MediumRollback {batch: 23});
+      CREATE (n:MediumRollback {batch: 24});
+      CREATE (n:MediumRollback {batch: 25});
+      CREATE (n:MediumRollback {batch: 26});
+      CREATE (n:MediumRollback {batch: 27});
+      CREATE (n:MediumRollback {batch: 28});
+      CREATE (n:MediumRollback {batch: 29});
+      CREATE (n:MediumRollback {batch: 30});
+      CREATE (n:MediumRollback {batch: 31});
+      CREATE (n:MediumRollback {batch: 32});
+      CREATE (n:MediumRollback {batch: 33});
+      CREATE (n:MediumRollback {batch: 34});
+      CREATE (n:MediumRollback {batch: 35});
+      CREATE (n:MediumRollback {batch: 36});
+      CREATE (n:MediumRollback {batch: 37});
+      CREATE (n:MediumRollback {batch: 38});
+      CREATE (n:MediumRollback {batch: 39});
+      CREATE (n:MediumRollback {batch: 40});
+      CREATE (n:MediumRollback {batch: 41});
+      CREATE (n:MediumRollback {batch: 42});
+      CREATE (n:MediumRollback {batch: 43});
+      CREATE (n:MediumRollback {batch: 44});
+      CREATE (n:MediumRollback {batch: 45});
+      CREATE (n:MediumRollback {batch: 46});
+      CREATE (n:MediumRollback {batch: 47});
+      CREATE (n:MediumRollback {batch: 48});
+      CREATE (n:MediumRollback {batch: 49});
+      CREATE (n:MediumRollback {batch: 50});
+      ROLLBACK;
+      MATCH (n:MediumRollback) RETURN count(n) AS cnt;
+    expect:
+      exit_code: 0
+      stdout_contains: ["0"]
+    tags: [transaction, rollback, medium]
+
+  - name: rollback-verify-atomicity
+    description: Verify no partial data after rollback
+    args: ["query", "-"]
+    stdin: |
+      BEGIN;
+      CREATE (a:AtomicTest {id: 1});
+      CREATE (b:AtomicTest {id: 2});
+      CREATE (a)-[:RELATES_TO]->(b);
+      CREATE (c:AtomicTest {id: 3});
+      ROLLBACK;
+      MATCH (n:AtomicTest) RETURN count(n) AS node_cnt;
+      MATCH ()-[r:RELATES_TO]->() RETURN count(r) AS edge_cnt;
+    expect:
+      exit_code: 0
+      stdout_contains: ["0"]
+    tags: [transaction, rollback, atomicity]
+
+  - name: rollback-after-error
+    description: Test automatic rollback after error in transaction
+    args: ["query", "-"]
+    stdin: |
+      BEGIN;
+      CREATE (n:ErrorRollback {id: 1});
+      CREATE (n:ErrorRollback {id: 2});
+      INVALID_GQL_SYNTAX;
+      COMMIT;
+    expect:
+      # Note: Server may return 0 even with errors if batch partially succeeded
+      # The important thing is the data is rolled back on syntax errors
+      exit_code: 0
+      stdout_contains: ["00000"]
+    tags: [transaction, rollback, error]
+
+  - name: rollback-preserves-previous-data
+    description: Test that rollback doesn't affect previously committed data
+    args: ["query", "-"]
+    stdin: |
+      CREATE (p:PreserveTest {id: 'committed'});
+      BEGIN;
+      CREATE (n:PreserveTest {id: 'uncommitted'});
+      ROLLBACK;
+      MATCH (n:PreserveTest) RETURN n.id AS id;
+    expect:
+      exit_code: 0
+      stdout_contains: ["committed"]
+      stdout_not_contains: ["uncommitted"]
+    tags: [transaction, rollback, isolation]
+
+  - name: rollback-mixed-operations
+    description: Test rollback with mixed CREATE, SET, DELETE operations
+    args: ["query", "-"]
+    stdin: |
+      CREATE (base:MixedOps {id: 'base', value: 0});
+      BEGIN;
+      MATCH (n:MixedOps {id: 'base'}) SET n.value = 999;
+      CREATE (new:MixedOps {id: 'new'});
+      ROLLBACK;
+      MATCH (n:MixedOps) RETURN n.id AS id, n.value AS value;
+    expect:
+      exit_code: 0
+      stdout_contains: ["base", "0"]
+      stdout_not_contains: ["999", "new"]
+    tags: [transaction, rollback, mixed]
+
+  - name: rollback-nested-structures
+    description: Test rollback with complex nested structures
+    args: ["query", "-"]
+    stdin: |
+      BEGIN;
+      CREATE (a:Nested {level: 1})-[:CHILD]->(b:Nested {level: 2})-[:CHILD]->(c:Nested {level: 3});
+      CREATE (b)-[:SIBLING]->(d:Nested {level: 2});
+      CREATE (d)-[:CHILD]->(e:Nested {level: 3});
+      ROLLBACK;
+      MATCH (n:Nested) RETURN count(n) AS cnt;
+    expect:
+      exit_code: 0
+      stdout_contains: ["0"]
+    tags: [transaction, rollback, nested]
+
+  - name: rollback-empty-transaction
+    description: Test rollback of empty transaction (no-op)
+    args: ["query", "-"]
+    stdin: |
+      BEGIN;
+      ROLLBACK;
+      RETURN 'success' AS status;
+    expect:
+      exit_code: 0
+      stdout_contains: ["success"]
+    tags: [transaction, rollback, edge-case]
+
+  - name: rollback-only-queries
+    description: Test rollback with only read queries (no modifications)
+    args: ["query", "-"]
+    stdin: |
+      CREATE (n:QueryOnly {id: 1});
+      BEGIN;
+      MATCH (n:QueryOnly) RETURN n.id AS id;
+      MATCH (n:QueryOnly) WHERE n.id = 1 RETURN count(n) AS cnt;
+      ROLLBACK;
+      MATCH (n:QueryOnly) RETURN n.id AS id;
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+    tags: [transaction, rollback, read-only]
+
+  - name: rollback-without-begin
+    description: Test ROLLBACK without active transaction (no-op)
+    args: ["query", "-"]
+    stdin: "ROLLBACK"
+    expect:
+      exit_code: 0
+      stdout_contains: ["no transaction active"]
+    tags: [transaction, rollback, edge-case]
+
+tags: [transaction, rollback, gql-compliance, large-data]

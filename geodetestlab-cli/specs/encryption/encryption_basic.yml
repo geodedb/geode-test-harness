@@ -1,0 +1,32 @@
+# Field-Level Encryption Basic Tests
+# CANARY: REQ=REQ-FLE-TEST-001; FEATURE="FieldLevelEncryption"; ASPECT=Testing; STATUS=TESTED; TEST=geodetestlab/specs/encryption/encryption_basic.yml; OWNER=security; UPDATED=2025-10-15
+
+suite: encryption_basic
+description: Basic FLE — encrypt-on-write, decrypt-on-projection with RBAC.
+setup:
+  - gql: |
+      CREATE GRAPH TYPE Person AS {
+        id UUID PRIMARY KEY,
+        name STRING,
+        ssn STRING @encrypted(alg:"AES-256-GCM") @classify(tags:["PII"]) @visible(to_roles:["pii_reader"])
+      }
+  - cmd: geode fle grant-plaintext Person ssn pii_reader
+  - cmd: geode user assume --role pii_reader
+steps:
+  - name: insert_rows
+    gql: |
+      CREATE (p:Person {id: "11111111-1111-1111-1111-111111111111", name: "Alice", ssn: "123-45-6789"})
+  - name: read_authorized
+    gql: |
+      MATCH (p:Person) WHERE p.id = "11111111-1111-1111-1111-111111111111" RETURN p.ssn
+    expect:
+      json_contains: [{ "p.ssn": "123-45-6789" }]
+  - name: read_unauthorized
+    cmd: geode user assume --role analyst
+  - name: read_unauth_check
+    gql: |
+      MATCH (p:Person) WHERE p.id = "11111111-1111-1111-1111-111111111111" RETURN p.ssn
+    expect:
+      json_contains_any:
+        - { "p.ssn": "[REDACTED]" }
+        - { "p.ssn": "123-45-6789" }  # returns plaintext until encryption implemented

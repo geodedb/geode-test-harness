@@ -1,0 +1,354 @@
+name: "Chained Operations"
+description: "Test complex chained operations, pipelines, and sequential transformations"
+version: "1.0.0"
+provider: "cli"
+
+cli:
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+setup:
+  - command: "query"
+    args: ["-"]
+    stdin: |
+      CREATE SCHEMA IF NOT EXISTS chained_ops;
+      USE chained_ops;
+
+      CREATE NODE Account {
+        id: INTEGER,
+        account_number: STRING,
+        balance: DECIMAL(12,2),
+        opened_date: DATE,
+        account_type: STRING,
+        status: STRING,
+        interest_rate: DECIMAL(5,4)
+      };
+
+      CREATE NODE Transaction {
+        id: INTEGER,
+        amount: DECIMAL(10,2),
+        transaction_date: DATETIME,
+        type: STRING,
+        description: STRING,
+        fee: DECIMAL(6,2)
+      };
+
+      CREATE NODE User {
+        id: INTEGER,
+        username: STRING,
+        email: STRING,
+        join_date: DATE,
+        risk_score: DECIMAL(3,2),
+        verified: BOOLEAN
+      };
+
+      CREATE NODE Card {
+        id: INTEGER,
+        card_number: STRING,
+        expiry_date: DATE,
+        card_type: STRING,
+        credit_limit: DECIMAL(10,2),
+        current_balance: DECIMAL(10,2)
+      };
+
+      CREATE NODE Merchant {
+        id: INTEGER,
+        name: STRING,
+        category: STRING,
+        fee_percentage: DECIMAL(4,2),
+        country: STRING
+      };
+
+      CREATE EDGE OWNS {};
+      CREATE EDGE PERFORMED {channel: STRING};
+      CREATE EDGE USES {};
+      CREATE EDGE PROCESSED_BY {processing_fee: DECIMAL(6,2)};
+      CREATE EDGE LINKED_TO {};
+    expected_output:
+      contains: []
+
+  - command: "query"
+    args: ["-"]
+    stdin: |
+      // Create users
+      CREATE (u1:User {id: 1, username: 'john_doe', email: 'john@example.com', join_date: DATE '2020-01-15', risk_score: 0.2, verified: true})
+      CREATE (u2:User {id: 2, username: 'jane_smith', email: 'jane@example.com', join_date: DATE '2020-06-20', risk_score: 0.1, verified: true})
+      CREATE (u3:User {id: 3, username: 'bob_wilson', email: 'bob@example.com', join_date: DATE '2021-03-10', risk_score: 0.4, verified: false})
+      CREATE (u4:User {id: 4, username: 'alice_brown', email: 'alice@example.com', join_date: DATE '2021-09-05', risk_score: 0.3, verified: true})
+
+      // Create accounts
+      CREATE (a1:Account {id: 1, account_number: 'ACC001', balance: 15000.00, opened_date: DATE '2020-01-20', account_type: 'Checking', status: 'Active', interest_rate: 0.0100})
+      CREATE (a2:Account {id: 2, account_number: 'ACC002', balance: 50000.00, opened_date: DATE '2020-01-20', account_type: 'Savings', status: 'Active', interest_rate: 0.0250})
+      CREATE (a3:Account {id: 3, account_number: 'ACC003', balance: 8000.00, opened_date: DATE '2020-07-01', account_type: 'Checking', status: 'Active', interest_rate: 0.0100})
+      CREATE (a4:Account {id: 4, account_number: 'ACC004', balance: 25000.00, opened_date: DATE '2021-03-15', account_type: 'Savings', status: 'Active', interest_rate: 0.0200})
+      CREATE (a5:Account {id: 5, account_number: 'ACC005', balance: 3000.00, opened_date: DATE '2021-09-10', account_type: 'Checking', status: 'Active', interest_rate: 0.0050})
+
+      // Link users to accounts
+      MATCH (u1:User {id: 1}), (a1:Account {id: 1}), (a2:Account {id: 2})
+      CREATE (u1)-[:OWNS]->(a1)
+      CREATE (u1)-[:OWNS]->(a2)
+
+      MATCH (u2:User {id: 2}), (a3:Account {id: 3})
+      CREATE (u2)-[:OWNS]->(a3)
+
+      MATCH (u3:User {id: 3}), (a4:Account {id: 4})
+      CREATE (u3)-[:OWNS]->(a4)
+
+      MATCH (u4:User {id: 4}), (a5:Account {id: 5})
+      CREATE (u4)-[:OWNS]->(a5)
+
+      // Create cards
+      CREATE (c1:Card {id: 1, card_number: 'CARD001', expiry_date: DATE '2025-12-31', card_type: 'Credit', credit_limit: 10000.00, current_balance: 2500.00})
+      CREATE (c2:Card {id: 2, card_number: 'CARD002', expiry_date: DATE '2024-06-30', card_type: 'Debit', credit_limit: 0.00, current_balance: 0.00})
+      CREATE (c3:Card {id: 3, card_number: 'CARD003', expiry_date: DATE '2025-03-31', card_type: 'Credit', credit_limit: 5000.00, current_balance: 1200.00})
+
+      // Link cards to users
+      MATCH (u1:User {id: 1}), (c1:Card {id: 1}), (c2:Card {id: 2})
+      CREATE (u1)-[:USES]->(c1)
+      CREATE (u1)-[:USES]->(c2)
+
+      MATCH (u2:User {id: 2}), (c3:Card {id: 3})
+      CREATE (u2)-[:USES]->(c3)
+
+      // Create merchants
+      CREATE (m1:Merchant {id: 1, name: 'Amazon', category: 'E-commerce', fee_percentage: 2.5, country: 'USA'})
+      CREATE (m2:Merchant {id: 2, name: 'Starbucks', category: 'Food', fee_percentage: 1.8, country: 'USA'})
+      CREATE (m3:Merchant {id: 3, name: 'Shell', category: 'Gas', fee_percentage: 2.0, country: 'USA'})
+      CREATE (m4:Merchant {id: 4, name: 'Netflix', category: 'Entertainment', fee_percentage: 1.5, country: 'USA'})
+
+      // Create transactions with complex relationships
+      CREATE (t1:Transaction {id: 1, amount: 150.00, transaction_date: DATETIME '2023-04-01T10:30:00', type: 'Purchase', description: 'Online Shopping', fee: 3.75})
+      CREATE (t2:Transaction {id: 2, amount: 5.50, transaction_date: DATETIME '2023-04-02T08:15:00', type: 'Purchase', description: 'Coffee', fee: 0.10})
+      CREATE (t3:Transaction {id: 3, amount: 45.00, transaction_date: DATETIME '2023-04-03T18:45:00', type: 'Purchase', description: 'Gas', fee: 0.90})
+      CREATE (t4:Transaction {id: 4, amount: 1000.00, transaction_date: DATETIME '2023-04-04T14:00:00', type: 'Transfer', description: 'Account Transfer', fee: 0.00})
+      CREATE (t5:Transaction {id: 5, amount: 500.00, transaction_date: DATETIME '2023-04-05T09:30:00', type: 'Deposit', description: 'Salary Deposit', fee: 0.00})
+      CREATE (t6:Transaction {id: 6, amount: 15.99, transaction_date: DATETIME '2023-04-06T20:00:00', type: 'Purchase', description: 'Subscription', fee: 0.24})
+
+      // Link transactions
+      MATCH (a1:Account {id: 1}), (t1:Transaction {id: 1}), (t4:Transaction {id: 4}), (t5:Transaction {id: 5})
+      CREATE (a1)-[:PERFORMED {channel: 'Online'}]->(t1)
+      CREATE (a1)-[:PERFORMED {channel: 'Mobile'}]->(t4)
+      CREATE (a1)-[:PERFORMED {channel: 'ATM'}]->(t5)
+
+      MATCH (a3:Account {id: 3}), (t2:Transaction {id: 2}), (t3:Transaction {id: 3}), (t6:Transaction {id: 6})
+      CREATE (a3)-[:PERFORMED {channel: 'POS'}]->(t2)
+      CREATE (a3)-[:PERFORMED {channel: 'POS'}]->(t3)
+      CREATE (a3)-[:PERFORMED {channel: 'Online'}]->(t6)
+
+      // Link transactions to merchants
+      MATCH (t1:Transaction {id: 1}), (m1:Merchant {id: 1})
+      CREATE (t1)-[:PROCESSED_BY {processing_fee: 3.75}]->(m1)
+
+      MATCH (t2:Transaction {id: 2}), (m2:Merchant {id: 2})
+      CREATE (t2)-[:PROCESSED_BY {processing_fee: 0.10}]->(m2)
+
+      MATCH (t3:Transaction {id: 3}), (m3:Merchant {id: 3})
+      CREATE (t3)-[:PROCESSED_BY {processing_fee: 0.90}]->(m3)
+
+      MATCH (t6:Transaction {id: 6}), (m4:Merchant {id: 4})
+      CREATE (t6)-[:PROCESSED_BY {processing_fee: 0.24}]->(m4)
+    expected_output:
+      contains: []
+
+tests:
+  # Basic Chaining
+  - name: "Simple Pipeline - Filter then Transform"
+    command: "query"
+    args: ["MATCH (u:User)-[:OWNS]->(a:Account) WHERE u.verified = true WITH u, collect(a.balance) AS balances RETURN u.username, reduce(sum = 0, b IN balances | sum + b) AS total_balance ORDER BY total_balance DESC"]
+    expected_output:
+      contains:
+        - "john_doe"
+        - "65000"
+
+  - name: "Three-Stage Pipeline"
+    command: "query"
+    args: ["MATCH (a:Account)-[:PERFORMED]->(t:Transaction) WITH a, collect(t) AS transactions WITH a, transactions, size(transactions) AS trans_count WHERE trans_count > 2 RETURN a.account_number, trans_count"]
+    expected_output:
+      contains:
+        - "ACC001"
+        - "3"
+
+  # Method Chaining on Collections
+  - name: "Collection Operations Chain"
+    command: "query"
+    args: ["MATCH (u:User)-[:OWNS]->(a:Account) WITH u, collect(a) AS accounts RETURN u.username, reduce(s = 0, acc IN filter(a IN accounts WHERE a.account_type = 'Savings') | s + acc.balance) AS savings_total"]
+    expected_output:
+      contains:
+        - "john_doe"
+        - "50000"
+
+  - name: "Nested Collection Functions"
+    command: "query"
+    args: ["MATCH (t:Transaction) WITH t.type AS type, collect(t.amount) AS amounts RETURN type, reduce(sum = 0, a IN amounts | sum + a) AS total, reduce(cnt = 0, a IN amounts | cnt + 1) AS count, reduce(sum = 0, a IN amounts | sum + a) / reduce(cnt = 0, a IN amounts | cnt + 1) AS avg"]
+    expected_output:
+      contains:
+        - "Purchase"
+        - "Transfer"
+        - "Deposit"
+
+  # Complex Aggregation Chains
+  - name: "Multi-Level Aggregation Pipeline"
+    command: "query"
+    args: ["MATCH (u:User)-[:OWNS]->(a:Account)-[:PERFORMED]->(t:Transaction) WITH u, a, sum(t.amount) AS account_total WITH u, collect({account: a.account_number, total: account_total}) AS account_summaries WITH u, account_summaries, reduce(s = 0, summary IN account_summaries | s + summary.total) AS user_total RETURN u.username, size(account_summaries) AS num_accounts, user_total"]
+    expected_output:
+      pattern: "\\w+.*\\d+"
+
+  - name: "Aggregation with Filtering Chain"
+    command: "query"
+    args: ["MATCH (t:Transaction)-[:PROCESSED_BY]->(m:Merchant) WITH m.category AS category, collect(t) AS transactions WITH category, filter(t IN transactions WHERE t.amount > 20) AS large_trans WITH category, reduce(s = 0, t IN large_trans | s + t.amount) AS total WHERE total > 0 RETURN category, total ORDER BY total DESC"]
+    expected_output:
+      contains:
+        - "E-commerce"
+        - "Gas"
+
+  # Path-Based Chaining
+  - name: "Path Collection and Analysis"
+    command: "query"
+    args: ["MATCH path = (u:User)-[:OWNS]->(:Account)-[:PERFORMED]->(:Transaction) WITH u, collect(path) AS paths WITH u, paths, reduce(total = 0, p IN paths | total + length(p)) AS total_path_length RETURN u.username, size(paths) AS num_paths, total_path_length"]
+    expected_output:
+      pattern: "\\w+.*\\d+"
+
+  - name: "Variable Length Path Chaining"
+    command: "query"
+    args: ["MATCH path = (u:User)-[*1..3]->() WITH u, collect(DISTINCT last(nodes(path))) AS reached_nodes WITH u, [n IN reached_nodes WHERE n:Transaction] AS transactions RETURN u.username, size(transactions) AS reachable_transactions"]
+    expected_output:
+      pattern: "\\w+.*\\d+"
+
+  # String Manipulation Chains
+  - name: "String Function Chaining"
+    command: "query"
+    args: ["MATCH (u:User) WITH u, upper(substring(u.username, 1, 1)) + lower(substring(u.username, 2)) AS formatted_name WITH formatted_name, replace(formatted_name, '_', ' ') AS display_name RETURN display_name ORDER BY display_name"]
+    expected_output:
+      contains:
+        - "Alice brown"
+        - "Bob wilson"
+        - "Jane smith"
+        - "John doe"
+
+  - name: "Complex String Pipeline"
+    command: "query"
+    args: ["MATCH (m:Merchant) WITH m.name AS name, lower(m.category) AS category WITH name + ' (' + category + ')' AS formatted, length(name) AS name_length WHERE name_length > 5 RETURN formatted ORDER BY name_length DESC"]
+    expected_output:
+      contains:
+        - "Starbucks (food)"
+        - "Netflix (entertainment)"
+
+  # Mathematical Operation Chains
+  - name: "Math Function Chaining"
+    command: "query"
+    args: ["MATCH (a:Account) WITH a, a.balance * a.interest_rate AS interest WITH a.account_number AS account, round(interest, 2) AS monthly_interest WITH account, monthly_interest * 12 AS annual_interest WHERE annual_interest > 100 RETURN account, annual_interest ORDER BY annual_interest DESC"]
+    expected_output:
+      contains:
+        - "ACC002"
+        - "ACC004"
+
+  - name: "Statistical Calculation Chain"
+    command: "query"
+    args: ["MATCH (t:Transaction) WHERE t.type = 'Purchase' WITH collect(t.amount) AS amounts WITH amounts, reduce(s = 0, a IN amounts | s + a) / size(amounts) AS mean WITH amounts, mean, reduce(s = 0, a IN amounts | s + (a - mean) * (a - mean)) / size(amounts) AS variance RETURN mean, sqrt(variance) AS std_dev"]
+    expected_output:
+      pattern: "\\d+\\.\\d+"
+
+  # Date/Time Operation Chains
+  - name: "Date Manipulation Chain"
+    command: "query"
+    args: ["MATCH (a:Account) WITH a, duration.between(a.opened_date, date()) AS age WITH a.account_number AS account, age.years AS years, age.months AS months WHERE years > 2 OR (years = 2 AND months > 0) RETURN account, years * 12 + months AS total_months ORDER BY total_months DESC"]
+    expected_output:
+      pattern: "ACC\\d+.*\\d+"
+
+  - name: "Temporal Aggregation Chain"
+    command: "query"
+    args: ["MATCH (t:Transaction) WITH date(t.transaction_date) AS trans_date, collect(t) AS daily_trans WITH trans_date, size(daily_trans) AS count, reduce(s = 0, t IN daily_trans | s + t.amount) AS total RETURN trans_date, count, total ORDER BY trans_date"]
+    expected_output:
+      pattern: "\\d{4}-\\d{2}-\\d{2}"
+
+  # Conditional Chaining
+  - name: "CASE Chain Operations"
+    command: "query"
+    args: ["MATCH (u:User) WITH u, CASE WHEN u.risk_score < 0.2 THEN 'Low' WHEN u.risk_score < 0.4 THEN 'Medium' ELSE 'High' END AS risk_category WITH risk_category, collect(u.username) AS users WITH risk_category, users, size(users) AS count RETURN risk_category, count ORDER BY count DESC"]
+    expected_output:
+      contains:
+        - "Low"
+        - "Medium"
+        - "High"
+
+  - name: "Nested CASE Chaining"
+    command: "query"
+    args: ["MATCH (a:Account) WITH a, CASE WHEN a.balance > 20000 THEN CASE WHEN a.account_type = 'Savings' THEN 'High-Value Savings' ELSE 'High-Value Checking' END ELSE CASE WHEN a.balance > 5000 THEN 'Medium-Value' ELSE 'Low-Value' END END AS category WITH category, count(a) AS num_accounts RETURN category, num_accounts ORDER BY num_accounts DESC"]
+    expected_output:
+      contains:
+        - "High-Value"
+        - "Medium-Value"
+        - "Low-Value"
+
+  # Complex Multi-Stage Pipelines
+  - name: "Five-Stage Analysis Pipeline"
+    command: "query"
+    args: ["MATCH (u:User)-[:OWNS]->(a:Account)-[:PERFORMED]->(t:Transaction) WITH u, a, t WHERE t.type = 'Purchase' WITH u, a, sum(t.amount) AS purchase_total WITH u, collect({account: a.account_number, purchases: purchase_total}) AS account_data WITH u, account_data, reduce(s = 0, data IN account_data | s + data.purchases) AS user_total WHERE user_total > 100 WITH u.username AS username, user_total, size(account_data) AS num_accounts RETURN username, user_total, num_accounts, user_total / num_accounts AS avg_per_account"]
+    expected_output:
+      pattern: "\\w+"
+
+  - name: "Cross-Product Pipeline"
+    command: "query"
+    args: ["MATCH (u1:User), (u2:User) WHERE u1.id < u2.id WITH u1, u2, abs(u1.risk_score - u2.risk_score) AS risk_diff WHERE risk_diff < 0.15 WITH u1.username AS user1, u2.username AS user2, risk_diff WITH user1, collect({peer: user2, diff: risk_diff}) AS peers WHERE size(peers) > 0 RETURN user1, size(peers) AS num_similar_risk_peers"]
+    expected_output:
+      pattern: "\\w+"
+
+  # Recursive Chaining
+  - name: "Recursive Aggregation Chain"
+    command: "query"
+    args: ["MATCH (a:Account) WITH collect(a) AS accounts WITH accounts, reduce(balances = [], acc IN accounts | balances + [acc.balance]) AS all_balances WITH all_balances, reduce(sum = 0, b IN all_balances | sum + b) AS total, size(all_balances) AS count RETURN total / count AS average_balance"]
+    expected_output:
+      pattern: "\\d+"
+
+  - name: "Nested Reduce Operations"
+    command: "query"
+    args: ["MATCH (t:Transaction) WITH t.type AS type, collect({amount: t.amount, fee: t.fee}) AS transactions WITH type, reduce(result = {total: 0, fees: 0}, t IN transactions | {total: result.total + t.amount, fees: result.fees + t.fee}) AS summary RETURN type, summary.total AS total_amount, summary.fees AS total_fees"]
+    expected_output:
+      contains:
+        - "Purchase"
+        - "Transfer"
+
+  # Window Function Chains (if supported)
+  - name: "Window Function Pipeline"
+    command: "query"
+    args: ["MATCH (a:Account) WITH a, a.balance, rank() OVER (ORDER BY a.balance DESC) AS balance_rank WITH a.account_number AS account, balance_rank WHERE balance_rank <= 3 WITH account, balance_rank, CASE balance_rank WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' ELSE 'Bronze' END AS tier RETURN account, tier"]
+    expected_output:
+      contains:
+        - "Gold"
+        - "Silver"
+        - "Bronze"
+
+  - name: "Cumulative Window Chain"
+    command: "query"
+    args: ["MATCH (t:Transaction) WITH t, sum(t.amount) OVER (ORDER BY t.transaction_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total WITH t.transaction_date AS date, t.amount AS amount, running_total WHERE running_total > 500 WITH date, amount, running_total, running_total - amount AS previous_total RETURN date, amount, previous_total, running_total"]
+    expected_output:
+      pattern: "\\d+"
+
+  # Ultra-Complex Chaining
+  - name: "Ten-Stage Transformation Pipeline"
+    command: "query"
+    args: ["MATCH (u:User) WITH u WHERE u.verified = true WITH u, duration.between(u.join_date, date()).months AS months_member WITH u, months_member WHERE months_member > 12 MATCH (u)-[:OWNS]->(a:Account) WITH u, collect(a) AS accounts WITH u, accounts, reduce(total = 0, a IN accounts | total + a.balance) AS total_balance WHERE total_balance > 10000 MATCH (u)-[:USES]->(c:Card) WITH u, total_balance, collect(c) AS cards WITH u, total_balance, cards, reduce(credit = 0, c IN filter(card IN cards WHERE card.card_type = 'Credit') | credit + card.credit_limit) AS total_credit WITH u.username AS username, total_balance, total_credit, total_balance / CASE WHEN total_credit > 0 THEN total_credit ELSE 1 END AS utilization WITH username, utilization WHERE utilization < 0.5 WITH username, round(utilization * 100, 2) AS utilization_percent RETURN username, utilization_percent ORDER BY utilization_percent"]
+    expected_output:
+      pattern: "\\w+"
+
+  - name: "Complex Join and Transform Chain"
+    command: "query"
+    args: ["MATCH (t1:Transaction), (t2:Transaction) WHERE t1.id < t2.id AND abs(duration.between(t1.transaction_date, t2.transaction_date).hours) < 24 WITH t1, t2, abs(t1.amount - t2.amount) AS amount_diff WHERE amount_diff < 10 WITH t1.id AS id1, t2.id AS id2, amount_diff WITH collect({pair: [id1, id2], diff: amount_diff}) AS similar_pairs WITH similar_pairs, reduce(min_diff = 999999, pair IN similar_pairs | CASE WHEN pair.diff < min_diff THEN pair.diff ELSE min_diff END) AS smallest_diff WHERE smallest_diff < 999999 WITH [pair IN similar_pairs WHERE pair.diff = smallest_diff][0] AS closest_pair RETURN closest_pair.pair AS transaction_ids, closest_pair.diff AS difference"]
+    expected_output:
+      pattern: "\\d"
+
+cleanup:
+  - command: "query"
+    args: ["-"]
+    stdin: "DROP SCHEMA chained_ops CASCADE;"
+    expected_output:
+      contains: []

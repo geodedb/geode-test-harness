@@ -1,0 +1,275 @@
+# Vector IndexOptimizer Integration Test Specification
+# Tests advanced cost estimation, query optimization, and statistics integration
+
+metadata:
+  version: "1.0"
+  description: "Vector IndexOptimizer integration testing with cost estimation and statistics"
+  created: "2025-10-04"
+  updated: "2025-10-04"
+  category: "vector-optimizer"
+  priority: "high"
+
+# Test configuration
+config:
+  timeout: 45
+  retries: 2
+  setup_commands: []
+  teardown_commands: []
+
+tests:
+  # Test 1: Vector Index Creation with Statistics Initialization
+  - name: "vector_index_statistics_initialization"
+    description: "Test vector index creation initializes statistics correctly"
+    command: ["geode", "query"]
+    input: |
+      CREATE INDEX embedding_stats_idx ON Document (embedding) USING vector_f32
+    expected_patterns:
+      - "Index created successfully"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 2: HNSW Index Creation with Dimension Tracking
+  - name: "hnsw_index_dimension_tracking"
+    description: "Test HNSW index creation with proper dimension parameter tracking"
+    command: ["geode", "query"]
+    input: |
+      CREATE INDEX hnsw_128d_idx ON Document (embedding) USING vector_hnsw
+    expected_patterns:
+      - "Index created successfully"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 3: Vector Query Cost Estimation Test
+  - name: "vector_query_cost_estimation"
+    description: "Test EXPLAIN output shows vector query cost estimation"
+    command: ["geode", "query"]
+    input: |
+      CREATE (doc1:Document {title: 'Test Doc 1', embedding: vectorf32('[0.1, 0.2, 0.3, 0.4]')})
+      CREATE (doc2:Document {title: 'Test Doc 2', embedding: vectorf32('[0.5, 0.6, 0.7, 0.8]')})
+      CREATE (doc3:Document {title: 'Test Doc 3', embedding: vectorf32('[0.2, 0.4, 0.6, 0.8]')})
+      EXPLAIN MATCH (d:Document)
+      WHERE vector_cosine(d.embedding, vectorf32('[0.5, 0.5, 0.5, 0.5]')) > 0.8
+      RETURN d.title
+    expected_patterns:
+      - "Query Plan"
+      - "cost"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 4: Distance Metric Cost Factor Verification
+  - name: "distance_metric_cost_factors"
+    description: "Test that different distance metrics show different cost estimates"
+    command: ["geode", "query"]
+    input: |
+      CREATE (v1:Vector {data: vectorf32('[1.0, 2.0, 3.0, 4.0]')})
+      CREATE (v2:Vector {data: vectorf32('[2.0, 3.0, 4.0, 5.0]')})
+      EXPLAIN MATCH (v:Vector)
+      WHERE vector_l2(v.data, vectorf32('[1.0, 2.0, 3.0, 4.0]')) < 2.0
+      RETURN v
+    expected_patterns:
+      - "Query Plan"
+      - "Vector"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 5: K-NN Query Optimization Test
+  - name: "knn_query_optimization"
+    description: "Test K-NN query optimization with EXPLAIN output"
+    command: ["geode", "query"]
+    input: |
+      CREATE (item1:Item {features: vectorf32('[0.1, 0.2, 0.3]')})
+      CREATE (item2:Item {features: vectorf32('[0.4, 0.5, 0.6]')})
+      CREATE (item3:Item {features: vectorf32('[0.7, 0.8, 0.9]')})
+      CREATE (item4:Item {features: vectorf32('[0.2, 0.4, 0.6]')})
+      CREATE (item5:Item {features: vectorf32('[0.3, 0.6, 0.9]')})
+      EXPLAIN MATCH (i:Item)
+      WHERE vector_cosine(i.features, vectorf32('[0.5, 0.5, 0.5]')) > 0.7
+      RETURN i
+      ORDER BY vector_cosine(i.features, vectorf32('[0.5, 0.5, 0.5]')) DESC
+      LIMIT 3
+    expected_patterns:
+      - "Query Plan"
+      - "cost"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 6: Vector Index vs Sequential Scan Decision
+  - name: "vector_index_vs_sequential_decision"
+    description: "Test optimizer chooses between vector index and sequential scan"
+    command: ["geode", "query"]
+    input: |
+      CREATE INDEX opt_test_idx ON TestVector (data) USING vector_f32;
+      CREATE (tv1:TestVector {data: vectorf32('[1.0, 1.0]')})
+      CREATE (tv2:TestVector {data: vectorf32('[2.0, 2.0]')})
+      EXPLAIN MATCH (tv:TestVector)
+      WHERE vector_l2(tv.data, vectorf32('[1.5, 1.5]')) < 1.0
+      RETURN tv
+    expected_patterns:
+      - "Query Plan"
+      - "TestVector"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 7: Multiple Distance Metrics in Single Query
+  - name: "multiple_distance_metrics_optimization"
+    description: "Test optimization with multiple distance metrics in one query"
+    command: ["geode", "query"]
+    input: |
+      CREATE (multi:MultiVector {
+        dense: vectorf32('[0.8, 0.6, 0.4]'),
+        sparse: vectori32('[1, 0, 1, 0, 1]')
+      })
+      EXPLAIN MATCH (m:MultiVector)
+      WHERE vector_cosine(m.dense, vectorf32('[1.0, 0.0, 0.0]')) > 0.5
+        AND manhattan_distance(m.sparse, vectori32('[1, 1, 0, 0, 1]')) < 3
+      RETURN m
+    expected_patterns:
+      - "Query Plan"
+      - "MultiVector"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 8: Vector Aggregation Query Optimization
+  - name: "vector_aggregation_optimization"
+    description: "Test optimization of queries with vector aggregation operations"
+    command: ["geode", "query"]
+    input: |
+      CREATE (agg1:AggTest {group: 'A', vec: vectorf32('[1.0, 1.0]')})
+      CREATE (agg2:AggTest {group: 'A', vec: vectorf32('[1.1, 0.9]')})
+      CREATE (agg3:AggTest {group: 'B', vec: vectorf32('[5.0, 5.0]')})
+      EXPLAIN MATCH (a:AggTest)
+      WITH a.group AS grp,
+           AVG(vector_l2(a.vec, vectorf32('[0.0, 0.0]'))) AS avg_dist
+      RETURN grp, avg_dist
+      ORDER BY avg_dist
+    expected_patterns:
+      - "Query Plan"
+      - "AggTest"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 9: Vector Index Statistics Recording
+  - name: "vector_index_statistics_recording"
+    description: "Test that vector queries record statistics for optimization"
+    command: ["geode", "query"]
+    input: |
+      CREATE INDEX stats_tracking_idx ON StatsTest (vector_data) USING vector_f32;
+      CREATE (st1:StatsTest {id: 1, vector_data: vectorf32('[0.1, 0.2, 0.3]')})
+      CREATE (st2:StatsTest {id: 2, vector_data: vectorf32('[0.4, 0.5, 0.6]')})
+      CREATE (st3:StatsTest {id: 3, vector_data: vectorf32('[0.7, 0.8, 0.9]')})
+      MATCH (st:StatsTest)
+      WHERE vector_cosine(st.vector_data, vectorf32('[0.5, 0.5, 0.5]')) > 0.8
+      RETURN st.id, vector_cosine(st.vector_data, vectorf32('[0.5, 0.5, 0.5]')) AS similarity
+      ORDER BY similarity DESC
+    expected_patterns:
+      - "id"
+      - "similarity"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 10: Vector Query Performance Scaling
+  - name: "vector_query_performance_scaling"
+    description: "Test vector query performance with increasing dataset size"
+    command: ["geode", "query"]
+    input: |
+      CREATE (scale1:ScaleTest {id: 1, vec: vectorf32('[0.1, 0.1, 0.1]')})
+      CREATE (scale2:ScaleTest {id: 2, vec: vectorf32('[0.2, 0.2, 0.2]')})
+      CREATE (scale3:ScaleTest {id: 3, vec: vectorf32('[0.3, 0.3, 0.3]')})
+      CREATE (scale4:ScaleTest {id: 4, vec: vectorf32('[0.4, 0.4, 0.4]')})
+      CREATE (scale5:ScaleTest {id: 5, vec: vectorf32('[0.5, 0.5, 0.5]')})
+      CREATE (scale6:ScaleTest {id: 6, vec: vectorf32('[0.6, 0.6, 0.6]')})
+      CREATE (scale7:ScaleTest {id: 7, vec: vectorf32('[0.7, 0.7, 0.7]')})
+      CREATE (scale8:ScaleTest {id: 8, vec: vectorf32('[0.8, 0.8, 0.8]')})
+      CREATE (scale9:ScaleTest {id: 9, vec: vectorf32('[0.9, 0.9, 0.9]')})
+      CREATE (scale10:ScaleTest {id: 10, vec: vectorf32('[1.0, 1.0, 1.0]')})
+      MATCH (s:ScaleTest)
+      WHERE vector_l2(s.vec, vectorf32('[0.5, 0.5, 0.5]')) < 0.3
+      RETURN COUNT(s) AS nearby_vectors
+    expected_patterns:
+      - "nearby_vectors"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 11: Mixed Vector and Non-Vector Query Optimization
+  - name: "mixed_vector_nonvector_optimization"
+    description: "Test optimization of queries mixing vector and traditional operations"
+    command: ["geode", "query"]
+    input: |
+      CREATE (mixed1:MixedTest {
+        name: 'Item A',
+        category: 'electronics',
+        price: 100.50,
+        features: vectorf32('[0.8, 0.2, 0.6]')
+      })
+      CREATE (mixed2:MixedTest {
+        name: 'Item B',
+        category: 'electronics',
+        price: 200.75,
+        features: vectorf32('[0.6, 0.8, 0.4]')
+      })
+      EXPLAIN MATCH (m:MixedTest)
+      WHERE m.category = 'electronics'
+        AND m.price < 150.0
+        AND vector_cosine(m.features, vectorf32('[1.0, 0.0, 0.5]')) > 0.7
+      RETURN m.name, m.price
+    expected_patterns:
+      - "Query Plan"
+      - "MixedTest"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 12: Vector Index Recommendation System
+  - name: "vector_index_recommendations"
+    description: "Test vector index usage recommendations based on query patterns"
+    command: ["geode", "query"]
+    input: |
+      CREATE INDEX rec_test_idx ON RecommendTest (embedding) USING vector_hnsw;
+      CREATE (rec1:RecommendTest {item: 'A', embedding: vectorf32('[0.9, 0.1, 0.5]')})
+      CREATE (rec2:RecommendTest {item: 'B', embedding: vectorf32('[0.1, 0.9, 0.3]')})
+      CREATE (rec3:RecommendTest {item: 'C', embedding: vectorf32('[0.5, 0.5, 0.9]')})
+      MATCH (r:RecommendTest)
+      WHERE vector_cosine(r.embedding, vectorf32('[0.8, 0.2, 0.4]')) > 0.6
+      RETURN r.item, vector_cosine(r.embedding, vectorf32('[0.8, 0.2, 0.4]')) AS score
+      ORDER BY score DESC
+      LIMIT 2
+    expected_patterns:
+      - "item"
+      - "score"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+# Summary and reporting
+summary:
+  total_tests: 12
+  categories:
+    - statistics_integration: 3
+    - cost_estimation: 4
+    - optimization_decisions: 3
+    - performance_scaling: 2
+  estimated_runtime: "8-12 minutes"
+
+# Performance benchmarks
+benchmarks:
+  - name: "vector_index_creation_with_stats"
+    description: "Vector index creation with statistics initialization"
+    target_time_ms: 200
+
+  - name: "vector_cost_estimation_speed"
+    description: "Vector query cost estimation performance"
+    target_time_ms: 50
+
+  - name: "vector_optimization_decision_speed"
+    description: "Vector optimization decision-making performance"
+    target_time_ms: 10

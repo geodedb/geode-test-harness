@@ -1,0 +1,582 @@
+version: "1.0"
+name: "Shell Extended Tests"
+description: "Extended enterprise tests from enterprise_test_extended.gql covering edge cases, boundary conditions, complex patterns, and stress testing"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+secrets:
+  admin_password:
+    source: "env"
+    key: "GEODE_ADMIN_PASSWORD"
+    required: false
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+
+tests:
+  # Section 1: Extended Schema Setup
+  - name: "create-extended-corp-graph"
+    description: "Create extended_corp graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "CREATE GRAPH IF NOT EXISTS extended_corp;"
+    expect:
+      exit_code: 0
+    tags: ["graph", "create"]
+
+  - name: "create-extended-inventory-graph"
+    description: "Create extended_inventory graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "CREATE GRAPH IF NOT EXISTS extended_inventory;"
+    expect:
+      exit_code: 0
+    tags: ["graph", "create"]
+
+  - name: "create-extended-social-graph"
+    description: "Create extended_social graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "CREATE GRAPH IF NOT EXISTS extended_social;"
+    expect:
+      exit_code: 0
+    tags: ["graph", "create"]
+
+  - name: "setup-corp-departments"
+    description: "Create departments with various budget levels"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_corp;
+      MATCH (n) DETACH DELETE n;
+      CREATE (:Department {name: 'Engineering', budget: 10000000, location: 'Building A', active: true});
+      CREATE (:Department {name: 'Sales', budget: 5000000, location: 'Building B', active: true});
+      CREATE (:Department {name: 'NewDept', budget: 0, location: 'Building E', active: true});
+    expect:
+      exit_code: 0
+    tags: ["create", "department"]
+
+  - name: "setup-corp-employees"
+    description: "Create employees with various salary levels"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_corp;
+      CREATE (:Employee {id: 'E001', name: 'Alice Chen', department: 'Engineering', salary: 150000, level: 5, active: true});
+      CREATE (:Employee {id: 'E002', name: 'Bob Williams', department: 'Engineering', salary: 130000, level: 4, active: true});
+      CREATE (:Employee {id: 'E006', name: 'Fiona Garcia', department: 'Sales', salary: 120000, level: 5, active: true});
+      CREATE (:Employee {id: 'E024', name: 'Xavier Rich', department: 'Engineering', salary: 500000, level: 6, active: true});
+      CREATE (:Employee {id: 'E025', name: 'Yolanda Min', department: 'Support', salary: 35000, level: 1, active: true});
+    expect:
+      exit_code: 0
+    tags: ["create", "employee"]
+
+  - name: "setup-corp-projects"
+    description: "Create projects"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_corp;
+      CREATE (:Project {name: 'AI Initiative', budget: 2000000, status: 'active'});
+      CREATE (:Project {name: 'Legacy Cleanup', budget: 0, status: 'cancelled'});
+    expect:
+      exit_code: 0
+    tags: ["create", "project"]
+
+  # Section 2: Empty Results and Boundary Conditions
+  - name: "empty-result-nonexistent-dept"
+    description: "Query that returns no results"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee {department: 'NonExistent'}) RETURN e.name AS name;"
+    expect:
+      exit_code: 0
+    tags: ["empty", "edge-case"]
+
+  - name: "filter-excludes-all"
+    description: "Filter that excludes all results"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WHERE e.salary > 1000000 RETURN e.name AS millionaires;"
+    expect:
+      exit_code: 0
+    tags: ["filter", "edge-case"]
+
+  - name: "limit-zero"
+    description: "LIMIT 0 edge case"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN e.name LIMIT 0;"
+    expect:
+      exit_code: 0
+    tags: ["limit", "edge-case"]
+
+  - name: "skip-beyond-count"
+    description: "SKIP beyond result count"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN e.name ORDER BY e.salary DESC SKIP 100 LIMIT 10;"
+    expect:
+      exit_code: 0
+    tags: ["skip", "edge-case"]
+
+  # Section 3: Complex Aggregation Edge Cases
+  - name: "aggregation-empty-group"
+    description: "Aggregation on empty group"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee {department: 'Support', active: false}) RETURN count(*) AS active_support, sum(e.salary) AS total_salary;"
+    expect:
+      exit_code: 0
+    tags: ["aggregation", "empty"]
+
+  - name: "multiple-aggregations-groupby"
+    description: "Multiple aggregations with GROUP BY"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WHERE e.active = true RETURN e.department AS dept, count(*) AS total, sum(e.salary) AS sum_sal, avg(e.salary) AS avg_sal, min(e.salary) AS min_sal, max(e.salary) AS max_sal GROUP BY e.department ORDER BY sum_sal DESC;"
+    expect:
+      exit_code: 0
+    tags: ["aggregation", "groupby"]
+
+  - name: "aggregation-zero-values"
+    description: "Aggregation with zero values"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (d:Department) RETURN d.name, d.budget, CASE WHEN d.budget = 0 THEN 'No Budget' ELSE 'Has Budget' END AS status ORDER BY d.budget ASC;"
+    expect:
+      exit_code: 0
+    tags: ["aggregation", "case"]
+
+  - name: "count-distinct-types"
+    description: "COUNT DISTINCT on various types"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN count(DISTINCT e.department) AS unique_depts, count(DISTINCT e.level) AS unique_levels;"
+    expect:
+      exit_code: 0
+    tags: ["aggregation", "distinct"]
+
+  # Section 4: Complex WITH Clause Chains
+  - name: "triple-with-chain"
+    description: "Triple WITH chain"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WITH e.department AS dept, count(*) AS cnt, avg(e.salary) AS avg WITH dept, cnt, avg WHERE cnt >= 1 WITH dept, cnt, avg, cnt * avg AS dept_impact RETURN dept, cnt, avg, dept_impact ORDER BY dept_impact DESC;"
+    expect:
+      exit_code: 0
+    tags: ["with", "chain"]
+
+  - name: "with-aggregation-filter"
+    description: "WITH + aggregation + filter"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WITH e.department AS dept, sum(e.salary) AS total_sal WITH dept, total_sal WHERE total_sal > 100000 RETURN count(*) AS high_payroll_depts, sum(total_sal) AS combined_payroll;"
+    expect:
+      exit_code: 0
+    tags: ["with", "aggregation"]
+
+  - name: "with-rename-chain"
+    description: "WITH changing column names through chain"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WITH e.name AS original_name, e.salary AS original_salary WITH original_name AS employee, original_salary AS pay WITH employee AS person, pay AS compensation RETURN person, compensation ORDER BY compensation DESC LIMIT 5;"
+    expect:
+      exit_code: 0
+    tags: ["with", "rename"]
+
+  # Section 5: ORDER BY Edge Cases
+  - name: "orderby-computed-alias"
+    description: "ORDER BY on computed expression using ALIAS"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN e.name, e.salary, e.level, e.salary / e.level AS salary_per_level ORDER BY salary_per_level DESC LIMIT 5;"
+    expect:
+      exit_code: 0
+    tags: ["orderby", "computed"]
+
+  - name: "orderby-multiple-directions"
+    description: "ORDER BY with multiple directions"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN e.department, e.level, e.salary, e.name ORDER BY e.department ASC, e.level DESC, e.salary DESC, e.name ASC;"
+    expect:
+      exit_code: 0
+    tags: ["orderby", "multiple"]
+
+  - name: "orderby-aggregated-alias"
+    description: "ORDER BY on aggregated column ALIAS"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN e.department AS dept, avg(e.salary) AS avg_salary GROUP BY e.department ORDER BY avg_salary ASC;"
+    expect:
+      exit_code: 0
+    tags: ["orderby", "aggregation"]
+
+  # Section 6: Multi-MATCH Complex Patterns
+  - name: "triple-match-aggregation"
+    description: "Triple MATCH with aggregation"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (d:Department) MATCH (e:Employee) MATCH (p:Project) WHERE e.department = d.name RETURN d.name AS dept, count(DISTINCT e) AS employees GROUP BY d.name ORDER BY employees DESC;"
+    expect:
+      exit_code: 0
+    tags: ["match", "multi"]
+
+  # Section 9: NULL Handling Edge Cases
+  - name: "coalesce-chain"
+    description: "COALESCE chain"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) OPTIONAL MATCH (e)-[:REPORTS_TO]->(m:Employee) RETURN e.name, coalesce(m.name, 'No Manager') AS manager;"
+    expect:
+      exit_code: 0
+    tags: ["null", "coalesce"]
+
+  - name: "null-arithmetic"
+    description: "NULL in arithmetic propagates"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) OPTIONAL MATCH (e)-[:REPORTS_TO]->(m:Employee) RETURN e.name, m.salary AS manager_salary, m.salary + 1000 AS manager_salary_plus ORDER BY e.name LIMIT 5;"
+    expect:
+      exit_code: 0
+    tags: ["null", "arithmetic"]
+
+  - name: "is-null-filter"
+    description: "IS NULL filter"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) OPTIONAL MATCH (e)-[:REPORTS_TO]->(m:Employee) WHERE m IS NULL RETURN e.name AS top_level ORDER BY e.name;"
+    expect:
+      exit_code: 0
+    tags: ["null", "filter"]
+
+  # Section 10: CASE Expression Edge Cases
+  - name: "nested-case"
+    description: "Nested CASE expressions"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_corp;
+      MATCH (e:Employee)
+      RETURN e.name,
+             CASE
+                 WHEN e.salary >= 140000 THEN
+                     CASE WHEN e.level >= 5 THEN 'Executive' ELSE 'Senior Expert' END
+                 WHEN e.salary >= 100000 THEN 'Senior'
+                 ELSE 'Junior'
+             END AS tier;
+    expect:
+      exit_code: 0
+    tags: ["case", "nested"]
+
+  - name: "case-in-aggregation"
+    description: "CASE in aggregation"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN e.department, sum(CASE WHEN e.active = true THEN 1 ELSE 0 END) AS active_count GROUP BY e.department ORDER BY active_count DESC;"
+    expect:
+      exit_code: 0
+    tags: ["case", "aggregation"]
+
+  # Section 11: Set Operations Edge Cases
+  - name: "union-empty-set"
+    description: "UNION with empty set"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee {department: 'NonExistent'}) RETURN e.name AS person UNION MATCH (e:Employee {department: 'Engineering'}) RETURN e.name AS person;"
+    expect:
+      exit_code: 0
+    tags: ["set", "union"]
+
+  - name: "intersect-subset"
+    description: "INTERSECT with subset relationship"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WHERE e.salary > 100000 RETURN e.name AS person INTERSECT MATCH (e:Employee) WHERE e.salary > 120000 RETURN e.name AS person;"
+    expect:
+      exit_code: 0
+    tags: ["set", "intersect"]
+
+  - name: "except-all-from-set"
+    description: "EXCEPT all from set"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee {department: 'Engineering'}) RETURN e.name AS person EXCEPT MATCH (e:Employee {department: 'Engineering'}) RETURN e.name AS person;"
+    expect:
+      exit_code: 0
+    tags: ["set", "except"]
+
+  # Section 12: String Edge Cases
+  - name: "empty-string-ops"
+    description: "Empty string operations"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN '' AS empty_string, size('') AS empty_size;"
+    expect:
+      exit_code: 0
+    tags: ["string", "empty"]
+
+  - name: "case-insensitive-compare"
+    description: "Case-insensitive comparison"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WHERE lower(e.department) = 'engineering' RETURN count(*) AS eng_count;"
+    expect:
+      exit_code: 0
+    tags: ["string", "compare"]
+
+  # Section 13: Numeric Edge Cases
+  - name: "negative-numbers"
+    description: "Negative numbers in expressions"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN -100 AS negative, abs(-100) AS absolute, sign(-100) AS sign_val;"
+    expect:
+      exit_code: 0
+    tags: ["numeric", "negative"]
+
+  - name: "large-number"
+    description: "Large number handling"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 9999999999 AS large_num, 9999999999 * 2 AS doubled;"
+    expect:
+      exit_code: 0
+    tags: ["numeric", "large"]
+
+  - name: "zero-handling"
+    description: "Zero handling"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 0 AS zero, 0 + 1 AS zero_plus_one, 100 - 100 AS difference_zero;"
+    expect:
+      exit_code: 0
+    tags: ["numeric", "zero"]
+
+  - name: "modulo-division"
+    description: "Modulo and integer division"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 10 % 3 AS modulo_result, 10 / 3 AS integer_div;"
+    expect:
+      exit_code: 0
+    tags: ["numeric", "modulo"]
+
+  # Section 14: List Edge Cases
+  - name: "empty-list-ops"
+    description: "Empty list operations"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [] AS empty_list, size([]) AS empty_size;"
+    expect:
+      exit_code: 0
+    tags: ["list", "empty"]
+
+  - name: "single-element-list"
+    description: "Single element list"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [42] AS single, head([42]) AS single_head, tail([42]) AS single_tail;"
+    expect:
+      exit_code: 0
+    tags: ["list", "single"]
+
+  - name: "list-index-access"
+    description: "List index edge cases"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [1,2,3,4,5][0] AS first, [1,2,3,4,5][4] AS last_valid;"
+    expect:
+      exit_code: 0
+    tags: ["list", "index"]
+
+  - name: "list-slicing"
+    description: "List slicing edge cases"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [1,2,3,4,5][0..1] AS first_one, [1,2,3,4,5][0..5] AS all_elements;"
+    expect:
+      exit_code: 0
+    tags: ["list", "slice"]
+
+  - name: "in-predicate-empty"
+    description: "IN predicate with empty list"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 1 IN [] AS in_empty;"
+    expect:
+      exit_code: 0
+    tags: ["list", "in"]
+
+  # Section 16: Graph Isolation Verification
+  - name: "setup-inventory-graph"
+    description: "Setup inventory graph for isolation test"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_inventory;
+      MATCH (n) DETACH DELETE n;
+      CREATE (:Product {sku: 'SKU001', name: 'Widget A', price: 100, stock: 500});
+      CREATE (:Product {sku: 'SKU002', name: 'Widget B', price: 150, stock: 300});
+      CREATE (:Warehouse {id: 'WH01', location: 'East', capacity: 10000});
+    expect:
+      exit_code: 0
+    tags: ["graph", "setup"]
+
+  - name: "verify-corp-employee-count"
+    description: "Verify extended_corp Employee count"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN count(*) AS corp_employees;"
+    expect:
+      exit_code: 0
+      stdout_contains: "corp_employees"
+    tags: ["graph", "isolation"]
+
+  - name: "verify-no-employee-in-inventory"
+    description: "Verify no Employee in inventory graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_inventory; MATCH (e:Employee) RETURN count(*) AS inventory_employees;"
+    expect:
+      exit_code: 0
+    tags: ["graph", "isolation"]
+
+  - name: "inventory-product-count"
+    description: "Inventory graph Product count"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_inventory; MATCH (p:Product) RETURN count(*) AS inventory_products;"
+    expect:
+      exit_code: 0
+    tags: ["graph", "isolation"]
+
+  # Section 17: Social Graph Patterns
+  - name: "setup-social-graph"
+    description: "Setup social graph"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_social;
+      MATCH (n) DETACH DELETE n;
+      CREATE (:User {id: 'U001', name: 'Alice', age: 30, city: 'NYC'});
+      CREATE (:User {id: 'U002', name: 'Bob', age: 25, city: 'LA'});
+      CREATE (:User {id: 'U003', name: 'Carol', age: 35, city: 'NYC'});
+      CREATE (:User {id: 'U006', name: 'Frank', age: 40, city: 'NYC'});
+    expect:
+      exit_code: 0
+    tags: ["social", "setup"]
+
+  - name: "setup-friendships"
+    description: "Create friendship relationships"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_social;
+      MATCH (u1:User {name: 'Alice'}), (u2:User {name: 'Bob'}) CREATE (u1)-[:FRIENDS_WITH {since: '2020-01-01'}]->(u2);
+      MATCH (u1:User {name: 'Bob'}), (u2:User {name: 'Alice'}) CREATE (u1)-[:FRIENDS_WITH {since: '2020-01-01'}]->(u2);
+      MATCH (u1:User {name: 'Alice'}), (u2:User {name: 'Carol'}) CREATE (u1)-[:FRIENDS_WITH {since: '2019-06-15'}]->(u2);
+    expect:
+      exit_code: 0
+    tags: ["social", "relationship"]
+
+  - name: "friends-of-friends"
+    description: "Friends of friends (2-hop)"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_social; MATCH (u:User {name: 'Alice'})-[:FRIENDS_WITH]->()-[:FRIENDS_WITH]->(fof:User) WHERE fof.name <> 'Alice' RETURN DISTINCT fof.name AS friends_of_friends;"
+    expect:
+      exit_code: 0
+    tags: ["social", "traversal"]
+
+  - name: "no-friends-user"
+    description: "Users with no friends"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_social; MATCH (u:User) WHERE NOT EXISTS { MATCH (u)-[:FRIENDS_WITH]->(:User) } RETURN u.name AS lonely_user;"
+    expect:
+      exit_code: 0
+    tags: ["social", "isolated"]
+
+  - name: "friend-count-per-user"
+    description: "Friend count per user"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_social; MATCH (u:User) OPTIONAL MATCH (u)-[:FRIENDS_WITH]->(f:User) RETURN u.name, count(f) AS friend_count GROUP BY u.name ORDER BY friend_count DESC;"
+    expect:
+      exit_code: 0
+    tags: ["social", "aggregation"]
+
+  # Section 18: Date Edge Cases
+  - name: "date-comparison"
+    description: "Date comparison"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WHERE e.active = true RETURN e.name ORDER BY e.name LIMIT 3;"
+    expect:
+      exit_code: 0
+    tags: ["date", "compare"]
+
+  - name: "date-extraction"
+    description: "Date extraction"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN date('2024-06-15').year AS year, date('2024-06-15').month AS month, date('2024-06-15').day AS day;"
+    expect:
+      exit_code: 0
+    tags: ["date", "extract"]
+
+  - name: "current-date-components"
+    description: "Current date components"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN date().year AS current_year, date().month AS current_month;"
+    expect:
+      exit_code: 0
+    tags: ["date", "current"]
+
+  # Section 19: Stress Tests
+  - name: "large-aggregation"
+    description: "Large aggregation all employees"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) RETURN count(*) AS total, sum(e.salary) AS total_salary, avg(e.salary) AS avg_salary, min(e.salary) AS min_salary, max(e.salary) AS max_salary;"
+    expect:
+      exit_code: 0
+    tags: ["stress", "aggregation"]
+
+  - name: "complex-exists-chain"
+    description: "Complex EXISTS chain"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (e:Employee) WHERE e.active = true RETURN e.name AS connected_employee ORDER BY e.name;"
+    expect:
+      exit_code: 0
+    tags: ["stress", "exists"]
+
+  # Section 20: Summary and Verification
+  - name: "summary-counts-corp"
+    description: "Summary counts in corp graph"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_corp;
+      MATCH (e:Employee) RETURN 'Employees' AS type, count(*) AS count
+      UNION ALL
+      MATCH (d:Department) RETURN 'Departments' AS type, count(*) AS count
+      UNION ALL
+      MATCH (p:Project) RETURN 'Projects' AS type, count(*) AS count;
+    expect:
+      exit_code: 0
+    tags: ["summary", "union"]
+
+  - name: "summary-counts-inventory"
+    description: "Summary counts in inventory graph"
+    args: ["query", "--insecure", "-"]
+    stdin: |
+      USE GRAPH extended_inventory;
+      MATCH (p:Product) RETURN 'Products' AS type, count(*) AS count
+      UNION ALL
+      MATCH (w:Warehouse) RETURN 'Warehouses' AS type, count(*) AS count;
+    expect:
+      exit_code: 0
+    tags: ["summary", "union"]
+
+  - name: "summary-counts-social"
+    description: "Summary counts in social graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_social; MATCH (u:User) RETURN 'Users' AS type, count(*) AS count;"
+    expect:
+      exit_code: 0
+    tags: ["summary", "count"]
+
+  # Section 21: Cleanup
+  - name: "cleanup-corp"
+    description: "Cleanup extended_corp graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_corp; MATCH (n) DETACH DELETE n; DROP GRAPH IF EXISTS extended_corp;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-inventory"
+    description: "Cleanup extended_inventory graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_inventory; MATCH (n) DETACH DELETE n; DROP GRAPH IF EXISTS extended_inventory;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-social"
+    description: "Cleanup extended_social graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH extended_social; MATCH (n) DETACH DELETE n; DROP GRAPH IF EXISTS extended_social;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]

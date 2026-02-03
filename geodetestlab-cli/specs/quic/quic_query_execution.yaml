@@ -1,0 +1,114 @@
+name: quic_query_execution
+description: Test QUIC protocol query execution
+provider: geode
+
+setup:
+  - name: start_server
+    command: ["serve", "--listen-quic", "127.0.0.1:3141", "--test-exit-after-first"]
+    background: true
+    wait_for: "QUIC server listening"
+    timeout: 5
+
+teardown:
+  - name: stop_server
+    command: ["kill", "${server_pid}"]
+    ignore_errors: true
+
+tests:
+  - name: basic_quic_query
+    description: Execute a simple query over QUIC
+    command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS x"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "SCHEMA:"
+        - '"name":"x"'
+        - "RESULT:"
+        - '"x":1'
+        - "STATUS:"
+        - '"status_class":"00000"'
+
+  - name: quic_query_with_string
+    description: Execute query returning string over QUIC
+    command: ["query", "--server", "127.0.0.1:3141", "RETURN 'hello' AS greeting"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - '"name":"greeting"'
+        - '"greeting":"hello"'
+
+  - name: quic_query_multiple_values
+    description: Execute query with multiple return values
+    command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS a, 2 AS b, 3 AS c"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - '"name":"a"'
+        - '"name":"b"'
+        - '"name":"c"'
+        - '"a":1'
+        - '"b":2'
+        - '"c":3'
+
+  - name: quic_handshake_timeout
+    description: Verify handshake timeout with unreachable server
+    command: ["query", "--server", "127.0.0.1:19999", "RETURN 1"]
+    expect:
+      exit_code: 1
+      stderr_contains:
+        - "QUIC handshake failed"
+        - "Ensure the server is running"
+
+  - name: quic_with_insecure_flag
+    description: Test QUIC with insecure certificate handling
+    command: ["query", "--server", "127.0.0.1:3141", "--insecure", "RETURN 1 AS x"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "RESULT:"
+        - '"x":1'
+
+  - name: quic_empty_response_handling
+    description: Test handling of empty query results
+    command: ["query", "--server", "127.0.0.1:3141", "MATCH (n:NonExistent) RETURN n"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "SCHEMA:"
+        - "STATUS:"
+
+  - name: quic_large_response
+    description: Test QUIC with larger response data
+    command: ["query", "--server", "127.0.0.1:3141", "UNWIND range(1, 100) AS i RETURN i"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "SCHEMA:"
+        - "RESULT:"
+        - '"i":1'
+        - '"i":100'
+        - "STATUS:"
+
+  - name: quic_special_characters
+    description: Test query with special characters
+    command: ["query", "--server", "127.0.0.1:3141", "RETURN 'hello\\nworld\\t!' AS text"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - '"text":"hello\\nworld\\t!"'
+
+  - name: quic_readstream_regression
+    description: Regression test for readStream WouldBlock issue
+    command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS test"]
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "SCHEMA:"
+        - "RESULT:"
+        - "STATUS:"
+      stdout_not_contains:
+        - "Error:"
+        - "Failed to receive"
+    notes: |
+      This test ensures the readStream function returns error.WouldBlock
+      instead of 0 when the stream inbox is empty, allowing proper polling.

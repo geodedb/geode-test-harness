@@ -1,0 +1,270 @@
+# Undirected Pattern Matching Tests
+# CANARY: REQ=REQ-GQL-UNDIRECTED-PATTERN-001; FEATURE="UndirectedPatternMatch"; ASPECT=Testing; STATUS=TESTED; OWNER=engine; UPDATED=2026-01-29
+#
+# Tests for undirected relationship patterns (-[r]-) which should traverse BOTH directions.
+# Per ISO/IEC 39075:2024, undirected patterns match edges regardless of direction.
+# Bug fix: Previously only traversed outgoing edges, missing incoming edges.
+
+version: "1.0"
+name: "Undirected Pattern Matching Tests"
+description: |
+  Comprehensive tests for undirected relationship pattern matching.
+  Verifies that -[r]- patterns return results from BOTH directions,
+  not just outgoing edges.
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "error"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # =============================================================================
+  # Setup: Create test graph with directed edges
+  # =============================================================================
+
+  - name: "setup-create-nodes"
+    description: "Create test nodes for undirected pattern testing"
+    query: |
+      CREATE (a:Person {name: 'Alice'}),
+             (b:Person {name: 'Bob'}),
+             (c:Person {name: 'Charlie'}),
+             (d:Person {name: 'Diana'})
+      RETURN count(*) AS created
+    expect:
+      success: true
+      result_contains: ["4"]
+    tags: ["undirected", "setup"]
+
+  - name: "setup-create-relationships"
+    description: "Create directed relationships (Alice->Bob, Alice->Charlie, Diana->Alice)"
+    query: |
+      MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'})
+      CREATE (a)-[:KNOWS {since: 2020}]->(b)
+      RETURN type(r) AS rel_type
+    expect:
+      success: true
+    tags: ["undirected", "setup"]
+
+  - name: "setup-create-relationship-2"
+    description: "Create Alice->Charlie relationship"
+    query: |
+      MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'})
+      CREATE (a)-[:KNOWS {since: 2021}]->(c)
+      RETURN 'created' AS status
+    expect:
+      success: true
+    tags: ["undirected", "setup"]
+
+  - name: "setup-create-relationship-3"
+    description: "Create Diana->Alice relationship"
+    query: |
+      MATCH (d:Person {name: 'Diana'}), (a:Person {name: 'Alice'})
+      CREATE (d)-[:KNOWS {since: 2022}]->(a)
+      RETURN 'created' AS status
+    expect:
+      success: true
+    tags: ["undirected", "setup"]
+
+  # =============================================================================
+  # Baseline: Directed patterns
+  # =============================================================================
+
+  - name: "directed-outgoing-from-alice"
+    description: "Verify outgoing edges from Alice: Alice->Bob, Alice->Charlie"
+    query: |
+      MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b)
+      RETURN b.name AS connected_to ORDER BY b.name
+    expect:
+      success: true
+      geode_query:
+        row_count: 2
+        columns: ["connected_to"]
+      result_contains: ["Bob", "Charlie"]
+    tags: ["undirected", "baseline"]
+
+  - name: "directed-incoming-to-alice"
+    description: "Verify incoming edges to Alice: Diana->Alice"
+    query: |
+      MATCH (a:Person {name: 'Alice'})<-[r:KNOWS]-(b)
+      RETURN b.name AS connected_from
+    expect:
+      success: true
+      geode_query:
+        row_count: 1
+        columns: ["connected_from"]
+      result_contains: ["Diana"]
+    tags: ["undirected", "baseline"]
+
+  # =============================================================================
+  # Core: Undirected pattern tests
+  # =============================================================================
+
+  - name: "undirected-from-alice-all-connections"
+    description: "Undirected pattern should return ALL connections (both directions)"
+    query: |
+      MATCH (a:Person {name: 'Alice'})-[r:KNOWS]-(b)
+      RETURN b.name AS connected ORDER BY b.name
+    expect:
+      success: true
+      geode_query:
+        row_count: 3
+        columns: ["connected"]
+      result_contains: ["Bob", "Charlie", "Diana"]
+    tags: ["undirected", "core"]
+
+  - name: "undirected-count-verification"
+    description: "Count should be 3 for undirected (2 outgoing + 1 incoming)"
+    query: |
+      MATCH (a:Person {name: 'Alice'})-[r:KNOWS]-(b)
+      RETURN count(*) AS total_connections
+    expect:
+      success: true
+      geode_query:
+        row_count: 1
+        columns: ["total_connections"]
+      result_contains: ["3"]
+    tags: ["undirected", "core"]
+
+  - name: "undirected-from-bob"
+    description: "Bob has one undirected connection (Alice->Bob)"
+    query: |
+      MATCH (b:Person {name: 'Bob'})-[r:KNOWS]-(other)
+      RETURN other.name AS connected
+    expect:
+      success: true
+      geode_query:
+        row_count: 1
+        columns: ["connected"]
+      result_contains: ["Alice"]
+    tags: ["undirected", "core"]
+
+  - name: "undirected-from-diana"
+    description: "Diana has one undirected connection (Diana->Alice)"
+    query: |
+      MATCH (d:Person {name: 'Diana'})-[r:KNOWS]-(other)
+      RETURN other.name AS connected
+    expect:
+      success: true
+      geode_query:
+        row_count: 1
+        columns: ["connected"]
+      result_contains: ["Alice"]
+    tags: ["undirected", "core"]
+
+  # =============================================================================
+  # Edge cases
+  # =============================================================================
+
+  - name: "undirected-no-type-filter"
+    description: "Undirected pattern without relationship type filter"
+    query: |
+      MATCH (a:Person {name: 'Alice'})-[r]-(b)
+      RETURN count(*) AS total
+    expect:
+      success: true
+      geode_query:
+        row_count: 1
+        columns: ["total"]
+      result_contains: ["3"]
+    tags: ["undirected", "edge-cases"]
+
+  - name: "undirected-with-relationship-properties"
+    description: "Undirected pattern can access relationship properties"
+    query: |
+      MATCH (a:Person {name: 'Alice'})-[r:KNOWS]-(b)
+      RETURN b.name AS connected, r.since AS year ORDER BY year
+    expect:
+      success: true
+      geode_query:
+        row_count: 3
+        columns: ["connected", "year"]
+    tags: ["undirected", "edge-cases"]
+
+  - name: "undirected-with-where-clause"
+    description: "Undirected pattern with WHERE clause filtering"
+    query: |
+      MATCH (a:Person {name: 'Alice'})-[r:KNOWS]-(b)
+      WHERE r.since >= 2021
+      RETURN b.name AS connected ORDER BY b.name
+    expect:
+      success: true
+      geode_query:
+        row_count: 2
+        columns: ["connected"]
+      result_contains: ["Charlie", "Diana"]
+    tags: ["undirected", "edge-cases"]
+
+  - name: "undirected-isolated-node"
+    description: "Node with no connections returns 0 rows for undirected"
+    query: |
+      CREATE (lonely:Person {name: 'Lonely'})
+      RETURN 'created' AS status
+    expect:
+      success: true
+    tags: ["undirected", "edge-cases", "setup"]
+
+  - name: "undirected-isolated-node-query"
+    description: "Undirected query on isolated node returns empty"
+    query: |
+      MATCH (l:Person {name: 'Lonely'})-[r]-(other)
+      RETURN count(*) AS connections
+    expect:
+      success: true
+      geode_query:
+        row_count: 1
+        columns: ["connections"]
+      result_contains: ["0"]
+    tags: ["undirected", "edge-cases"]
+
+  # =============================================================================
+  # Aggregation with undirected patterns
+  # =============================================================================
+
+  - name: "undirected-aggregation-count"
+    description: "Aggregation with undirected pattern"
+    query: |
+      MATCH (p:Person)-[r:KNOWS]-(other)
+      RETURN p.name AS person, count(*) AS connections
+      ORDER BY connections DESC
+    expect:
+      success: true
+      geode_query:
+        columns: ["person", "connections"]
+    tags: ["undirected", "aggregation"]
+
+  # =============================================================================
+  # Cleanup
+  # =============================================================================
+
+  - name: "cleanup-test-data"
+    description: "Clean up test nodes and relationships"
+    query: |
+      MATCH (n:Person) WHERE n.name IN ['Alice', 'Bob', 'Charlie', 'Diana', 'Lonely']
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expect:
+      success: true
+    tags: ["undirected", "cleanup"]
+
+metadata:
+  gaps_covered:
+    - id: "UNDIRECTED-PATTERN-BUG"
+      title: "Undirected patterns only traverse outgoing edges"
+      severity: "High"
+      description: "The -[r]- pattern was treating undirected the same as right-directed"
+  created: "2026-01-29"
+  author: "engine-team"
+
+invariants:
+  - type: "server_running"
+
+tags: ["undirected", "pattern-matching", "gql-compliance", "regression"]

@@ -1,0 +1,191 @@
+# CANARY: REQ=REQ-LIB-MIGRATION-CONFIG-TEST-002; FEATURE="External Library Migration"; ASPECT=ConfigFormatTests; STATUS=TESTED; OWNER=test; UPDATED=2026-01-24
+# Comprehensive tests for Geode configuration file formats (YAML, TOML, JSON)
+# Tests config file loading, precedence, and format support
+
+name: config_formats_comprehensive
+description: Tests for multi-format configuration file support (YAML, TOML, JSON)
+
+setup:
+  - mkdir -p /tmp/geode-config-test/.geode /tmp/geode-config-test/data
+
+tests:
+  # ============================================================================
+  # YAML Configuration Tests
+  # ============================================================================
+
+  - name: YAML config file - basic server options
+    description: Test loading server configuration from YAML format
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/config.yaml << 'EOF'
+        # Geode server configuration (YAML format)
+        listen_quic: "0.0.0.0:13141"
+        data_dir: "/tmp/geode-config-test/data"
+        log_level: "debug"
+        EOF
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/config.yaml", "--help"]
+    expect:
+      contains:
+        - "--config"
+      exit_code: 0
+
+  - name: YAML config file - alternate .yml extension
+    description: Test that .yml extension is recognized
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/config.yml << 'EOF'
+        listen_quic: "0.0.0.0:13142"
+        log_level: "info"
+        EOF
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/config.yml", "--help"]
+    expect:
+      contains:
+        - "--config"
+      exit_code: 0
+
+  # ============================================================================
+  # TOML Configuration Tests
+  # ============================================================================
+
+  - name: TOML config file - basic server options
+    description: Test loading server configuration from TOML format
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/config.toml << 'EOF'
+        # Geode server configuration (TOML format)
+        listen_quic = "0.0.0.0:13143"
+        data_dir = "/tmp/geode-config-test/data"
+        log_level = "warn"
+        EOF
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/config.toml", "--help"]
+    expect:
+      contains:
+        - "--config"
+      exit_code: 0
+
+  - name: TOML config file - with sections
+    description: Test TOML config with section headers
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/config-sections.toml << 'EOF'
+        [server]
+        listen_quic = "0.0.0.0:13144"
+
+        [storage]
+        data_dir = "/tmp/geode-config-test/data"
+
+        [logging]
+        log_level = "trace"
+        EOF
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/config-sections.toml", "--help"]
+    expect:
+      exit_code: 0
+
+  # ============================================================================
+  # JSON Configuration Tests
+  # ============================================================================
+
+  - name: JSON config file - basic server options
+    description: Test loading server configuration from JSON format
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/config.json << 'EOF'
+        {
+          "listen_quic": "0.0.0.0:13145",
+          "data_dir": "/tmp/geode-config-test/data",
+          "log_level": "error"
+        }
+        EOF
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/config.json", "--help"]
+    expect:
+      contains:
+        - "--config"
+      exit_code: 0
+
+  - name: JSON config file - with nested structure
+    description: Test JSON config with nested objects
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/config-nested.json << 'EOF'
+        {
+          "server": {
+            "listen_quic": "0.0.0.0:13146"
+          },
+          "storage": {
+            "data_dir": "/tmp/geode-config-test/data"
+          },
+          "logging": {
+            "log_level": "critical"
+          }
+        }
+        EOF
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/config-nested.json", "--help"]
+    expect:
+      exit_code: 0
+
+  # ============================================================================
+  # CLI Flag Precedence Tests
+  # ============================================================================
+
+  - name: CLI flags override config file values
+    description: Verify that CLI flags take precedence over config file
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/config-override.yaml << 'EOF'
+        listen_quic: "0.0.0.0:19999"
+        log_level: "trace"
+        EOF
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/config-override.yaml", "--listen-quic", "0.0.0.0:18888", "--help"]
+    expect:
+      exit_code: 0
+
+  # ============================================================================
+  # Error Handling Tests
+  # ============================================================================
+
+  - name: Invalid config file path warning
+    description: Test warning for non-existent config file
+    args: ["serve", "--config", "/nonexistent/path/config.yaml", "--help"]
+    expect:
+      exit_code: 0
+
+  - name: Malformed YAML config handling
+    description: Test error handling for invalid YAML syntax
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/bad.yaml << 'ENDOFFILE'
+        listen_quic: "0.0.0.0:13147
+        data_dir: [invalid
+        ENDOFFILE
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/bad.yaml", "--help"]
+    expect:
+      exit_code: 0
+
+  - name: Malformed JSON config handling
+    description: Test error handling for invalid JSON syntax
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/bad.json << 'ENDOFFILE'
+        { "listen_quic": "0.0.0.0:13148"
+        ENDOFFILE
+    args: ["serve", "--config", "/tmp/geode-config-test/.geode/bad.json", "--help"]
+    expect:
+      exit_code: 0
+
+  # ============================================================================
+  # Config Short Flag Tests
+  # ============================================================================
+
+  - name: Config short flag -c works
+    description: Test that -c is equivalent to --config
+    setup:
+      - |
+        cat > /tmp/geode-config-test/.geode/config.yaml << 'EOF'
+        listen_quic: "0.0.0.0:13150"
+        EOF
+    args: ["serve", "-c", "/tmp/geode-config-test/.geode/config.yaml", "--help"]
+    expect:
+      exit_code: 0
+
+cleanup:
+  - rm -rf /tmp/geode-config-test

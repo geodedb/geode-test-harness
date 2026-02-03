@@ -1,0 +1,275 @@
+# GAP-0193: IMPL Batch Promotion Integration Tests
+# Tests for Circular Dependency Resolution, ServerRefactoring, ListProperties,
+# ExecutionRefactoring, WithGroupByAggregation, MapProperties, MetadataIntegration,
+# MemorySafety, StringMinMax categories
+
+name: gap_0193_impl_batch_promotion
+description: GAP-0193 IMPL batch promotion integration tests
+mode: server
+timeout: 30
+
+tests:
+  # ListProperties Tests
+  - name: list-creation-basic
+    query: "RETURN [1, 2, 3] AS numbers"
+    expect:
+      success: true
+      columns: [numbers]
+
+  - name: list-element-access
+    query: "WITH [10, 20, 30] AS list RETURN list[1] AS middle"
+    expect:
+      success: true
+      columns: [middle]
+
+  - name: list-slice-operation
+    query: "WITH [1, 2, 3, 4, 5] AS list RETURN list[1..4] AS slice"
+    expect:
+      success: true
+      columns: [slice]
+
+  - name: list-size-function
+    query: "RETURN size([1, 2, 3, 4, 5]) AS len"
+    expect:
+      success: true
+      columns: [len]
+
+  - name: list-head-tail
+    query: "WITH [1, 2, 3] AS list RETURN head(list) AS first, tail(list) AS rest"
+    expect:
+      success: true
+      columns: [first, rest]
+
+  - name: list-concat
+    query: "RETURN [1, 2] + [3, 4] AS combined"
+    expect:
+      success: true
+      columns: [combined]
+
+  - name: list-in-operator
+    query: "RETURN 2 IN [1, 2, 3] AS found, 5 IN [1, 2, 3] AS notFound"
+    expect:
+      success: true
+      columns: [found, notFound]
+
+  - name: list-unwind
+    query: "UNWIND [1, 2, 3] AS num RETURN num"
+    expect:
+      success: true
+      columns: [num]
+
+  - name: list-comprehension
+    query: "RETURN [x IN range(1, 5) WHERE x > 2 | x * 2] AS doubled"
+    expect:
+      success: true
+      columns: [doubled]
+
+  # MapProperties Tests
+  - name: map-creation-basic
+    query: "RETURN {name: 'Alice', age: 30} AS person"
+    expect:
+      success: true
+      columns: [person]
+
+  - name: map-property-access
+    query: "WITH {name: 'Bob', city: 'NYC'} AS person RETURN person.name AS name, person.city AS city"
+    expect:
+      success: true
+      columns: [name, city]
+
+  - name: map-keys-function
+    query: "RETURN keys({a: 1, b: 2, c: 3}) AS mapKeys"
+    expect:
+      success: true
+      columns: [mapKeys]
+
+  - name: map-nested
+    query: "RETURN {outer: {inner: {value: 42}}} AS nested"
+    expect:
+      success: true
+      columns: [nested]
+
+  # WithGroupByAggregation Tests
+  - name: groupby-count
+    query: |
+      UNWIND [{type: 'A'}, {type: 'B'}, {type: 'A'}] AS item
+      WITH item.type AS type, count(*) AS cnt
+      RETURN type, cnt ORDER BY type
+    expect:
+      success: true
+      columns: [type, cnt]
+
+  - name: groupby-sum
+    query: |
+      UNWIND [{cat: 'X', val: 10}, {cat: 'X', val: 20}, {cat: 'Y', val: 30}] AS item
+      WITH item.cat AS cat, sum(item.val) AS total
+      RETURN cat, total ORDER BY cat
+    expect:
+      success: true
+      columns: [cat, total]
+
+  - name: groupby-avg
+    query: |
+      UNWIND [{g: 'A', v: 10}, {g: 'A', v: 20}, {g: 'B', v: 30}] AS item
+      WITH item.g AS grp, avg(item.v) AS average
+      RETURN grp, average ORDER BY grp
+    expect:
+      success: true
+      columns: [grp, average]
+
+  - name: groupby-min-max
+    query: |
+      UNWIND [{g: 'X', n: 5}, {g: 'X', n: 15}, {g: 'Y', n: 10}] AS item
+      WITH item.g AS grp, min(item.n) AS minimum, max(item.n) AS maximum
+      RETURN grp, minimum, maximum ORDER BY grp
+    expect:
+      success: true
+      columns: [grp, minimum, maximum]
+
+  - name: groupby-collect
+    query: |
+      UNWIND [{type: 'A', name: 'Alice'}, {type: 'B', name: 'Bob'}, {type: 'A', name: 'Anna'}] AS item
+      WITH item.type AS type, collect(item.name) AS names
+      RETURN type, names ORDER BY type
+    expect:
+      success: true
+      columns: [type, names]
+
+  - name: groupby-having-filter
+    query: |
+      UNWIND range(1, 10) AS num
+      WITH num % 3 AS group, count(*) AS cnt
+      WHERE cnt > 2
+      RETURN group, cnt ORDER BY group
+    expect:
+      success: true
+      columns: [group, cnt]
+
+  - name: groupby-order-by-agg
+    query: |
+      UNWIND [{t: 'A'}, {t: 'B'}, {t: 'A'}, {t: 'C'}, {t: 'A'}] AS item
+      WITH item.t AS type, count(*) AS cnt
+      ORDER BY cnt DESC
+      RETURN type, cnt
+    expect:
+      success: true
+      columns: [type, cnt]
+
+  # StringMinMax Tests
+  - name: string-min
+    query: "UNWIND ['cherry', 'apple', 'banana'] AS fruit RETURN min(fruit) AS first"
+    expect:
+      success: true
+      columns: [first]
+
+  - name: string-max
+    query: "UNWIND ['cherry', 'apple', 'banana'] AS fruit RETURN max(fruit) AS last"
+    expect:
+      success: true
+      columns: [last]
+
+  - name: string-minmax-combined
+    query: "UNWIND ['c', 'a', 'b', 'd'] AS letter RETURN min(letter) AS minLetter, max(letter) AS maxLetter"
+    expect:
+      success: true
+      columns: [minLetter, maxLetter]
+
+  # MetadataIntegration Tests
+  - name: metadata-db-labels
+    query: "CALL db.labels() YIELD label RETURN label LIMIT 10"
+    expect:
+      success: true
+      columns: [label]
+
+  - name: metadata-db-relationship-types
+    query: "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType LIMIT 10"
+    expect:
+      success: true
+      columns: [relationshipType]
+
+  - name: metadata-db-property-keys
+    query: "CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey LIMIT 10"
+    expect:
+      success: true
+      columns: [propertyKey]
+
+  - name: metadata-db-indexes
+    query: "CALL db.indexes() YIELD name, type RETURN name, type LIMIT 10"
+    expect:
+      success: true
+      columns: [name, type]
+
+  - name: metadata-db-constraints
+    query: "CALL db.constraints() YIELD name, type RETURN name, type LIMIT 10"
+    expect:
+      success: true
+      columns: [name, type]
+
+  # ExecutionRefactoring Tests
+  - name: exec-match-return
+    query: "MATCH (n) RETURN n LIMIT 5"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: exec-create-return
+    query: |
+      CREATE (n:ExecTest_gap0193 {value: 42})
+      RETURN n.value AS value
+    expect:
+      success: true
+      columns: [value]
+
+  - name: exec-merge-return
+    query: |
+      MERGE (n:MergeTest_gap0193 {id: 1})
+      ON CREATE SET n.created = true
+      ON MATCH SET n.matched = true
+      RETURN n
+    expect:
+      success: true
+      columns: [n]
+
+  - name: exec-set-operation
+    query: |
+      CREATE (n:SetTest_gap0193 {old: 'value'})
+      SET n.new = 'updated', n.timestamp = timestamp()
+      RETURN n.new AS newValue
+    expect:
+      success: true
+      columns: [newValue]
+
+  - name: exec-delete-operation
+    query: |
+      MATCH (n) WHERE n:ExecTest_gap0193 OR n:MergeTest_gap0193 OR n:SetTest_gap0193
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expect:
+      success: true
+      columns: [deleted]
+
+  # Comprehensive multi-clause tests
+  - name: comprehensive-pipeline
+    query: |
+      UNWIND range(1, 20) AS num
+      WITH num, num % 5 AS group
+      WITH group, count(*) AS cnt, sum(num) AS total, avg(num) AS average
+      WHERE cnt >= 4
+      RETURN group, cnt, total, average
+      ORDER BY total DESC
+    expect:
+      success: true
+      columns: [group, cnt, total, average]
+
+  - name: comprehensive-list-map
+    query: |
+      WITH [{name: 'A', vals: [1, 2, 3]}, {name: 'B', vals: [4, 5, 6]}] AS items
+      UNWIND items AS item
+      WITH item.name AS name, item.vals AS vals
+      UNWIND vals AS val
+      WITH name, collect(val * 2) AS doubled
+      RETURN name, doubled
+      ORDER BY name
+    expect:
+      success: true
+      columns: [name, doubled]

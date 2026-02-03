@@ -1,0 +1,159 @@
+version: "1.0"
+name: "Geode UNION Property Access Tests"
+description: "Comprehensive tests for UNION operations with property access functionality"
+
+# Test configuration
+config:
+  executable: "./zig-out/bin/geode"
+  default_args: ["query", "--format", "json"]
+  timeout: 30
+
+# Test groups
+test_groups:
+  - name: "basic_property_access"
+    description: "Basic property access in MATCH queries"
+    tests:
+      - name: "single_property_access"
+        query: 'MATCH (n:Person) RETURN n.name'
+        expected_columns: ["n.name"]
+        expected_count: 2
+        assertions:
+          - type: "json_contains"
+            field: "rows[0][0].name"
+            value: "Alice"
+          - type: "json_contains"
+            field: "rows[1][0].name"
+            value: "Bob"
+          - type: "status_class"
+            value: "00000"
+
+      - name: "multiple_property_access"
+        query: 'MATCH (n:Person) RETURN n.name, n.age'
+        expected_columns: ["n.name", "n.age"]
+        expected_count: 2
+        assertions:
+          - type: "json_contains"
+            field: "rows[0][0]"
+            value: {"name": "Alice", "age": 30}
+          - type: "json_contains"
+            field: "rows[1][0]"
+            value: {"name": "Bob", "age": 25}
+
+      - name: "full_node_serialization"
+        query: 'MATCH (n:Person) RETURN n LIMIT 1'
+        expected_columns: ["n"]
+        expected_count: 1
+        assertions:
+          - type: "json_path_exists"
+            path: "result.rows[0][0].n.properties"
+          - type: "json_path_exists"
+            path: "result.rows[0][0].n.labels"
+          - type: "json_path_exists"
+            path: "result.rows[0][0].n.id"
+
+  - name: "union_operations"
+    description: "UNION operations with property access"
+    tests:
+      - name: "basic_union_property_access"
+        query: 'MATCH (n:Person) RETURN n.name UNION MATCH (m:Person) RETURN m.name'
+        expected_columns: ["n.name"]
+        expected_count: 2
+        assertions:
+          - type: "json_contains_any"
+            field: "rows"
+            values: [
+              [{"name": "Alice"}],
+              [{"name": "Bob"}]
+            ]
+          - type: "status_class"
+            value: "00000"
+
+      - name: "union_with_aliases"
+        query: 'MATCH (n:Person) RETURN n.name AS person_name UNION MATCH (m:Person) RETURN m.name AS person_name'
+        expected_columns: ["person_name"]
+        expected_count: 2
+        assertions:
+          - type: "json_contains_any"
+            field: "rows"
+            values: [
+              [{"person_name": "Alice"}],
+              [{"person_name": "Bob"}]
+            ]
+
+      - name: "union_multiple_properties"
+        query: 'MATCH (n:Person) RETURN n.name, n.age UNION MATCH (m:Person) RETURN m.name, m.age'
+        expected_columns: ["n.name", "n.age"]
+        expected_count: 2
+        assertions:
+          - type: "row_count_range"
+            min: 1
+            max: 2
+
+      - name: "union_with_literals"
+        query: 'MATCH (n:Person) RETURN n.name, ''person'' AS type UNION MATCH (m:Person) RETURN m.name, ''individual'' AS type'
+        expected_columns: ["n.name", "type"]
+        expected_count: 2
+        assertions:
+          - type: "status_class"
+            value: "00000"
+
+  - name: "type_inference"
+    description: "Type inference in UNION operations"
+    tests:
+      - name: "string_type_inference"
+        query: 'MATCH (n:Person) RETURN n.name AS value UNION MATCH (m:Person) RETURN m.name AS value'
+        expected_columns: ["value"]
+        assertions:
+          - type: "schema_column_type"
+            column: "value"
+            expected_type: "STRING"
+
+      - name: "mixed_type_inference"
+        query: 'MATCH (n:Person) RETURN n.name AS value UNION MATCH (m:Person) RETURN m.age AS value'
+        expected_columns: ["value"]
+        assertions:
+          - type: "schema_column_type"
+            column: "value"
+            expected_type: "MIXED"
+
+  - name: "performance"
+    description: "Performance tests for UNION property access"
+    tests:
+      - name: "multi_node_union_performance"
+        query: 'MATCH (a:Person) RETURN a.name UNION MATCH (b:Person) RETURN b.name UNION MATCH (c:Person) RETURN c.name'
+        expected_columns: ["a.name"]
+        assertions:
+          - type: "execution_time_max"
+            max_ms: 1000
+          - type: "status_class"
+            value: "00000"
+
+  - name: "edge_cases"
+    description: "Edge cases and error handling"
+    tests:
+      - name: "union_with_missing_property"
+        query: 'MATCH (n:Person) RETURN n.name UNION MATCH (m:Person) RETURN m.nonexistent'
+        expected_columns: ["n.name"]
+        assertions:
+          - type: "status_class"
+            value: "00000"
+
+      - name: "union_empty_results"
+        query: 'MATCH (n:NonexistentLabel) RETURN n.name UNION MATCH (m:Person) RETURN m.name'
+        expected_columns: ["n.name"]
+        assertions:
+          - type: "status_class"
+            value: "00000"
+
+# Setup and teardown
+setup:
+  commands:
+    - query: 'CREATE (alice:Person {name: ''Alice'', age: 30})'
+      description: "Create Alice node"
+    - query: 'CREATE (bob:Person {name: ''Bob'', age: 25})'
+      description: "Create Bob node"
+
+teardown:
+  commands:
+    - query: 'MATCH (n) DELETE n'
+      description: "Clean up all nodes"

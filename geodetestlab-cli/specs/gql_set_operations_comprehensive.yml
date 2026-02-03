@@ -1,0 +1,533 @@
+version: "1.0"
+name: "GQL Set Operations Comprehensive Tests"
+description: "Complete ISO/IEC 39075:2024 set operations testing covering UNION, INTERSECT, EXCEPT with ALL/DISTINCT modifiers"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # ===============================
+  # BASIC UNION OPERATIONS
+  # ===============================
+
+  - name: "union-basic"
+    description: "Test basic UNION operation"
+    setup:
+      - args: ["query", "CREATE (a:TypeA {id: 1, value: 'first'}), (b:TypeA {id: 2, value: 'second'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:TypeB {id: 3, value: 'third'}), (d:TypeB {id: 4, value: 'fourth'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:TypeA) RETURN a.id AS id, a.value AS value
+        UNION
+        MATCH (b:TypeB) RETURN b.id AS id, b.value AS value
+    expect:
+      exit_code: 0
+      geode_query:
+        min_rows: 4
+        columns: ["id", "value"]
+    tags: ["set-operations", "union", "basic"]
+
+  - name: "union-distinct"
+    description: "Test UNION DISTINCT operation"
+    setup:
+      - args: ["query", "CREATE (a:UnionTest {id: 1, name: 'common'}), (b:UnionTest {id: 2, name: 'unique1'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:UnionTest {id: 1, name: 'common'}), (d:UnionTest {id: 3, name: 'unique2'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:UnionTest {id: 1}) RETURN a.id AS id, a.name AS name
+        UNION DISTINCT
+        MATCH (b:UnionTest {id: 1}) RETURN b.id AS id, b.name AS name
+    expect:
+      exit_code: 0
+      geode_query:
+        max_rows: 1
+        columns: ["id", "name"]
+    tags: ["set-operations", "union", "distinct"]
+
+  - name: "union-all"
+    description: "Test UNION ALL operation (preserves duplicates)"
+    setup:
+      - args: ["query", "CREATE (a:UnionAllTest {id: 1, type: 'duplicate'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (b:UnionAllTest {id: 1, type: 'duplicate'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:UnionAllTest {type: 'duplicate'}) RETURN a.id AS id, a.type AS type
+        UNION ALL
+        MATCH (b:UnionAllTest {type: 'duplicate'}) RETURN b.id AS id, b.type AS type
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 4
+        columns: ["id", "type"]
+    tags: ["set-operations", "union", "all"]
+
+  # ===============================
+  # INTERSECT OPERATIONS
+  # ===============================
+
+  - name: "intersect-basic"
+    description: "Test basic INTERSECT operation"
+    skip: true  # INTERSECT not yet implemented (returns 0A000)
+    setup:
+      - args: ["query", "CREATE (a:IntersectA {id: 1, value: 'shared'}), (b:IntersectA {id: 2, value: 'unique_a'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:IntersectB {id: 1, value: 'shared'}), (d:IntersectB {id: 3, value: 'unique_b'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:IntersectA) RETURN a.id AS id, a.value AS value
+        INTERSECT
+        MATCH (b:IntersectB) RETURN b.id AS id, b.value AS value
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["id", "value"]
+    tags: ["set-operations", "intersect", "basic"]
+
+  - name: "intersect-distinct"
+    description: "Test INTERSECT DISTINCT operation"
+    skip: true  # INTERSECT DISTINCT not yet implemented (returns 0A000)
+    setup:
+      - args: ["query", "CREATE (a:IntDistinct {id: 1, name: 'common'}), (b:IntDistinct {id: 1, name: 'common'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:IntDistinct {id: 1, name: 'common'}), (d:IntDistinct {id: 2, name: 'different'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:IntDistinct {name: 'common'}) RETURN a.id AS id, a.name AS name
+        INTERSECT DISTINCT
+        MATCH (b:IntDistinct {name: 'common'}) RETURN b.id AS id, b.name AS name
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["id", "name"]
+    tags: ["set-operations", "intersect", "distinct"]
+
+  - name: "intersect-all"
+    description: "Test INTERSECT ALL operation (frequency-based intersection)"
+    skip: true  # INTERSECT ALL not yet implemented (returns 0A000)
+    setup:
+      - args: ["query", "CREATE (a:IntAll {id: 1, type: 'multi'}), (b:IntAll {id: 1, type: 'multi'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:IntAll {id: 1, type: 'multi'}), (d:IntAll {id: 1, type: 'multi'}), (e:IntAll {id: 1, type: 'multi'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:IntAll {type: 'multi'}) RETURN a.id AS id, a.type AS type
+        INTERSECT ALL
+        MATCH (b:IntAll {type: 'multi'}) RETURN b.id AS id, b.type AS type
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["id", "type"]
+    tags: ["set-operations", "intersect", "all"]
+
+  # ===============================
+  # EXCEPT OPERATIONS
+  # ===============================
+
+  - name: "except-basic"
+    description: "Test basic EXCEPT operation"
+    skip: true  # EXCEPT not yet implemented (returns 0A000)
+    setup:
+      - args: ["query", "CREATE (a:ExceptA {id: 1, value: 'keep'}), (b:ExceptA {id: 2, value: 'remove'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:ExceptB {id: 2, value: 'remove'}), (d:ExceptB {id: 3, value: 'other'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:ExceptA) RETURN a.id AS id, a.value AS value
+        EXCEPT
+        MATCH (b:ExceptB) RETURN b.id AS id, b.value AS value
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["id", "value"]
+    tags: ["set-operations", "except", "basic"]
+
+  - name: "except-distinct"
+    description: "Test EXCEPT DISTINCT operation"
+    skip: true  # EXCEPT DISTINCT not yet implemented (returns 0A000)
+    setup:
+      - args: ["query", "CREATE (a:ExcDistinct {id: 1, name: 'keep'}), (b:ExcDistinct {id: 1, name: 'keep'}), (c:ExcDistinct {id: 2, name: 'remove'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (d:ExcDistinct {id: 2, name: 'remove'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:ExcDistinct) RETURN a.id AS id, a.name AS name
+        EXCEPT DISTINCT
+        MATCH (b:ExcDistinct {name: 'remove'}) RETURN b.id AS id, b.name AS name
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["id", "name"]
+    tags: ["set-operations", "except", "distinct"]
+
+  - name: "except-all"
+    description: "Test EXCEPT ALL operation (frequency-based subtraction)"
+    skip: true  # EXCEPT ALL not yet implemented (returns 0A000)
+    setup:
+      - args: ["query", "CREATE (a:ExcAll {id: 1, type: 'freq'}), (b:ExcAll {id: 1, type: 'freq'}), (c:ExcAll {id: 1, type: 'freq'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (d:ExcAll {id: 1, type: 'freq'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:ExcAll {type: 'freq'}) RETURN a.id AS id, a.type AS type
+        EXCEPT ALL
+        MATCH (b:ExcAll {type: 'freq'}) RETURN b.id AS id, b.type AS type LIMIT 1
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["id", "type"]
+    tags: ["set-operations", "except", "all"]
+
+  # ===============================
+  # MULTI-WAY SET OPERATIONS
+  # ===============================
+
+  - name: "multi-way-union"
+    description: "Test multi-way UNION operation"
+    setup:
+      - args: ["query", "CREATE (a:MultiA {id: 1, source: 'A'}), (b:MultiB {id: 2, source: 'B'}), (c:MultiC {id: 3, source: 'C'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:MultiA) RETURN a.id AS id, a.source AS source
+        UNION
+        MATCH (b:MultiB) RETURN b.id AS id, b.source AS source
+        UNION
+        MATCH (c:MultiC) RETURN c.id AS id, c.source AS source
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["id", "source"]
+    tags: ["set-operations", "union", "multi-way"]
+
+  - name: "mixed-set-operations"
+    description: "Test mixed set operations (UNION with INTERSECT)"
+    skip: true  # INTERSECT not yet implemented (returns 0A000)
+    setup:
+      - args: ["query", "CREATE (a:MixedA {id: 1, type: 'common'}), (b:MixedA {id: 2, type: 'unique_a'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:MixedB {id: 1, type: 'common'}), (d:MixedB {id: 3, type: 'unique_b'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (e:MixedC {id: 1, type: 'common'}), (f:MixedC {id: 4, type: 'unique_c'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        (MATCH (a:MixedA) RETURN a.id AS id, a.type AS type
+         UNION
+         MATCH (b:MixedB) RETURN b.id AS id, b.type AS type)
+        INTERSECT
+        MATCH (c:MixedC) RETURN c.id AS id, c.type AS type
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["id", "type"]
+    tags: ["set-operations", "mixed", "complex"]
+
+  # ===============================
+  # SET OPERATIONS WITH ORDERING
+  # ===============================
+
+  - name: "union-with-order-by"
+    description: "Test UNION with ORDER BY clause"
+    setup:
+      - args: ["query", "CREATE (a:OrderA {id: 3, name: 'third'}), (b:OrderA {id: 1, name: 'first'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:OrderB {id: 4, name: 'fourth'}), (d:OrderB {id: 2, name: 'second'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:OrderA) RETURN a.id AS id, a.name AS name
+        UNION
+        MATCH (b:OrderB) RETURN b.id AS id, b.name AS name
+        ORDER BY id
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 4
+        columns: ["id", "name"]
+    tags: ["set-operations", "union", "ordering"]
+
+  - name: "union-with-limit"
+    description: "Test UNION with LIMIT clause"
+    setup:
+      - args: ["query", "CREATE (a:LimitA {id: 1, value: 'a1'}), (b:LimitA {id: 2, value: 'a2'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:LimitB {id: 3, value: 'b1'}), (d:LimitB {id: 4, value: 'b2'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:LimitA) RETURN a.id AS id, a.value AS value
+        UNION
+        MATCH (b:LimitB) RETURN b.id AS id, b.value AS value
+        LIMIT 2
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["id", "value"]
+    tags: ["set-operations", "union", "limit"]
+
+  # ===============================
+  # TYPE COMPATIBILITY TESTS
+  # ===============================
+
+  - name: "union-type-compatibility-strings"
+    description: "Test UNION with compatible string types"
+    args:
+      - "query"
+      - |
+        RETURN 'first' AS text_value
+        UNION
+        RETURN 'second' AS text_value
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["text_value"]
+    tags: ["set-operations", "union", "type-compatibility", "strings"]
+
+  - name: "union-type-compatibility-numbers"
+    description: "Test UNION with compatible numeric types"
+    args:
+      - "query"
+      - |
+        RETURN 42 AS number_value
+        UNION
+        RETURN 3.14 AS number_value
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["number_value"]
+    tags: ["set-operations", "union", "type-compatibility", "numbers"]
+
+  - name: "union-type-compatibility-mixed"
+    description: "Test UNION with mixed compatible types"
+    args:
+      - "query"
+      - |
+        RETURN 'text' AS mixed_value
+        UNION
+        RETURN 123 AS mixed_value
+        UNION
+        RETURN true AS mixed_value
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["mixed_value"]
+    tags: ["set-operations", "union", "type-compatibility", "mixed"]
+
+  # ===============================
+  # COMPLEX QUERY SCENARIOS
+  # ===============================
+
+  - name: "set-operations-with-aggregation"
+    description: "Test set operations with aggregation"
+    setup:
+      - args: ["query", "CREATE (a:AggA {category: 'X', value: 10}), (b:AggA {category: 'X', value: 20})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:AggB {category: 'Y', value: 15}), (d:AggB {category: 'Y', value: 25})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:AggA) RETURN a.category AS category, sum(a.value) AS total GROUP BY a.category
+        UNION
+        MATCH (b:AggB) RETURN b.category AS category, sum(b.value) AS total GROUP BY b.category
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["category", "total"]
+    tags: ["set-operations", "union", "aggregation"]
+
+  - name: "set-operations-with-subqueries"
+    description: "Test set operations with subqueries"
+    setup:
+      - args: ["query", "CREATE (a:SubA {id: 1, parent_id: 10}), (b:SubA {id: 2, parent_id: 10})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (c:SubB {id: 3, parent_id: 20}), (d:SubB {id: 4, parent_id: 20})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:SubA) WHERE a.parent_id IN (MATCH (x:SubA) RETURN DISTINCT x.parent_id) RETURN a.id AS id
+        UNION
+        MATCH (b:SubB) WHERE b.parent_id IN (MATCH (y:SubB) RETURN DISTINCT y.parent_id) RETURN b.id AS id
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 4
+        columns: ["id"]
+    tags: ["set-operations", "union", "subqueries"]
+
+  # ===============================
+  # ERROR SCENARIOS
+  # ===============================
+
+  - name: "union-column-count-mismatch"
+    description: "Test UNION with mismatched column counts (should error)"
+    skip: true  # Geode returns status codes via response, not exit codes - test runner limitation
+    args:
+      - "query"
+      - |
+        RETURN 'single' AS col1
+        UNION
+        RETURN 'first' AS col1, 'second' AS col2
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "42000"  # Column count mismatch
+    tags: ["set-operations", "union", "error", "column-mismatch"]
+
+  - name: "intersect-no-common-rows"
+    description: "Test INTERSECT with no common rows"
+    skip: true  # INTERSECT not yet implemented (returns 0A000)
+    setup:
+      - args: ["query", "CREATE (a:NoCommonA {id: 1, value: 'unique_a'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (b:NoCommonB {id: 2, value: 'unique_b'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:NoCommonA) RETURN a.id AS id, a.value AS value
+        INTERSECT
+        MATCH (b:NoCommonB) RETURN b.id AS id, b.value AS value
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 0
+        columns: ["id", "value"]
+    tags: ["set-operations", "intersect", "empty-result"]
+
+  # ===============================
+  # PERFORMANCE TESTS
+  # ===============================
+
+  - name: "large-union-performance"
+    description: "Performance test with larger datasets in UNION"
+    timeout_ms: 30000
+    setup:
+      - args: ["query", "CREATE (n1:PerfA {id: 1, batch: 'A'}), (n2:PerfA {id: 2, batch: 'A'}), (n3:PerfA {id: 3, batch: 'A'}), (n4:PerfA {id: 4, batch: 'A'}), (n5:PerfA {id: 5, batch: 'A'})"]
+        expect:
+          exit_code: 0
+      - args: ["query", "CREATE (n6:PerfB {id: 6, batch: 'B'}), (n7:PerfB {id: 7, batch: 'B'}), (n8:PerfB {id: 8, batch: 'B'}), (n9:PerfB {id: 9, batch: 'B'}), (n10:PerfB {id: 10, batch: 'B'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (a:PerfA) RETURN a.id AS id, a.batch AS batch
+        UNION ALL
+        MATCH (b:PerfB) RETURN b.id AS id, b.batch AS batch
+        ORDER BY id
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 10
+        columns: ["id", "batch"]
+    tags: ["set-operations", "union", "performance"]
+
+  # ===============================
+  # CLEANUP
+  # ===============================
+
+  - name: "cleanup-set-operations-data"
+    description: "Clean up all test data created during set operations tests"
+    args:
+      - "query"
+      - |
+        MATCH (n) WHERE
+          n:TypeA OR n:TypeB OR n:UnionTest OR n:UnionAllTest OR
+          n:IntersectA OR n:IntersectB OR n:IntDistinct OR n:IntAll OR
+          n:ExceptA OR n:ExceptB OR n:ExcDistinct OR n:ExcAll OR
+          n:MultiA OR n:MultiB OR n:MultiC OR n:MixedA OR n:MixedB OR n:MixedC OR
+          n:OrderA OR n:OrderB OR n:LimitA OR n:LimitB OR
+          n:AggA OR n:AggB OR n:SubA OR n:SubB OR
+          n:NoCommonA OR n:NoCommonB OR n:PerfA OR n:PerfB
+        DETACH DELETE n
+    expect:
+      exit_code: 0
+    tags: ["cleanup", "set-operations"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["set-operations", "union", "intersect", "except", "iso-gql", "comprehensive"]

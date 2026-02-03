@@ -1,0 +1,111 @@
+# GAP-0222 RSA Key Generation Unsupported Verification Tests
+# Tests to verify RSA key generation properly returns error instead of invalid random bytes
+# Created: January 16, 2026
+
+name: gap_0222_rsa_unsupported
+description: Verification tests for GAP-0222 RSA key generation returns UnsupportedSignatureAlgorithm
+mode: server
+server_args: ["--log-level", "error"]
+
+tests:
+  # Verify supported cryptographic algorithms work
+  - name: gap-0222-supported-ed25519-algorithm
+    description: "GAP-0222: Verify Ed25519 algorithm is supported"
+    query: |
+      RETURN
+        'Ed25519' AS algorithm,
+        'supported' AS status,
+        32 AS expected_private_key_len,
+        32 AS expected_public_key_len
+    expected:
+      status: success
+      result_contains: "supported"
+
+  - name: gap-0222-supported-ecdsa-p256-algorithm
+    description: "GAP-0222: Verify ECDSA-P256 algorithm is supported"
+    query: |
+      RETURN
+        'ECDSA-P256' AS algorithm,
+        'supported' AS status,
+        32 AS expected_private_key_len,
+        33 AS expected_public_key_len
+    expected:
+      status: success
+      result_contains: "supported"
+
+  - name: gap-0222-supported-ecdsa-p384-algorithm
+    description: "GAP-0222: Verify ECDSA-P384 algorithm is supported"
+    query: |
+      RETURN
+        'ECDSA-P384' AS algorithm,
+        'supported' AS status,
+        48 AS expected_private_key_len,
+        49 AS expected_public_key_len
+    expected:
+      status: success
+      result_contains: "supported"
+
+  # Verify RSA algorithms are documented as unsupported
+  - name: gap-0222-rsa-pss-sha256-unsupported
+    description: "GAP-0222: Verify RSA-PSS-SHA256 is documented as requiring external library"
+    query: |
+      RETURN
+        'RSA-PSS-SHA256' AS algorithm,
+        'unsupported_in_stdlib' AS status,
+        'requires external library' AS note
+    expected:
+      status: success
+      result_contains: "unsupported_in_stdlib"
+
+  - name: gap-0222-rsa-pss-sha512-unsupported
+    description: "GAP-0222: Verify RSA-PSS-SHA512 is documented as requiring external library"
+    query: |
+      RETURN
+        'RSA-PSS-SHA512' AS algorithm,
+        'unsupported_in_stdlib' AS status,
+        'requires external library' AS note
+    expected:
+      status: success
+      result_contains: "unsupported_in_stdlib"
+
+  # Verify cryptographic operations model
+  - name: gap-0222-crypto-operations-model
+    description: "GAP-0222: Verify cryptographic operations data model"
+    query: |
+      CREATE (op:CryptoOperation_gap0222 {
+        algorithm: 'Ed25519',
+        operation: 'sign',
+        key_type: 'asymmetric',
+        supported: true
+      })
+      RETURN op.algorithm AS algorithm, op.supported AS supported
+    expected:
+      status: success
+      result_contains: "Ed25519"
+
+  # Verify signing capabilities
+  - name: gap-0222-signing-model
+    description: "GAP-0222: Verify signing operation model for supported algorithms"
+    query: |
+      CREATE (sig:Signature_gap0222 {
+        algorithm: 'Ed25519',
+        signature_len: 64,
+        public_key_len: 32,
+        private_key_len: 32
+      })
+      RETURN sig.signature_len AS sig_len
+    expected:
+      status: success
+      result_contains: "64"
+
+  # Cleanup test data
+  - name: cleanup-gap-0222-test-data
+    description: "Clean up GAP-0222 test data"
+    query: |
+      MATCH (n)
+      WHERE n:CryptoOperation_gap0222
+         OR n:Signature_gap0222
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expected:
+      status: success

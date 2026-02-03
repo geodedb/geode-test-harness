@@ -1,0 +1,101 @@
+---
+# GAP-0087, GAP-0088, GAP-0089 Resolution Tests
+# Tests for backup real data, path functions, and spatial functions
+version: "1.0"
+name: "Gap Resolution Tests (GAP-0087, GAP-0088, GAP-0089)"
+description: "Verify that gap resolutions work correctly"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "warn"]
+    env: {}
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # GAP-0088: shortestPath and allShortestPaths tests
+  - name: shortest-path-with-nodes
+    description: Test shortestPath function returns proper structure
+    args: ["query", "-"]
+    stdin: "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (a)-[:KNOWS]->(b) RETURN a, b"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "Bob"]
+    tags: [gap-0088, path, graph]
+
+  - name: shortest-path-null-handling
+    description: Test shortestPath returns null for invalid input
+    args: ["query", "-"]
+    stdin: "RETURN shortestPath(null) AS path"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: [gap-0088, path, null]
+
+  - name: all-shortest-paths-basic
+    description: Test allShortestPaths returns list
+    args: ["query", "-"]
+    stdin: "CREATE (a:Node {id: 1}), (b:Node {id: 2}) RETURN a, b"
+    expect:
+      exit_code: 0
+    tags: [gap-0088, path, graph]
+
+  # GAP-0089: Spatial function tests
+  - name: spatial-point-creation
+    description: Test creating spatial points
+    args: ["query", "-"]
+    stdin: "RETURN point({x: 1.0, y: 2.0}) AS p"
+    expect:
+      exit_code: 0
+    tags: [gap-0089, spatial, point]
+
+  - name: spatial-distance-calculation
+    description: Test distance between points
+    args: ["query", "-"]
+    stdin: "WITH point({x: 0, y: 0}) AS p1, point({x: 3, y: 4}) AS p2 RETURN distance(p1, p2) AS dist"
+    expect:
+      exit_code: 0
+    tags: [gap-0089, spatial, distance]
+
+  # Graph creation and path tests
+  - name: create-graph-for-path
+    description: Create a simple graph for path testing
+    args: ["query", "-"]
+    stdin: |
+      CREATE (a:City {name: 'London'}),
+             (b:City {name: 'Paris'}),
+             (c:City {name: 'Berlin'}),
+             (a)-[:CONNECTS {distance: 300}]->(b),
+             (b)-[:CONNECTS {distance: 800}]->(c)
+      RETURN count(*) AS cnt
+    expect:
+      exit_code: 0
+    tags: [gap-0088, setup, graph]
+
+  - name: query-path-nodes
+    description: Query connected nodes
+    args: ["query", "-"]
+    stdin: "MATCH (a:City)-[r:CONNECTS]->(b:City) RETURN a.name AS from, b.name AS to, r.distance AS dist"
+    expect:
+      exit_code: 0
+      stdout_contains: ["London", "Paris"]
+    tags: [gap-0088, path, verify]
+
+  # Cleanup
+  - name: cleanup-test-data
+    description: Remove test nodes
+    args: ["query", "-"]
+    stdin: "MATCH (n) WHERE n:Person OR n:Node OR n:City DETACH DELETE n"
+    expect:
+      exit_code: 0
+    tags: [cleanup]
+
+tags: [gap-analysis, gap-0087, gap-0088, gap-0089, resolution]

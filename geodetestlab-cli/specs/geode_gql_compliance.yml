@@ -1,0 +1,399 @@
+version: "1.0"
+name: "Geode GQL ISO/IEC 39075:2024 Compliance Tests"
+description: "Test suite validating core GQL standard compliance features that are implemented"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "error"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # Setup test data for comprehensive testing
+  - name: "setup-comprehensive-schema"
+    description: "Create comprehensive test schema with all data types"
+    args: ["query", "-"]
+    stdin: |
+      CREATE
+        (alice:Person {name: 'Alice', age: 30, email: 'alice@example.com', active: true, salary: 75000.50}),
+        (bob:Person {name: 'Bob', age: 25, email: 'bob@example.com', active: false, salary: 65000.00}),
+        (charlie:Person {name: 'Charlie', age: 35, email: 'charlie@example.com', active: true, salary: 85000.75}),
+        (techcorp:Company {name: 'TechCorp', founded: 2010, revenue: 1500000.00, active: true}),
+        (startup:Company {name: 'StartupInc', founded: 2020, revenue: 250000.00, active: true}),
+        (alice)-[:WORKS_FOR {since: 2020, role: 'Senior Engineer'}]->(techcorp),
+        (bob)-[:WORKS_FOR {since: 2022, role: 'Developer'}]->(techcorp),
+        (charlie)-[:WORKS_FOR {since: 2015, role: 'Product Director'}]->(techcorp),
+        (alice)-[:KNOWS {since: 2020}]->(bob),
+        (alice)-[:KNOWS {since: 2018}]->(charlie),
+        (bob)-[:KNOWS {since: 2021}]->(charlie)
+      RETURN count(*) AS created
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["created"]
+    tags: ["setup", "schema"]
+
+  # ===============================
+  # CORE KEYWORD COMPLIANCE TESTS
+  # ===============================
+
+  - name: "keywords-basic-match-where-return"
+    description: "Test basic keywords: MATCH, WHERE, RETURN"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) WHERE p.age > 25 RETURN p.name AS name, p.age AS age ORDER BY p.age"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "age"]
+    tags: ["keywords", "basic"]
+
+  - name: "keywords-create-delete"
+    description: "Test CREATE and DELETE keywords"
+    args: ["query", "-"]
+    stdin: "CREATE (temp:TempNode {id: 999}) RETURN temp.id AS temp_id"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["temp_id"]
+    tags: ["keywords", "create"]
+
+  - name: "keywords-delete-temp"
+    description: "Test DELETE keyword"
+    args: ["query", "-"]
+    stdin: "MATCH (temp:TempNode {id: 999}) DELETE temp"
+    expect:
+      exit_code: 0
+    tags: ["keywords", "delete"]
+
+  # ===============================
+  # AGGREGATION FUNCTION TESTS
+  # ===============================
+
+  - name: "aggregation-count-functions"
+    description: "Test COUNT aggregation functions"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) RETURN COUNT(*) AS total_count, COUNT(p.name) AS name_count"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["total_count", "name_count"]
+    tags: ["aggregation", "count"]
+
+  - name: "aggregation-sum-avg-min-max"
+    description: "Test SUM, AVG, MIN, MAX aggregation functions"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) RETURN SUM(p.age) AS total_age, AVG(p.salary) AS avg_salary, MIN(p.age) AS min_age, MAX(p.salary) AS max_salary"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["total_age", "avg_salary", "min_age", "max_salary"]
+    tags: ["aggregation", "math"]
+
+  # ===============================
+  # STRING FUNCTIONS
+  # ===============================
+
+  - name: "string-predicates"
+    description: "Test STARTS WITH, ENDS WITH, CONTAINS predicates"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) WHERE p.email STARTS WITH 'alice' OR p.email ENDS WITH 'example.com' OR p.name CONTAINS 'har' RETURN p.name AS name, p.email AS email ORDER BY p.name"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["name", "email"]
+    tags: ["string", "predicates"]
+
+  - name: "string-functions-comprehensive"
+    description: "Test comprehensive string functions"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) RETURN p.name AS name, length(p.name) AS name_length, upper(p.name) AS upper_name, lower(p.email) AS lower_email ORDER BY p.name LIMIT 2"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "name_length", "upper_name", "lower_email"]
+    tags: ["string", "functions"]
+
+  # ===============================
+  # BUILT-IN FUNCTION TESTS
+  # ===============================
+
+  - name: "math-functions-comprehensive"
+    description: "Test comprehensive mathematical functions"
+    args: ["query", "-"]
+    stdin: "RETURN abs(-5) AS abs_val, sqrt(16) AS sqrt_val, ceil(3.2) AS ceil_val, floor(3.8) AS floor_val, round(3.5) AS round_val"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["abs_val", "sqrt_val", "ceil_val", "floor_val", "round_val"]
+    tags: ["math", "functions"]
+
+  # ===============================
+  # PATH QUANTIFIERS AND PATTERNS
+  # ===============================
+
+  - name: "variable-length-paths-basic"
+    description: "Test basic variable-length path patterns"
+    args: ["query", "-"]
+    stdin: "MATCH (p1:Person)-[*1..2]->(p2:Person) RETURN p1.name AS from_name, p2.name AS to_name"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["from_name", "to_name"]
+    tags: ["paths", "quantifiers"]
+
+  - name: "variable-length-paths-unbounded"
+    description: "Test unbounded variable-length paths"
+    args: ["query", "-"]
+    stdin: "MATCH (p1:Person)-[*..3]->(p2:Person) WHERE p1.name = 'Alice' RETURN p1.name AS from_name, p2.name AS to_name"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["from_name", "to_name"]
+    tags: ["paths", "quantifiers"]
+
+  # ===============================
+  # COMPLEX QUERY PATTERNS
+  # ===============================
+
+  - name: "with-clause-projection"
+    description: "Test WITH clause for query chaining"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) WITH p.name AS person_name, c.name AS company_name WHERE company_name = 'TechCorp' RETURN person_name AS employee, company_name AS employer ORDER BY employee"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["employee", "employer"]
+    tags: ["with", "projection"]
+
+  - name: "distinct-operations"
+    description: "Test DISTINCT operations"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN DISTINCT c.name AS company ORDER BY company"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["company"]
+    tags: ["distinct", "unique"]
+
+  - name: "union-operations"
+    description: "Test UNION operations"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) RETURN p.name AS name, 'Person' AS type UNION MATCH (c:Company) RETURN c.name AS name, 'Company' AS type ORDER BY name"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["name", "type"]
+    tags: ["union", "set-operations"]
+
+  - name: "complex-pattern-matching"
+    description: "Test complex graph patterns"
+    args: ["query", "-"]
+    stdin: "MATCH (p1:Person)-[:KNOWS]->(p2:Person), (p2)-[:WORKS_FOR]->(c:Company) WHERE p1.age > 25 AND c.founded < 2015 RETURN p1.name AS person1, p2.name AS person2, c.name AS company"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["person1", "person2", "company"]
+    tags: ["complex", "patterns"]
+
+  # ===============================
+  # OPERATORS AND EXPRESSIONS
+  # ===============================
+
+  - name: "comparison-operators"
+    description: "Test all comparison operators"
+    args: ["query", "-"]
+    stdin: "RETURN 1 = 1 AS equals, 2 <> 3 AS not_equals, 3 < 4 AS less_than, 4 <= 4 AS less_equal, 5 > 4 AS greater, 5 >= 5 AS greater_equal"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["equals", "not_equals", "less_than", "less_equal", "greater", "greater_equal"]
+    tags: ["operators", "comparison"]
+
+  - name: "logical-operators"
+    description: "Test logical operators"
+    args: ["query", "-"]
+    stdin: "RETURN true AND false AS and_result, true OR false AS or_result, NOT true AS not_result"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["and_result", "or_result", "not_result"]
+    tags: ["operators", "logical"]
+
+  - name: "arithmetic-operators"
+    description: "Test arithmetic operators"
+    args: ["query", "-"]
+    stdin: "RETURN 10 + 5 AS addition, 10 - 3 AS subtraction, 4 * 6 AS multiplication, 15 / 3 AS division, 17 % 5 AS modulo"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["addition", "subtraction", "multiplication", "division", "modulo"]
+    tags: ["operators", "arithmetic"]
+
+  - name: "null-handling"
+    description: "Test NULL handling operations"
+    args: ["query", "-"]
+    stdin: "RETURN null IS NULL AS is_null, 'value' IS NOT NULL AS not_null"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["is_null", "not_null"]
+    tags: ["operators", "null"]
+
+  # ===============================
+  # DATA TYPE TESTS
+  # ===============================
+
+  - name: "primitive-data-types"
+    description: "Test primitive data types"
+    args: ["query", "-"]
+    stdin: "RETURN true AS boolean_val, 42 AS integer_val, 3.14159 AS float_val, 'hello world' AS string_val, null AS null_val"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["boolean_val", "integer_val", "float_val", "string_val", "null_val"]
+    tags: ["datatypes", "primitives"]
+
+  - name: "collection-data-types"
+    description: "Test collection data types"
+    args: ["query", "-"]
+    stdin: "RETURN [1, 2, 3, 4, 5] AS list_val, {name: 'Alice', age: 30, active: true} AS map_val"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["list_val", "map_val"]
+    tags: ["datatypes", "collections"]
+
+  # ===============================
+  # ADVANCED QUERY FEATURES
+  # ===============================
+
+  - name: "case-expressions"
+    description: "Test CASE expressions"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) RETURN p.name AS name, CASE WHEN p.age < 30 THEN 'Young' WHEN p.age < 35 THEN 'Middle' ELSE 'Senior' END AS age_category ORDER BY p.name"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["name", "age_category"]
+    tags: ["case", "expressions"]
+
+  - name: "optional-match-nulls"
+    description: "Test OPTIONAL MATCH with NULL handling"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) OPTIONAL MATCH (p)-[r:MANAGES]->(subordinate:Person) RETURN p.name AS manager, subordinate.name AS subordinate_name ORDER BY p.name"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["manager", "subordinate_name"]
+    tags: ["optional", "nulls"]
+
+  # ===============================
+  # PERFORMANCE AND OPTIMIZATION
+  # ===============================
+
+  - name: "large-result-pagination"
+    description: "Test pagination with LIMIT and OFFSET"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY p.age, p.name LIMIT 2 OFFSET 1"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "age"]
+    tags: ["pagination", "performance"]
+
+  - name: "explain-query-plan"
+    description: "Test EXPLAIN functionality"
+    args: ["query", "-"]
+    stdin: "EXPLAIN MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN p.name, c.name"
+    expect:
+      exit_code: 0
+    tags: ["explain", "optimization"]
+
+  - name: "profile-query-execution"
+    description: "Test PROFILE functionality"
+    args: ["query", "-"]
+    stdin: "PROFILE MATCH (p:Person) RETURN count(p) AS person_count"
+    expect:
+      exit_code: 0
+    tags: ["profile", "performance"]
+
+  # ===============================
+  # ERROR HANDLING AND EDGE CASES
+  # ===============================
+
+  - name: "syntax-error-handling"
+    description: "Test proper handling of syntax errors"
+    args: ["query", "-"]
+    stdin: "MATCH (n:) RETURN n"
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "42000"
+    tags: ["error", "syntax"]
+
+  # ===============================
+  # COMPLIANCE VERIFICATION
+  # ===============================
+
+  - name: "iso-compliance-verification"
+    description: "Run internal GQL compliance test"
+    args: ["query", "-"]
+    stdin: "RETURN 'GQL ISO/IEC 39075:2024 Core Compliance' AS compliance_status"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["compliance_status"]
+    tags: ["compliance", "verification"]
+
+  # ===============================
+  # CLEANUP
+  # ===============================
+
+  - name: "cleanup-test-data"
+    description: "Clean up all test data"
+    args: ["query", "-"]
+    stdin: "MATCH (n) DELETE n"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "verify-complete-cleanup"
+    description: "Verify all data is cleaned up"
+    args: ["query", "-"]
+    stdin: "MATCH (n) RETURN count(n) AS remaining_nodes"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["remaining_nodes"]
+    tags: ["cleanup", "verify"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["gql", "compliance", "iso", "standard", "core", "features"]

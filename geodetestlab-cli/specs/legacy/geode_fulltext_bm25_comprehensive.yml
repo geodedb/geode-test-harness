@@ -1,0 +1,288 @@
+name: "Full-Text Search BM25 Comprehensive Tests"
+description: "Comprehensive testing of BM25 scoring full-text search functionality with multiple analyzers"
+
+setup:
+  server_mode: embedded
+  timeout: 30
+
+teardown:
+  cleanup_data: true
+
+tests:
+  # Basic full-text index creation with different analyzers
+  - name: "fulltext_index_creation_simple"
+    description: "Create full-text index with simple analyzer"
+    steps:
+      - command: query
+        input: "CREATE INDEX article_content_simple_idx ON Article (content) USING fulltext_simple"
+        expect:
+          status_class: "00000"
+          message_contains: "Index created successfully"
+
+  - name: "fulltext_index_creation_standard"
+    description: "Create full-text index with standard analyzer"
+    steps:
+      - command: query
+        input: "CREATE INDEX article_content_std_idx ON Article (content) USING fulltext_standard"
+        expect:
+          status_class: "00000"
+          message_contains: "Index created successfully"
+
+  - name: "fulltext_index_creation_english"
+    description: "Create full-text index with English analyzer"
+    steps:
+      - command: query
+        input: "CREATE INDEX article_content_en_idx ON Article (content) USING fulltext_english"
+        expect:
+          status_class: "00000"
+          message_contains: "Index created successfully"
+
+  # Content insertion for testing
+  - name: "article_data_insertion"
+    description: "Insert articles with various content for full-text testing"
+    steps:
+      - command: query
+        input: "CREATE (a1:Article {title: 'Machine Learning Basics', content: 'Machine learning is a subset of artificial intelligence that focuses on algorithms and statistical models.'})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "CREATE (a2:Article {title: 'Deep Learning Guide', content: 'Deep learning uses neural networks with multiple layers to model and understand complex patterns in data.'})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "CREATE (a3:Article {title: 'Natural Language Processing', content: 'Natural language processing combines computational linguistics with machine learning and deep learning models.'})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "CREATE (a4:Article {title: 'Computer Vision Applications', content: 'Computer vision applications use deep learning and machine learning algorithms for image recognition and analysis.'})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "CREATE (a5:Article {title: 'Artificial Intelligence Overview', content: 'Artificial intelligence encompasses machine learning, deep learning, natural language processing, and computer vision.'})"
+        expect:
+          status_class: "00000"
+
+  # BM25 scoring with different query terms
+  - name: "bm25_single_term_search"
+    description: "Test BM25 scoring with single search term"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'machine', 'simple') > 0.0 RETURN a.title, fulltext_search(a.content, 'machine', 'simple') AS bm25_score ORDER BY bm25_score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "Machine Learning"
+            - "bm25_score"
+
+  - name: "bm25_multi_term_search"
+    description: "Test BM25 scoring with multiple search terms"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'machine learning', 'standard') > 0.0 RETURN a.title, fulltext_search(a.content, 'machine learning', 'standard') AS bm25_score ORDER BY bm25_score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "Machine Learning"
+            - "bm25_score"
+
+  - name: "bm25_phrase_search"
+    description: "Test BM25 scoring with phrase search"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'deep learning models', 'english') > 0.0 RETURN a.title, fulltext_search(a.content, 'deep learning models', 'english') AS bm25_score ORDER BY bm25_score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "bm25_score"
+
+  # Analyzer comparison and behavior
+  - name: "analyzer_simple_vs_standard"
+    description: "Compare simple vs standard analyzer behavior"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) RETURN a.title, fulltext_search(a.content, 'machine-learning', 'simple') AS simple_score, fulltext_search(a.content, 'machine-learning', 'standard') AS standard_score WHERE simple_score > 0.0 OR standard_score > 0.0"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "title"
+
+  - name: "english_analyzer_stemming"
+    description: "Test English analyzer stemming behavior"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'algorithms', 'english') > 0.0 RETURN a.title, fulltext_search(a.content, 'algorithms', 'english') AS score ORDER BY score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "title"
+
+  # Advanced BM25 features
+  - name: "bm25_threshold_filtering"
+    description: "Test BM25 score threshold filtering"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'artificial intelligence', 'standard') > 1.0 RETURN a.title, fulltext_search(a.content, 'artificial intelligence', 'standard') AS score ORDER BY score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "score"
+
+  - name: "bm25_top_k_results"
+    description: "Test BM25 top-K results with LIMIT"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'learning', 'standard') > 0.0 RETURN a.title, fulltext_search(a.content, 'learning', 'standard') AS score ORDER BY score DESC LIMIT 3"
+        expect:
+          status_class: "00000"
+          max_results: 3
+
+  # Index optimization and query planning
+  - name: "fulltext_optimization_explain"
+    description: "Verify full-text search optimization in query plan"
+    steps:
+      - command: query
+        input: "EXPLAIN MATCH (a:Article) WHERE fulltext_search(a.content, 'machine learning deep', 'standard') > 0.5 RETURN a.title, fulltext_search(a.content, 'machine learning deep', 'standard') AS score ORDER BY score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "Index"
+            - "fulltext"
+            - "cost"
+
+  - name: "fulltext_with_property_filter"
+    description: "Test full-text search combined with property filtering"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE a.title CONTAINS 'Learning' AND fulltext_search(a.content, 'neural networks', 'english') > 0.0 RETURN a.title, fulltext_search(a.content, 'neural networks', 'english') AS score"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "Learning"
+            - "score"
+
+  # Term frequency and document frequency effects
+  - name: "bm25_tf_effects"
+    description: "Test BM25 term frequency effects"
+    steps:
+      - command: query
+        input: "CREATE (rep:Article {title: 'Repetitive Content', content: 'machine machine machine learning machine learning algorithms machine learning models machine learning techniques'})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'machine', 'simple') > 0.0 RETURN a.title, fulltext_search(a.content, 'machine', 'simple') AS score ORDER BY score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "Repetitive Content"
+            - "score"
+
+  # Error handling and edge cases
+  - name: "fulltext_empty_query"
+    description: "Test full-text search with empty query"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, '', 'simple') > 0.0 RETURN a.title"
+        expect:
+          status_class: "22000"  # Should fail with empty query
+
+  - name: "fulltext_invalid_analyzer"
+    description: "Test full-text search with invalid analyzer"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'test', 'invalid_analyzer') > 0.0 RETURN a.title"
+        expect:
+          status_class: "22000"  # Should fail with invalid analyzer
+
+  - name: "fulltext_special_characters"
+    description: "Test full-text search with special characters"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'machine-learning @#$%', 'standard') > 0.0 RETURN a.title, fulltext_search(a.content, 'machine-learning @#$%', 'standard') AS score"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "title"
+
+  # Index statistics and performance
+  - name: "fulltext_index_statistics"
+    description: "Test full-text index statistics"
+    steps:
+      - command: query
+        input: "CALL index.statistics('article_content_std_idx') YIELD index_name, index_type, total_entries, unique_values"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "article_content_std_idx"
+            - "fulltext_standard"
+
+  # Relevance ranking with different content types
+  - name: "bm25_relevance_ranking"
+    description: "Test BM25 relevance ranking with varied content"
+    steps:
+      - command: query
+        input: "CREATE (short:Article {title: 'Short', content: 'Machine learning.'}), (long:Article {title: 'Long', content: 'This is a very long article about machine learning and artificial intelligence that covers many aspects of these technologies including deep learning neural networks and natural language processing with extensive detail and comprehensive coverage of the subject matter.'})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'machine learning', 'standard') > 0.0 RETURN a.title, fulltext_search(a.content, 'machine learning', 'standard') AS score ORDER BY score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "score"
+
+  # Index cleanup
+  - name: "fulltext_index_drop"
+    description: "Test dropping full-text indexes"
+    steps:
+      - command: query
+        input: "DROP INDEX article_content_simple_idx"
+        expect:
+          status_class: "00000"
+          message_contains: "Index dropped successfully"
+      - command: query
+        input: "DROP INDEX article_content_std_idx"
+        expect:
+          status_class: "00000"
+          message_contains: "Index dropped successfully"
+      - command: query
+        input: "DROP INDEX article_content_en_idx"
+        expect:
+          status_class: "00000"
+          message_contains: "Index dropped successfully"
+
+  # Full-text search without index (fallback)
+  - name: "fulltext_search_no_index"
+    description: "Test full-text search without index (sequential scan)"
+    steps:
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'artificial intelligence', 'standard') > 0.0 RETURN a.title, fulltext_search(a.content, 'artificial intelligence', 'standard') AS score ORDER BY score DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "title"
+            - "score"
+
+  # Performance with large text corpus
+  - name: "fulltext_performance_test"
+    description: "Test full-text search performance with larger corpus"
+    steps:
+      - command: query
+        input: "CREATE INDEX perf_fulltext_idx ON Article (content) USING fulltext_standard"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "CREATE (corpus1:Article {title: 'Tech Article 1', content: 'Modern machine learning algorithms utilize sophisticated neural network architectures to process and analyze vast amounts of data. Deep learning frameworks enable researchers and engineers to build complex models for computer vision, natural language processing, and predictive analytics.'}), (corpus2:Article {title: 'Tech Article 2', content: 'Artificial intelligence systems are revolutionizing industries through automation and intelligent decision making. Machine learning models trained on large datasets can identify patterns and make predictions with remarkable accuracy.'}), (corpus3:Article {title: 'Tech Article 3', content: 'Natural language processing technologies enable computers to understand and generate human language. These systems use advanced algorithms and machine learning techniques to parse text, extract meaning, and generate responses.'})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "MATCH (a:Article) WHERE fulltext_search(a.content, 'machine learning algorithms', 'standard') > 0.0 RETURN COUNT(a) AS matching_articles"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "matching_articles"
+
+validation:
+  - check_no_memory_leaks: true
+  - verify_index_cleanup: true
+  - validate_bm25_scoring: true
+  - check_analyzer_behavior: true

@@ -1,0 +1,180 @@
+name: quic_client_isolation
+description: Test QUIC server client isolation and error handling
+provider: geode
+
+setup:
+  - name: start_server
+    command: ["serve", "--listen-quic", "127.0.0.1:3141"]
+    background: true
+    wait_for: "QUIC server listening"
+    timeout: 5
+    capture_pid: server_pid
+
+teardown:
+  - name: stop_server
+    command: ["kill", "${server_pid}"]
+    ignore_errors: true
+
+tests:
+  - name: client_error_isolation
+    description: Verify one client's error doesn't affect others
+    steps:
+      - name: healthy_client_before
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'healthy1' AS status"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"status":"healthy1"']
+
+      - name: failing_client
+        command: ["query", "--server", "127.0.0.1:3141", "INVALID QUERY SYNTAX !!!"]
+        expect:
+          exit_code: 1
+        ignore_errors: true
+
+      - name: healthy_client_after
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'healthy2' AS status"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"status":"healthy2"']
+
+  - name: client_timeout_isolation
+    description: Verify slow client doesn't block others
+    parallel: true
+    steps:
+      - name: slow_client
+        command: ["query", "--server", "127.0.0.1:3141", "UNWIND range(1, 1000000) AS i RETURN count(i) AS total"]
+        timeout: 10
+        ignore_errors: true
+
+      - name: fast_client_1
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'fast1' AS result"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"result":"fast1"']
+
+      - name: fast_client_2
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'fast2' AS result"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"result":"fast2"']
+
+  - name: client_disconnection_handling
+    description: Test server handles client disconnections gracefully
+    steps:
+      - name: client_connects
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'connected' AS state"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"state":"connected"']
+
+      - name: force_disconnect
+        # Simulate abrupt disconnection by killing client mid-query
+        command: ["timeout", "0.1", "geode", "query", "--server", "127.0.0.1:3141", "UNWIND range(1, 1000000) AS i RETURN i"]
+        ignore_errors: true
+
+      - name: new_client_after_disconnect
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'new_client' AS state"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"state":"new_client"']
+
+  - name: malformed_request_isolation
+    description: Verify malformed requests don't crash server
+    steps:
+      - name: valid_before_malformed
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS num"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"num":1']
+
+      - name: malformed_json_request
+        # Try to send malformed JSON (missing closing brace)
+        command: ["bash", "-c", "echo '{\"type\":\"RUN_GQL\",\"text\":\"RETURN 1\"' | nc -u 127.0.0.1 3141"]
+        ignore_errors: true
+        timeout: 1
+
+      - name: valid_after_malformed
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 2 AS num"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"num":2']
+
+  - name: resource_cleanup_verification
+    description: Verify server cleans up resources after client disconnect
+    steps:
+      - name: create_many_connections
+        parallel: true
+        repeat: 10
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 1 AS x"]
+        expect:
+          exit_code: 0
+
+      - name: wait_for_cleanup
+        command: ["sleep", "2"]
+        ignore_errors: true
+
+      - name: verify_new_connection_works
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'cleanup_ok' AS status"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"status":"cleanup_ok"']
+
+  - name: concurrent_error_and_success
+    description: Mix of failing and succeeding clients running concurrently
+    parallel: true
+    steps:
+      - name: success_1
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'ok1' AS msg"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"msg":"ok1"']
+
+      - name: failure_1
+        command: ["query", "--server", "127.0.0.1:3141", "SYNTAX ERROR"]
+        expect:
+          exit_code: 1
+        ignore_errors: true
+
+      - name: success_2
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'ok2' AS msg"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"msg":"ok2"']
+
+      - name: failure_2
+        command: ["query", "--server", "127.0.0.1:3141", "MORE SYNTAX ERRORS"]
+        expect:
+          exit_code: 1
+        ignore_errors: true
+
+      - name: success_3
+        command: ["query", "--server", "127.0.0.1:3141", "RETURN 'ok3' AS msg"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"msg":"ok3"']
+
+  - name: stream_id_isolation
+    description: Verify different stream IDs are properly isolated
+    notes: |
+      Each QUIC connection can have multiple streams. This test verifies
+      that operations on different streams don't interfere with each other.
+    steps:
+      - name: stream_1_operation
+        command: ["query", "--server", "127.0.0.1:3141", "CREATE (n:Stream1 {id: 1}) RETURN n.id AS stream"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"stream":1']
+
+      - name: stream_2_operation
+        command: ["query", "--server", "127.0.0.1:3141", "CREATE (n:Stream2 {id: 2}) RETURN n.id AS stream"]
+        expect:
+          exit_code: 0
+          stdout_contains: ['"stream":2']
+
+      - name: verify_both_exist
+        command: ["query", "--server", "127.0.0.1:3141", "MATCH (n) WHERE n.id IN [1, 2] RETURN n.id AS id ORDER BY id"]
+        expect:
+          exit_code: 0
+          stdout_contains:
+            - '"id":1'
+            - '"id":2'

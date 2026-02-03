@@ -1,0 +1,73 @@
+# GAP-0209 Governance Regression Tests
+# Ensures status.csv maintains 0 IMPL and 0 STUB entries
+# https://gitlab.com/devnw/codepros/geode/-/issues/338
+#
+# These tests verify the governance policy targets and data quality
+# of the status.csv requirement ledger.
+
+name: gap_0209_governance_regression
+description: Regression tests for GAP-0209 status.csv governance compliance
+version: "1.0.0"
+mode: cli
+
+tests:
+  # Governance target verification
+  - name: impl-count-zero
+    description: Verify status.csv has 0 IMPL entries (governance target)
+    command: awk -F',' '$4 == "IMPL"' docs/status.csv | wc -l
+    expected_stdout: "0"
+
+  - name: stub-count-zero
+    description: Verify status.csv has 0 STUB entries (governance target)
+    command: awk -F',' '$4 == "STUB"' docs/status.csv | wc -l
+    expected_stdout: "0"
+
+  - name: tested-count-nonzero
+    description: Verify status.csv has TESTED entries
+    command: awk -F',' '$4 == "TESTED"' docs/status.csv | wc -l | awk '{if ($1 > 2500) print "PASS"; else print "FAIL"}'
+    expected_stdout: "PASS"
+
+  - name: exempt-count-nonzero
+    description: Verify status.csv has EXEMPT entries
+    command: awk -F',' '$4 == "EXEMPT"' docs/status.csv | wc -l | awk '{if ($1 > 200) print "PASS"; else print "FAIL"}'
+    expected_stdout: "PASS"
+
+  # Data quality verification
+  - name: no-exemptemented-typo
+    description: Verify no EXEMPTEMENTED typo in status.csv
+    command: grep -c "EXEMPTEMENTED" docs/status.csv || echo "0"
+    expected_stdout: "0"
+
+  - name: no-testedemented-typo
+    description: Verify no TESTEDEMENTED typo in status.csv
+    command: grep -c "TESTEDEMENTED" docs/status.csv || echo "0"
+    expected_stdout: "0"
+
+  # File integrity checks
+  - name: status-csv-exists
+    description: Verify status.csv file exists
+    command: test -f docs/status.csv && echo "EXISTS" || echo "MISSING"
+    expected_stdout: "EXISTS"
+
+  - name: status-csv-has-header
+    description: Verify status.csv has proper CSV header
+    command: head -1 docs/status.csv | grep -c "REQ,Feature,Aspect,Status"
+    expected_stdout: "1"
+
+  # Category verification for exempt entries
+  - name: loadtest-exempt
+    description: Verify loadtest entries are EXEMPT (infrastructure code)
+    command: awk -F',' '$1 ~ /REQ-LOADTEST/ && $4 != "EXEMPT" {count++} END {print count+0}' docs/status.csv
+    expected_stdout: "0"
+
+  - name: gpu-benchmarks-exempt
+    description: Verify GPU benchmark entries are EXEMPT (infrastructure code)
+    command: awk -F',' '$2 == "GPU Acceleration" && ($3 == "Benchmarks" || $3 == "Validation") && $4 != "EXEMPT" {count++} END {print count+0}' docs/status.csv
+    expected_stdout: "0"
+
+  # Valid status values check
+  - name: valid-status-values
+    description: Verify all status values are valid (TESTED, EXEMPT, BENCHED, etc.)
+    command: |
+      awk -F',' 'NR>1 && $4 != "" && $4 !~ /^(TESTED|EXEMPT|BENCHED|REMOVED|FIXED|IMPLEMENTED|ACTIVE|ASSESSMENT|SPEC)$/ {invalid++} END {print invalid+0}' docs/status.csv
+    expected_stdout: "0"

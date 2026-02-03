@@ -1,0 +1,548 @@
+version: "1.0"
+name: "GQL Query Operations Comprehensive Tests"
+description: "Complete ISO/IEC 39075:2024 query operations testing covering MATCH, OPTIONAL, FOR, LET, FILTER, and complex patterns"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+setup:
+  - args: ["query", "-"]
+    stdin: "CREATE (alice:Person {name: 'Alice', age: 30, city: 'New York'}), (bob:Person {name: 'Bob', age: 25, city: 'San Francisco'}), (carol:Person {name: 'Carol', age: 35, city: 'London'}), (company:Company {name: 'TechCorp', founded: 2010, employees: 100}), (product:Product {name: 'Database', version: '1.0', price: 999.99}), (alice)-[:WORKS_FOR {since: 2020, role: 'Engineer'}]->(company), (bob)-[:WORKS_FOR {since: 2021, role: 'Designer'}]->(company), (carol)-[:MANAGES {since: 2019}]->(alice), (alice)-[:DEVELOPED {start_date: '2022-01-01'}]->(product), (company)-[:OWNS {acquired: 2022}]->(product)"
+    expect:
+      exit_code: 0
+
+tests:
+  # ===============================
+  # BASIC MATCH OPERATIONS
+  # ===============================
+
+  - name: "match-all-nodes"
+    description: "Test basic MATCH all nodes"
+    args: ["query", "MATCH (n) RETURN count(n) AS total_nodes"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["total_nodes"]
+    tags: ["match", "basic", "all"]
+
+  - name: "match-nodes-by-label"
+    description: "Test MATCH nodes by label"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name ORDER BY p.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["name"]
+    tags: ["match", "label", "basic"]
+
+  - name: "match-nodes-by-property"
+    description: "Test MATCH nodes by property"
+    args: ["query", "MATCH (p:Person {city: 'New York'}) RETURN p.name AS name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name"]
+    tags: ["match", "property", "basic"]
+
+  - name: "match-nodes-multiple-properties"
+    description: "Test MATCH nodes with multiple properties"
+    args: ["query", "MATCH (p:Person {name: 'Alice', city: 'New York'}) RETURN p.age AS age"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["age"]
+    tags: ["match", "property", "multiple"]
+
+  # ===============================
+  # RELATIONSHIP MATCHING
+  # ===============================
+
+  - name: "match-relationships-basic"
+    description: "Test basic relationship matching"
+    args: ["query", "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN p.name AS person, c.name AS company"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["person", "company"]
+    tags: ["match", "relationship", "basic"]
+
+  - name: "match-relationships-with-properties"
+    description: "Test relationship matching with properties"
+    args: ["query", "MATCH (p:Person)-[r:WORKS_FOR {role: 'Engineer'}]->(c:Company) RETURN p.name AS engineer, r.since AS since"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["engineer", "since"]
+    tags: ["match", "relationship", "properties"]
+
+  - name: "match-undirected-relationships"
+    description: "Test undirected relationship matching"
+    args: ["query", "MATCH (p1:Person)-[:MANAGES]-(p2:Person) RETURN p1.name AS manager, p2.name AS employee"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2  # Should match both directions
+        columns: ["manager", "employee"]
+    tags: ["match", "relationship", "undirected"]
+
+  - name: "match-any-relationship"
+    description: "Test matching any relationship type"
+    args: ["query", "MATCH (p:Person)-[r]->(target) RETURN p.name AS person, type(r) AS rel_type, labels(target)[0] AS target_type"]
+    expect:
+      exit_code: 0
+      geode_query:
+        min_rows: 1
+        columns: ["person", "rel_type", "target_type"]
+    tags: ["match", "relationship", "any"]
+
+  # ===============================
+  # PATH PATTERNS
+  # ===============================
+
+  - name: "match-path-variable"
+    description: "Test path variable assignment"
+    args: ["query", "MATCH path = (p:Person)-[:WORKS_FOR]->(c:Company) RETURN p.name AS person, length(path) AS path_length"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["person", "path_length"]
+    tags: ["match", "path", "variable"]
+
+  - name: "match-variable-length-path"
+    description: "Test variable length path patterns"
+    args: ["query", "MATCH (p:Person)-[*1..2]->(target) RETURN p.name AS person, labels(target)[0] AS target_type"]
+    expect:
+      exit_code: 0
+      geode_query:
+        min_rows: 1
+        columns: ["person", "target_type"]
+    tags: ["match", "path", "variable-length"]
+
+  - name: "match-specific-length-path"
+    description: "Test specific length path patterns"
+    args: ["query", "MATCH (p:Person)-[*2]->(target) RETURN p.name AS person, labels(target)[0] AS target_type"]
+    expect:
+      exit_code: 0
+      geode_query:
+        min_rows: 0
+        columns: ["person", "target_type"]
+    tags: ["match", "path", "specific-length"]
+
+  - name: "match-any-length-path"
+    description: "Test any length path patterns"
+    args: ["query", "MATCH (p:Person)-[*]->(target) RETURN p.name AS person, labels(target)[0] AS target_type LIMIT 5"]
+    expect:
+      exit_code: 0
+      geode_query:
+        max_rows: 5
+        columns: ["person", "target_type"]
+    tags: ["match", "path", "any-length"]
+
+  # ===============================
+  # OPTIONAL MATCH OPERATIONS
+  # ===============================
+
+  - name: "optional-match-basic"
+    description: "Test basic OPTIONAL MATCH"
+    args: ["query", "MATCH (p:Person) OPTIONAL MATCH (p)-[:MANAGES]->(subordinate) RETURN p.name AS person, subordinate.name AS manages"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["person", "manages"]
+    tags: ["optional", "match", "basic"]
+
+  - name: "optional-match-with-where"
+    description: "Test OPTIONAL MATCH with WHERE clause"
+    args: ["query", "MATCH (p:Person) OPTIONAL MATCH (p)-[r:WORKS_FOR]->(c:Company) WHERE r.role = 'Engineer' RETURN p.name AS person, c.name AS company"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["person", "company"]
+    tags: ["optional", "match", "where"]
+
+  - name: "optional-match-nested"
+    description: "Test nested OPTIONAL MATCH with braces"
+    args:
+      - "query"
+      - |
+        MATCH (p:Person)
+        OPTIONAL {
+          MATCH (p)-[:WORKS_FOR]->(c:Company);
+          MATCH (p)-[:DEVELOPED]->(prod:Product)
+        }
+        RETURN p.name AS person, c.name AS company, prod.name AS product
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["person", "company", "product"]
+    tags: ["optional", "match", "nested"]
+
+  - name: "optional-match-with-parentheses"
+    description: "Test OPTIONAL MATCH with parentheses"
+    args:
+      - "query"
+      - |
+        MATCH (p:Person)
+        OPTIONAL (
+          MATCH (p)-[:WORKS_FOR]->(c:Company)
+        )
+        RETURN p.name AS person, c.name AS company
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["person", "company"]
+    tags: ["optional", "match", "parentheses"]
+
+  # ===============================
+  # FILTER OPERATIONS
+  # ===============================
+
+  - name: "filter-with-where-clause"
+    description: "Test FILTER with WHERE clause"
+    args: ["query", "MATCH (p:Person) FILTER WHERE p.age > 28 RETURN p.name AS name, p.age AS age ORDER BY p.age"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "age"]
+    tags: ["filter", "where", "basic"]
+
+  - name: "filter-with-search-condition"
+    description: "Test FILTER with search condition"
+    args: ["query", "MATCH (p:Person) FILTER p.city = 'New York' OR p.city = 'London' RETURN p.name AS name, p.city AS city"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name", "city"]
+    tags: ["filter", "search", "condition"]
+
+  - name: "filter-complex-conditions"
+    description: "Test FILTER with complex conditions"
+    args: ["query", "MATCH (p:Person) FILTER WHERE p.age >= 25 AND p.age <= 35 AND p.city <> 'London' RETURN p.name AS name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name"]
+    tags: ["filter", "complex", "conditions"]
+
+  # ===============================
+  # LET OPERATIONS
+  # ===============================
+
+  - name: "let-value-variable"
+    description: "Test LET with value variable definition"
+    args: ["query", "LET $max_age = 35 MATCH (p:Person) WHERE p.age <= $max_age RETURN p.name AS name, p.age AS age"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["name", "age"]
+    tags: ["let", "variable", "value"]
+
+  - name: "let-expression-assignment"
+    description: "Test LET with expression assignment"
+    args: ["query", "MATCH (p:Person) LET age_category = CASE WHEN p.age < 30 THEN 'young' ELSE 'mature' END RETURN p.name AS name, age_category"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["name", "age_category"]
+    tags: ["let", "expression", "assignment"]
+
+  - name: "let-multiple-variables"
+    description: "Test LET with multiple variable definitions"
+    args: ["query", "LET $company_name = 'TechCorp', $min_year = 2020 MATCH (p:Person)-[r:WORKS_FOR]->(c:Company {name: $company_name}) WHERE r.since >= $min_year RETURN p.name AS name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name"]
+    tags: ["let", "multiple", "variables"]
+
+  # ===============================
+  # FOR OPERATIONS
+  # ===============================
+
+  - name: "for-list-iteration"
+    description: "Test FOR with list iteration"
+    args: ["query", "FOR item IN [1, 2, 3, 4, 5] RETURN item * 2 AS doubled"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 5
+        columns: ["doubled"]
+    tags: ["for", "list", "iteration"]
+
+  - name: "for-with-ordinality"
+    description: "Test FOR with ORDINALITY"
+    args: ["query", "FOR item IN ['a', 'b', 'c'] WITH ORDINALITY pos RETURN item, pos"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["item", "pos"]
+    tags: ["for", "ordinality", "position"]
+
+  - name: "for-with-offset"
+    description: "Test FOR with OFFSET"
+    args: ["query", "FOR item IN ['x', 'y', 'z'] WITH OFFSET idx RETURN item, idx"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["item", "idx"]
+    tags: ["for", "offset", "index"]
+
+  - name: "for-binding-table"
+    description: "Test FOR with binding table reference"
+    args:
+      - "query"
+      - |
+        MATCH (p:Person)
+        WITH p.name AS person_name
+        FOR name IN person_name
+        RETURN name
+    expect:
+      exit_code: 0
+      geode_query:
+        min_rows: 1
+        columns: ["name"]
+    tags: ["for", "binding", "table"]
+
+  # ===============================
+  # COMPLEX QUERY PATTERNS
+  # ===============================
+
+  - name: "match-multiple-patterns"
+    description: "Test MATCH with multiple patterns"
+    args: ["query", "MATCH (p:Person)-[:WORKS_FOR]->(c:Company), (p)-[:DEVELOPED]->(prod:Product) RETURN p.name AS developer, c.name AS company, prod.name AS product"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["developer", "company", "product"]
+    tags: ["match", "multiple", "patterns"]
+
+  - name: "nested-match-patterns"
+    description: "Test nested MATCH patterns"
+    args:
+      - "query"
+      - |
+        MATCH (p:Person)
+        MATCH (p)-[:WORKS_FOR]->(c:Company)
+        MATCH (c)-[:OWNS]->(prod:Product)
+        RETURN p.name AS person, c.name AS company, prod.name AS product
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["person", "company", "product"]
+    tags: ["match", "nested", "patterns"]
+
+  - name: "query-with-all-clauses"
+    description: "Test query combining MATCH, OPTIONAL, FILTER, LET"
+    args:
+      - "query"
+      - |
+        LET $target_role = 'Engineer'
+        MATCH (p:Person)
+        OPTIONAL MATCH (p)-[r:WORKS_FOR {role: $target_role}]->(c:Company)
+        FILTER WHERE p.age > 25
+        RETURN p.name AS person, c.name AS company, r.role AS role
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["person", "company", "role"]
+    tags: ["complex", "all-clauses", "comprehensive"]
+
+  # ===============================
+  # RETURN STATEMENT VARIATIONS
+  # ===============================
+
+  - name: "return-asterisk"
+    description: "Test RETURN * (all variables)"
+    args: ["query", "MATCH (p:Person) WHERE p.name = 'Alice' RETURN *"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["return", "asterisk", "all"]
+
+  - name: "return-distinct"
+    description: "Test RETURN DISTINCT"
+    args: ["query", "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN DISTINCT c.name AS company"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["company"]
+    tags: ["return", "distinct", "unique"]
+
+  - name: "return-no-bindings"
+    description: "Test RETURN NO BINDINGS"
+    args: ["query", "MATCH (p:Person) RETURN NO BINDINGS"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 0
+    tags: ["return", "no-bindings", "empty"]
+
+  - name: "return-with-aliases"
+    description: "Test RETURN with various aliases"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS person_name, p.age AS person_age, p.city AS location ORDER BY person_name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["person_name", "person_age", "location"]
+    tags: ["return", "aliases", "renaming"]
+
+  # ===============================
+  # ORDER BY AND PAGINATION
+  # ===============================
+
+  - name: "order-by-single-column"
+    description: "Test ORDER BY single column"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name ORDER BY p.age"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["name"]
+    tags: ["order", "single", "column"]
+
+  - name: "order-by-multiple-columns"
+    description: "Test ORDER BY multiple columns"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name, p.age AS age ORDER BY p.city ASC, p.age DESC"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["name", "age"]
+    tags: ["order", "multiple", "columns"]
+
+  - name: "limit-basic"
+    description: "Test basic LIMIT clause"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name ORDER BY p.name LIMIT 2"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name"]
+    tags: ["limit", "basic", "pagination"]
+
+  - name: "offset-basic"
+    description: "Test basic OFFSET clause"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name ORDER BY p.name OFFSET 1"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name"]
+    tags: ["offset", "basic", "pagination"]
+
+  - name: "offset-limit-combined"
+    description: "Test OFFSET and LIMIT combined"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name ORDER BY p.name OFFSET 1 LIMIT 1"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name"]
+    tags: ["offset", "limit", "combined"]
+
+  - name: "limit-offset-order"
+    description: "Test LIMIT OFFSET order (both valid orders)"
+    args: ["query", "MATCH (p:Person) RETURN p.name AS name ORDER BY p.name LIMIT 2 OFFSET 1"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+        columns: ["name"]
+    tags: ["limit", "offset", "order"]
+
+  # ===============================
+  # AGGREGATION WITH QUERY
+  # ===============================
+
+  - name: "query-with-count"
+    description: "Test query with COUNT aggregation"
+    args: ["query", "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN c.name AS company, count(p) AS employee_count GROUP BY c.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["company", "employee_count"]
+    tags: ["query", "aggregation", "count"]
+
+  - name: "query-with-group-by"
+    description: "Test query with GROUP BY"
+    args: ["query", "MATCH (p:Person) RETURN p.city AS city, count(p) AS person_count GROUP BY p.city ORDER BY city"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["city", "person_count"]
+    tags: ["query", "group-by", "aggregation"]
+
+  # ===============================
+  # PERFORMANCE TESTS
+  # ===============================
+
+  - name: "complex-query-performance"
+    description: "Performance test with complex query pattern"
+    timeout_ms: 30000
+    args:
+      - "query"
+      - |
+        MATCH (p:Person)
+        OPTIONAL MATCH (p)-[w:WORKS_FOR]->(c:Company)
+        OPTIONAL MATCH (p)-[m:MANAGES]->(subordinate:Person)
+        OPTIONAL MATCH (p)-[d:DEVELOPED]->(prod:Product)
+        WHERE p.age > 20
+        RETURN p.name AS person,
+               c.name AS company,
+               count(subordinate) AS subordinates,
+               count(prod) AS products_developed
+        GROUP BY p.name, c.name
+        ORDER BY p.name
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 3
+        columns: ["person", "company", "subordinates", "products_developed"]
+    tags: ["performance", "complex", "query"]
+
+invariants:
+  - type: "server_running"
+
+cleanup:
+  - args: ["query", "MATCH (n) DETACH DELETE n"]
+    expect:
+      exit_code: 0
+
+tags: ["query", "match", "optional", "filter", "let", "for", "iso-gql", "comprehensive"]

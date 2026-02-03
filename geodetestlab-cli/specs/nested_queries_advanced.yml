@@ -1,0 +1,232 @@
+description: "Advanced nested queries with complex logic (features currently supported)"
+binary: geode
+timeout: 30
+
+cli:
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "error"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+setup:
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (c1:CustAdv {id: 1, name: 'Alice', email: 'alice@example.com', tier: 'Gold', credit_limit: 10000.00})
+      CREATE (c2:CustAdv {id: 2, name: 'Bob', email: 'bob@example.com', tier: 'Silver', credit_limit: 5000.00})
+      CREATE (c3:CustAdv {id: 3, name: 'Charlie', email: 'charlie@example.com', tier: 'Gold', credit_limit: 8000.00})
+      CREATE (c4:CustAdv {id: 4, name: 'Diana', email: 'diana@example.com', tier: 'Bronze', credit_limit: 2000.00})
+      CREATE (c5:CustAdv {id: 5, name: 'Eve', email: 'eve@example.com', tier: 'Silver', credit_limit: 6000.00})
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (p1:ProdAdv {id: 1, name: 'Laptop', category: 'Electronics', price: 999.99, stock: 50, rating: 4.5})
+      CREATE (p2:ProdAdv {id: 2, name: 'Mouse', category: 'Electronics', price: 29.99, stock: 200, rating: 4.2})
+      CREATE (p3:ProdAdv {id: 3, name: 'Desk', category: 'Furniture', price: 299.99, stock: 30, rating: 4.7})
+      CREATE (p4:ProdAdv {id: 4, name: 'Chair', category: 'Furniture', price: 199.99, stock: 75, rating: 4.3})
+      CREATE (p5:ProdAdv {id: 5, name: 'Monitor', category: 'Electronics', price: 399.99, stock: 40, rating: 4.6})
+      CREATE (p6:ProdAdv {id: 6, name: 'Keyboard', category: 'Electronics', price: 79.99, stock: 150, rating: 4.4})
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (s1:SupplierAdv {id: 1, name: 'TechCorp', country: 'USA', reliability_score: 4.8})
+      CREATE (s2:SupplierAdv {id: 2, name: 'FurniturePlus', country: 'Canada', reliability_score: 4.5})
+      CREATE (s3:SupplierAdv {id: 3, name: 'GlobalSupply', country: 'China', reliability_score: 3.9})
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (o1:OrderAdv {id: 1, total_amount: 1329.97, status: 'Completed', shipping_cost: 20.00})
+      CREATE (o2:OrderAdv {id: 2, total_amount: 499.98, status: 'Completed', shipping_cost: 15.00})
+      CREATE (o3:OrderAdv {id: 3, total_amount: 1679.95, status: 'Pending', shipping_cost: 25.00})
+      CREATE (o4:OrderAdv {id: 4, total_amount: 329.98, status: 'Completed', shipping_cost: 10.00})
+      CREATE (o5:OrderAdv {id: 5, total_amount: 899.97, status: 'Processing', shipping_cost: 18.00})
+    expect:
+      exit_code: 0
+
+  # Create relationships
+  - args: ["query", "-"]
+    stdin: |
+      MATCH (c1:CustAdv {id: 1}), (o1:OrderAdv {id: 1})
+      CREATE (c1)-[:PLACED_ADV]->(o1)
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      MATCH (c2:CustAdv {id: 2}), (o2:OrderAdv {id: 2})
+      CREATE (c2)-[:PLACED_ADV]->(o2)
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      MATCH (c1:CustAdv {id: 1}), (o3:OrderAdv {id: 3})
+      CREATE (c1)-[:PLACED_ADV]->(o3)
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      MATCH (c3:CustAdv {id: 3}), (o4:OrderAdv {id: 4})
+      CREATE (c3)-[:PLACED_ADV]->(o4)
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      MATCH (c4:CustAdv {id: 4}), (o5:OrderAdv {id: 5})
+      CREATE (c4)-[:PLACED_ADV]->(o5)
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      MATCH (s1:SupplierAdv {id: 1}), (p1:ProdAdv {id: 1})
+      CREATE (s1)-[:SUPPLIES_ADV {lead_time: 7, min_order: 10}]->(p1)
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      MATCH (s2:SupplierAdv {id: 2}), (p3:ProdAdv {id: 3})
+      CREATE (s2)-[:SUPPLIES_ADV {lead_time: 10, min_order: 5}]->(p3)
+    expect:
+      exit_code: 0
+
+tests:
+  # UNION Queries
+  - name: "union-nested-results"
+    description: "UNION of nested query results"
+    args: ["query", "-"]
+    stdin: "MATCH (c:CustAdv) WHERE c.credit_limit > 7000 RETURN c.name AS name UNION MATCH (s:SupplierAdv) WHERE s.reliability_score > 4.4 RETURN s.name AS name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "Charlie", "TechCorp", "FurniturePlus"]
+    tags: ["nested", "union"]
+
+  - name: "union-all-products"
+    description: "UNION ALL for products from different categories"
+    args: ["query", "-"]
+    stdin: "MATCH (p:ProdAdv) WHERE p.category = 'Electronics' RETURN p.name AS name UNION ALL MATCH (p:ProdAdv) WHERE p.category = 'Furniture' RETURN p.name AS name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Laptop", "Desk"]
+    tags: ["union-all"]
+
+  # DISTINCT Queries
+  - name: "high-value-customers"
+    description: "High value customers query with DISTINCT"
+    args: ["query", "-"]
+    stdin: "MATCH (c:CustAdv)-[:PLACED_ADV]->(o:OrderAdv) WHERE o.total_amount > 500 RETURN DISTINCT c.name, c.tier ORDER BY c.name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "Diana"]
+    tags: ["filter", "distinct"]
+
+  - name: "distinct-suppliers"
+    description: "DISTINCT supplier countries"
+    args: ["query", "-"]
+    stdin: "MATCH (s:SupplierAdv) RETURN DISTINCT s.country AS country ORDER BY country"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Canada", "China", "USA"]
+    tags: ["distinct"]
+
+  # Filter with AND Conditions
+  - name: "electronics-high-rating"
+    description: "Electronics with high rating"
+    args: ["query", "-"]
+    stdin: "MATCH (p:ProdAdv) WHERE p.category = 'Electronics' AND p.rating > 4.3 RETURN p.name, p.price, p.rating ORDER BY p.rating DESC"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Monitor", "Laptop"]
+    tags: ["filter", "category"]
+
+  - name: "furniture-high-rating"
+    description: "Furniture with high rating and stock"
+    args: ["query", "-"]
+    stdin: "MATCH (p:ProdAdv) WHERE p.category = 'Furniture' AND p.rating > 4.2 RETURN p.name, p.rating"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Desk", "Chair"]
+    tags: ["filter", "and"]
+
+  # Filter with OR Conditions
+  - name: "gold-or-silver-customers"
+    description: "Customers with Gold or Silver tier"
+    args: ["query", "-"]
+    stdin: "MATCH (c:CustAdv) WHERE c.tier = 'Gold' OR c.tier = 'Silver' RETURN c.name, c.tier ORDER BY c.name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "Bob", "Charlie", "Eve"]
+    tags: ["filter", "or"]
+
+  # Relationship Traversal
+  - name: "customer-orders-relationship"
+    description: "Customer orders via relationship"
+    args: ["query", "-"]
+    stdin: "MATCH (c:CustAdv)-[:PLACED_ADV]->(o:OrderAdv) RETURN c.name, o.total_amount ORDER BY o.total_amount DESC"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "1679.95"]
+    tags: ["relationship"]
+
+  - name: "supplier-products-relationship"
+    description: "Supplier products via relationship"
+    args: ["query", "-"]
+    stdin: "MATCH (s:SupplierAdv)-[:SUPPLIES_ADV]->(p:ProdAdv) RETURN s.name, p.name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["TechCorp", "Laptop"]
+    tags: ["relationship"]
+
+  # Credit limit filters
+  - name: "high-credit-customers"
+    description: "Customers with high credit limit"
+    args: ["query", "-"]
+    stdin: "MATCH (c:CustAdv) WHERE c.credit_limit >= 5000 RETURN c.name, c.credit_limit ORDER BY c.credit_limit DESC"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "10000", "Charlie", "8000"]
+    tags: ["filter"]
+
+  - name: "order-status-filter"
+    description: "Filter orders by status"
+    args: ["query", "-"]
+    stdin: "MATCH (o:OrderAdv) WHERE o.status = 'Completed' RETURN o.id, o.total_amount ORDER BY o.total_amount DESC"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1329.97"]
+    tags: ["filter"]
+
+  # Price range queries
+  - name: "products-price-range"
+    description: "Products in price range"
+    args: ["query", "-"]
+    stdin: "MATCH (p:ProdAdv) WHERE p.price >= 100 AND p.price <= 500 RETURN p.name, p.price ORDER BY p.price DESC"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Monitor", "Desk", "Chair"]
+    tags: ["filter", "range"]
+
+  # Stock queries
+  - name: "high-stock-products"
+    description: "Products with high stock"
+    args: ["query", "-"]
+    stdin: "MATCH (p:ProdAdv) WHERE p.stock > 100 RETURN p.name, p.stock ORDER BY p.stock DESC"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Mouse", "Keyboard"]
+    tags: ["filter"]

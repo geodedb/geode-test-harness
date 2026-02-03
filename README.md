@@ -244,7 +244,7 @@ Runners depend on client libraries in sibling directories:
 | Client | Location | Module/Package |
 |--------|----------|----------------|
 | Zig | `../geode-client-zig` | geode_client |
-| Go | `../geode-client-go` | go.codepros.org/geode |
+| Go | `../geode-client-go` | geodedb.com/geode |
 | Rust | `../geode-client-rust` | geode-client |
 | Python | `../geode-client-python` | geode_client |
 | Node.js | `../geode-client-nodejs` | @geode/client |

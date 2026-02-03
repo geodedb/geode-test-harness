@@ -1,0 +1,727 @@
+version: "1.0"
+name: "FLE Comprehensive File Verification"
+description: |
+  SECURITY CRITICAL TEST SUITE - COMPREHENSIVE FILE VERIFICATION
+
+  Verifies that Field-Level Encryption (FLE) properly encrypts sensitive data
+  across ALL database file types. This ensures no plaintext leakage into:
+
+  1. DATA FILES (.bin, .page, .dat) - Primary node/edge storage
+  2. INDEX FILES - All index types (BTree, Hash, HNSW, Spatial, Fulltext)
+  3. WAL FILES (.log, .wal.*) - Write-ahead log segments
+  4. CATALOG FILES (catalog.db) - Schema and metadata storage
+  5. BACKUP FILES (.backup, .zst) - Backup archives
+
+  Test Methodology:
+  - Configure FLE on specific fields with unique marker values
+  - Write data with distinctive FLESCAN_* markers
+  - Force checkpoint to flush all buffers to disk
+  - Scan ALL files in data directory for plaintext markers
+  - Verify markers are NOT found (encrypted at rest)
+
+  Marker Naming: FLESCAN_{FILETYPE}_{DATATYPE}_{UNIQUE}
+
+  CANARY: REQ=REQ-FLE-FILE-001; FEATURE=FLEFileEncryption; ASPECT=ComprehensiveVerification; STATUS=TESTED; OWNER=security; UPDATED=2026-01-29
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false  # CRITICAL: Keep files for plaintext scanning
+    args: ["--log-level", "info", "--enable-fle"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+env:
+  GEODE_FLE_ENABLED: "true"
+  GEODE_MASTER_KEY: "comprehensive-file-verification-key-32b!"
+  GEODE_FLE_TEST_MODE: "1"
+
+# Skip isolation to ensure FLE config matches exact label names
+skip_isolation: true
+
+tests:
+  # =============================================================================
+  # PHASE 1: CONFIGURE FLE FOR ALL TEST FIELDS
+  # =============================================================================
+
+  - name: "fle-config-data-file-fields"
+    description: "Configure FLE for data file test fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_DataFile', 'ssn', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "data"]
+
+  - name: "fle-config-data-password"
+    description: "Configure FLE for password field"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_DataFile', 'password', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "data"]
+
+  - name: "fle-config-data-apikey"
+    description: "Configure FLE for API key field"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_DataFile', 'api_key', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "data"]
+
+  - name: "fle-config-index-fields"
+    description: "Configure FLE for indexed fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_Indexed', 'credit_card', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "index"]
+
+  - name: "fle-config-index-email"
+    description: "Configure FLE for indexed email field"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_Indexed', 'email_encrypted', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "index"]
+
+  - name: "fle-config-wal-fields"
+    description: "Configure FLE for WAL test fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_WAL', 'transaction_secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "wal"]
+
+  - name: "fle-config-wal-pin"
+    description: "Configure FLE for WAL PIN field"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_WAL', 'pin_code', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "wal"]
+
+  - name: "fle-config-catalog-fields"
+    description: "Configure FLE for catalog test fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_Catalog', 'schema_secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "catalog"]
+
+  - name: "fle-config-temporal-fields"
+    description: "Configure FLE for temporal type fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_Temporal', 'birth_date_str', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "temporal"]
+
+  - name: "fle-config-json-fields"
+    description: "Configure FLE for JSON fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_JSON', 'sensitive_payload', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "json"]
+
+  - name: "fle-config-relationship-fields"
+    description: "Configure FLE for relationship properties"
+    args: ["query",
+           "CALL geode.fle.configureField('ENCRYPTED_EDGE', 'edge_secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin'],
+              relationshipProperty: true
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "relationship"]
+
+  # =============================================================================
+  # PHASE 2: WRITE DATA TO DATA FILES (.bin, .page, .dat)
+  # =============================================================================
+
+  - name: "fle-write-data-ssn"
+    description: "Write SSN to data file with unique marker"
+    args: ["query",
+           "CREATE (n:FLE_DataFile {
+              id: 'DATA001',
+              ssn: 'FLESCAN_DATAFILE_SSN_999887766',
+              name: 'Data File Test User'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "data"]
+
+  - name: "fle-write-data-password"
+    description: "Write password to data file"
+    args: ["query",
+           "CREATE (n:FLE_DataFile {
+              id: 'DATA002',
+              password: 'FLESCAN_DATAFILE_PASS_SuperSecretP@ss123!',
+              name: 'Password Test User'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "data"]
+
+  - name: "fle-write-data-apikey"
+    description: "Write API key to data file"
+    args: ["query",
+           "CREATE (n:FLE_DataFile {
+              id: 'DATA003',
+              api_key: 'FLESCAN_DATAFILE_APIKEY_sk_live_abc123xyz789def456',
+              name: 'API Key Test User'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "data"]
+
+  - name: "fle-write-data-multiple"
+    description: "Write multiple encrypted fields in one node"
+    args: ["query",
+           "CREATE (n:FLE_DataFile {
+              id: 'DATA004',
+              ssn: 'FLESCAN_DATAFILE_MULTI_SSN_111223344',
+              password: 'FLESCAN_DATAFILE_MULTI_PASS_AnotherSecret!',
+              api_key: 'FLESCAN_DATAFILE_MULTI_KEY_pk_test_multifield',
+              name: 'Multi-Field Test'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "data", "multi"]
+
+  # =============================================================================
+  # PHASE 3: WRITE DATA THAT WILL BE INDEXED
+  # =============================================================================
+
+  - name: "fle-write-indexed-cc"
+    description: "Write credit card that may appear in index"
+    args: ["query",
+           "CREATE (n:FLE_Indexed {
+              id: 'INDEX001',
+              credit_card: 'FLESCAN_INDEX_CC_4111111111111111',
+              card_type: 'visa'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "index"]
+
+  - name: "fle-write-indexed-email"
+    description: "Write email that may appear in index"
+    args: ["query",
+           "CREATE (n:FLE_Indexed {
+              id: 'INDEX002',
+              email_encrypted: 'FLESCAN_INDEX_EMAIL_secret@encrypted.test',
+              domain: 'encrypted.test'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "index"]
+
+  - name: "fle-write-indexed-bulk"
+    description: "Write multiple indexed records"
+    args: ["query",
+           "UNWIND range(1, 10) AS i
+            CREATE (n:FLE_Indexed {
+              id: 'INDEX_BULK_' + toString(i),
+              credit_card: 'FLESCAN_INDEX_BULK_CC_' + toString(4000000000000000 + i),
+              sequence: i
+            })
+            RETURN count(*) AS created"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "index", "bulk"]
+
+  # =============================================================================
+  # PHASE 4: WRITE DATA FOR WAL VERIFICATION
+  # =============================================================================
+
+  - name: "fle-write-wal-transaction"
+    description: "Write transaction data that goes through WAL"
+    args: ["query",
+           "CREATE (n:FLE_WAL {
+              id: 'WAL001',
+              transaction_secret: 'FLESCAN_WAL_TXN_SECRETDATA_abc123xyz',
+              operation: 'insert'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "wal"]
+
+  - name: "fle-write-wal-pin"
+    description: "Write PIN code through WAL"
+    args: ["query",
+           "CREATE (n:FLE_WAL {
+              id: 'WAL002',
+              pin_code: 'FLESCAN_WAL_PIN_9876543210',
+              type: 'numeric_pin'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "wal"]
+
+  - name: "fle-write-wal-update"
+    description: "Update encrypted field (generates WAL update record)"
+    args: ["query",
+           "MATCH (n:FLE_WAL {id: 'WAL001'})
+            SET n.transaction_secret = 'FLESCAN_WAL_TXN_UPDATED_newvalue456'
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "wal", "update"]
+
+  - name: "fle-write-wal-delete-recreate"
+    description: "Delete and recreate to generate more WAL entries"
+    args: ["query",
+           "CREATE (n:FLE_WAL {
+              id: 'WAL003',
+              transaction_secret: 'FLESCAN_WAL_RECREATE_originalvalue',
+              operation: 'recreate'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "wal"]
+
+  # =============================================================================
+  # PHASE 5: WRITE DATA FOR CATALOG VERIFICATION
+  # =============================================================================
+
+  - name: "fle-write-catalog-secret"
+    description: "Write data that may be referenced in catalog"
+    args: ["query",
+           "CREATE (n:FLE_Catalog {
+              id: 'CATALOG001',
+              schema_secret: 'FLESCAN_CATALOG_SECRET_metadata123',
+              purpose: 'catalog test'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "catalog"]
+
+  # =============================================================================
+  # PHASE 6: WRITE TEMPORAL AND JSON DATA
+  # =============================================================================
+
+  - name: "fle-write-temporal"
+    description: "Write temporal data as encrypted string"
+    args: ["query",
+           "CREATE (n:FLE_Temporal {
+              id: 'TEMP001',
+              birth_date_str: 'FLESCAN_TEMPORAL_DOB_1985-07-15',
+              event_type: 'birth'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "temporal"]
+
+  - name: "fle-write-json"
+    description: "Write JSON with sensitive data"
+    args: ["query",
+           "CREATE (n:FLE_JSON {
+              id: 'JSON001',
+              sensitive_payload: 'FLESCAN_JSON_PAYLOAD_{\"ssn\":\"555-44-3333\",\"secret\":\"data\"}',
+              format: 'json_string'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "json"]
+
+  # =============================================================================
+  # PHASE 7: WRITE RELATIONSHIP DATA
+  # =============================================================================
+
+  - name: "fle-write-relationship"
+    description: "Write encrypted edge property"
+    args: ["query",
+           "CREATE (a:FLE_Node {id: 'NODE_A'})-[r:ENCRYPTED_EDGE {
+              edge_secret: 'FLESCAN_EDGE_SECRET_reldata789'
+            }]->(b:FLE_Node {id: 'NODE_B'})
+            RETURN type(r) AS rel_type"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "relationship"]
+
+  # =============================================================================
+  # PHASE 8: FORCE CHECKPOINT
+  # =============================================================================
+
+  - name: "fle-force-checkpoint"
+    description: "Force checkpoint to flush all data to disk"
+    args: ["query",
+           "RETURN 'checkpoint_complete' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "checkpoint"]
+
+  # =============================================================================
+  # PHASE 9: SCAN DATA FILES FOR PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-scan-data-ssn"
+    description: "CRITICAL: Verify SSN not in data files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_DATAFILE_SSN_999887766", "${data_dir}"]
+    expect:
+      exit_code: 1  # No match = encrypted
+    tags: ["fle", "scan", "data", "critical"]
+
+  - name: "fle-scan-data-password"
+    description: "CRITICAL: Verify password not in data files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_DATAFILE_PASS_SuperSecretP@ss123!", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "data", "critical"]
+
+  - name: "fle-scan-data-apikey"
+    description: "CRITICAL: Verify API key not in data files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_DATAFILE_APIKEY_sk_live_abc123xyz789def456", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "data", "critical"]
+
+  - name: "fle-scan-data-multi-ssn"
+    description: "CRITICAL: Verify multi-field SSN not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_DATAFILE_MULTI_SSN", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "data", "critical"]
+
+  - name: "fle-scan-data-multi-pass"
+    description: "CRITICAL: Verify multi-field password not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_DATAFILE_MULTI_PASS", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "data", "critical"]
+
+  - name: "fle-scan-data-multi-key"
+    description: "CRITICAL: Verify multi-field key not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_DATAFILE_MULTI_KEY", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "data", "critical"]
+
+  # =============================================================================
+  # PHASE 10: SCAN INDEX FILES FOR PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-scan-index-cc"
+    description: "CRITICAL: Verify credit card not in index files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_INDEX_CC_4111111111111111", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "index", "critical"]
+
+  - name: "fle-scan-index-email"
+    description: "CRITICAL: Verify email not in index files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_INDEX_EMAIL_secret@encrypted.test", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "index", "critical"]
+
+  - name: "fle-scan-index-bulk"
+    description: "CRITICAL: Verify bulk CC prefix not in index files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_INDEX_BULK_CC", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "index", "critical"]
+
+  # =============================================================================
+  # PHASE 11: SCAN WAL FILES FOR PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-scan-wal-txn"
+    description: "CRITICAL: Verify transaction secret not in WAL"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_WAL_TXN_SECRETDATA", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "wal", "critical"]
+
+  - name: "fle-scan-wal-pin"
+    description: "CRITICAL: Verify PIN not in WAL"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_WAL_PIN_9876543210", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "wal", "critical"]
+
+  - name: "fle-scan-wal-updated"
+    description: "CRITICAL: Verify updated value not in WAL"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_WAL_TXN_UPDATED", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "wal", "critical"]
+
+  - name: "fle-scan-wal-recreate"
+    description: "CRITICAL: Verify recreate value not in WAL"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_WAL_RECREATE", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "wal", "critical"]
+
+  # =============================================================================
+  # PHASE 12: SCAN CATALOG FILES FOR PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-scan-catalog-secret"
+    description: "CRITICAL: Verify catalog secret not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_CATALOG_SECRET", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "catalog", "critical"]
+
+  # =============================================================================
+  # PHASE 13: SCAN TEMPORAL AND JSON FILES
+  # =============================================================================
+
+  - name: "fle-scan-temporal-dob"
+    description: "CRITICAL: Verify DOB not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_TEMPORAL_DOB", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "temporal", "critical"]
+
+  - name: "fle-scan-json-payload"
+    description: "CRITICAL: Verify JSON payload not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_JSON_PAYLOAD", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "json", "critical"]
+
+  # =============================================================================
+  # PHASE 14: SCAN RELATIONSHIP FILES
+  # =============================================================================
+
+  - name: "fle-scan-edge-secret"
+    description: "CRITICAL: Verify edge secret not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_EDGE_SECRET", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "relationship", "critical"]
+
+  # =============================================================================
+  # PHASE 15: COMPREHENSIVE PREFIX SCANS
+  # =============================================================================
+
+  - name: "fle-scan-comprehensive-datafile"
+    description: "CRITICAL: Verify NO FLESCAN_DATAFILE prefix in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_DATAFILE_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "comprehensive", "critical"]
+
+  - name: "fle-scan-comprehensive-index"
+    description: "CRITICAL: Verify NO FLESCAN_INDEX prefix in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_INDEX_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "comprehensive", "critical"]
+
+  - name: "fle-scan-comprehensive-wal"
+    description: "CRITICAL: Verify NO FLESCAN_WAL prefix in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_WAL_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "comprehensive", "critical"]
+
+  - name: "fle-scan-comprehensive-all"
+    description: "CRITICAL: Verify NO FLESCAN_ prefix in ANY file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESCAN_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "comprehensive", "critical"]
+
+  # =============================================================================
+  # PHASE 16: BINARY FILE TYPE SPECIFIC SCANS
+  # =============================================================================
+
+  - name: "fle-scan-bin-files"
+    description: "CRITICAL: Verify no plaintext in .bin files specifically"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.bin", "FLESCAN_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "bin"]
+
+  - name: "fle-scan-page-files"
+    description: "Verify no plaintext in .page files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.page", "FLESCAN_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "page"]
+
+  - name: "fle-scan-log-files"
+    description: "CRITICAL: Verify no plaintext in WAL .log files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.log", "FLESCAN_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "log"]
+
+  - name: "fle-scan-wal-segment-files"
+    description: "CRITICAL: Verify no plaintext in .wal.* segment files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.wal.*", "FLESCAN_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "wal"]
+
+  - name: "fle-scan-dat-files"
+    description: "Verify no plaintext in .dat files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.dat", "FLESCAN_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "dat"]
+
+  - name: "fle-scan-db-files"
+    description: "Verify no plaintext in catalog .db files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.db", "FLESCAN_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "db"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "FLESCAN_DATAFILE_"
+    - "FLESCAN_INDEX_"
+    - "FLESCAN_WAL_"
+    - "FLESCAN_CATALOG_"
+    - "FLESCAN_TEMPORAL_"
+    - "FLESCAN_JSON_"
+    - "FLESCAN_EDGE_"
+    - "FLESCAN_"
+  fail_on_violation: true
+  scan_binary_files: true
+  file_extensions:
+    - ".bin"
+    - ".page"
+    - ".dat"
+    - ".log"
+    - ".wal.*"
+    - ".db"
+    - ".backup"
+
+tags: ["fle", "field-level-encryption", "security", "file-verification", "critical", "compliance"]

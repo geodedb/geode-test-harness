@@ -3,7 +3,7 @@ module gitlab.com/devnw/geode/geode-test-harness/runners
 go 1.24.0
 
 require (
-	go.codepros.org/geode v1.0.0
+	geodedb.com/geode v1.0.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -17,4 +17,4 @@ require (
 	golang.org/x/tools v0.37.0 // indirect
 )
 
-replace go.codepros.org/geode => ../../geode-client-go
+replace geodedb.com/geode => ../../geode-client-go

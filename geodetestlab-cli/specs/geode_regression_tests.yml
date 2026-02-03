@@ -1,0 +1,322 @@
+name: geode-regression-tests
+description: "Regression tests for previously fixed issues"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    startup_timeout_ms: 30000
+    args: ["--log-level", "error"]
+
+setup:
+  # Create shared test data for Person queries
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (:Person {name: 'Alice', age: 30})
+      CREATE (:Person {name: 'Bob', age: 25})
+      CREATE (:Person {name: 'Charlie', age: 35})
+      CREATE (:Person {name: 'David', age: 28})
+      CREATE (:Person {name: 'Eve', age: 32})
+    expect:
+      exit_code: 0
+
+tests:
+  # Property-based Ordering (previously fixed)
+  - name: order-by-node-property
+    args: ["query", "CREATE (a:Person {name: 'Alice', age: 30}), (b:Person {name: 'Bob', age: 25}), (c:Person {name: 'Charlie', age: 35}) RETURN a.name AS name, a.age AS age UNION ALL SELECT b.name AS name, b.age AS age UNION ALL SELECT c.name AS name, c.age AS age ORDER BY age", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Bob", "Alice", "Charlie"]
+
+  - name: order-by-multiple-properties
+    args: ["query", "MATCH (n:Person) RETURN n.name, n.age ORDER BY n.age DESC, n.name ASC", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name", "age"]
+
+  # Count Aggregation (previously fixed)
+  - name: simple-count
+    setup:
+      - "query \"CREATE (a:Person {name: 'TestPerson1', age: 25}), (b:Person {name: 'TestPerson2', age: 30})\" --format json"
+    args: ["query", "MATCH (n:Person) RETURN count(n) AS total", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["total"]
+
+  - name: count-with-grouping
+    args: ["query", "MATCH (n:Person) RETURN n.age, count(*) AS count GROUP BY n.age ORDER BY count DESC", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["count"]
+
+  - name: count-distinct
+    args: ["query", "MATCH (n:Person) RETURN count(DISTINCT n.age) AS uniqueAges", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["uniqueAges"]
+
+  # LIMIT without ORDER BY (previously fixed)
+  - name: limit-without-order
+    args: ["query", "MATCH (n:Person) RETURN n.name LIMIT 2", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: skip-and-limit
+    args: ["query", "MATCH (n:Person) RETURN n.name ORDER BY n.name SKIP 1 LIMIT 2", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: limit-then-skip-order
+    args: ["query", "MATCH (n:Person) RETURN n.name ORDER BY n.name LIMIT 10 SKIP 2", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  # Node ID Collisions (previously fixed)
+  - name: unique-node-ids
+    args: ["query", "CREATE (a:Test {id: 1}), (b:Test {id: 2}), (c:Test {id: 3}) WITH a, b, c MATCH (n:Test) RETURN id(n) AS nodeId ORDER BY nodeId", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["nodeId"]
+
+  - name: no-id-collision-on-delete-create
+    args: ["query", "CREATE (n:Temp {value: 'first'}) WITH id(n) AS firstId DELETE n CREATE (m:Temp {value: 'second'}) RETURN firstId <> id(m) AS different", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+
+  # String Literal Handling
+  - name: single-quote-strings
+    args: ["query", "CREATE (n:Text {message: 'Hello, World!'}) RETURN n.message", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Hello, World!"]
+
+  - name: escaped-single-quotes
+    args: ["query", "CREATE (n:Text {message: 'It''s working'}) RETURN n.message", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["It's working"]
+
+  # QUIC/TLS Handling
+  - name: secure-connection-test
+    args: ["query", "RETURN 'Connection established' AS status", "--format", "json", "--insecure"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Connection established"]
+
+  # Aggregation Functions
+  - name: sum-aggregation
+    args: ["query", "MATCH (n:Person) RETURN sum(n.age) AS totalAge", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["totalAge"]
+
+  - name: avg-aggregation
+    args: ["query", "MATCH (n:Person) RETURN avg(n.age) AS avgAge", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["avgAge"]
+
+  - name: min-max-aggregation
+    args: ["query", "MATCH (n:Person) RETURN min(n.age) AS minAge, max(n.age) AS maxAge", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["minAge", "maxAge"]
+
+  # Note: Removed collect-aggregation test - collect() function not in ISO GQL standard
+
+  # WHERE Clause Variations
+  - name: where-with-and
+    args: ["query", "MATCH (n:Person) WHERE n.age > 25 AND n.age < 35 RETURN n.name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: where-with-or
+    args: ["query", "MATCH (n:Person) WHERE n.age < 25 OR n.age > 35 RETURN n.name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: where-with-not
+    args: ["query", "MATCH (n:Person) WHERE NOT n.age = 30 RETURN n.name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: where-with-in
+    args: ["query", "MATCH (n:Person) WHERE n.age IN [25, 30, 35] RETURN n.name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: where-with-exists
+    args: ["query", "MATCH (n:Person) WHERE EXISTS(n.email) RETURN n.name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: where-with-regex
+    setup:
+      - "query \"CREATE (a:Person {name: 'Alice', age: 25}), (b:Person {name: 'Bob', age: 30})\" --format json"
+    args: ["query", "MATCH (n:Person) WHERE n.name =~ 'A.*' RETURN n.name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice"]
+
+  # UNION Operations
+  - name: union-all
+    args: ["query", "MATCH (n:Person {age: 30}) RETURN n.name AS name UNION ALL MATCH (m:Person {age: 25}) RETURN m.name AS name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: union-distinct
+    args: ["query", "MATCH (n:Person) WHERE n.age < 30 RETURN n.name AS name UNION MATCH (m:Person) WHERE m.age >= 25 RETURN m.name AS name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  # WITH Clause
+  - name: with-filtering
+    args: ["query", "MATCH (n:Person) WITH n WHERE n.age > 25 RETURN n.name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  - name: with-aggregation
+    # Testing: WITH clause mixing aggregation and non-aggregation with WHERE
+    args: ["query", "MATCH (n:Person) WITH n.age AS age, count(*) AS count WHERE count > 0 RETURN age, count", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["age", "count"]
+
+  - name: with-ordering
+    args: ["query", "MATCH (n:Person) WITH n ORDER BY n.age DESC LIMIT 2 RETURN n.name", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  # CASE Expressions
+  - name: case-when-then
+    args: ["query", "MATCH (n:Person) RETURN n.name, CASE WHEN n.age < 30 THEN 'young' WHEN n.age < 60 THEN 'middle' ELSE 'senior' END AS category", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["category"]
+
+  - name: case-with-default
+    args: ["query", "MATCH (n:Person) RETURN n.name, CASE n.age WHEN 25 THEN 'twentyfive' WHEN 30 THEN 'thirty' ELSE 'other' END AS ageGroup", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["ageGroup"]
+
+  # List Operations
+  # Note: Removed list-comprehension test - range() function and list comprehensions not in ISO GQL standard
+
+  - name: list-functions
+    args: ["query", "WITH [1, 2, 3, 4, 5] AS list RETURN head(list) AS first, tail(list) AS rest, size(list) AS length", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["first", "rest", "length"]
+
+  # Map Operations
+  - name: map-literal
+    args: ["query", "RETURN {name: 'Test', value: 42, active: true} AS map", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name", "value", "active"]
+
+  - name: map-projection
+    args: ["query", "MATCH (n:Person) RETURN n {.name, .age} AS personMap", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["personMap"]
+
+  # Mathematical Functions
+  - name: math-functions
+    args: ["query", "RETURN abs(-5) AS absVal, ceil(4.3) AS ceilVal, floor(4.7) AS floorVal, round(4.5) AS roundVal, sqrt(16) AS sqrtVal", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["5", "5", "4", "5", "4"]
+
+  - name: trig-functions
+    args: ["query", "RETURN sin(0) AS sinVal, cos(0) AS cosVal, tan(0) AS tanVal", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["0", "1", "0"]
+
+  # String Functions
+  - name: string-functions
+    args: ["query", "WITH 'Hello World' AS str RETURN toLower(str) AS lower, toUpper(str) AS upper, trim('  test  ') AS trimmed, size(str) AS length", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["hello world", "HELLO WORLD", "test", "11"]
+
+  - name: string-operations
+    args: ["query", "RETURN 'Hello' + ' ' + 'World' AS concatenated, substring('Testing', 0, 4) AS substr, replace('Hello World', 'World', 'Geode') AS replaced", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Hello World", "Test", "Hello Geode"]
+
+  # Date/Time Functions
+  - name: datetime-functions
+    args: ["query", "RETURN date() AS today, datetime() AS now, time() AS currentTime", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["today", "now", "currentTime"]
+
+  - name: datetime-operations
+    args: ["query", "WITH datetime('2024-01-01T12:00:00') AS dt RETURN dt.year AS year, dt.month AS month, dt.day AS day, dt.hour AS hour", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["2024", "1", "1", "12"]
+
+  # NULL Handling
+  - name: null-checks
+    args: ["query", "WITH null AS val RETURN val IS NULL AS isNull, val IS NOT NULL AS isNotNull, coalesce(val, 'default') AS withDefault", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["true", "false", "default"]
+
+  # OPTIONAL MATCH
+  - name: optional-match
+    args: ["query", "MATCH (p:Person) OPTIONAL MATCH (p)-[:OWNS]->(thing) RETURN p.name, thing.name AS owned", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+
+  # Path updates (GQL doesn't have FOREACH, using alternative)
+  - name: path-node-update
+    # Testing: Variable-length path with SET
+    args: ["query", "MATCH (n)-[*]->(m) SET n.visited = true, m.visited = true RETURN count(n)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["count"]
+
+  # List operations (GQL doesn't have UNWIND, using VALUES instead)
+  - name: values-list
+    # Testing: VALUES clause with RETURN
+    args: ["query", "VALUES (1), (2), (3), (4), (5) AS (number) RETURN number * 2 AS doubled", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["2", "4", "6", "8", "10"]
+
+  # GQL-style comments (double-dash disabled per GB02, use // instead)
+  - name: gql-style-comments
+    args: ["query", "-", "--format", "json"]
+    stdin: "RETURN 1 AS x // this is a comment"
+    expect:
+      exit_code: 0
+      stdout_contains: ["x", "1"]
+
+  - name: gql-style-comments-multiline
+    args: ["query", "-", "--format", "json"]
+    stdin: |
+      // This is a GQL comment
+      RETURN 42 AS value
+    expect:
+      exit_code: 0
+      stdout_contains: ["value", "42"]

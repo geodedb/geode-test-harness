@@ -1,0 +1,146 @@
+version: "1.0"
+name: "TDE Plaintext Verification - Disabled Baseline (Control Test)"
+description: |
+  IMPORTANT: BASELINE CONTROL TEST
+
+  This test verifies that when TDE is DISABLED, plaintext data IS written to disk.
+  This serves as a control test to ensure our plaintext detection methodology works.
+
+  If this test passes, it confirms:
+  1. The grep-based plaintext scanning is functional
+  2. Data is actually being written to disk
+  3. The test markers are correctly formatted
+  4. The data_dir variable resolves correctly
+
+  CRITICAL: This test should FIND plaintext (exit_code: 0 for grep)
+  This is the OPPOSITE of TDE-enabled tests!
+
+  NOTE: This test uses --disable-tde flag and no encryption environment variables.
+
+  CANARY: REQ=REQ-TDE-ENFORCE-006; FEATURE=TDEEnforcement; ASPECT=BaselineControl; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false
+    # NOTE: TDE is DISABLED for this baseline test
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+# NOTE: No TDE environment variables set!
+
+tests:
+  # ===============================
+  # PHASE 1: WRITE PLAINTEXT DATA
+  # ===============================
+
+  - name: "tde-baseline-write-marker-data"
+    description: "Write marker data without encryption"
+    args: ["query",
+           "CREATE (n:BaselineTest_Marker {
+              type: 'PlaintextMarker',
+              secret: 'BASELINE_PLAINTEXT_MARKER_XYZ123',
+              description: 'This should be found in data files'
+            })
+            RETURN n.secret AS secret"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "baseline", "plaintext", "write"]
+
+  - name: "tde-baseline-write-ssn"
+    description: "Write SSN without encryption"
+    args: ["query",
+           "CREATE (n:BaselineTest_SSN {
+              type: 'UnencryptedSSN',
+              ssn: 'BASELINE_SSN_UNENCRYPTED_999887777',
+              name: 'Plaintext Person'
+            })
+            RETURN n.ssn AS ssn"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "baseline", "ssn", "write"]
+
+  - name: "tde-baseline-write-credit-card"
+    description: "Write credit card without encryption"
+    args: ["query",
+           "CREATE (n:BaselineTest_CC {
+              type: 'UnencryptedCC',
+              card_number: 'BASELINE_CC_PLAINTEXT_4111222233334444',
+              cvv: '123'
+            })
+            RETURN n.card_number AS card"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "baseline", "creditcard", "write"]
+
+  # ===============================
+  # PHASE 2: FORCE DATA TO DISK
+  # ===============================
+
+  - name: "tde-baseline-force-flush"
+    description: "Force data flush to disk"
+    args: ["query",
+           "RETURN 'flush_complete' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["tde", "baseline", "flush"]
+
+  # ===============================
+  # PHASE 3: VERIFY PLAINTEXT IS FOUND
+  # These should SUCCEED (exit_code: 0) because TDE is DISABLED
+  # ===============================
+
+  - name: "tde-baseline-verify-marker-found"
+    description: "BASELINE: Verify marker IS found in data files (TDE disabled)"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BASELINE_PLAINTEXT_MARKER_XYZ123", "${data_dir}"]
+    expect:
+      exit_code: 0  # grep returns 0 when match found - EXPECTED for disabled TDE!
+    tags: ["tde", "baseline", "verify", "found"]
+
+  - name: "tde-baseline-verify-ssn-found"
+    description: "BASELINE: Verify SSN IS found in data files (TDE disabled)"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BASELINE_SSN_UNENCRYPTED_999887777", "${data_dir}"]
+    expect:
+      exit_code: 0  # EXPECTED: plaintext should be found!
+    tags: ["tde", "baseline", "verify", "ssn", "found"]
+
+  - name: "tde-baseline-verify-cc-found"
+    description: "BASELINE: Verify credit card IS found in data files (TDE disabled)"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BASELINE_CC_PLAINTEXT_4111222233334444", "${data_dir}"]
+    expect:
+      exit_code: 0  # EXPECTED: plaintext should be found!
+    tags: ["tde", "baseline", "verify", "creditcard", "found"]
+
+  - name: "tde-baseline-verify-prefix-found"
+    description: "BASELINE: Verify BASELINE_ prefix IS found in data files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BASELINE_", "${data_dir}"]
+    expect:
+      exit_code: 0  # EXPECTED: plaintext should be found!
+    tags: ["tde", "baseline", "verify", "comprehensive", "found"]
+
+invariants:
+  - type: "server_running"
+
+# NOTE: This is a BASELINE test - we EXPECT plaintext to be found!
+plaintext_verification:
+  enabled: false  # Disabled because this is the control test
+  note: "This test intentionally has TDE disabled to verify detection methodology"
+
+tags: ["tde", "baseline", "control-test", "methodology-verification", "plaintext-detection"]

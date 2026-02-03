@@ -1,0 +1,461 @@
+version: "1.0"
+name: "MCP Server Integration Tests"
+description: "Model Context Protocol (MCP) server integration tests for AI/LLM access to Geode"
+
+# CANARY: REQ=REQ-LIB-MIGRATION-MCP-009; FEATURE="External Library Migration"; ASPECT=MCPIntegrationTests; STATUS=IMPL; OWNER=testing; UPDATED=2026-01-24
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null  # Auto-allocate
+    data_dir: null  # Use temporary directory
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+secrets:
+  admin_password:
+    source: "env"
+    key: "GEODE_ADMIN_PASSWORD"
+    required: false
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+  provider: "mock"
+  max_cases: 5
+  seed: 42
+  geode_specific: true
+  include_gql: true
+  include_auth: false
+
+tests:
+  # =============================================================================
+  # MCP Help and Basic Commands
+  # =============================================================================
+
+  - name: "mcp-help"
+    description: "Test MCP help command displays usage information"
+    args: ["mcp", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Model Context Protocol", "MCP", "serve", "endpoint"]
+    tags: ["mcp", "help", "basic"]
+
+  - name: "mcp-serve-help"
+    description: "Test MCP serve subcommand help"
+    args: ["mcp", "serve", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["MCP", "serve", "http", "port", "endpoint"]
+    tags: ["mcp", "help", "serve"]
+
+  # =============================================================================
+  # MCP Server Initialization Tests
+  # =============================================================================
+
+  - name: "mcp-initialize-stdio"
+    description: "Test MCP server initialization via stdio"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"geodetestlab","version":"1.0"}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["jsonrpc", "result", "serverInfo"]
+      stdout_regex: ["\"protocolVersion\"\\s*:\\s*\""]
+    tags: ["mcp", "initialize", "stdio"]
+
+  - name: "mcp-tools-list"
+    description: "Test MCP tools/list method returns available tools"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["query", "schema", "explain", "catalogs", "graphs"]
+    tags: ["mcp", "tools", "list"]
+
+  - name: "mcp-resources-list"
+    description: "Test MCP resources/list method returns available resources"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"resources/list"}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["geode://", "schema", "stats"]
+    tags: ["mcp", "resources", "list"]
+
+  - name: "mcp-prompts-list"
+    description: "Test MCP prompts/list method returns available prompts"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"prompts/list"}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["prompts"]
+    tags: ["mcp", "prompts", "list"]
+
+  # =============================================================================
+  # MCP Tool Execution Tests
+  # Note: Without a running Geode server, tools return error responses but
+  # still follow the MCP protocol correctly with content/isError structure
+  # =============================================================================
+
+  - name: "mcp-tool-query-simple"
+    description: "Test MCP query tool with simple RETURN statement"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"query":"RETURN 1 AS result"}}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "content"]
+    tags: ["mcp", "tools", "query"]
+
+  - name: "mcp-tool-schema"
+    description: "Test MCP schema tool returns response"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"schema","arguments":{}}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "content"]
+    tags: ["mcp", "tools", "schema"]
+
+  - name: "mcp-tool-catalogs"
+    description: "Test MCP catalogs tool returns response"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"catalogs","arguments":{}}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "content"]
+    tags: ["mcp", "tools", "catalogs"]
+
+  - name: "mcp-tool-graphs"
+    description: "Test MCP graphs tool returns response"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"graphs","arguments":{}}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "content"]
+    tags: ["mcp", "tools", "graphs"]
+
+  - name: "mcp-tool-explain"
+    description: "Test MCP explain tool returns response"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"explain","arguments":{"query":"MATCH (n) RETURN n LIMIT 10"}}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "content"]
+    tags: ["mcp", "tools", "explain"]
+
+  # =============================================================================
+  # MCP Resource Read Tests
+  # =============================================================================
+
+  - name: "mcp-resource-schema"
+    description: "Test MCP resources/read for schema resource"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"geode://default/default/schema"}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result"]
+    tags: ["mcp", "resources", "read", "schema"]
+
+  - name: "mcp-resource-stats"
+    description: "Test MCP resources/read for stats resource"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"geode://default/default/stats"}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result"]
+    tags: ["mcp", "resources", "read", "stats"]
+
+  - name: "mcp-resource-config"
+    description: "Test MCP resources/read for config resource"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"geode://config"}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "version", "gql_compliance"]
+    tags: ["mcp", "resources", "read", "config"]
+
+  # =============================================================================
+  # MCP Error Handling Tests
+  # =============================================================================
+
+  - name: "mcp-invalid-method"
+    description: "Test MCP handles invalid method gracefully"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"invalid/method"}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["error"]
+    tags: ["mcp", "error", "invalid-method"]
+
+  - name: "mcp-unknown-tool"
+    description: "Test MCP handles unknown tool gracefully"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"unknown_tool","arguments":{}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["error"]
+    tags: ["mcp", "error", "unknown-tool"]
+
+  - name: "mcp-malformed-json"
+    description: "Test MCP handles malformed JSON gracefully"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {invalid json}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["error"]
+    tags: ["mcp", "error", "malformed-json"]
+
+  # =============================================================================
+  # MCP Query Tool Advanced Tests
+  # Note: Without a running Geode server, tools return timeout/connection errors
+  # =============================================================================
+
+  - name: "mcp-query-with-parameters"
+    description: "Test MCP query tool with query parameters"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"query":"RETURN $value AS result","parameters":{"value":42}}}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "content"]
+    tags: ["mcp", "tools", "query", "parameters"]
+
+  - name: "mcp-query-match-pattern"
+    description: "Test MCP query tool with MATCH pattern"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"query":"MATCH (n) RETURN count(n) AS count"}}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "content"]
+    tags: ["mcp", "tools", "query", "match"]
+
+  - name: "mcp-query-create-node"
+    description: "Test MCP query tool can create nodes"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"query":"CREATE (n:MCPTest {name: 'test_node'}) RETURN n.name AS name"}}}
+    timeout_ms: 10000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "content"]
+    tags: ["mcp", "tools", "query", "create"]
+
+  # =============================================================================
+  # MCP Endpoint Configuration Tests
+  # =============================================================================
+
+  - name: "mcp-custom-endpoint"
+    description: "Test MCP server with custom endpoint configuration"
+    args: ["mcp", "serve", "-e", "localhost:3141"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["query", "schema"]
+    tags: ["mcp", "endpoint", "config"]
+
+  # =============================================================================
+  # MCP Template Tests
+  # =============================================================================
+
+  - name: "mcp-resource-templates"
+    description: "Test MCP resources/templates method returns URI templates"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["uriTemplate", "schema", "stats"]
+    tags: ["mcp", "resources", "templates"]
+
+  # =============================================================================
+  # MCP Capabilities Tests
+  # =============================================================================
+
+  - name: "mcp-server-info"
+    description: "Test MCP server returns proper server info on initialize"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["serverInfo", "name", "version"]
+    tags: ["mcp", "initialize", "server-info"]
+
+  - name: "mcp-capabilities"
+    description: "Test MCP server returns capabilities on initialize"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["capabilities", "tools", "resources"]
+    tags: ["mcp", "initialize", "capabilities"]
+
+  # =============================================================================
+  # MCP LSP Tool Tests
+  # =============================================================================
+
+  - name: "mcp-tool-validate-valid"
+    description: "Test MCP validate tool with valid GQL query"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"validate","arguments":{"query":"RETURN 1 AS x"}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "isValid"]
+    tags: ["mcp", "tools", "validate", "lsp"]
+
+  - name: "mcp-tool-validate-invalid"
+    description: "Test MCP validate tool with invalid GQL query"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"validate","arguments":{"query":"MATCH () RETRN x"}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "diagnostics"]
+    tags: ["mcp", "tools", "validate", "lsp", "error"]
+
+  - name: "mcp-tool-complete"
+    description: "Test MCP complete tool for GQL completions"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"complete","arguments":{"query":"MATCH (n) ","line":1,"column":10}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "completions"]
+    tags: ["mcp", "tools", "complete", "lsp"]
+
+  - name: "mcp-tool-hover"
+    description: "Test MCP hover tool for GQL hover information"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"hover","arguments":{"query":"MATCH (n) RETURN n","line":1,"column":2}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "contents"]
+    tags: ["mcp", "tools", "hover", "lsp"]
+
+  - name: "mcp-tool-diagnostics"
+    description: "Test MCP diagnostics tool for GQL diagnostics"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"diagnostics","arguments":{"query":"RETURN 1"}}}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "isValid"]
+    tags: ["mcp", "tools", "diagnostics", "lsp"]
+
+  - name: "mcp-tools-list-lsp"
+    description: "Test MCP tools/list includes LSP tools"
+    args: ["mcp", "serve"]
+    stdin: |
+      {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    timeout_ms: 5000
+    expect:
+      exit_code: 0
+      stdout_contains: ["validate", "complete", "hover", "diagnostics"]
+    tags: ["mcp", "tools", "list", "lsp"]

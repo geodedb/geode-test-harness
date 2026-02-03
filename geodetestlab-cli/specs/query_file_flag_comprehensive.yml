@@ -1,0 +1,629 @@
+version: "1.0"
+name: "Geode Query File Flag Comprehensive Tests"
+description: "Comprehensive tests for geode query --file/-f flag with chunked execution"
+
+# CANARY: REQ=REQ-CLI-FILE-FLAG-TEST-001; FEATURE="QueryFileFlag"; ASPECT=E2ETests; STATUS=TESTED; OWNER=test; UPDATED=2026-02-02
+# Tests for Issue GAP-384: --file flag to execute GQL from files (same as /source in shell)
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    startup_timeout_ms: 30000
+    args: ["--disable-auth", "--insecure", "--log-level", "error"]
+
+secrets: {}
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+
+tests:
+  # ============================================================================
+  # Setup: Create test graph and temporary files
+  # ============================================================================
+
+  - name: "setup-file-test-graph"
+    description: "Create graph for file flag tests"
+    args: ["query", "--insecure", "CREATE GRAPH IF NOT EXISTS file_test_graph"]
+    expect:
+      exit_code: 0
+    tags: ["setup"]
+
+  # ============================================================================
+  # Basic File Execution Tests
+  # ============================================================================
+
+  - name: "file-flag-basic-single-statement"
+    description: "Execute single statement from file using --file flag"
+    setup:
+      files:
+        - path: "/tmp/geode_test_single.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n:FileTest {id: 1, name: 'basic'});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_single.gql"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Executing from file"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:FileTest {id: 1}) DELETE n"]
+    tags: ["file", "basic"]
+
+  - name: "file-flag-short-form"
+    description: "Execute file using -f short flag"
+    setup:
+      files:
+        - path: "/tmp/geode_test_short.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n:FileTest {id: 2, name: 'short-flag'});
+    args: ["query", "--insecure", "-f", "/tmp/geode_test_short.gql"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Executing from file"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:FileTest {id: 2}) DELETE n"]
+    tags: ["file", "short-flag"]
+
+  - name: "file-flag-verify-execution"
+    description: "Verify file execution created nodes"
+    setup:
+      files:
+        - path: "/tmp/geode_test_verify.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (a:VerifyTest {seq: 1});
+            CREATE (b:VerifyTest {seq: 2});
+            CREATE (c:VerifyTest {seq: 3});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_verify.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:VerifyTest) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["3"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:VerifyTest) DELETE n"]
+    tags: ["file", "verify"]
+
+  # ============================================================================
+  # Comment Stripping Tests
+  # ============================================================================
+
+  - name: "file-flag-strip-double-hyphen-comments"
+    description: "Test that -- comments are stripped from file"
+    setup:
+      files:
+        - path: "/tmp/geode_test_comments_hyphen.gql"
+          content: |
+            -- This is a comment at the start
+            USE GRAPH file_test_graph;
+            -- Another comment in the middle
+            CREATE (n:CommentTest {id: 10, type: 'hyphen'});
+            -- Final comment
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_comments_hyphen.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:CommentTest {id: 10}) RETURN n.type AS type"]
+        expect:
+          stdout_contains: ["hyphen"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:CommentTest {id: 10}) DELETE n"]
+    tags: ["file", "comments"]
+
+  - name: "file-flag-strip-hash-comments"
+    description: "Test that # comments are stripped from file"
+    setup:
+      files:
+        - path: "/tmp/geode_test_comments_hash.gql"
+          content: |
+            # This is a hash comment
+            USE GRAPH file_test_graph;
+            # Another hash comment
+            CREATE (n:CommentTest {id: 11, type: 'hash'});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_comments_hash.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:CommentTest {id: 11}) RETURN n.type AS type"]
+        expect:
+          stdout_contains: ["hash"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:CommentTest {id: 11}) DELETE n"]
+    tags: ["file", "comments"]
+
+  - name: "file-flag-strip-empty-lines"
+    description: "Test that empty lines are stripped"
+    setup:
+      files:
+        - path: "/tmp/geode_test_empty_lines.gql"
+          content: |
+            USE GRAPH file_test_graph;
+
+            CREATE (n:EmptyLineTest {id: 20});
+
+            CREATE (m:EmptyLineTest {id: 21});
+
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_empty_lines.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:EmptyLineTest) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["2"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:EmptyLineTest) DELETE n"]
+    tags: ["file", "whitespace"]
+
+  - name: "file-flag-mixed-comments-and-empty-lines"
+    description: "Test file with mixed comments, empty lines, and statements"
+    setup:
+      files:
+        - path: "/tmp/geode_test_mixed.gql"
+          content: |
+            -- Setup section
+            USE GRAPH file_test_graph;
+
+            # Create some nodes
+            CREATE (a:MixedTest {id: 30});
+
+            -- Second node
+            CREATE (b:MixedTest {id: 31});
+            # Third node with hash comment
+
+            CREATE (c:MixedTest {id: 32});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_mixed.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MixedTest) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["3"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MixedTest) DELETE n"]
+    tags: ["file", "comments", "whitespace"]
+
+  # ============================================================================
+  # Path Expansion Tests
+  # ============================================================================
+
+  - name: "file-flag-tilde-expansion-error"
+    description: "Test tilde expansion when HOME is set (expect file not found for test path)"
+    args: ["query", "--insecure", "--file", "~/nonexistent_geode_test_file_xyz.gql"]
+    expect:
+      exit_code: 2
+      stderr_contains: ["Error: Cannot open file", "nonexistent_geode_test_file_xyz.gql"]
+    tags: ["file", "path", "error"]
+
+  - name: "file-flag-absolute-path"
+    description: "Test execution with absolute path"
+    setup:
+      files:
+        - path: "/tmp/geode_test_absolute.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n:AbsPathTest {id: 40});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_absolute.gql"]
+    expect:
+      exit_code: 0
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:AbsPathTest) DELETE n"]
+    tags: ["file", "path"]
+
+  - name: "file-flag-relative-path"
+    description: "Test execution with relative path"
+    setup:
+      files:
+        - path: "./geode_test_relative.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n:RelPathTest {id: 41});
+    args: ["query", "--insecure", "--file", "./geode_test_relative.gql"]
+    expect:
+      exit_code: 0
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:RelPathTest) DELETE n"]
+      - ["rm", "-f", "./geode_test_relative.gql"]
+    tags: ["file", "path"]
+
+  # ============================================================================
+  # Error Handling Tests
+  # ============================================================================
+
+  - name: "file-flag-file-not-found"
+    description: "Test error when file does not exist"
+    args: ["query", "--insecure", "--file", "/tmp/nonexistent_file_that_does_not_exist_12345.gql"]
+    expect:
+      exit_code: 2
+      stderr_contains: ["Error: Cannot open file", "nonexistent_file_that_does_not_exist_12345.gql"]
+    tags: ["file", "error", "not-found"]
+
+  - name: "file-flag-empty-file"
+    description: "Test error when file contains no valid statements (only comments/whitespace)"
+    setup:
+      files:
+        - path: "/tmp/geode_test_empty.gql"
+          content: |
+            -- Only comments
+            # More comments
+
+            -- Nothing else
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_empty.gql"]
+    expect:
+      exit_code: 2
+      stderr_contains: ["Error: File contains no valid GQL statements"]
+    tags: ["file", "error", "empty"]
+
+  - name: "file-flag-missing-argument"
+    description: "Test error when --file flag is missing path argument"
+    args: ["query", "--insecure", "--file"]
+    expect:
+      exit_code: 2
+      stderr_contains: ["Error: --file requires a file path"]
+    tags: ["file", "error", "usage"]
+
+  - name: "file-flag-permission-denied"
+    description: "Test error when file is not readable (permission denied)"
+    skip: true  # Requires special file setup with restricted permissions
+    setup:
+      files:
+        - path: "/tmp/geode_test_no_perms.gql"
+          content: "USE GRAPH file_test_graph; CREATE (n:Test {id: 1});"
+          mode: "0000"  # No read permissions
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_no_perms.gql"]
+    expect:
+      exit_code: 2
+      stderr_contains: ["Error: Cannot open file", "PermissionDenied"]
+    cleanup:
+      - ["chmod", "644", "/tmp/geode_test_no_perms.gql"]
+      - ["rm", "-f", "/tmp/geode_test_no_perms.gql"]
+    tags: ["file", "error", "permissions"]
+
+  # ============================================================================
+  # Multi-Statement Execution Tests
+  # ============================================================================
+
+  - name: "file-flag-multiple-statements"
+    description: "Execute file with multiple statements (small file, single batch)"
+    setup:
+      files:
+        - path: "/tmp/geode_test_multi.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n1:MultiStmt {id: 50, seq: 1});
+            CREATE (n2:MultiStmt {id: 51, seq: 2});
+            CREATE (n3:MultiStmt {id: 52, seq: 3});
+            CREATE (n4:MultiStmt {id: 53, seq: 4});
+            CREATE (n5:MultiStmt {id: 54, seq: 5});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_multi.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MultiStmt) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["5"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MultiStmt) DELETE n"]
+    tags: ["file", "multi-statement"]
+
+  - name: "file-flag-ten-statements"
+    description: "Execute file with 10 statements"
+    setup:
+      files:
+        - path: "/tmp/geode_test_ten.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n1:TenStmt {id: 60});
+            CREATE (n2:TenStmt {id: 61});
+            CREATE (n3:TenStmt {id: 62});
+            CREATE (n4:TenStmt {id: 63});
+            CREATE (n5:TenStmt {id: 64});
+            CREATE (n6:TenStmt {id: 65});
+            CREATE (n7:TenStmt {id: 66});
+            CREATE (n8:TenStmt {id: 67});
+            CREATE (n9:TenStmt {id: 68});
+            CREATE (n10:TenStmt {id: 69});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_ten.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:TenStmt) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["10"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:TenStmt) DELETE n"]
+    tags: ["file", "multi-statement"]
+
+  # ============================================================================
+  # Chunked Execution Tests (Large Files > 32KB)
+  # ============================================================================
+
+  - name: "file-flag-chunked-execution-message"
+    description: "Test that large files trigger chunked execution with progress message"
+    skip: true  # Requires generating a large file (>32KB)
+    setup:
+      files:
+        - path: "/tmp/geode_test_large.gql"
+          content: |
+            # This would be a programmatically generated file > 32KB
+            # with many CREATE statements to trigger chunking
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_large.gql"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Large file detected", "using chunked execution"]
+    tags: ["file", "chunked"]
+
+  - name: "file-flag-medium-file"
+    description: "Execute file with 50 statements (below 32KB threshold)"
+    setup:
+      script: |
+        #!/bin/bash
+        {
+          echo "USE GRAPH file_test_graph;"
+          for i in {1..50}; do
+            echo "CREATE (n:MediumFile {id: $i, data: 'test-data-value'});"
+          done
+        } > /tmp/geode_test_medium.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_medium.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MediumFile) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["50"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MediumFile) DELETE n"]
+    tags: ["file", "medium"]
+
+  # ============================================================================
+  # Statement Batching Tests
+  # ============================================================================
+
+  - name: "file-flag-mixed-statement-types"
+    description: "Execute file with mixed CREATE, MATCH, and relationship statements"
+    setup:
+      files:
+        - path: "/tmp/geode_test_mixed_types.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (a:MixedType {name: 'A'});
+            CREATE (b:MixedType {name: 'B'});
+            MATCH (x:MixedType {name: 'A'}), (y:MixedType {name: 'B'})
+            CREATE (x)-[:RELATED_TO]->(y);
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_mixed_types.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH ()-[r:RELATED_TO]->() RETURN count(r) AS cnt"]
+        expect:
+          stdout_contains: ["1"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MixedType) DETACH DELETE n"]
+    tags: ["file", "mixed-types"]
+
+  - name: "file-flag-multiline-statement"
+    description: "Execute file with statement spanning multiple lines"
+    setup:
+      files:
+        - path: "/tmp/geode_test_multiline.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n:MultilineStmt {
+              id: 100,
+              name: 'multiline-test',
+              description: 'A statement that spans multiple lines',
+              value: 42,
+              active: true
+            });
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_multiline.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MultilineStmt) RETURN n.name AS name"]
+        expect:
+          stdout_contains: ["multiline-test"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:MultilineStmt) DELETE n"]
+    tags: ["file", "multiline"]
+
+  # ============================================================================
+  # Integration with Other Flags
+  # ============================================================================
+
+  - name: "file-flag-with-graph-flag"
+    description: "Test --file flag combined with --graph flag"
+    setup:
+      commands:
+        - ["query", "--insecure", "CREATE GRAPH IF NOT EXISTS file_flag_graph2"]
+      files:
+        - path: "/tmp/geode_test_with_graph.gql"
+          content: |
+            CREATE (n:GraphFlagTest {id: 200});
+    args: ["query", "--insecure", "--graph", "file_flag_graph2", "--file", "/tmp/geode_test_with_graph.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_flag_graph2; MATCH (n:GraphFlagTest) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["1"]
+    cleanup:
+      - ["query", "--insecure", "DROP GRAPH IF EXISTS file_flag_graph2"]
+    tags: ["file", "graph-flag"]
+
+  - name: "file-flag-with-format-json"
+    description: "Test --file flag with --format json"
+    setup:
+      files:
+        - path: "/tmp/geode_test_format.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n:FormatTest {id: 201});
+    args: ["query", "--insecure", "--format", "json", "--file", "/tmp/geode_test_format.gql"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:FormatTest) DELETE n"]
+    tags: ["file", "format"]
+
+  # ============================================================================
+  # Transaction Behavior Tests
+  # ============================================================================
+
+  - name: "file-flag-transaction-atomicity"
+    description: "Verify statements from file execute atomically"
+    setup:
+      files:
+        - path: "/tmp/geode_test_txn.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (t1:TxnTest {seq: 1});
+            CREATE (t2:TxnTest {seq: 2});
+            CREATE (t3:TxnTest {seq: 3});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_txn.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:TxnTest) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["3"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:TxnTest) DELETE n"]
+    tags: ["file", "transaction"]
+
+  - name: "file-flag-explicit-transaction"
+    description: "Test file with explicit BEGIN/COMMIT statements"
+    setup:
+      files:
+        - path: "/tmp/geode_test_explicit_txn.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            BEGIN;
+            CREATE (e1:ExplicitTxn {id: 1});
+            CREATE (e2:ExplicitTxn {id: 2});
+            COMMIT;
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_explicit_txn.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:ExplicitTxn) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["2"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:ExplicitTxn) DELETE n"]
+    tags: ["file", "transaction", "explicit"]
+
+  # ============================================================================
+  # Edge Cases
+  # ============================================================================
+
+  - name: "file-flag-statements-without-semicolons"
+    description: "Test that statements without semicolons are not executed"
+    setup:
+      files:
+        - path: "/tmp/geode_test_no_semicolon.gql"
+          content: |
+            USE GRAPH file_test_graph
+            CREATE (n:NoSemicolon {id: 1})
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_no_semicolon.gql"]
+    expect:
+      exit_code: 2
+      stderr_contains: ["Error: File contains no valid GQL statements"]
+    tags: ["file", "edge-case", "semicolon"]
+
+  - name: "file-flag-trailing-semicolon-only"
+    description: "Test statement completion with trailing semicolons"
+    setup:
+      files:
+        - path: "/tmp/geode_test_trailing.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n:TrailingSemi {id: 300});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_trailing.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:TrailingSemi) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["1"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:TrailingSemi) DELETE n"]
+    tags: ["file", "edge-case"]
+
+  - name: "file-flag-windows-line-endings"
+    description: "Test file with Windows CRLF line endings"
+    setup:
+      script: |
+        #!/bin/bash
+        printf "USE GRAPH file_test_graph;\r\nCREATE (n:WindowsLineEndings {id: 400});\r\n" > /tmp/geode_test_crlf.gql
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_crlf.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:WindowsLineEndings) RETURN count(n) AS cnt"]
+        expect:
+          stdout_contains: ["1"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:WindowsLineEndings) DELETE n"]
+    tags: ["file", "edge-case", "line-endings"]
+
+  - name: "file-flag-unicode-content"
+    description: "Test file with Unicode characters in properties"
+    setup:
+      files:
+        - path: "/tmp/geode_test_unicode.gql"
+          content: |
+            USE GRAPH file_test_graph;
+            CREATE (n:UnicodeTest {id: 500, name: '测试', emoji: '🚀', description: 'Tëst with åccénts'});
+    args: ["query", "--insecure", "--file", "/tmp/geode_test_unicode.gql"]
+    expect:
+      exit_code: 0
+    verify:
+      - args: ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:UnicodeTest) RETURN n.name AS name"]
+        expect:
+          stdout_contains: ["测试"]
+    cleanup:
+      - ["query", "--insecure", "USE GRAPH file_test_graph; MATCH (n:UnicodeTest) DELETE n"]
+    tags: ["file", "edge-case", "unicode"]
+
+  # ============================================================================
+  # Help and Documentation Tests
+  # ============================================================================
+
+  - name: "file-flag-help-documentation"
+    description: "Verify --file flag is documented in query help"
+    args: ["query", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["--file", "-f", "file path"]
+    tags: ["file", "help"]
+
+  - name: "file-flag-help-example"
+    description: "Verify usage example includes --file flag"
+    args: ["query", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["--file"]
+    tags: ["file", "help"]
+
+  # ============================================================================
+  # Cleanup
+  # ============================================================================
+
+  - name: "cleanup-file-test-graph"
+    description: "Drop test graph"
+    args: ["query", "--insecure", "DROP GRAPH IF EXISTS file_test_graph"]
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-temp-files"
+    description: "Remove all temporary test files"
+    skip: true  # File cleanup handled by OS or CI
+    cleanup:
+      - ["rm", "-f", "/tmp/geode_test_*.gql"]
+    tags: ["cleanup"]

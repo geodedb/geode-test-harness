@@ -1,0 +1,280 @@
+version: "1.0"
+name: "Gap Analysis Fixes - GAP-0123 to GAP-0136 Regression Tests"
+description: "Regression tests for January 2026 gap fixes: CSR property offset, decimal overflow, ORDER BY federation, subquery imports, metadata handling, and statement error messages"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "error"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+setup:
+  # Create test data for decimal aggregation tests
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (:DecTest {val: 1.5})
+      CREATE (:DecTest {val: 2.5})
+      CREATE (:DecTest {val: 3.0})
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (:AvgTest {val: 10})
+      CREATE (:AvgTest {val: 20})
+      CREATE (:AvgTest {val: 30})
+    expect:
+      exit_code: 0
+
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (:BigTest {val: 999999999999})
+      CREATE (:BigTest {val: 888888888888})
+      CREATE (:BigTest {val: 777777777777})
+    expect:
+      exit_code: 0
+
+  # Create test data for ORDER BY tests
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (:OrdTest {val: 3})
+      CREATE (:OrdTest {val: 1})
+      CREATE (:OrdTest {val: 4})
+      CREATE (:OrdTest {val: 5})
+      CREATE (:OrdTest {val: 2})
+    expect:
+      exit_code: 0
+
+  # Create test data for aggregation regression
+  - args: ["query", "-"]
+    stdin: |
+      CREATE (:AggReg {val: 1})
+      CREATE (:AggReg {val: 2})
+      CREATE (:AggReg {val: 3})
+      CREATE (:AggReg {val: 4})
+      CREATE (:AggReg {val: 5})
+    expect:
+      exit_code: 0
+
+tests:
+  # =============================================================================
+  # GAP-0124: Decimal Overflow Guard
+  # =============================================================================
+
+  - name: "gap-0124-decimal-sum-normal"
+    description: "Decimal SUM aggregation works for normal values"
+    args: ["query", "-"]
+    stdin: "MATCH (n:DecTest) RETURN sum(n.val) AS total"
+    expect:
+      exit_code: 0
+      stdout_contains: ["total", "7"]
+    tags: ["gap-0124", "decimal", "aggregation"]
+
+  - name: "gap-0124-decimal-avg-normal"
+    description: "Decimal AVG aggregation works for normal values"
+    args: ["query", "-"]
+    stdin: "MATCH (n:AvgTest) RETURN avg(n.val) AS average"
+    expect:
+      exit_code: 0
+      stdout_contains: ["average", "20"]
+    tags: ["gap-0124", "decimal", "aggregation"]
+
+  - name: "gap-0124-decimal-large-values"
+    description: "Decimal aggregation handles large values without corruption"
+    args: ["query", "-"]
+    stdin: "MATCH (n:BigTest) RETURN sum(n.val) AS total"
+    expect:
+      exit_code: 0
+      stdout_contains: ["total"]
+    tags: ["gap-0124", "decimal", "overflow"]
+
+  # =============================================================================
+  # GAP-0125: GQL Subquery Imported Variables (Parser)
+  # =============================================================================
+
+  - name: "gap-0125-call-subquery-basic"
+    description: "CALL subquery basic execution"
+    args: ["query", "-"]
+    stdin: |
+      WITH 1 AS x
+      CALL {
+        RETURN 2 AS y
+      }
+      RETURN x, y
+    expect:
+      exit_code: 0
+      stdout_contains: ["x", "y"]
+    tags: ["gap-0125", "subquery", "call"]
+
+  - name: "gap-0125-nested-return"
+    description: "CALL subquery with nested RETURN"
+    args: ["query", "-"]
+    stdin: |
+      CALL {
+        RETURN 'nested' AS result
+      }
+      RETURN result
+    expect:
+      exit_code: 0
+      stdout_contains: ["result", "nested"]
+    tags: ["gap-0125", "subquery"]
+
+  # =============================================================================
+  # GAP-0127/0128: SHOW Statement Error Messages
+  # =============================================================================
+
+  - name: "gap-0127-show-indexes-error"
+    description: "SHOW INDEXES returns specific not-implemented error"
+    skip: true
+    skip_reason: "SHOW statements not yet implemented end-to-end"
+    args: ["query", "-"]
+    stdin: |
+      SHOW INDEXES
+    expect:
+      exit_code: 0
+      stdout_contains: ["not"]
+    tags: ["gap-0127", "show", "error"]
+
+  - name: "gap-0127-show-constraints-error"
+    description: "SHOW CONSTRAINTS returns specific not-implemented error"
+    skip: true
+    skip_reason: "SHOW statements not yet implemented end-to-end"
+    args: ["query", "-"]
+    stdin: |
+      SHOW CONSTRAINTS
+    expect:
+      exit_code: 0
+      stdout_contains: ["not"]
+    tags: ["gap-0127", "show", "error"]
+
+  # =============================================================================
+  # GAP-0130: ORDER BY in Federation
+  # =============================================================================
+
+  - name: "gap-0130-order-by-asc"
+    description: "ORDER BY ascending works correctly"
+    args: ["query", "-"]
+    stdin: "MATCH (n:OrdTest) RETURN n.val AS v ORDER BY n.val ASC"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1", "2", "3", "4", "5"]
+    tags: ["gap-0130", "order-by"]
+
+  - name: "gap-0130-order-by-desc"
+    description: "ORDER BY descending works correctly"
+    args: ["query", "-"]
+    stdin: "MATCH (n:OrdTest) RETURN n.val AS v ORDER BY n.val DESC"
+    expect:
+      exit_code: 0
+      stdout_contains: ["5", "4", "3", "2", "1"]
+    tags: ["gap-0130", "order-by"]
+
+  - name: "gap-0130-order-by-multiple-keys"
+    description: "ORDER BY with multiple keys"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (a:Item {category: 'A', value: 2});
+      CREATE (b:Item {category: 'A', value: 1});
+      CREATE (c:Item {category: 'B', value: 3});
+      MATCH (n:Item) RETURN n.category AS cat, n.value AS val ORDER BY cat ASC, val ASC
+    expect:
+      exit_code: 0
+      stdout_contains: ["cat", "val"]
+    tags: ["gap-0130", "order-by", "multi-key"]
+
+  - name: "gap-0130-order-by-with-limit"
+    description: "ORDER BY with LIMIT for top-K selection"
+    args: ["query", "-"]
+    stdin: "MATCH (n:OrdTest) RETURN n.val AS v ORDER BY n.val DESC LIMIT 3"
+    expect:
+      exit_code: 0
+      stdout_contains: ["5", "4", "3"]
+    tags: ["gap-0130", "order-by", "limit", "top-k"]
+
+  # =============================================================================
+  # GAP-0134: Shell TLS Configuration
+  # =============================================================================
+
+  - name: "gap-0134-shell-insecure-warning"
+    description: "Shell with --insecure shows warning"
+    args: ["shell", "--insecure", "--help"]
+    expect:
+      exit_code: 0
+    tags: ["gap-0134", "shell", "tls"]
+
+  # =============================================================================
+  # Basic Query Regression (ensure fixes don't break core functionality)
+  # =============================================================================
+
+  - name: "regression-basic-return"
+    description: "Basic RETURN statement works"
+    args: ["query", "-"]
+    stdin: |
+      RETURN 1 AS x, 'hello' AS y, true AS z
+    expect:
+      exit_code: 0
+      stdout_contains: ["x", "y", "z", "1", "hello", "true"]
+    tags: ["regression", "basic"]
+
+  - name: "regression-create-node"
+    description: "CREATE node works"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (n:TestGap {id: 123}) RETURN n.id AS id
+    expect:
+      exit_code: 0
+      stdout_contains: ["id", "123"]
+    tags: ["regression", "create"]
+
+  - name: "regression-match-return"
+    description: "MATCH and RETURN work together"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (a:GapTest {name: 'Alice'});
+      CREATE (b:GapTest {name: 'Bob'});
+      MATCH (n:GapTest) RETURN n.name AS name ORDER BY name
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "Bob"]
+    tags: ["regression", "match"]
+
+  - name: "regression-aggregation"
+    description: "Aggregation functions work"
+    args: ["query", "-"]
+    stdin: "MATCH (n:AggReg) RETURN count(n) AS cnt, sum(n.val) AS total, avg(n.val) AS average"
+    expect:
+      exit_code: 0
+      stdout_contains: ["cnt", "5", "total", "average"]
+    tags: ["regression", "aggregation"]
+
+  - name: "regression-where-filter"
+    description: "WHERE filtering works"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (a:FilterTest {value: 10});
+      CREATE (b:FilterTest {value: 20});
+      CREATE (c:FilterTest {value: 30});
+      MATCH (n:FilterTest) WHERE n.value > 15 RETURN n.value AS val ORDER BY val
+    expect:
+      exit_code: 0
+      stdout_contains: ["20", "30"]
+    tags: ["regression", "where"]
+
+  - name: "regression-relationship"
+    description: "Relationship creation and matching works"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2020}]->(b:Person {name: 'Bob'});
+      MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN a.name AS from, b.name AS to, r.since AS since
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "Bob", "2020"]
+    tags: ["regression", "relationship"]

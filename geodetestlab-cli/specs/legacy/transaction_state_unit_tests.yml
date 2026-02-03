@@ -1,0 +1,234 @@
+description: "Unit tests for transaction state handling (START TRANSACTION, COMMIT, ROLLBACK)"
+binary: geode
+timeout: 10
+
+tests:
+  # ===============================
+  # START TRANSACTION TESTS
+  # ===============================
+  - name: "transaction-start-basic"
+    description: "Test basic START TRANSACTION"
+    args: ["query", "-"]
+    stdin: "START TRANSACTION"
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        columns: ["status"]
+    tags: ["transaction", "start"]
+
+  - name: "transaction-start-create-commit"
+    description: "Test START TRANSACTION followed by CREATE and COMMIT"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (n:Test {id: 1})
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "create", "commit"]
+
+  - name: "transaction-start-create-rollback"
+    description: "Test START TRANSACTION followed by CREATE and ROLLBACK"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (n:Test {id: 2})
+      ROLLBACK
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "create", "rollback"]
+
+  # ===============================
+  # MULTIPLE OPERATIONS IN TRANSACTION
+  # ===============================
+  - name: "transaction-multiple-creates"
+    description: "Test multiple CREATE operations in one transaction"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (p:Person {name: 'Alice'})
+      CREATE (c:Company {name: 'Acme'})
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "multiple_ops"]
+
+  - name: "transaction-create-match-update"
+    description: "Test CREATE, MATCH, UPDATE in transaction"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (p:Person {name: 'Bob', age: 25})
+      MATCH (p:Person {name: 'Bob'}) SET p.age = 26
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "update"]
+
+  # ===============================
+  # TRANSACTION ISOLATION TESTS
+  # ===============================
+  - name: "transaction-no-active-error"
+    description: "Test COMMIT without active transaction returns error"
+    args: ["query", "-"]
+    stdin: "COMMIT"
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "0A000"
+    tags: ["transaction", "error_handling"]
+
+  - name: "transaction-rollback-no-active-error"
+    description: "Test ROLLBACK without active transaction returns error"
+    args: ["query", "-"]
+    stdin: "ROLLBACK"
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "0A000"
+    tags: ["transaction", "error_handling"]
+
+  # ===============================
+  # TRANSACTION CLEANUP TESTS
+  # ===============================
+  - name: "transaction-state-cleanup-after-commit"
+    description: "Test transaction state is cleaned up after COMMIT"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (n:Test {id: 100})
+      COMMIT
+      START TRANSACTION
+      CREATE (n:Test {id: 200})
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "cleanup"]
+
+  - name: "transaction-state-cleanup-after-rollback"
+    description: "Test transaction state is cleaned up after ROLLBACK"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (n:Test {id: 300})
+      ROLLBACK
+      START TRANSACTION
+      CREATE (n:Test {id: 400})
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "cleanup"]
+
+  # ===============================
+  # INTEGRATION TESTS
+  # ===============================
+  - name: "transaction-full-lifecycle"
+    description: "Test complete transaction lifecycle"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (p:Person {name: 'Charlie', status: 'pending'})
+      MATCH (p:Person {name: 'Charlie'}) SET p.status = 'active'
+      COMMIT
+      MATCH (p:Person {name: 'Charlie'}) RETURN p.status AS status
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - ["active"]
+    tags: ["transaction", "integration"]
+
+  - name: "transaction-with-merge"
+    description: "Test MERGE within transaction"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      MERGE (p:Person {email: 'tx@example.com'})
+      ON CREATE SET p.created_in_tx = true
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "merge"]
+
+  - name: "transaction-with-delete"
+    description: "Test DELETE within transaction"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (n:TempNode {id: 999})
+      START TRANSACTION
+      MATCH (n:TempNode {id: 999}) DELETE n
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "delete"]
+
+  # ===============================
+  # COMPLEX TRANSACTION SCENARIOS
+  # ===============================
+  - name: "transaction-nested-patterns"
+    description: "Test transaction with nested graph patterns"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (p:Person {name: 'Dave'})
+      CREATE (c:Company {name: 'TechCorp'})
+      CREATE (p)-[:WORKS_FOR]->(c)
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "patterns"]
+
+  - name: "transaction-multiple-commits"
+    description: "Test multiple separate transactions in sequence"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (n1:Node {id: 1})
+      COMMIT
+      START TRANSACTION
+      CREATE (n2:Node {id: 2})
+      COMMIT
+      START TRANSACTION
+      CREATE (n3:Node {id: 3})
+      COMMIT
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["transaction", "sequential"]
+
+  - name: "transaction-rollback-verification"
+    description: "Verify ROLLBACK doesn't persist changes"
+    args: ["query", "-"]
+    stdin: |
+      START TRANSACTION
+      CREATE (n:ShouldNotExist {id: 12345})
+      ROLLBACK
+      MATCH (n:ShouldNotExist) RETURN count(n) AS count
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+        rows:
+          - [0]
+    tags: ["transaction", "rollback_verification"]

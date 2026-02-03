@@ -1,0 +1,414 @@
+version: "1.0"
+name: "Comprehensive Spatial Functions Tests"
+description: "Tests for all spatial functions: ST_Point, ST_AsText, ST_AsGeoJson, ST_X, ST_Y, ST_Distance, ST_Area, ST_Centroid, ST_Buffer, ST_Contains, ST_Intersects, ST_Within"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+secrets:
+  admin_password:
+    source: "env"
+    key: "GEODE_ADMIN_PASSWORD"
+    required: false
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+
+tests:
+  # ============================================
+  # ST_Point Tests
+  # ============================================
+  - name: "st-point-creation"
+    description: "Test ST_Point function creates a point geometry"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Point(1.5, 2.5) AS point"
+    expect:
+      exit_code: 0
+      stdout_contains: ["point"]
+    tags: ["spatial", "point", "creation"]
+
+  - name: "st-point-integers"
+    description: "Test ST_Point with integer coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Point(10, 20) AS point"
+    expect:
+      exit_code: 0
+      stdout_contains: ["point"]
+    tags: ["spatial", "point", "integers"]
+
+  - name: "st-point-negative"
+    description: "Test ST_Point with negative coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Point(-122.4194, 37.7749) AS point"
+    expect:
+      exit_code: 0
+      stdout_contains: ["point"]
+    tags: ["spatial", "point", "negative"]
+
+  - name: "st-point-origin"
+    description: "Test ST_Point at origin"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Point(0, 0) AS point"
+    expect:
+      exit_code: 0
+      stdout_contains: ["point"]
+    tags: ["spatial", "point", "origin"]
+
+  # ============================================
+  # ST_AsText (WKT output) Tests
+  # ============================================
+  - name: "st-astext-point"
+    description: "Test ST_AsText converts point to WKT"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Point(1.0, 2.0)) AS wkt"
+    expect:
+      exit_code: 0
+      stdout_contains: ["POINT"]
+    tags: ["spatial", "wkt", "astext"]
+
+  - name: "st-astext-coordinates"
+    description: "Test ST_AsText preserves coordinate values"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Point(10.5, 20.5)) AS wkt"
+    expect:
+      exit_code: 0
+      stdout_contains: ["10", "20"]
+    tags: ["spatial", "wkt", "astext"]
+
+  - name: "st-astext-negative-coords"
+    description: "Test ST_AsText handles negative coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Point(-122.4194, 37.7749)) AS wkt"
+    expect:
+      exit_code: 0
+      stdout_contains: ["POINT", "-122"]
+    tags: ["spatial", "wkt", "negative"]
+
+  # ============================================
+  # ST_AsGeoJson Tests
+  # ============================================
+  - name: "st-asgeojson-point"
+    description: "Test ST_AsGeoJson converts point to GeoJSON"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsGeoJson(ST_Point(1.0, 2.0)) AS geojson"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Point", "coordinates"]
+    tags: ["spatial", "geojson"]
+
+  - name: "st-asgeojson-values"
+    description: "Test ST_AsGeoJson preserves coordinate values"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsGeoJson(ST_Point(10.5, 20.5)) AS geojson"
+    expect:
+      exit_code: 0
+      stdout_contains: ["10", "20"]
+    tags: ["spatial", "geojson"]
+
+  - name: "st-asgeojson-negative-coords"
+    description: "Test ST_AsGeoJson handles negative coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsGeoJson(ST_Point(-122.4194, 37.7749)) AS geojson"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Point", "coordinates", "-122"]
+    tags: ["spatial", "geojson", "negative"]
+
+  - name: "st-asgeojson-polygon"
+    description: "Test ST_AsGeoJson converts polygon to GeoJSON"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsGeoJson(GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))')) AS geojson"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Polygon", "coordinates"]
+    tags: ["spatial", "geojson", "polygon"]
+
+  - name: "st-asgeojson-polygon-values"
+    description: "Test ST_AsGeoJson polygon preserves coordinate values"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsGeoJson(GeometryFromText('POLYGON((1 2, 3 4, 5 6, 1 2))')) AS geojson"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Polygon", "1", "2", "3", "4", "5", "6"]
+    tags: ["spatial", "geojson", "polygon"]
+
+  - name: "st-asgeojson-polygon-negative"
+    description: "Test ST_AsGeoJson polygon with negative coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsGeoJson(GeometryFromText('POLYGON((-10 -20, 10 -20, 10 20, -10 20, -10 -20))')) AS geojson"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Polygon", "-10", "-20"]
+    tags: ["spatial", "geojson", "polygon", "negative"]
+
+  - name: "st-asgeojson-origin-point"
+    description: "Test ST_AsGeoJson with point at origin"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsGeoJson(ST_Point(0, 0)) AS geojson"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Point", "coordinates", "0"]
+    tags: ["spatial", "geojson", "origin"]
+
+  # ============================================
+  # ST_X and ST_Y Tests
+  # ============================================
+  - name: "st-x-extraction"
+    description: "Test ST_X extracts X coordinate from point"
+    args: ["query", "-"]
+    stdin: "RETURN ST_X(ST_Point(10.5, 20.5)) AS x"
+    expect:
+      exit_code: 0
+      stdout_contains: ["10"]
+    tags: ["spatial", "st_x", "coordinate"]
+
+  - name: "st-y-extraction"
+    description: "Test ST_Y extracts Y coordinate from point"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Y(ST_Point(10.5, 20.5)) AS y"
+    expect:
+      exit_code: 0
+      stdout_contains: ["20"]
+    tags: ["spatial", "st_y", "coordinate"]
+
+  - name: "st-xy-negative"
+    description: "Test ST_X and ST_Y with negative coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_X(ST_Point(-122.4, 37.7)) AS x, ST_Y(ST_Point(-122.4, 37.7)) AS y"
+    expect:
+      exit_code: 0
+      stdout_contains: ["-122", "37"]
+    tags: ["spatial", "st_x", "st_y", "negative"]
+
+  # ============================================
+  # ST_Distance Tests
+  # ============================================
+  - name: "st-distance-same-point"
+    description: "Test ST_Distance between same points is 0"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Distance(ST_Point(0, 0), ST_Point(0, 0)) AS distance"
+    expect:
+      exit_code: 0
+      stdout_contains: ["0"]
+    tags: ["spatial", "distance"]
+
+  - name: "st-distance-simple"
+    description: "Test ST_Distance between two points (3-4-5 triangle)"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Distance(ST_Point(0, 0), ST_Point(3, 4)) AS distance"
+    expect:
+      exit_code: 0
+      stdout_contains: ["5"]
+    tags: ["spatial", "distance"]
+
+  - name: "st-distance-unit"
+    description: "Test ST_Distance with unit distance"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Distance(ST_Point(0, 0), ST_Point(1, 0)) AS distance"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+    tags: ["spatial", "distance"]
+
+  # ============================================
+  # ST_Area Tests
+  # ============================================
+  - name: "st-area-point"
+    description: "Test ST_Area of point is 0"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Area(ST_Point(0, 0)) AS area"
+    expect:
+      exit_code: 0
+      stdout_contains: ["0"]
+    tags: ["spatial", "area"]
+
+  - name: "st-area-polygon"
+    description: "Test ST_Area of unit square polygon"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Area(GeometryFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))')) AS area"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+    tags: ["spatial", "area", "polygon"]
+
+  # ============================================
+  # ST_Centroid Tests
+  # ============================================
+  - name: "st-centroid-point"
+    description: "Test ST_Centroid of point returns the point"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Centroid(ST_Point(5, 10))) AS centroid"
+    expect:
+      exit_code: 0
+      stdout_contains: ["POINT", "5", "10"]
+    tags: ["spatial", "centroid"]
+
+  - name: "st-centroid-polygon"
+    description: "Test ST_Centroid of unit square"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Centroid(GeometryFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))'))) AS centroid"
+    expect:
+      exit_code: 0
+      stdout_contains: ["POINT", "1"]
+    tags: ["spatial", "centroid", "polygon"]
+
+  # ============================================
+  # ST_Buffer Tests
+  # ============================================
+  - name: "st-buffer-point"
+    description: "Test ST_Buffer around point creates polygon"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Buffer(ST_Point(0, 0), 1)) AS buffer"
+    expect:
+      exit_code: 0
+      stdout_contains: ["POLYGON"]
+    tags: ["spatial", "buffer"]
+
+  - name: "st-buffer-area"
+    description: "Test ST_Buffer creates polygon with area"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Area(ST_Buffer(ST_Point(0, 0), 1)) AS area"
+    expect:
+      exit_code: 0
+    tags: ["spatial", "buffer", "area"]
+
+  # ============================================
+  # ST_Contains Tests
+  # ============================================
+  - name: "st-contains-point-in-polygon"
+    description: "Test ST_Contains with point inside polygon"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Contains(GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'), ST_Point(5, 5)) AS contains"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["spatial", "contains"]
+
+  - name: "st-contains-point-outside-polygon"
+    description: "Test ST_Contains with point outside polygon"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Contains(GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))'), ST_Point(50, 50)) AS contains"
+    expect:
+      exit_code: 0
+      stdout_contains: ["false"]
+    tags: ["spatial", "contains"]
+
+  - name: "st-contains-same-point"
+    description: "Test ST_Contains with same point"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Contains(ST_Point(5, 5), ST_Point(5, 5)) AS contains"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["spatial", "contains", "point"]
+
+  # ============================================
+  # ST_Within Tests
+  # ============================================
+  - name: "st-within-point-in-polygon"
+    description: "Test ST_Within with point inside polygon"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Within(ST_Point(5, 5), GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))')) AS within"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["spatial", "within"]
+
+  - name: "st-within-point-outside-polygon"
+    description: "Test ST_Within with point outside polygon"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Within(ST_Point(50, 50), GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))')) AS within"
+    expect:
+      exit_code: 0
+      stdout_contains: ["false"]
+    tags: ["spatial", "within"]
+
+  # ============================================
+  # ST_Intersects Tests
+  # ============================================
+  - name: "st-intersects-same-point"
+    description: "Test ST_Intersects between same points"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Intersects(ST_Point(5, 5), ST_Point(5, 5)) AS intersects"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["spatial", "intersects"]
+
+  - name: "st-intersects-different-points"
+    description: "Test ST_Intersects between different points"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Intersects(ST_Point(0, 0), ST_Point(5, 5)) AS intersects"
+    expect:
+      exit_code: 0
+      stdout_contains: ["false"]
+    tags: ["spatial", "intersects"]
+
+  - name: "st-intersects-point-polygon"
+    description: "Test ST_Intersects between point and polygon"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Intersects(ST_Point(5, 5), GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))')) AS intersects"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["spatial", "intersects", "polygon"]
+
+  # ============================================
+  # Real-world coordinates tests
+  # ============================================
+  - name: "st-point-san-francisco"
+    description: "Test ST_Point with San Francisco coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Point(-122.4194, 37.7749)) AS location"
+    expect:
+      exit_code: 0
+      stdout_contains: ["POINT", "-122", "37"]
+    tags: ["spatial", "real-world"]
+
+  - name: "st-distance-cities"
+    description: "Test ST_Distance between city coordinate approximations"
+    args: ["query", "-"]
+    stdin: "RETURN ST_Distance(ST_Point(-122.4, 37.8), ST_Point(-118.2, 34.1)) AS distance"
+    expect:
+      exit_code: 0
+    tags: ["spatial", "real-world", "distance"]
+
+  # ============================================
+  # Edge cases
+  # ============================================
+  - name: "st-point-large-coords"
+    description: "Test ST_Point with large coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Point(1000000.5, -1000000.5)) AS point"
+    expect:
+      exit_code: 0
+      stdout_contains: ["POINT", "1000000"]
+    tags: ["spatial", "edge-case"]
+
+  - name: "st-point-small-decimals"
+    description: "Test ST_Point with small decimal coordinates"
+    args: ["query", "-"]
+    stdin: "RETURN ST_AsText(ST_Point(0.001, 0.002)) AS point"
+    expect:
+      exit_code: 0
+      stdout_contains: ["POINT", "0.00"]
+    tags: ["spatial", "edge-case"]

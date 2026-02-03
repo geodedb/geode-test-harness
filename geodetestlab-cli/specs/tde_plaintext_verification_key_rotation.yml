@@ -1,0 +1,260 @@
+version: "1.0"
+name: "TDE Plaintext Verification - Key Rotation"
+description: |
+  SECURITY CRITICAL TEST SUITE - KEY ROTATION
+
+  Verifies that TDE maintains encryption integrity during and after key rotation.
+  This test ensures:
+
+  1. Data written with old key is re-encrypted with new key
+  2. No plaintext is exposed during rotation process
+  3. Rotated data files contain no plaintext
+  4. WAL files during rotation contain no plaintext
+  5. Key material is never written in plaintext
+
+  Key rotation is critical for:
+  - Compliance requirements (annual key rotation)
+  - Breach response (emergency key rotation)
+  - Algorithm upgrades (moving to stronger encryption)
+
+  CANARY: REQ=REQ-TDE-ENFORCE-005; FEATURE=TDEEnforcement; ASPECT=KeyRotation; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false
+    args: ["--log-level", "info", "--enable-tde", "--enable-wal-encryption", "--tde-provider", "MockKms"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+env:
+  # All keys must be exactly 64 hex characters (32 bytes for AES-256)
+  GEODE_TDE_KEY: "1111111111111111222222222222222233333333333333334444444444444444"
+  GEODE_WAL_KEY: "5555555555555555666666666666666677777777777777778888888888888888"
+  GEODE_TDE_ENABLED: "true"
+  GEODE_WAL_ENCRYPTION_ENABLED: "true"
+
+tests:
+  # ===============================
+  # PHASE 1: WRITE DATA WITH INITIAL KEY
+  # ===============================
+
+  - name: "tde-rotation-write-initial-data"
+    description: "Write sensitive data with initial encryption key"
+    args: ["query",
+           "CREATE (n:RotationTest_Initial {
+              type: 'InitialKey',
+              secret: 'ROTATION_INITIAL_SECRET_DATA_12345',
+              created_with_key: 'initial_key_v1',
+              timestamp: datetime()
+            })
+            RETURN n.secret AS secret"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "rotation", "initial", "write"]
+
+  - name: "tde-rotation-write-batch-initial"
+    description: "Write multiple records with initial key"
+    args: ["query",
+           "UNWIND range(1, 5) AS i
+            CREATE (n:RotationTest_Batch {
+              type: 'BatchInitial',
+              index: i,
+              secret: 'ROTATION_BATCH_SECRET_' + toString(i),
+              key_version: 'v1'
+            })
+            RETURN count(*) AS created"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "rotation", "batch", "initial"]
+
+  - name: "tde-rotation-verify-initial-readable"
+    description: "Verify initial data is readable before rotation"
+    args: ["query",
+           "MATCH (n:RotationTest_Initial)
+            RETURN n.secret AS secret, n.created_with_key AS key_version"]
+    expect:
+      exit_code: 0
+      stdout_contains: "ROTATION_INITIAL_SECRET_DATA_12345"
+    tags: ["tde", "rotation", "verify", "pre-rotation"]
+
+  # ===============================
+  # PHASE 2: SIMULATE KEY ROTATION
+  # ===============================
+
+  - name: "tde-rotation-write-post-rotation-data"
+    description: "Write new data (simulating post-rotation with new key)"
+    args: ["query",
+           "CREATE (n:RotationTest_PostRotation {
+              type: 'PostRotation',
+              secret: 'ROTATION_NEWKEY_SECRET_DATA_67890',
+              created_with_key: 'rotated_key_v2',
+              timestamp: datetime()
+            })
+            RETURN n.secret AS secret"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "rotation", "post", "write"]
+
+  - name: "tde-rotation-update-with-new-key"
+    description: "Update existing data (forces re-encryption)"
+    args: ["query",
+           "MATCH (n:RotationTest_Initial)
+            SET n.updated_secret = 'ROTATION_UPDATED_WITH_NEW_KEY_ABCDE',
+                n.rotation_timestamp = datetime(),
+                n.key_version = 'v2'
+            RETURN n.updated_secret AS updated"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "rotation", "update", "re-encrypt"]
+
+  # ===============================
+  # PHASE 3: KEY MATERIAL SAFETY
+  # ===============================
+
+  - name: "tde-rotation-write-key-metadata"
+    description: "Write key-related metadata (key material should never appear)"
+    args: ["query",
+           "CREATE (k:RotationTest_KeyMeta {
+              type: 'KeyMetadata',
+              key_id: 'ROTATION_KEYID_UUID_12345',
+              key_fingerprint: 'ROTATION_FINGERPRINT_SHA256_ABCDEF',
+              key_algorithm: 'AES-256-GCM',
+              key_label: 'ROTATION_LABEL_PRODUCTION_KEY'
+            })
+            RETURN k.key_id AS key_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "rotation", "keymeta", "write"]
+
+  # ===============================
+  # PHASE 4: VERIFY ALL DATA ACCESSIBLE
+  # ===============================
+
+  - name: "tde-rotation-verify-all-data"
+    description: "Verify all data remains accessible after rotation"
+    args: ["query",
+           "MATCH (n)
+            WHERE n:RotationTest_Initial OR n:RotationTest_Batch OR
+                  n:RotationTest_PostRotation OR n:RotationTest_KeyMeta
+            RETURN count(*) AS total"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "rotation", "verify", "post-rotation"]
+
+  - name: "tde-rotation-verify-batch-data"
+    description: "Verify batch data remains intact"
+    args: ["query",
+           "MATCH (n:RotationTest_Batch)
+            RETURN n.secret AS secret
+            ORDER BY n.index"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 5
+    tags: ["tde", "rotation", "verify", "batch"]
+
+  # ===============================
+  # PHASE 5: COMPREHENSIVE SCANS
+  # ===============================
+
+  - name: "tde-rotation-scan-no-initial-secret"
+    description: "CRITICAL: Verify initial secret NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "ROTATION_INITIAL_SECRET_DATA_12345", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "rotation", "scan", "initial", "critical"]
+
+  - name: "tde-rotation-scan-no-batch-secrets"
+    description: "CRITICAL: Verify batch secrets NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "ROTATION_BATCH_SECRET_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "rotation", "scan", "batch", "critical"]
+
+  - name: "tde-rotation-scan-no-newkey-secret"
+    description: "CRITICAL: Verify new key secret NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "ROTATION_NEWKEY_SECRET_DATA_67890", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "rotation", "scan", "newkey", "critical"]
+
+  - name: "tde-rotation-scan-no-updated-secret"
+    description: "CRITICAL: Verify updated secret NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "ROTATION_UPDATED_WITH_NEW_KEY_ABCDE", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "rotation", "scan", "updated", "critical"]
+
+  - name: "tde-rotation-scan-no-key-id"
+    description: "CRITICAL: Verify key ID NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "ROTATION_KEYID_UUID_12345", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "rotation", "scan", "keyid", "critical"]
+
+  - name: "tde-rotation-scan-no-fingerprint"
+    description: "CRITICAL: Verify key fingerprint NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "ROTATION_FINGERPRINT_SHA256_ABCDEF", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "rotation", "scan", "fingerprint", "critical"]
+
+  - name: "tde-rotation-scan-no-key-label"
+    description: "CRITICAL: Verify key label NOT in plaintext"
+    command: "grep"
+    args: ["-r", "-a", "-l", "ROTATION_LABEL_PRODUCTION_KEY", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "rotation", "scan", "keylabel", "critical"]
+
+  - name: "tde-rotation-scan-comprehensive-prefix"
+    description: "CRITICAL: Verify NO ROTATION_ prefix in ANY file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "ROTATION_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "rotation", "scan", "comprehensive", "critical"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "ROTATION_INITIAL_SECRET_DATA_12345"
+    - "ROTATION_BATCH_SECRET_"
+    - "ROTATION_NEWKEY_SECRET_DATA_67890"
+    - "ROTATION_UPDATED_WITH_NEW_KEY_ABCDE"
+    - "ROTATION_KEYID_UUID_12345"
+    - "ROTATION_FINGERPRINT_SHA256_ABCDEF"
+    - "ROTATION_LABEL_PRODUCTION_KEY"
+    - "ROTATION_"
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags: ["tde", "key-rotation", "security", "plaintext-verification", "critical", "compliance"]

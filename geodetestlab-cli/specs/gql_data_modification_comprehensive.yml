@@ -1,0 +1,444 @@
+version: "1.0"
+name: "GQL Data Modification Comprehensive Tests"
+description: "Complete ISO/IEC 39075:2024 data modification testing covering INSERT, SET, REMOVE, DELETE operations"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # ===============================
+  # INSERT OPERATIONS
+  # ===============================
+
+  - name: "insert-basic-node"
+    description: "Test basic INSERT node pattern"
+    args: ["query", "INSERT (n:Person {name: 'Alice', age: 30})"]
+    expect:
+      exit_code: 0
+    tags: ["insert", "node", "basic"]
+
+  - name: "insert-multiple-nodes"
+    description: "Test INSERT multiple nodes"
+    args: ["query", "INSERT (a:Person {name: 'Bob', age: 25}), (b:Person {name: 'Carol', age: 35})"]
+    expect:
+      exit_code: 0
+    tags: ["insert", "node", "multiple"]
+
+  - name: "insert-relationship"
+    description: "Test INSERT relationship pattern"
+    setup:
+      - args: ["query", "INSERT (a:Person {name: 'David', age: 40}), (b:Person {name: 'Eve', age: 28})"]
+        expect:
+          exit_code: 0
+    args: ["query", "INSERT (a:Person {name: 'David'})-[:KNOWS {since: 2020}]->(b:Person {name: 'Eve'})"]
+    expect:
+      exit_code: 0
+    tags: ["insert", "relationship", "basic"]
+
+  - name: "insert-complex-pattern"
+    description: "Test INSERT complex pattern with nodes and relationships"
+    args:
+      - "query"
+      - |
+        INSERT (company:Company {name: 'TechCorp', founded: 2010}),
+               (person:Person {name: 'Frank', age: 32}),
+               (project:Project {name: 'WebApp', budget: 50000}),
+               (person)-[:WORKS_FOR {since: 2022, role: 'Developer'}]->(company),
+               (person)-[:ASSIGNED_TO {start_date: '2023-01-01'}]->(project)
+    expect:
+      exit_code: 0
+    tags: ["insert", "complex", "pattern"]
+
+  - name: "insert-node-with-properties"
+    description: "Test INSERT node with various property types"
+    args:
+      - "query"
+      - "INSERT (n:Product {id: 1, name: 'Laptop', price: 999.99, in_stock: true, tags: ['electronics', 'computers'], metadata: {brand: 'TechBrand', model: 'X1'}})"
+    expect:
+      exit_code: 0
+    tags: ["insert", "properties", "types"]
+
+  # ===============================
+  # SET OPERATIONS
+  # ===============================
+
+  - name: "set-property-basic"
+    description: "Test basic SET property operation"
+    setup:
+      - args: ["query", "INSERT (n:Person {name: 'Grace', age: 26})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Grace'}) SET n.age = 27"]
+    expect:
+      exit_code: 0
+    tags: ["set", "property", "basic"]
+
+  - name: "set-multiple-properties"
+    description: "Test SET multiple properties"
+    setup:
+      - args: ["query", "INSERT (n:Person {name: 'Henry', age: 30})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Henry'}) SET n.age = 31, n.city = 'New York', n.updated = true"]
+    expect:
+      exit_code: 0
+    tags: ["set", "property", "multiple"]
+
+  - name: "set-all-properties"
+    description: "Test SET all properties with property map"
+    setup:
+      - args: ["query", "INSERT (n:Person {name: 'Ivy', age: 29})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Ivy'}) SET n = {name: 'Ivy Johnson', age: 30, department: 'Engineering', active: true}"]
+    expect:
+      exit_code: 0
+    tags: ["set", "properties", "all"]
+
+  - name: "set-label"
+    description: "Test SET label operation"
+    setup:
+      - args: ["query", "INSERT (n:Person {name: 'Jack', age: 33})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Jack'}) SET n:Employee"]
+    expect:
+      exit_code: 0
+    tags: ["set", "label", "basic"]
+
+  - name: "set-multiple-labels"
+    description: "Test SET multiple labels"
+    setup:
+      - args: ["query", "INSERT (n:Person {name: 'Kate', age: 27})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Kate'}) SET n:Employee, n:Manager"]
+    expect:
+      exit_code: 0
+    tags: ["set", "label", "multiple"]
+
+  - name: "set-relationship-property"
+    description: "Test SET property on relationship"
+    setup:
+      - args: ["query", "INSERT (a:Person {name: 'Liam'}), (b:Person {name: 'Mia'}), (a)-[:KNOWS]->(b)"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (a:Person {name: 'Liam'})-[r:KNOWS]->(b:Person {name: 'Mia'}) SET r.strength = 'strong', r.verified = true"]
+    expect:
+      exit_code: 0
+    tags: ["set", "relationship", "property"]
+
+  - name: "set-computed-property"
+    description: "Test SET property with computed value"
+    setup:
+      - args: ["query", "INSERT (n:Product {name: 'Monitor', price: 299.99})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Product {name: 'Monitor'}) SET n.discounted_price = n.price * 0.9"]
+    expect:
+      exit_code: 0
+    tags: ["set", "property", "computed"]
+
+  # ===============================
+  # REMOVE OPERATIONS
+  # ===============================
+
+  - name: "remove-property-basic"
+    description: "Test basic REMOVE property operation"
+    setup:
+      - args: ["query", "INSERT (n:Person {name: 'Noah', age: 35, temp_field: 'remove_me'})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Noah'}) REMOVE n.temp_field"]
+    expect:
+      exit_code: 0
+    tags: ["remove", "property", "basic"]
+
+  - name: "remove-multiple-properties"
+    description: "Test REMOVE multiple properties"
+    setup:
+      - args: ["query", "INSERT (n:Person {name: 'Olivia', age: 28, temp1: 'remove', temp2: 'also_remove'})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Olivia'}) REMOVE n.temp1, n.temp2"]
+    expect:
+      exit_code: 0
+    tags: ["remove", "property", "multiple"]
+
+  - name: "remove-label-basic"
+    description: "Test basic REMOVE label operation"
+    setup:
+      - args: ["query", "INSERT (n:Person:Temporary {name: 'Paul', age: 42})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Paul'}) REMOVE n:Temporary"]
+    expect:
+      exit_code: 0
+    tags: ["remove", "label", "basic"]
+
+  - name: "remove-multiple-labels"
+    description: "Test REMOVE multiple labels"
+    setup:
+      - args: ["query", "INSERT (n:Person:Employee:Manager:Temporary {name: 'Quinn', age: 38})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:Person {name: 'Quinn'}) REMOVE n:Employee, n:Temporary"]
+    expect:
+      exit_code: 0
+    tags: ["remove", "label", "multiple"]
+
+  - name: "remove-relationship-property"
+    description: "Test REMOVE property from relationship"
+    setup:
+      - args: ["query", "INSERT (a:Person {name: 'Ryan'}), (b:Person {name: 'Sara'}), (a)-[:KNOWS {temp_prop: 'remove_me', since: 2020}]->(b)"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (a:Person {name: 'Ryan'})-[r:KNOWS]->(b:Person {name: 'Sara'}) REMOVE r.temp_prop"]
+    expect:
+      exit_code: 0
+    tags: ["remove", "relationship", "property"]
+
+  # ===============================
+  # DELETE OPERATIONS
+  # ===============================
+
+  - name: "delete-node-basic"
+    description: "Test basic DELETE node operation"
+    setup:
+      - args: ["query", "INSERT (n:TempNode {id: 1, name: 'delete_me'})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:TempNode {id: 1}) DELETE n"]
+    expect:
+      exit_code: 0
+    tags: ["delete", "node", "basic"]
+
+  - name: "delete-multiple-nodes"
+    description: "Test DELETE multiple nodes"
+    setup:
+      - args: ["query", "INSERT (a:TempNode {id: 2}), (b:TempNode {id: 3})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:TempNode) WHERE n.id IN [2, 3] DELETE n"]
+    expect:
+      exit_code: 0
+    tags: ["delete", "node", "multiple"]
+
+  - name: "delete-relationship-basic"
+    description: "Test DELETE relationship operation"
+    setup:
+      - args: ["query", "INSERT (a:Person {name: 'Tom'}), (b:Person {name: 'Uma'}), (a)-[:TEMP_REL]->(b)"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (a:Person {name: 'Tom'})-[r:TEMP_REL]->(b:Person {name: 'Uma'}) DELETE r"]
+    expect:
+      exit_code: 0
+    tags: ["delete", "relationship", "basic"]
+
+  - name: "detach-delete-node"
+    description: "Test DETACH DELETE node operation"
+    setup:
+      - args: ["query", "INSERT (a:Person {name: 'Victor'}), (b:TempNode {name: 'detach_me'}), (a)-[:CONNECTED]->(b)"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:TempNode {name: 'detach_me'}) DETACH DELETE n"]
+    expect:
+      exit_code: 0
+    tags: ["delete", "detach", "node"]
+
+  - name: "nodetach-delete-error"
+    description: "Test NODETACH DELETE on node with relationships (should error)"
+    skip: true  # Geode returns status codes via response, not exit codes - test runner limitation
+    setup:
+      - args: ["query", "INSERT (a:Person {name: 'Walter'}), (b:TempNode {name: 'nodetach_error'}), (a)-[:CONNECTED]->(b)"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:TempNode {name: 'nodetach_error'}) NODETACH DELETE n"]
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "22000"  # Integrity constraint violation
+    cleanup:
+      - args: ["query", "MATCH (n:TempNode {name: 'nodetach_error'}) DETACH DELETE n"]
+        expect:
+          exit_code: 0
+    tags: ["delete", "nodetach", "error"]
+
+  - name: "delete-complex-pattern"
+    description: "Test DELETE with complex matching pattern"
+    setup:
+      - args: ["query", "INSERT (a:TempNode {type: 'source'}), (b:TempNode {type: 'target'}), (a)-[:TEMP_CONNECTS {weight: 1.0}]->(b)"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (a:TempNode {type: 'source'})-[r:TEMP_CONNECTS]->(b:TempNode {type: 'target'}) DELETE r, a, b"]
+    expect:
+      exit_code: 0
+    tags: ["delete", "complex", "pattern"]
+
+  # ===============================
+  # COMBINED OPERATIONS
+  # ===============================
+
+  - name: "insert-set-workflow"
+    description: "Test INSERT followed by SET operations"
+    args:
+      - "query"
+      - |
+        INSERT (n:WorkflowTest {name: 'TestUser', status: 'new'});
+        MATCH (n:WorkflowTest {name: 'TestUser'}) SET n.status = 'active', n.created_at = 'now';
+        MATCH (n:WorkflowTest {name: 'TestUser'}) RETURN n.name AS name, n.status AS status
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name", "status"]
+    tags: ["workflow", "insert", "set"]
+
+  - name: "set-remove-workflow"
+    description: "Test SET followed by REMOVE operations"
+    setup:
+      - args: ["query", "INSERT (n:WorkflowTest {name: 'ModifyUser', temp: 'temporary', keep: 'permanent'})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (n:WorkflowTest {name: 'ModifyUser'}) SET n.updated = true;
+        MATCH (n:WorkflowTest {name: 'ModifyUser'}) REMOVE n.temp;
+        MATCH (n:WorkflowTest {name: 'ModifyUser'}) RETURN n.name AS name, n.keep AS keep, n.updated AS updated
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name", "keep", "updated"]
+    tags: ["workflow", "set", "remove"]
+
+  - name: "comprehensive-data-workflow"
+    description: "Comprehensive workflow: INSERT, SET, REMOVE, DELETE"
+    args:
+      - "query"
+      - |
+        INSERT (a:ComprehensiveTest {id: 1, name: 'Alpha', temp: 'remove_later'}),
+               (b:ComprehensiveTest {id: 2, name: 'Beta'}),
+               (a)-[:RELATES {strength: 'weak'}]->(b);
+        MATCH (n:ComprehensiveTest {id: 1}) SET n.processed = true;
+        MATCH (n:ComprehensiveTest {id: 1}) REMOVE n.temp;
+        MATCH (a:ComprehensiveTest {id: 1})-[r:RELATES]->(b:ComprehensiveTest {id: 2}) SET r.strength = 'strong';
+        MATCH (n:ComprehensiveTest) RETURN count(n) AS total_nodes
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["total_nodes"]
+      stdout_json_assert:
+        - expression: "results[0].total_nodes"
+          equals: 2
+    tags: ["workflow", "comprehensive", "all-operations"]
+
+  # ===============================
+  # PERFORMANCE TESTS
+  # ===============================
+
+  - name: "bulk-insert-performance"
+    description: "Performance test with bulk INSERT operations"
+    timeout_ms: 30000
+    args:
+      - "query"
+      - |
+        INSERT (n1:BulkTest {id: 1, batch: 'perf'}),
+               (n2:BulkTest {id: 2, batch: 'perf'}),
+               (n3:BulkTest {id: 3, batch: 'perf'}),
+               (n4:BulkTest {id: 4, batch: 'perf'}),
+               (n5:BulkTest {id: 5, batch: 'perf'}),
+               (n6:BulkTest {id: 6, batch: 'perf'}),
+               (n7:BulkTest {id: 7, batch: 'perf'}),
+               (n8:BulkTest {id: 8, batch: 'perf'}),
+               (n9:BulkTest {id: 9, batch: 'perf'}),
+               (n10:BulkTest {id: 10, batch: 'perf'});
+        MATCH (n:BulkTest {batch: 'perf'}) RETURN count(n) AS bulk_count
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["bulk_count"]
+      stdout_json_assert:
+        - expression: "results[0].bulk_count"
+          equals: 10
+    tags: ["performance", "bulk", "insert"]
+
+  - name: "bulk-set-performance"
+    description: "Performance test with bulk SET operations"
+    timeout_ms: 30000
+    setup:
+      - args: ["query", "INSERT (n1:BulkSetTest {id: 1}), (n2:BulkSetTest {id: 2}), (n3:BulkSetTest {id: 3}), (n4:BulkSetTest {id: 4}), (n5:BulkSetTest {id: 5})"]
+        expect:
+          exit_code: 0
+    args:
+      - "query"
+      - |
+        MATCH (n:BulkSetTest) SET n.processed = true, n.timestamp = 'bulk_update';
+        MATCH (n:BulkSetTest) RETURN count(n) AS updated_count
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["updated_count"]
+    tags: ["performance", "bulk", "set"]
+
+  # ===============================
+  # ERROR SCENARIOS
+  # ===============================
+
+  - name: "set-nonexistent-node-property"
+    description: "Test SET property on non-existent node (should succeed with no effect)"
+    args: ["query", "MATCH (n:NonExistent) SET n.property = 'value'"]
+    expect:
+      exit_code: 0
+    tags: ["error", "set", "nonexistent"]
+
+  - name: "remove-nonexistent-property"
+    description: "Test REMOVE non-existent property (should succeed with no effect)"
+    setup:
+      - args: ["query", "INSERT (n:ErrorTest {name: 'test'})"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (n:ErrorTest) REMOVE n.nonexistent_property"]
+    expect:
+      exit_code: 0
+    tags: ["error", "remove", "nonexistent"]
+
+  - name: "delete-nonexistent-node"
+    description: "Test DELETE non-existent node (should succeed with no effect)"
+    args: ["query", "MATCH (n:NonExistent) DELETE n"]
+    expect:
+      exit_code: 0
+    tags: ["error", "delete", "nonexistent"]
+
+  # ===============================
+  # CLEANUP
+  # ===============================
+
+  - name: "cleanup-data-modification-tests"
+    description: "Clean up all data created during data modification tests"
+    args:
+      - "query"
+      - "MATCH (n) WHERE n:Person OR n:Company OR n:Project OR n:Product OR n:TempNode OR n:WorkflowTest OR n:ComprehensiveTest OR n:BulkTest OR n:BulkSetTest OR n:ErrorTest DETACH DELETE n"
+    expect:
+      exit_code: 0
+    tags: ["cleanup", "data"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["data-modification", "insert", "set", "remove", "delete", "iso-gql", "comprehensive"]

@@ -1,0 +1,286 @@
+# mTLS Authentication Integration Tests
+# Tests certificate-based authentication with client cert mapping
+#
+# CANARY: REQ=REQ-AUTH-MTLS-TEST; FEATURE="mTLS Authentication Testing"; ASPECT=Security; STATUS=TESTED; TEST=geodetestlab/specs/mtls_auth.yml; OWNER=security; UPDATED=2026-01-29
+# GAP-0248: mTLS auth vs transport clarification
+
+version: "1.0"
+name: "mTLS Authentication Tests"
+description: |
+  Integration tests for Geode's mTLS (mutual TLS) certificate-based authentication.
+
+  This spec covers:
+  - Certificate-to-user mapping by fingerprint
+  - Certificate-to-user mapping by SAN (Subject Alternative Name)
+  - Certificate-to-user mapping by Subject CN
+  - Wildcard pattern matching
+  - Mapping enable/disable
+  - Certificate expiration handling
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 30000
+    format: "json"
+
+invariants:
+  - type: "server_running"
+
+tests:
+  # =============================================================================
+  # SECTION 1: CERTIFICATE MAPPING SETUP
+  # =============================================================================
+
+  - name: "mtls-setup-create-user"
+    description: "Create user for mTLS tests"
+    args: ["user", "create", "mtls_user", "mtls@test.com", "--password", "Mtls_Test_Passphrase_2026!"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["User 'mtls_user' created successfully"]
+    tags: ["mtls", "setup"]
+
+  - name: "mtls-setup-create-admin"
+    description: "Create admin user for mTLS tests"
+    args: ["user", "create", "mtls_admin", "mtls_admin@test.com", "--password", "Mtls_Admin_Passphrase_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mtls", "setup"]
+
+  # =============================================================================
+  # SECTION 2: FINGERPRINT-BASED MAPPING
+  # =============================================================================
+
+  - name: "mtls-map-fingerprint-create"
+    description: "Create certificate mapping by fingerprint"
+    args: ["mtls", "map", "--method", "fingerprint", "--pattern", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "--user", "mtls_user", "--roles", "user", "--description", "Test user cert"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mapping", "created"]
+    tags: ["mtls", "fingerprint", "mapping"]
+
+  - name: "mtls-map-fingerprint-admin"
+    description: "Create certificate mapping for admin by fingerprint"
+    args: ["mtls", "map", "--method", "fingerprint", "--pattern", "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210", "--user", "mtls_admin", "--roles", "admin,user", "--description", "Admin cert"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mapping", "created"]
+    tags: ["mtls", "fingerprint", "mapping"]
+
+  - name: "mtls-map-list"
+    description: "List all certificate mappings"
+    args: ["mtls", "list"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mtls_user", "mtls_admin", "fingerprint"]
+    tags: ["mtls", "list"]
+
+  # =============================================================================
+  # SECTION 3: SAN-BASED MAPPING
+  # =============================================================================
+
+  - name: "mtls-map-san-email-exact"
+    description: "Create mapping by SAN email (exact match)"
+    args: ["mtls", "map", "--method", "san_email", "--pattern", "alice@company.com", "--user", "mtls_user", "--roles", "user", "--description", "Alice email cert"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mapping", "created"]
+    tags: ["mtls", "san", "email", "mapping"]
+
+  - name: "mtls-map-san-email-wildcard"
+    description: "Create mapping by SAN email with wildcard"
+    args: ["mtls", "map", "--method", "san_email", "--pattern", "*@company.com", "--user", "mtls_user", "--roles", "employee", "--description", "All company emails"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mapping", "created"]
+    tags: ["mtls", "san", "email", "wildcard", "mapping"]
+
+  - name: "mtls-map-san-dns"
+    description: "Create mapping by SAN DNS name"
+    args: ["mtls", "map", "--method", "san_dns", "--pattern", "*.internal.company.com", "--user", "mtls_admin", "--roles", "service", "--description", "Internal services"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mapping", "created"]
+    tags: ["mtls", "san", "dns", "wildcard", "mapping"]
+
+  - name: "mtls-map-san-uri"
+    description: "Create mapping by SAN URI"
+    args: ["mtls", "map", "--method", "san_uri", "--pattern", "spiffe://company.com/service/*", "--user", "mtls_admin", "--roles", "service", "--description", "SPIFFE identities"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mapping", "created"]
+    tags: ["mtls", "san", "uri", "spiffe", "mapping"]
+
+  # =============================================================================
+  # SECTION 4: SUBJECT CN/DN MAPPING
+  # =============================================================================
+
+  - name: "mtls-map-subject-cn"
+    description: "Create mapping by Subject Common Name"
+    args: ["mtls", "map", "--method", "subject_cn", "--pattern", "service-account-*", "--user", "mtls_user", "--roles", "service", "--description", "Service accounts"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mapping", "created"]
+    tags: ["mtls", "subject", "cn", "mapping"]
+
+  - name: "mtls-map-subject-dn"
+    description: "Create mapping by Subject Distinguished Name"
+    args: ["mtls", "map", "--method", "subject_dn", "--pattern", "CN=admin,OU=Security,O=Company,C=US", "--user", "mtls_admin", "--roles", "admin", "--description", "Security team admin"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["mapping", "created"]
+    tags: ["mtls", "subject", "dn", "mapping"]
+
+  # =============================================================================
+  # SECTION 5: MAPPING MANAGEMENT
+  # =============================================================================
+
+  - name: "mtls-map-disable"
+    description: "Disable a certificate mapping"
+    args: ["mtls", "disable", "--method", "san_email", "--pattern", "alice@company.com"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["disabled"]
+    tags: ["mtls", "mapping", "disable"]
+
+  - name: "mtls-map-enable"
+    description: "Re-enable a certificate mapping"
+    args: ["mtls", "enable", "--method", "san_email", "--pattern", "alice@company.com"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["enabled"]
+    tags: ["mtls", "mapping", "enable"]
+
+  - name: "mtls-map-remove"
+    description: "Remove a certificate mapping"
+    args: ["mtls", "unmap", "--method", "subject_dn", "--pattern", "CN=admin,OU=Security,O=Company,C=US"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["removed"]
+    tags: ["mtls", "mapping", "remove"]
+
+  # =============================================================================
+  # SECTION 6: AUTHENTICATION SIMULATION
+  # =============================================================================
+
+  - name: "mtls-auth-simulate-fingerprint"
+    description: "Simulate authentication with known fingerprint"
+    args: ["mtls", "auth-test", "--fingerprint", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["authenticated", "mtls_user"]
+    tags: ["mtls", "auth", "simulate"]
+
+  - name: "mtls-auth-simulate-unknown"
+    description: "Simulate authentication with unknown fingerprint"
+    args: ["mtls", "auth-test", "--fingerprint", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["not authenticated", "no mapping"]
+    tags: ["mtls", "auth", "simulate", "failure"]
+
+  - name: "mtls-auth-simulate-san-email"
+    description: "Simulate authentication with SAN email"
+    args: ["mtls", "auth-test", "--san-email", "bob@company.com"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["authenticated"]
+    tags: ["mtls", "auth", "san", "simulate"]
+
+  - name: "mtls-auth-simulate-disabled-mapping"
+    description: "Disabled mapping should not authenticate"
+    args: ["mtls", "auth-test", "--san-email", "alice@company.com"]
+    skip: true  # Depends on mapping state
+    expect:
+      exit_code: 1
+      stderr_contains: ["not authenticated"]
+    tags: ["mtls", "auth", "disabled"]
+
+  # =============================================================================
+  # SECTION 7: EDGE CASES
+  # =============================================================================
+
+  - name: "mtls-edge-invalid-fingerprint-length"
+    description: "Invalid fingerprint length should fail"
+    args: ["mtls", "map", "--method", "fingerprint", "--pattern", "tooshort", "--user", "mtls_user", "--roles", "user", "--description", "Bad fingerprint"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["fingerprint", "64", "characters"]
+    tags: ["mtls", "edge-case", "fingerprint"]
+
+  - name: "mtls-edge-nonexistent-user"
+    description: "Mapping to non-existent user should fail"
+    args: ["mtls", "map", "--method", "fingerprint", "--pattern", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "--user", "does_not_exist", "--roles", "user", "--description", "Bad user"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["does not exist"]
+    tags: ["mtls", "edge-case", "user"]
+
+  - name: "mtls-edge-duplicate-mapping"
+    description: "Duplicate mapping should fail"
+    args: ["mtls", "map", "--method", "fingerprint", "--pattern", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "--user", "mtls_admin", "--roles", "admin", "--description", "Duplicate"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["already exists"]
+    tags: ["mtls", "edge-case", "duplicate"]
+
+  - name: "mtls-edge-empty-pattern"
+    description: "Empty pattern should fail"
+    args: ["mtls", "map", "--method", "san_email", "--pattern", "", "--user", "mtls_user", "--roles", "user", "--description", "Empty pattern"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["pattern", "required"]
+    tags: ["mtls", "edge-case", "empty"]
+
+  # =============================================================================
+  # SECTION 8: STRICT MODE
+  # =============================================================================
+
+  - name: "mtls-strict-mode-enable"
+    description: "Enable strict mode (require cert mapping)"
+    args: ["mtls", "config", "--strict-mode", "true"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["strict", "enabled"]
+    tags: ["mtls", "strict-mode"]
+
+  - name: "mtls-strict-mode-disable"
+    description: "Disable strict mode"
+    args: ["mtls", "config", "--strict-mode", "false"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["strict", "disabled"]
+    tags: ["mtls", "strict-mode"]
+
+  # =============================================================================
+  # SECTION 9: CLEANUP
+  # =============================================================================
+
+  - name: "mtls-cleanup-remove-all-mappings"
+    description: "Remove all test mappings"
+    args: ["mtls", "unmap-all", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mtls", "cleanup"]
+
+  - name: "mtls-cleanup-delete-user"
+    description: "Delete mtls_user"
+    args: ["user", "delete", "mtls_user", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mtls", "cleanup"]
+
+  - name: "mtls-cleanup-delete-admin"
+    description: "Delete mtls_admin"
+    args: ["user", "delete", "mtls_admin", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mtls", "cleanup"]
+
+tags: ["mtls", "security", "authentication", "certificate", "x509", "tls"]

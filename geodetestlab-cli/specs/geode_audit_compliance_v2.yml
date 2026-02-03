@@ -1,0 +1,79 @@
+version: "1.0"
+name: "Geode Audit Compliance V2 Test Suite"
+description: "Verification of extended audit fields and compliance requirements introduced in Phase 2"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info", "--audit", "--audit-file", "/tmp/geode_audit_v2.jsonl"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # ===============================
+  # EXTENDED FIELDS VERIFICATION
+  # ===============================
+
+  - name: "audit-v2-setup"
+    description: "Setup audit V2 test environment"
+    args: ["query", "CALL audit.configure(enabled => true, file_path => '/tmp/geode_audit_v2.jsonl') YIELD status RETURN status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["audit", "v2", "setup"]
+
+  - name: "audit-v2-tenant-id"
+    description: "Verify tenant_id field in audit logs"
+    # Assuming we can trigger an event with tenant_id via some call or simulation
+    args: ["query", "CALL audit.log_generic(event_type => 'data_access', user_id => 101, tenant_id => 'tenant_A', resource => 'res1', action => 'read') YIELD logged RETURN logged"]
+    expect:
+      exit_code: 0
+    tags: ["audit", "v2", "fields", "tenant"]
+
+  - name: "audit-v2-policy-id"
+    description: "Verify policy_id field in audit logs"
+    args: ["query", "CALL audit.log_generic(event_type => 'policy_violation', user_id => 102, policy_id => 999, resource => 'res2', action => 'write') YIELD logged RETURN logged"]
+    expect:
+      exit_code: 0
+    tags: ["audit", "v2", "fields", "policy"]
+
+  - name: "audit-v2-schema-change"
+    description: "Verify schema_change event type and fields"
+    args: ["query", "CALL audit.log_generic(event_type => 'schema_change', user_id => 103, resource => 'graph.schema', action => 'alter', detail_map => {change: 'add_index'}) YIELD logged RETURN logged"]
+    expect:
+      exit_code: 0
+    tags: ["audit", "v2", "schema"]
+
+  - name: "audit-v2-verify-contents"
+    description: "Read back audit log and verify extended fields exist"
+    # This assumes there's a stored procedure to read audit logs or we verify via file grep equivalent (not supported directly in yaml runner usually, but maybe via query?)
+    # Assuming `audit.get_recent_events` supports returning the new fields or raw json
+    args: ["query", "CALL audit.get_recent_events(limit => 10) YIELD event_type, tenant_id, policy_id RETURN event_type, tenant_id, policy_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        # Check that we get rows with the values we just logged
+        # This relies on the test runner validating presence of non-null values if we don't assert exact matches
+        columns: ["event_type", "tenant_id", "policy_id"]
+    tags: ["audit", "v2", "verification"]
+
+  # ===============================
+  # CLEANUP
+  # ===============================
+
+  - name: "audit-v2-cleanup"
+    description: "Cleanup V2 test artifacts"
+    args: ["query", "CALL audit.cleanup_test_artifacts()"]
+    expect:
+      exit_code: 0
+    tags: ["audit", "v2", "cleanup"]
+
+tags: ["audit", "compliance", "v2"]

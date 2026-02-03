@@ -1,0 +1,100 @@
+# Gap Analysis Security Fixes Regression Tests
+# GAP-0150: CLI Auth QUIC authentication fix
+# GAP-0151: Audit verification Ed25519 signature and digest interval fix
+# GAP-0152: PowerShell compatibility test determinism fix
+# Date: January 13, 2026
+
+version: "1.0"
+name: "gap_150_151_152_security_regression"
+description: "Regression tests for GAP-0150 (CLI auth QUIC), GAP-0151 (audit verify), GAP-0152 (PowerShell)"
+
+# Note: These tests verify CLI command behavior and help documentation
+# The actual security fixes are verified in Zig unit tests:
+#   - geode_audit_verify.zig: TestCANARY_REQ_AUDIT_VERIFY_001/002
+#   - audit.zig: TestCANARY_REQ_AUDIT_PWSH_001_PowerShellDeterminism
+# Interactive auth commands (login, passwd) prompt for input so cannot be tested without stdin
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 10000
+    cleanup: true
+    args: ["--log-level", "warn"]
+  client:
+    timeout_ms: 5000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # GAP-0150: CLI Authentication tests
+  # Note: Full QUIC authentication requires server connection
+  # Interactive login/passwd commands require stdin and are tested via unit tests
+  - name: "gap-0150-auth-help"
+    description: "Auth subcommand help should be available"
+    args: ["auth", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: "login"
+
+  - name: "gap-0150-auth-shows-logout"
+    description: "Auth help should show logout command"
+    args: ["auth", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: "logout"
+
+  - name: "gap-0150-auth-shows-session"
+    description: "Auth help should mention session management"
+    args: ["auth", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: "Session"
+
+  # GAP-0151: Audit verification tests
+  # Note: audit subcommand doesn't have its own --help yet
+  - name: "gap-0151-audit-verify-missing-file"
+    description: "Audit verify should error on missing file"
+    args: ["audit", "verify", "--file", "/nonexistent/file.jsonl"]
+    expect:
+      exit_code: 1
+
+  - name: "gap-0151-audit-verify-default-path"
+    description: "Audit verify with default path errors if file missing"
+    args: ["audit", "verify"]
+    expect:
+      exit_code: 1
+
+  # GAP-0152: PowerShell compatibility (verified through Zig unit tests)
+  # This test validates the main help shows audit flag
+  - name: "gap-0152-audit-flag-available"
+    description: "Audit flag should be available"
+    args: ["--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: "--audit"
+
+  # General CLI health checks
+  - name: "gap-general-help"
+    description: "Main help should show all commands"
+    args: ["--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: "serve"
+
+  - name: "gap-version"
+    description: "Version command should work"
+    args: ["--version"]
+    expect:
+      exit_code: 0
+
+  - name: "gap-auth-subcommand"
+    description: "Auth subcommand should be listed"
+    args: ["--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: "auth"
+
+tags: ["security", "regression", "gap-analysis", "authentication", "audit", "cli"]

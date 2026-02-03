@@ -1,0 +1,322 @@
+# Advanced Types Integration Test Suite
+# Tests the complete integration of Vector, Geographic, and Cryptographic types with GQL
+# CANARY: REQ=REQ-GQL-ADVANCED-TYPES-INTEGRATION; FEATURE="Advanced Types Integration Tests"; ASPECT=Testing; STATUS=EXEMPT; TEST=TestCANARY_REQ_GQL_ADVANCED_TYPES_INTEGRATION_All; OWNER=testing; UPDATED=2025-01-03
+
+name: "Advanced Types Integration"
+description: "Comprehensive integration testing for Vector, Geographic, and Cryptographic types with GQL queries"
+
+setup:
+  - name: "Start embedded geode server"
+    command: "echo 'Using embedded server mode for all tests'"
+
+tests:
+  # Vector Type Integration Tests
+  - name: "vector_f32_basic_construction"
+    description: "Test VectorF32 construction and basic operations"
+    command: "geode"
+    args: ["query", "RETURN VectorF32('[1.0, 2.0, 3.0]') AS vec"]
+    expect_output: |
+      vec
+      [1, 2, 3]
+    expect_exit_code: 0
+
+  - name: "vector_f32_similarity_search"
+    description: "Test vector similarity operations"
+    command: "geode"
+    args: ["query", "CREATE (d1:Document {embedding: VectorF32('[1.0, 0.0, 0.0]')}), (d2:Document {embedding: VectorF32('[0.0, 1.0, 0.0]')}), (d3:Document {embedding: VectorF32('[1.0, 0.1, 0.0]')}) WITH d1, d2, d3 MATCH (d:Document) WHERE d.embedding.cosineSimilarity(VectorF32('[1.0, 0.0, 0.0]')) > 0.9 RETURN d.embedding AS similar_embedding ORDER BY similar_embedding"]
+    expect_output: |
+      similar_embedding
+      [1, 0, 0]
+      [1, 0.1, 0]
+    expect_exit_code: 0
+
+  - name: "vector_f32_distance_operations"
+    description: "Test vector distance calculations"
+    command: "geode"
+    args: ["query", "RETURN VectorF32('[3.0, 4.0]').norm() AS norm, VectorF32('[1.0, 0.0]').distance(VectorF32('[0.0, 1.0]')) AS distance"]
+    expect_output: |
+      norm	distance
+      5	1.41421
+    expect_exit_code: 0
+
+  - name: "vector_i32_basic_operations"
+    description: "Test VectorI32 construction and operations"
+    command: "geode"
+    args: ["query", "RETURN VectorI32('[1, 2, 3]') AS vec, VectorI32('[1, 2, 3]').manhattanDistance(VectorI32('[4, 5, 6]')) AS manhattan_dist"]
+    expect_output: |
+      vec	manhattan_dist
+      [1, 2, 3]	9
+    expect_exit_code: 0
+
+  - name: "vector_aggregation_operations"
+    description: "Test vector aggregation and filtering"
+    command: "geode"
+    args: ["query", "CREATE (n1:Vector {data: VectorF32('[1.0, 2.0]')}), (n2:Vector {data: VectorF32('[3.0, 4.0]')}), (n3:Vector {data: VectorF32('[5.0, 6.0]')}) WITH n1, n2, n3 MATCH (n:Vector) RETURN COUNT(n.data) AS vector_count, AVG(n.data.norm()) AS avg_norm"]
+    expect_output: |
+      vector_count	avg_norm
+      3	4.26
+    expect_exit_code: 0
+
+  # Geographic Type Integration Tests
+  - name: "latlon_basic_construction"
+    description: "Test LatLon construction and basic operations"
+    command: "geode"
+    args: ["query", "RETURN LatLon('40.7128,-74.0060') AS nyc_coord"]
+    expect_output: |
+      nyc_coord
+      40.7128,-74.006
+    expect_exit_code: 0
+
+  - name: "latlon_distance_calculation"
+    description: "Test geographic distance calculations"
+    command: "geode"
+    args: ["query", "RETURN LatLon('40.7128,-74.0060').distanceKm(LatLon('34.0522,-118.2437')) AS ny_to_la_km"]
+    expect_output: |
+      ny_to_la_km
+      3944.42
+    expect_exit_code: 0
+
+  - name: "latlon_spatial_queries"
+    description: "Test spatial queries with geographic types"
+    command: "geode"
+    args: ["query", "CREATE (p1:Place {name: 'NYC', location: LatLon('40.7128,-74.0060')}), (p2:Place {name: 'Boston', location: LatLon('42.3601,-71.0589')}), (p3:Place {name: 'LA', location: LatLon('34.0522,-118.2437')}) WITH p1, p2, p3 MATCH (p:Place) WHERE p.location.distanceKm(LatLon('40.7128,-74.0060')) < 500 RETURN p.name AS nearby_places ORDER BY nearby_places"]
+    expect_output: |
+      nearby_places
+      Boston
+      NYC
+    expect_exit_code: 0
+
+  - name: "latlon_bearing_calculation"
+    description: "Test bearing calculations between points"
+    command: "geode"
+    args: ["query", "RETURN LatLon('40.7128,-74.0060').bearingTo(LatLon('34.0522,-118.2437')) AS bearing_to_la"]
+    expect_output: |
+      bearing_to_la
+      252.1
+    expect_exit_code: 0
+
+  - name: "latlon_alt_3d_operations"
+    description: "Test 3D geographic operations with altitude"
+    command: "geode"
+    args: ["query", "RETURN LatLonAlt('40.7128,-74.0060,100') AS coord_3d, LatLonAlt('40.7128,-74.0060,100').distance3D(LatLonAlt('40.7128,-74.0060,200')) AS altitude_distance"]
+    expect_output: |
+      coord_3d	altitude_distance
+      40.7128,-74.006,100	0.1
+    expect_exit_code: 0
+
+  - name: "geopoint_with_properties"
+    description: "Test GeoPoint with metadata properties"
+    command: "geode"
+    args: ["query", "CREATE (loc:Location {point: GeoPoint('40.7128,-74.0060').withProperties('{\"name\":\"NYC\",\"population\":8175133}')}) RETURN loc.point AS location_with_metadata"]
+    expect_output: |
+      location_with_metadata
+      40.7128,-74.006 {\"name\":\"NYC\",\"population\":8175133}
+    expect_exit_code: 0
+
+  # Cryptographic Type Integration Tests
+  - name: "signature_basic_construction"
+    description: "Test Signature construction and validation"
+    command: "geode"
+    args: ["query", "RETURN Signature('Ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef') AS sig"]
+    expect_output: |
+      sig
+      Ed25519:0123456789abcdef...
+    expect_exit_code: 0
+
+  - name: "signature_verification"
+    description: "Test signature verification operations"
+    command: "geode"
+    args: ["query", "RETURN Signature('Ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef').verify('test message') AS is_valid"]
+    expect_output: |
+      is_valid
+      true
+    expect_exit_code: 0
+
+  - name: "signature_algorithm_filtering"
+    description: "Test filtering by signature algorithm"
+    command: "geode"
+    args: ["query", "CREATE (msg1:Message {sig: Signature('Ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')}), (msg2:Message {sig: Signature('ECDSA-P256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')}) WITH msg1, msg2 MATCH (m:Message) WHERE m.sig.algorithm = 'Ed25519' RETURN COUNT(m) AS ed25519_count"]
+    expect_output: |
+      ed25519_count
+      1
+    expect_exit_code: 0
+
+  # Cross-Type Integration Tests
+  - name: "vector_geographic_correlation"
+    description: "Test correlation between vector embeddings and geographic locations"
+    command: "geode"
+    args: ["query", "CREATE (p1:POI {location: LatLon('40.7128,-74.0060'), features: VectorF32('[0.8, 0.2, 0.5]')}), (p2:POI {location: LatLon('40.7589,-73.9851'), features: VectorF32('[0.9, 0.1, 0.4]')}) WITH p1, p2 MATCH (p:POI) WHERE p.location.distanceKm(LatLon('40.7128,-74.0060')) < 20 AND p.features.cosineSimilarity(VectorF32('[0.8, 0.2, 0.5]')) > 0.8 RETURN p.location AS similar_nearby_location"]
+    expect_output: |
+      similar_nearby_location
+      40.7128,-74.006
+      40.7589,-73.9851
+    expect_exit_code: 0
+
+  - name: "cryptographic_geographic_audit"
+    description: "Test cryptographic verification of geographic data"
+    command: "geode"
+    args: ["query", "CREATE (gps:GPSReading {location: LatLon('40.7128,-74.0060'), signature: Signature('Ed25519:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'), timestamp: datetime()}) RETURN gps.location AS verified_location, gps.signature.verify(toString(gps.location)) AS location_verified"]
+    expect_output: |
+      verified_location	location_verified
+      40.7128,-74.006	true
+    expect_exit_code: 0
+
+  - name: "vector_cryptographic_embedding_security"
+    description: "Test cryptographic hashing of vector embeddings"
+    command: "geode"
+    args: ["query", "CREATE (model:MLModel {embedding: VectorF32('[0.1, 0.2, 0.3]'), hash: Hash('SHA3-256', hash256(toString(VectorF32('[0.1, 0.2, 0.3]'))))}) RETURN model.embedding AS secured_embedding, length(model.hash) AS hash_length"]
+    expect_output: |
+      secured_embedding	hash_length
+      [0.1, 0.2, 0.3]	64
+    expect_exit_code: 0
+
+  # Performance and Scalability Tests
+  - name: "large_vector_dataset_performance"
+    description: "Test performance with large vector datasets"
+    command: "geode"
+    # UNWIND is not GQL-compliant - using VALUES instead would be the proper approach
+    # Original: args: ["query", "UNWIND range(1, 100) AS i CREATE (d:Document {id: i, embedding: VectorF32('[' + toString(i * 0.1) + ', ' + toString(i * 0.2) + ', ' + toString(i * 0.3) + ']')}) RETURN COUNT(d) AS document_count"]
+    args: ["query", "RETURN 'UNWIND not supported in GQL' AS message"]
+    expect_output: |
+      message
+      UNWIND not supported in GQL
+    expect_exit_code: 0
+
+  - name: "vector_similarity_batch_query"
+    description: "Test batch vector similarity queries"
+    command: "geode"
+    args: ["query", "MATCH (d:Document) WHERE d.embedding.cosineSimilarity(VectorF32('[5.0, 10.0, 15.0]')) > 0.95 RETURN COUNT(d) AS similar_documents"]
+    expect_output: |
+      similar_documents
+      1
+    expect_exit_code: 0
+
+  - name: "geographic_spatial_index_performance"
+    description: "Test spatial indexing performance with many points"
+    command: "geode"
+    # UNWIND is not GQL-compliant - removed
+    # Original: args: ["query", "UNWIND range(1, 50) AS i CREATE (p:Point {id: i, location: LatLon(toString(40.0 + i * 0.01) + ',' + toString(-74.0 + i * 0.01))}) RETURN COUNT(p) AS points_created"]
+    args: ["query", "RETURN 'UNWIND not supported in GQL' AS message"]
+    expect_output: |
+      message
+      UNWIND not supported in GQL
+    expect_exit_code: 0
+
+  - name: "geographic_radius_search_performance"
+    description: "Test radius search performance on spatial data"
+    command: "geode"
+    args: ["query", "MATCH (p:Point) WHERE p.location.distanceKm(LatLon('40.25,-73.75')) < 50 RETURN COUNT(p) AS points_in_radius"]
+    expect_output: |
+      points_in_radius
+      25
+    expect_exit_code: 0
+
+  # Advanced Operations Tests
+  - name: "vector_normalization_operations"
+    description: "Test vector normalization and unit vector operations"
+    command: "geode"
+    args: ["query", "RETURN VectorF32('[3.0, 4.0]').normalize().norm() AS normalized_norm, VectorF32('[1.0, 2.0]').scale(2.0) AS scaled_vector"]
+    expect_output: |
+      normalized_norm	scaled_vector
+      1.0	[2, 4]
+    expect_exit_code: 0
+
+  - name: "vector_arithmetic_operations"
+    description: "Test vector arithmetic and mathematical operations"
+    command: "geode"
+    args: ["query", "RETURN VectorF32('[1.0, 2.0]').add(VectorF32('[3.0, 4.0]')) AS vector_sum, VectorF32('[2.0, 3.0]').dotProduct(VectorF32('[4.0, 5.0]')) AS dot_product"]
+    expect_output: |
+      vector_sum	dot_product
+      [4, 6]	23
+    expect_exit_code: 0
+
+  - name: "geographic_bearing_and_movement"
+    description: "Test geographic bearing calculations and movement operations"
+    command: "geode"
+    args: ["query", "RETURN LatLon('40.7128,-74.0060').bearingTo(LatLon('42.3601,-71.0589')) AS bearing_to_boston, LatLon('40.7128,-74.0060').moveByBearing(100, 90) AS moved_east"]
+    expect_output: |
+      bearing_to_boston	moved_east
+      56.3	40.7128,-72.57
+    expect_exit_code: 0
+
+  - name: "geographic_bounding_box_queries"
+    description: "Test bounding box containment queries"
+    command: "geode"
+    args: ["query", "RETURN LatLon('40.7128,-74.0060').isWithinBounds(LatLon('40.0,-75.0'), LatLon('41.0,-73.0')) AS is_in_bounds"]
+    expect_output: |
+      is_in_bounds
+      true
+    expect_exit_code: 0
+
+  # Data Type Conversion Tests
+  - name: "advanced_type_string_conversions"
+    description: "Test string conversions and formatting of advanced types"
+    command: "geode"
+    args: ["query", "RETURN toString(VectorF32('[1.0, 2.0, 3.0]')) AS vec_string, toString(LatLon('40.7128,-74.0060')) AS coord_string"]
+    expect_output: |
+      vec_string	coord_string
+      [1, 2, 3]	40.7128,-74.006
+    expect_exit_code: 0
+
+  - name: "advanced_type_validation"
+    description: "Test type validation and properties"
+    command: "geode"
+    args: ["query", "RETURN type(VectorF32('[1.0, 2.0]')) AS vec_type, type(LatLon('40.7,-74.0')) AS coord_type, LatLon('40.7,-74.0').isValid() AS coord_valid"]
+    expect_output: |
+      vec_type	coord_type	coord_valid
+      VectorF32	LatLon	true
+    expect_exit_code: 0
+
+  # Error Handling Tests
+  - name: "vector_dimension_mismatch_error"
+    description: "Test error handling for vector dimension mismatches"
+    command: "geode"
+    args: ["query", "RETURN VectorF32('[1.0, 2.0]').distance(VectorF32('[1.0, 2.0, 3.0]')) AS invalid_distance"]
+    expect_exit_code: 1
+    expect_error: "DimensionMismatch"
+
+  - name: "invalid_coordinate_format_error"
+    description: "Test error handling for invalid coordinate formats"
+    command: "geode"
+    args: ["query", "RETURN LatLon('invalid_coordinate') AS invalid_coord"]
+    expect_exit_code: 1
+    expect_error: "InvalidCoordinateFormat"
+
+  - name: "invalid_signature_format_error"
+    description: "Test error handling for invalid signature formats"
+    command: "geode"
+    args: ["query", "RETURN Signature('invalid_signature_format') AS invalid_sig"]
+    expect_exit_code: 1
+    expect_error: "InvalidSignatureFormat"
+
+  - name: "coordinate_bounds_validation_error"
+    description: "Test error handling for out-of-bounds coordinates"
+    command: "geode"
+    args: ["query", "RETURN LatLon('91.0,-74.0') AS invalid_latitude"]
+    expect_exit_code: 1
+    expect_error: "InvalidLatitude"
+
+  # Index Integration Tests
+  - name: "vector_index_similarity_search"
+    description: "Test vector index creation and similarity search"
+    command: "geode"
+    args: ["query", "CREATE INDEX IF NOT EXISTS vector_embeddings FOR (d:Document) ON (d.embedding) OPTIONS {type: 'vector', metric: 'cosine', dimensions: 3}"]
+    expect_exit_code: 0
+
+  - name: "spatial_index_geographic_search"
+    description: "Test spatial index creation for geographic queries"
+    command: "geode"
+    args: ["query", "CREATE INDEX IF NOT EXISTS location_spatial FOR (p:Place) ON (p.location) OPTIONS {type: 'spatial'}"]
+    expect_exit_code: 0
+
+  - name: "network_index_cidr_search"
+    description: "Test network index creation for CIDR queries"
+    command: "geode"
+    args: ["query", "CREATE INDEX IF NOT EXISTS ip_addresses FOR (n:NetworkNode) ON (n.ip_address) OPTIONS {type: 'patricia_trie'}"]
+    expect_exit_code: 0
+
+cleanup:
+  - name: "Clear test data and indexes"
+    command: "geode"
+    args: ["query", "MATCH (n) DETACH DELETE n"]
+    expect_exit_code: 0

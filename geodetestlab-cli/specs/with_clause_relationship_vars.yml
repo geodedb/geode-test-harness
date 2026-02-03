@@ -1,0 +1,214 @@
+version: "1.0"
+name: "WITH Clause Relationship Variable Preservation Tests"
+description: "Tests that WITH clause properly preserves relationship variables alongside node variables"
+
+# CANARY: REQ=REQ-GQL-WITH-REL-VARS-002; FEATURE="WithClauseRelationshipVars"; ASPECT=E2ETests; STATUS=TESTED; OWNER=execution; UPDATED=2026-01-29
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+
+tests:
+  # Setup tests
+  - name: "setup-with-rel-vars-graph"
+    description: "Create graph for WITH clause relationship variable tests"
+    args: ["query", "--insecure", "-"]
+    stdin: "DROP GRAPH IF EXISTS with_rel_test; CREATE GRAPH with_rel_test;"
+    expect:
+      exit_code: 0
+    tags: ["setup"]
+
+  - name: "setup-test-data"
+    description: "Create test nodes and relationships"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; CREATE (a:Person {name: 'Alice'})-[:KNOWS {since: 2020}]->(b:Person {name: 'Bob'})-[:KNOWS {since: 2021}]->(c:Person {name: 'Charlie'});"
+    expect:
+      exit_code: 0
+    tags: ["setup"]
+
+  - name: "setup-more-relationships"
+    description: "Create additional relationships for testing"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) CREATE (a)-[:FRIEND_OF {since: 2019}]->(c);"
+    expect:
+      exit_code: 0
+    tags: ["setup"]
+
+  # Basic relationship variable preservation tests
+  - name: "with-preserves-rel-type"
+    description: "WITH clause should preserve relationship variable for type() function"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a)-[r]->(b) WITH a, r, b RETURN a.name AS from_name, type(r) AS rel_type, b.name AS to_name;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "KNOWS", "Bob"]
+    tags: ["with", "relationship", "type"]
+
+  - name: "with-rel-properties"
+    description: "WITH clause should preserve relationship variable for property access"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a:Person {name: 'Alice'})-[r:KNOWS]->(b) WITH a, r, b RETURN r.since AS year;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["2020"]
+    tags: ["with", "relationship", "properties"]
+
+  - name: "with-rel-in-aggregation"
+    description: "WITH clause should allow relationship aggregation"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a)-[r]->(b) WITH type(r) AS rel_type, count(*) AS cnt RETURN rel_type, cnt;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["KNOWS", "2"]
+    tags: ["with", "relationship", "aggregation"]
+
+  - name: "with-rel-count-by-type"
+    description: "Count relationships by type using WITH"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH ()-[r]->() WITH type(r) AS t, count(r) AS c RETURN t, c ORDER BY c DESC;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["KNOWS"]
+    tags: ["with", "relationship", "count"]
+
+  # Chained WITH with relationships
+  - name: "with-chain-rel-preserved"
+    description: "Chained WITH clauses should preserve relationship variables"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a)-[r]->(b) WITH a, r, b WITH a.name AS name, type(r) AS rel RETURN name, rel;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "KNOWS"]
+    tags: ["with", "chain", "relationship"]
+
+  - name: "with-chain-rel-filter"
+    description: "Chained WITH with WHERE filtering on relationship"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a)-[r]->(b) WITH a, r, b WHERE r.since > 2019 RETURN a.name AS from_name, r.since AS year;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["2020"]
+    tags: ["with", "chain", "filter"]
+
+  # Multi-hop patterns with relationship variables
+  - name: "with-multi-hop-all-vars"
+    description: "Multi-hop pattern should preserve all relationship variables"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a)-[r1]->(b)-[r2]->(c) WITH a, r1, b, r2, c RETURN a.name AS start, type(r1) AS rel1, b.name AS mid, type(r2) AS rel2, c.name AS end_name;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "KNOWS", "Bob", "Charlie"]
+    tags: ["with", "multi-hop", "relationship"]
+
+  - name: "with-multi-hop-rel-properties"
+    description: "Multi-hop pattern should allow accessing relationship properties"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a:Person {name: 'Alice'})-[r1:KNOWS]->(b)-[r2:KNOWS]->(c) WITH r1.since AS year1, r2.since AS year2 RETURN year1, year2;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["2020", "2021"]
+    tags: ["with", "multi-hop", "properties"]
+
+  # Aggregation with relationship variables
+  - name: "with-rel-sum-property"
+    description: "Sum relationship property values"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH ()-[r:KNOWS]->() WITH sum(r.since) AS total_years RETURN total_years;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["4041"]
+    tags: ["with", "aggregation", "sum"]
+
+  - name: "with-rel-avg-property"
+    description: "Average relationship property values"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH ()-[r:KNOWS]->() WITH avg(r.since) AS avg_year RETURN avg_year;"
+    expect:
+      exit_code: 0
+    tags: ["with", "aggregation", "avg"]
+
+  - name: "with-rel-min-max-property"
+    description: "Min/Max relationship property values"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH ()-[r:KNOWS]->() WITH min(r.since) AS min_year, max(r.since) AS max_year RETURN min_year, max_year;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["2020", "2021"]
+    tags: ["with", "aggregation", "minmax"]
+
+  # Different relationship types
+  - name: "with-multiple-rel-types"
+    description: "Handle multiple relationship types in WITH"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a:Person {name: 'Alice'})-[r]->(b) WITH a, r, b, type(r) AS rel_type RETURN b.name AS target, rel_type ORDER BY rel_type;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Bob", "KNOWS", "Charlie", "FRIEND_OF"]
+    tags: ["with", "relationship", "multiple-types"]
+
+  # Edge cases
+  - name: "with-rel-null-property"
+    description: "Handle null relationship properties in WITH"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a)-[r]->(b) WITH a, r, b, r.nonexistent AS prop RETURN a.name AS name, prop;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice"]
+    tags: ["with", "relationship", "null"]
+
+  - name: "with-rel-alias"
+    description: "Alias relationship variable in WITH"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a)-[r]->(b) WITH r AS relationship, type(r) AS t RETURN t;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["KNOWS"]
+    tags: ["with", "relationship", "alias"]
+
+  # Complex patterns
+  - name: "with-rel-collect"
+    description: "Collect relationship types"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH (a:Person {name: 'Alice'})-[r]->(b) WITH collect(type(r)) AS rel_types RETURN rel_types;"
+    expect:
+      exit_code: 0
+    tags: ["with", "relationship", "collect"]
+
+  - name: "with-rel-distinct-types"
+    description: "Get distinct relationship types using WITH then RETURN DISTINCT"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH with_rel_test; MATCH ()-[r]->() WITH type(r) AS rel_type RETURN DISTINCT rel_type ORDER BY rel_type;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["FRIEND_OF", "KNOWS"]
+    tags: ["with", "relationship", "distinct"]
+
+  # Cleanup tests
+  - name: "cleanup-with-rel-vars-graph"
+    description: "Drop test graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "DROP GRAPH IF EXISTS with_rel_test;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]

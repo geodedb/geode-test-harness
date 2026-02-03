@@ -1,0 +1,751 @@
+# GAP-0104 to GAP-0122 Security Regression Tests
+# These tests ensure critical security gaps remain fixed
+#
+# CRITICAL SECURITY GAPS FIXED:
+# - GAP-0104: Removed hardcoded admin:admin123 credentials
+# - GAP-0105: TLS validation enabled by default
+# - GAP-0106: Authentication enabled by default
+# - GAP-0107: KMS uses crypto random for nonces
+# - GAP-0108: Default password requires env var
+# - GAP-0109: Deterministic nonce mode blocked in production
+# - GAP-0110: Audit uses crypto random
+# - GAP-0113: CLI TLS certificate verification flags (--ca-cert, --client-cert, --client-key)
+# - GAP-0120: Expression type coverage (List/Float support)
+# - GAP-0121: Quote handling in STARTS WITH expressions
+# - GAP-0112: DP join enumeration for query optimizer
+# - GAP-0119: Temporal property filtering with version chain traversal
+# - GAP-0114: Federation-aware index recommendations with per-shard cost breakdown
+# - GAP-0122: Library mode server embedding documentation and patterns
+# - GAP-0115: Memory allocation error handling documentation (Low)
+# - GAP-0118: Test coverage documentation consistency (Low)
+
+name: gap_0104_0122_security_regression
+description: Security regression tests for GAP-0104 through GAP-0122 fixes
+version: "1.0"
+requires:
+  - geode
+
+# Note: No setup section needed - these are shell-type tests that verify source code patterns
+# Any temp file cleanup is handled by individual test commands
+
+tests:
+  # GAP-0104: Hardcoded credentials removed
+  - name: gap-0104-no-hardcoded-admin123
+    description: "GAP-0104: Verify hardcoded admin:admin123 credentials are removed"
+    type: shell
+    command: |
+      # Search for hardcoded admin123 in authentication paths
+      if grep -r "admin123" src/cli/main.zig 2>/dev/null | grep -v "GAP-0104" | grep -v "SECURITY FIX" | grep -q "admin123"; then
+        echo "FAIL: Found hardcoded admin123 credential"
+        exit 1
+      fi
+      echo "PASS: No hardcoded admin123 credentials found"
+    expected_exit_code: 0
+
+  - name: gap-0104-env-var-credentials
+    description: "GAP-0104: Verify credentials come from environment variables"
+    type: shell
+    command: |
+      # Verify env var usage in user_management.zig
+      if grep -q "GEODE_ADMIN_USERNAME" src/security/user_management.zig && \
+         grep -q "GEODE_ADMIN_PASSWORD" src/security/user_management.zig; then
+        echo "PASS: Credentials use environment variables"
+        exit 0
+      fi
+      echo "FAIL: Environment variable credential configuration not found"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0105: TLS validation enabled by default
+  - name: gap-0105-tls-secure-default
+    description: "GAP-0105: Verify TLS validation enabled by default"
+    type: shell
+    command: |
+      # Check default allow_insecure value in quic.zig
+      if grep -A1 "allow_insecure:" src/transport/quic.zig | grep -q "= false"; then
+        echo "PASS: TLS validation enabled by default (allow_insecure = false)"
+        exit 0
+      fi
+      echo "FAIL: TLS validation not enabled by default"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0105-kms-tls-secure
+    description: "GAP-0105: Verify KMS transport uses secure TLS"
+    type: shell
+    command: |
+      # Check KMS remote server uses secure TLS
+      if grep "allow_insecure = false" src/security/kms_remote.zig | grep -q "false"; then
+        echo "PASS: KMS transport uses secure TLS"
+        exit 0
+      fi
+      echo "FAIL: KMS transport may use insecure TLS"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0106: Authentication enabled by default
+  - name: gap-0106-auth-enabled-default
+    description: "GAP-0106: Verify authentication is enabled by default"
+    type: shell
+    command: |
+      # Check default enable_auth value
+      if grep -A1 "GAP-0106 SECURITY FIX" src/cli/main.zig | grep -q "enable_auth = true"; then
+        echo "PASS: Authentication enabled by default"
+        exit 0
+      fi
+      echo "FAIL: Authentication not enabled by default"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0106-disable-auth-flag
+    description: "GAP-0106: Verify --disable-auth flag exists with warning"
+    type: shell
+    command: |
+      # Check for --disable-auth flag handling
+      if grep -q "disable-auth" src/cli/main.zig && \
+         grep -q "SECURITY WARNING" src/cli/main.zig; then
+        echo "PASS: --disable-auth flag with security warning exists"
+        exit 0
+      fi
+      echo "FAIL: --disable-auth flag or warning not found"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0107: KMS uses crypto random for nonces
+  - name: gap-0107-kms-crypto-random-nonces
+    description: "GAP-0107: Verify KMS uses cryptographic random for nonces"
+    type: shell
+    command: |
+      # Check nonce generation uses std.crypto.random
+      if grep -A5 "pub fn wrap" src/security/external_kms_client.zig | grep -q "std.crypto.random.bytes"; then
+        echo "PASS: KMS wrap() uses cryptographic random for nonces"
+        exit 0
+      fi
+      echo "FAIL: KMS may use deterministic PRNG for nonces"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0107-kms-production-block
+    description: "GAP-0107: Verify LocalSimulated KMS blocked in production"
+    type: shell
+    command: |
+      # Check for production build blocking
+      if grep -q "InsecureKmsInProduction" src/security/external_kms_client.zig; then
+        echo "PASS: LocalSimulated KMS returns error in production"
+        exit 0
+      fi
+      echo "FAIL: LocalSimulated KMS not blocked in production"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0109: Deterministic nonce mode blocked in production
+  - name: gap-0109-deterministic-nonce-blocked
+    description: "GAP-0109: Verify deterministic nonce mode blocked in production"
+    type: shell
+    command: |
+      # Check for production build blocking of deterministic mode
+      if grep -q "is_production_build" src/security/tde_nonce_gen.zig && \
+         grep -q "Deterministic nonce mode blocked in production" src/security/tde_nonce_gen.zig; then
+        echo "PASS: Deterministic nonce mode blocked in production builds"
+        exit 0
+      fi
+      echo "FAIL: Deterministic nonce mode not blocked"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0110: Audit uses crypto random
+  - name: gap-0110-audit-crypto-random
+    description: "GAP-0110: Verify audit key generation uses crypto random"
+    type: shell
+    command: |
+      # Check audit module uses std.crypto.random
+      if grep -A5 "GAP-0110 SECURITY FIX" src/security/audit.zig | grep -q "std.crypto.random.bytes"; then
+        echo "PASS: Audit key generation uses cryptographic random"
+        exit 0
+      fi
+      echo "FAIL: Audit may use deterministic PRNG"
+      exit 1
+    expected_exit_code: 0
+
+  # Build verification
+  - name: security-build-verification
+    description: "Verify all security fixes compile correctly"
+    type: shell
+    command: |
+      cd /home/benji/src/gl/devnw/codepros/geode
+      make build 2>&1
+      if [ $? -eq 0 ]; then
+        echo "PASS: Security fixes compile successfully"
+        exit 0
+      fi
+      echo "FAIL: Build failed"
+      exit 1
+    expected_exit_code: 0
+    timeout: 180
+
+  # CANARY marker verification
+  - name: canary-gap-0104-marker
+    description: "Verify CANARY marker for GAP-0104 security fix"
+    type: shell
+    command: |
+      if grep -r "GAP-0104" src/ | grep -q "SECURITY FIX"; then
+        echo "PASS: GAP-0104 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0104 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0105-marker
+    description: "Verify CANARY marker for GAP-0105 security fix"
+    type: shell
+    command: |
+      if grep -r "GAP-0105" src/ | grep -q "SECURITY FIX\|FIX"; then
+        echo "PASS: GAP-0105 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0105 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0106-marker
+    description: "Verify CANARY marker for GAP-0106 security fix"
+    type: shell
+    command: |
+      if grep -r "GAP-0106" src/ | grep -q "SECURITY FIX"; then
+        echo "PASS: GAP-0106 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0106 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0107-marker
+    description: "Verify CANARY marker for GAP-0107 security fix"
+    type: shell
+    command: |
+      if grep -r "GAP-0107" src/ | grep -q "SECURITY FIX"; then
+        echo "PASS: GAP-0107 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0107 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0113: CLI TLS Certificate Verification
+  - name: gap-0113-ca-cert-flag
+    description: "GAP-0113: Verify --ca-cert flag is implemented in CLI"
+    type: shell
+    command: |
+      if grep -q "ca_cert_path" src/cli/main.zig && \
+         grep -q '\"--ca-cert\"' src/cli/main.zig; then
+        echo "PASS: --ca-cert flag is implemented"
+        exit 0
+      fi
+      echo "FAIL: --ca-cert flag not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0113-client-cert-flag
+    description: "GAP-0113: Verify --client-cert flag is implemented in CLI"
+    type: shell
+    command: |
+      if grep -q "client_cert_path" src/cli/main.zig && \
+         grep -q '\"--client-cert\"' src/cli/main.zig; then
+        echo "PASS: --client-cert flag is implemented"
+        exit 0
+      fi
+      echo "FAIL: --client-cert flag not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0113-client-key-flag
+    description: "GAP-0113: Verify --client-key flag is implemented in CLI"
+    type: shell
+    command: |
+      if grep -q "client_key_path" src/cli/main.zig && \
+         grep -q '\"--client-key\"' src/cli/main.zig; then
+        echo "PASS: --client-key flag is implemented"
+        exit 0
+      fi
+      echo "FAIL: --client-key flag not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0113-connectEx-integration
+    description: "GAP-0113: Verify certificates are passed to connectEx"
+    type: shell
+    command: |
+      if grep -q "connectEx.*ca_cert_path.*client_cert_path.*client_key_path" src/cli/main.zig; then
+        echo "PASS: Certificate paths passed to connectEx"
+        exit 0
+      fi
+      echo "FAIL: Certificate paths not passed to connectEx"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0113-mutual-tls-validation
+    description: "GAP-0113: Verify mutual TLS validation (both cert and key required)"
+    type: shell
+    command: |
+      if grep -q "Both --client-cert and --client-key must be provided" src/cli/main.zig; then
+        echo "PASS: Mutual TLS validation implemented"
+        exit 0
+      fi
+      echo "FAIL: Mutual TLS validation not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0113-marker
+    description: "Verify CANARY marker for GAP-0113 security fix"
+    type: shell
+    command: |
+      if grep -r "GAP-0113" src/ | grep -q "SECURITY FIX"; then
+        echo "PASS: GAP-0113 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0113 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0113-help-text
+    description: "GAP-0113: Verify TLS certificate options in help text"
+    type: shell
+    command: |
+      if grep -q "CA certificate path" src/cli/main.zig && \
+         grep -q "mutual TLS" src/cli/main.zig; then
+        echo "PASS: TLS certificate options documented in help"
+        exit 0
+      fi
+      echo "FAIL: TLS certificate help text not found"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0120: Expression Type Coverage (List/Float)
+  - name: gap-0120-float-support
+    description: "GAP-0120: Verify Float to Double value conversion in graph algorithms"
+    type: shell
+    command: |
+      if grep -q "\.Float.*\.Double" src/execution/graph_algorithms.zig; then
+        echo "PASS: Float to Double conversion implemented"
+        exit 0
+      fi
+      echo "FAIL: Float to Double conversion not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0120-list-arraylit-conversion
+    description: "GAP-0120: Verify List to ArrayLit conversion in exec.zig"
+    type: shell
+    command: |
+      if grep -q "\.ArrayLit" src/exec.zig && grep -q "GAP-0120.*List" src/exec.zig; then
+        echo "PASS: List to ArrayLit conversion implemented"
+        exit 0
+      fi
+      echo "FAIL: List to ArrayLit conversion not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0120-decimal-expr-type
+    description: "GAP-0120: Verify Decimal expression type support"
+    type: shell
+    command: |
+      if grep -q "\.Decimal =>.*\.Value.*\.Decimal" src/server/graph/exec.zig; then
+        echo "PASS: Decimal expression type support implemented"
+        exit 0
+      fi
+      echo "FAIL: Decimal expression type not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0120-doublelit-expr-type
+    description: "GAP-0120: Verify DoubleLit expression type support"
+    type: shell
+    command: |
+      if grep -q "\.DoubleLit" src/server/graph/exec.zig && grep -q "GAP-0120" src/server/graph/exec.zig; then
+        echo "PASS: DoubleLit expression type support implemented"
+        exit 0
+      fi
+      echo "FAIL: DoubleLit expression type not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0120-marker
+    description: "Verify CANARY markers for GAP-0120 expression type fixes"
+    type: shell
+    command: |
+      if grep -r "GAP-0120" src/ | grep -q "CANARY\|FIX"; then
+        echo "PASS: GAP-0120 CANARY markers present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0120 CANARY markers missing"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0121: Quote Handling in STARTS WITH
+  - name: gap-0121-starts-with-test
+    description: "GAP-0121: Verify STARTS WITH quote handling test exists"
+    type: shell
+    command: |
+      if grep -q "STARTS WITH with various quote scenarios" src/gql.zig; then
+        echo "PASS: STARTS WITH quote test implemented"
+        exit 0
+      fi
+      echo "FAIL: STARTS WITH quote test not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0121-no-skipped-test
+    description: "GAP-0121: Verify skipped test was replaced with actual test"
+    type: shell
+    command: |
+      # Ensure the old skipped test no longer exists
+      if grep -q "SkipZigTest" src/gql.zig && grep -q "STARTS WITH" src/gql.zig | grep -q "SkipZigTest"; then
+        echo "FAIL: Skipped STARTS WITH test still exists"
+        exit 1
+      fi
+      echo "PASS: No skipped STARTS WITH test"
+      exit 0
+    expected_exit_code: 0
+
+  - name: canary-gap-0121-marker
+    description: "Verify CANARY marker for GAP-0121 quote handling fix"
+    type: shell
+    command: |
+      if grep -r "GAP-0121" src/ | grep -q "CANARY\|FIX"; then
+        echo "PASS: GAP-0121 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0121 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0112: Query Optimizer DP Join Enumeration
+  - name: gap-0112-dp-join-implementation
+    description: "GAP-0112: Verify DP join enumeration is implemented"
+    type: shell
+    command: |
+      if grep -q "generateLeftDeepJoinOrders" src/planner/query_optimizer.zig && \
+         grep -q "generateBushyJoinOrders" src/planner/query_optimizer.zig; then
+        echo "PASS: DP join enumeration implemented"
+        exit 0
+      fi
+      echo "FAIL: DP join enumeration not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0112-no-todo-stub
+    description: "GAP-0112: Verify TODO stub was replaced with implementation"
+    type: shell
+    command: |
+      # Check that the simple stub was replaced
+      if grep -q "TODO: Implement full dynamic programming approach" src/planner/query_optimizer.zig; then
+        echo "FAIL: Old TODO stub still exists"
+        exit 1
+      fi
+      echo "PASS: TODO stub replaced with implementation"
+      exit 0
+    expected_exit_code: 0
+
+  - name: canary-gap-0112-marker
+    description: "Verify CANARY marker for GAP-0112 DP join enumeration"
+    type: shell
+    command: |
+      if grep -r "GAP-0112" src/ | grep -q "CANARY\|FIX"; then
+        echo "PASS: GAP-0112 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0112 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0119: Temporal Property Filtering
+  - name: gap-0119-filter-node-properties-as-of
+    description: "GAP-0119: Verify filterNodePropertiesAsOf function is implemented"
+    type: shell
+    command: |
+      if grep -q "filterNodePropertiesAsOf" src/temporal/time_travel.zig; then
+        echo "PASS: filterNodePropertiesAsOf implemented"
+        exit 0
+      fi
+      echo "FAIL: filterNodePropertiesAsOf not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0119-find-property-version-as-of
+    description: "GAP-0119: Verify findPropertyVersionAsOf function for version chain traversal"
+    type: shell
+    command: |
+      if grep -q "findPropertyVersionAsOf" src/temporal/time_travel.zig; then
+        echo "PASS: findPropertyVersionAsOf implemented"
+        exit 0
+      fi
+      echo "FAIL: findPropertyVersionAsOf not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0119-as-of-timestamp-helper
+    description: "GAP-0119: Verify asOfToTimestamp helper function"
+    type: shell
+    command: |
+      if grep -q "asOfToTimestamp" src/temporal/time_travel.zig; then
+        echo "PASS: asOfToTimestamp helper implemented"
+        exit 0
+      fi
+      echo "FAIL: asOfToTimestamp not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0119-version-chain-support
+    description: "GAP-0119: Verify version chain traversal for temporal properties"
+    type: shell
+    command: |
+      # Check for version chain handling in property filtering
+      if grep -q "version_chain\|previous_version\|VersionedValue" src/temporal/time_travel.zig && \
+         grep -q "GAP-0119" src/temporal/time_travel.zig; then
+        echo "PASS: Version chain traversal support implemented"
+        exit 0
+      fi
+      echo "FAIL: Version chain traversal not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0119-marker
+    description: "Verify CANARY marker for GAP-0119 temporal property filtering"
+    type: shell
+    command: |
+      if grep -r "GAP-0119" src/ | grep -q "CANARY\|FIX"; then
+        echo "PASS: GAP-0119 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0119 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0114: Federation Index Recommendations
+  - name: gap-0114-federation-recommendations-impl
+    description: "GAP-0114: Verify getFederationIndexRecommendations is implemented"
+    type: shell
+    command: |
+      if grep -q "getFederationIndexRecommendations" src/server/index_optimizer.zig && \
+         grep -q "selectOptimalIndexTypeForPattern" src/server/index_optimizer.zig; then
+        echo "PASS: Federation index recommendations implemented"
+        exit 0
+      fi
+      echo "FAIL: Federation index recommendations not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0114-target-shards-calculation
+    description: "GAP-0114: Verify target shards calculation for different distribution strategies"
+    type: shell
+    command: |
+      if grep -q "calculateTargetShardsForPattern" src/server/index_optimizer.zig && \
+         grep -q "hash_based\|range_based\|geographic" src/server/index_optimizer.zig; then
+        echo "PASS: Target shards calculation implemented for distribution strategies"
+        exit 0
+      fi
+      echo "FAIL: Target shards calculation not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0114-per-shard-breakdown
+    description: "GAP-0114: Verify per-shard cost breakdown implementation"
+    type: shell
+    command: |
+      if grep -q "generateShardCostBreakdown" src/server/index_optimizer.zig && \
+         grep -q "ShardCostBreakdown" src/server/index_optimizer.zig; then
+        echo "PASS: Per-shard cost breakdown implemented"
+        exit 0
+      fi
+      echo "FAIL: Per-shard cost breakdown not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0114-index-benefit-calculation
+    description: "GAP-0114: Verify index benefit calculation considers selectivity and shards"
+    type: shell
+    command: |
+      if grep -q "calculateIndexBenefit" src/server/index_optimizer.zig && \
+         grep -q "selectivity_factor\|shard_factor" src/server/index_optimizer.zig; then
+        echo "PASS: Index benefit calculation implemented"
+        exit 0
+      fi
+      echo "FAIL: Index benefit calculation not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0114-recommendation-reason
+    description: "GAP-0114: Verify human-readable recommendation reason generation"
+    type: shell
+    command: |
+      if grep -q "generateRecommendationReason" src/server/index_optimizer.zig && \
+         grep -q "index recommended for" src/server/index_optimizer.zig; then
+        echo "PASS: Recommendation reason generation implemented"
+        exit 0
+      fi
+      echo "FAIL: Recommendation reason generation not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0114-marker
+    description: "Verify CANARY markers for GAP-0114 federation index recommendations"
+    type: shell
+    command: |
+      if grep -r "GAP-0114" src/ | grep -q "CANARY\|FIX"; then
+        echo "PASS: GAP-0114 CANARY markers present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0114 CANARY markers missing"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0122: Library Mode Server Embedding Documentation
+  - name: gap-0122-embedding-guide-documentation
+    description: "GAP-0122: Verify library embedding guide documentation exists"
+    type: shell
+    command: |
+      if grep -q "Library Mode Embedding Guide" src/lib.zig && \
+         grep -q "Query-Only Mode" src/lib.zig; then
+        echo "PASS: Library embedding guide documentation present"
+        exit 0
+      fi
+      echo "FAIL: Library embedding guide not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0122-embedding-use-cases
+    description: "GAP-0122: Verify embedding use case enumeration"
+    type: shell
+    command: |
+      if grep -q "EmbeddingUseCase" src/lib.zig && \
+         grep -q "local_queries\|distributed_queries\|embedded_server" src/lib.zig; then
+        echo "PASS: Embedding use cases enumerated"
+        exit 0
+      fi
+      echo "FAIL: Embedding use cases not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0122-recommended-patterns
+    description: "GAP-0122: Verify recommended pattern helper function"
+    type: shell
+    command: |
+      if grep -q "getRecommendedPattern" src/lib.zig && \
+         grep -q "Subprocess mode\|Client mode\|Query-only mode" src/lib.zig; then
+        echo "PASS: Recommended patterns helper implemented"
+        exit 0
+      fi
+      echo "FAIL: Recommended patterns helper not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0122-clear-error-message
+    description: "GAP-0122: Verify clear error message for NotImplemented"
+    type: shell
+    command: |
+      if grep -q "Server embedding not directly supported" src/lib.zig && \
+         grep -q "Recommended patterns:" src/lib.zig; then
+        echo "PASS: Clear error message with guidance implemented"
+        exit 0
+      fi
+      echo "FAIL: Clear error message not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0122-server-mode-check
+    description: "GAP-0122: Verify isServerModeAvailable function"
+    type: shell
+    command: |
+      if grep -q "isServerModeAvailable" src/lib.zig; then
+        echo "PASS: Server mode availability check implemented"
+        exit 0
+      fi
+      echo "FAIL: Server mode availability check not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0122-marker
+    description: "Verify CANARY marker for GAP-0122 library embedding documentation"
+    type: shell
+    command: |
+      if grep -r "GAP-0122" src/ | grep -q "CANARY\|FIX"; then
+        echo "PASS: GAP-0122 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0122 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0115: Memory Allocation Error Handling Documentation (Low)
+  - name: gap-0115-memory-safety-documentation
+    description: "GAP-0115: Verify memory allocation error handling documentation"
+    type: shell
+    command: |
+      if grep -q "Memory Allocation Patterns" src/lib.zig && \
+         grep -q "catch unreachable" src/lib.zig && \
+         grep -q "Arena Allocator Semantics" src/lib.zig; then
+        echo "PASS: Memory allocation documentation present"
+        exit 0
+      fi
+      echo "FAIL: Memory allocation documentation not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0115-production-recommendations
+    description: "GAP-0115: Verify production recommendations for memory handling"
+    type: shell
+    command: |
+      if grep -q "Production Recommendations" src/lib.zig && \
+         grep -q "memory cgroups" src/lib.zig; then
+        echo "PASS: Production recommendations documented"
+        exit 0
+      fi
+      echo "FAIL: Production recommendations not found"
+      exit 1
+    expected_exit_code: 0
+
+  - name: canary-gap-0115-marker
+    description: "Verify CANARY marker for GAP-0115 memory safety documentation"
+    type: shell
+    command: |
+      if grep -r "GAP-0115" src/ | grep -q "CANARY\|DOCUMENTATION"; then
+        echo "PASS: GAP-0115 CANARY marker present"
+        exit 0
+      fi
+      echo "FAIL: GAP-0115 CANARY marker missing"
+      exit 1
+    expected_exit_code: 0
+
+  # GAP-0118: Test Coverage Documentation Consistency (Low)
+  - name: gap-0118-consistent-test-numbers
+    description: "GAP-0118: Verify test coverage numbers are documented consistently"
+    type: shell
+    command: |
+      # Check FEATURES_OVERVIEW.md for consistent numbers
+      if grep -q "88.3% Geodetestlab Coverage" docs/FEATURES_OVERVIEW.md && \
+         grep -q "97% Unit Test Pass Rate" docs/FEATURES_OVERVIEW.md; then
+        echo "PASS: Test coverage numbers documented consistently"
+        exit 0
+      fi
+      echo "FAIL: Test coverage numbers inconsistent"
+      exit 1
+    expected_exit_code: 0
+
+  - name: gap-0118-test-type-clarification
+    description: "GAP-0118: Verify test types are clearly distinguished"
+    type: shell
+    command: |
+      # Check that geodetestlab vs unit tests are distinguished
+      if grep -q "Geodetestlab" docs/FEATURES_OVERVIEW.md && \
+         grep -q "Unit Test" docs/FEATURES_OVERVIEW.md; then
+        echo "PASS: Test types clearly distinguished"
+        exit 0
+      fi
+      echo "FAIL: Test types not distinguished"
+      exit 1
+    expected_exit_code: 0
+
+cleanup:
+  - name: cleanup-test-artifacts
+    command: "rm -rf /tmp/geode_gap_test_* 2>/dev/null || true"

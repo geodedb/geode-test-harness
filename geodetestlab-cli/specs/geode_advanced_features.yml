@@ -1,0 +1,293 @@
+version: "1.0"
+name: "Geode Advanced Features Tests"
+description: "Testing of advanced Geode features including backup/restore, federation, migrations, and monitoring"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info", "--enable-metrics"]
+  client:
+    timeout_ms: 20000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # Setup test data for advanced features
+  - name: "setup-test-data"
+    description: "Create comprehensive test dataset for advanced features"
+    args:
+      - "query"
+      - |
+        CREATE
+          (alice:Person {name: 'Alice', age: 30, department: 'Engineering'}),
+          (bob:Person {name: 'Bob', age: 35, department: 'Sales'}),
+          (carol:Person {name: 'Carol', age: 28, department: 'Marketing'}),
+          (techcorp:Company {name: 'TechCorp', founded: 2010, revenue: 1000000}),
+          (project1:Project {name: 'WebApp', budget: 50000, status: 'active'}),
+          (project2:Project {name: 'MobileApp', budget: 75000, status: 'planning'}),
+          (alice)-[:WORKS_FOR {since: 2020, salary: 75000}]->(techcorp),
+          (bob)-[:WORKS_FOR {since: 2018, salary: 85000}]->(techcorp),
+          (carol)-[:WORKS_FOR {since: 2021, salary: 70000}]->(techcorp),
+          (alice)-[:ASSIGNED_TO {role: 'Lead Developer'}]->(project1),
+          (bob)-[:ASSIGNED_TO {role: 'Product Manager'}]->(project2),
+          (carol)-[:ASSIGNED_TO {role: 'Marketing Lead'}]->(project1)
+        RETURN count(*) AS nodes_created
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["nodes_created"]
+    tags: ["setup", "data"]
+
+  # Backup operations
+  - name: "create-full-backup"
+    description: "Create a full database backup"
+    args: ["backup", "create", "--type", "full", "--output", "/tmp/geode_backup_full.gz", "--compress"]
+    expect:
+      exit_code: 0
+      # Backup falls back to local backup when server connection fails in test mode
+      # Success message is "Backup created successfully" on stdout
+      stdout_contains: ["Backup created successfully"]
+    tags: ["backup", "full"]
+
+  - name: "create-incremental-backup"
+    description: "Create an incremental backup"
+    skip: true  # Requires extracting backup ID from parent file - complex test setup needed
+    setup:
+      - "backup create --type full --output /tmp/geode_backup_full_parent.gz --compress"
+    args: ["backup", "create", "--type", "incremental", "--output", "/tmp/geode_backup_incremental.gz", "--compress", "--parent", "BACKUP_ID_FROM_SETUP"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["backup", "created", "incremental"]
+    tags: ["backup", "incremental"]
+
+  - name: "list-backups"
+    description: "List available backups"
+    args: ["backup", "list"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["full"]  # Only full backup is created (incremental test is skipped)
+    tags: ["backup", "list"]
+
+  - name: "backup-metadata"
+    description: "Get backup metadata"
+    args: ["backup", "info", "/tmp/geode_backup_full.gz"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["size", "timestamp", "type"]
+    tags: ["backup", "metadata"]
+
+  # Modify data before restore test
+  - name: "modify-data-before-restore"
+    description: "Modify data to test restore functionality"
+    args: ["query", "MATCH (p:Person {name: 'Alice'}) SET p.age = 31, p.status = 'modified' RETURN p.name AS name, p.age AS age, p.status AS status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name", "age", "status"]
+    tags: ["data", "modify"]
+
+  # Restore operations
+  - name: "restore-from-backup"
+    description: "Restore database from backup"
+    args: ["restore", "/tmp/geode_backup_full.gz", "--confirm"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["restore", "completed"]
+    tags: ["restore", "database"]
+
+  - name: "verify-restore"
+    description: "Verify data after restore"
+    args: ["query", "MATCH (p:Person {name: 'Alice'}) RETURN p.age AS age, p.status AS status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["age", "status"]
+    tags: ["restore", "verify"]
+
+  # Migration operations
+  - name: "check-migration-status"
+    description: "Check database migration status"
+    args: ["migrate", "status"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Migration status:"]
+    tags: ["migration", "status"]
+
+  - name: "run-migrations"
+    description: "Test migration dry-run planning"
+    args: ["migrate", "up", "--dry-run"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["migration", "Dry run"]
+    tags: ["migration", "up"]
+
+  - name: "create-migration"
+    description: "Create a new migration"
+    args: ["migrate", "create", "add_indexes", "--dir", "/tmp/geodetestlab_advanced_migrations"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Created migration file"]
+    tags: ["migration", "create"]
+
+  # Schema introspection
+  - name: "create-node-index"
+    description: "Create index on node property"
+    args: ["query", "CREATE INDEX IF NOT EXISTS person_name_idx FOR (p:Person) ON (p.name)"]
+    expect:
+      exit_code: 0
+    tags: ["index", "create", "node"]
+
+  - name: "create-relationship-index"
+    description: "Create index on relationship property"
+    args: ["query", "CREATE INDEX IF NOT EXISTS works_for_since_idx FOR ()-[r:WORKS_FOR]-() ON (r.since)"]
+    expect:
+      exit_code: 0
+    tags: ["index", "create", "relationship"]
+
+  - name: "list-indexes"
+    description: "List all indexes"
+    args: ["query", "SHOW INDEXES"]
+    expect:
+      exit_code: 0
+      geode_query:
+        min_rows: 1
+    tags: ["index", "list"]
+
+  - name: "drop-index"
+    description: "Drop an index"
+    # Note: Index was already created in create-node-index test above
+    args: ["query", "DROP INDEX IF EXISTS person_name_idx"]
+    expect:
+      exit_code: 0
+    tags: ["index", "drop"]
+
+  # Constraint management
+  - name: "create-uniqueness-constraint"
+    description: "Create uniqueness constraint"
+    args: ["query", "CREATE CONSTRAINT person_email_unique FOR (p:Person) REQUIRE p.email IS UNIQUE"]
+    expect:
+      exit_code: 0
+    tags: ["constraint", "unique"]
+
+  - name: "create-node-key-constraint"
+    description: "Create node key constraint"
+    args: ["query", "CREATE CONSTRAINT company_key FOR (c:Company) REQUIRE (c.name, c.founded) IS NODE KEY"]
+    expect:
+      exit_code: 0
+    tags: ["constraint", "nodekey"]
+
+  - name: "list-constraints"
+    description: "List all constraints"
+    args: ["query", "SHOW CONSTRAINTS"]
+    expect:
+      exit_code: 0
+      geode_query:
+        min_rows: 1
+    tags: ["constraint", "list"]
+
+  # Performance and monitoring
+  - name: "explain-query-plan"
+    description: "Explain query execution plan"
+    args: ["query", "EXPLAIN MATCH (p:Person)-[:WORKS_FOR]->(c:Company) WHERE p.age > 30 RETURN p.name, c.name"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["plan", "cost"]
+    tags: ["performance", "explain"]
+
+  - name: "profile-query-execution"
+    description: "Profile query execution"
+    args: ["query", "PROFILE MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN count(p) AS employee_count"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["profile", "time", "rows"]
+    tags: ["performance", "profile"]
+
+  # Transaction management
+  - name: "long-running-transaction"
+    description: "Test long-running transaction"
+    args: ["query", "--begin", "MATCH (p:Person) SET p.last_updated = timestamp() RETURN count(p) AS updated"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["updated"]
+    tags: ["transaction", "long"]
+
+  - name: "rollback-transaction"
+    description: "Test transaction rollback"
+    args: ["query", "--rollback", "MATCH (p:Person) RETURN count(p) AS count"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["count"]
+    tags: ["transaction", "rollback"]
+
+  # Federation testing (if available)
+  - name: "bulk-data-load"
+    description: "Test bulk data loading"
+    # UNWIND is not GQL-compliant - replaced with simpler test
+    # Original: args: ["query", "UNWIND range(1, 1000) AS i CREATE (n:BulkTest {id: i, value: 'test_' + toString(i)}) RETURN count(n) AS created"]
+    args: ["query", "CREATE (n1:BulkTest {id: 1, value: 'test_1'}), (n2:BulkTest {id: 2, value: 'test_2'}), (n3:BulkTest {id: 3, value: 'test_3'}) RETURN count(*) AS created"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["created"]
+    tags: ["bulk", "load"]
+
+  - name: "bulk-data-update"
+    description: "Test bulk data updates"
+    args: ["query", "MATCH (n:BulkTest) WHERE n.id % 10 = 0 SET n.special = true RETURN count(n) AS updated"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["updated"]
+    tags: ["bulk", "update"]
+
+  - name: "bulk-data-delete"
+    description: "Test bulk data deletion"
+    args: ["query", "MATCH (n:BulkTest) DELETE n RETURN count(n) AS deleted"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["deleted"]
+    tags: ["bulk", "delete"]
+
+  # Cleanup
+  - name: "cleanup-constraints"
+    description: "Clean up test constraints"
+    args: ["query", "DROP CONSTRAINT person_email_unique"]
+    expect:
+      exit_code: 0
+    tags: ["cleanup", "constraint"]
+
+  - name: "cleanup-test-data"
+    description: "Clean up all test data"
+    args: ["query", "MATCH (n) DETACH DELETE n"]
+    expect:
+      exit_code: 0
+    tags: ["cleanup", "data"]
+
+  - name: "cleanup-backup-files"
+    description: "Clean up backup files"
+    args: ["backup", "cleanup", "--older-than", "1h"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["cleanup", "completed"]
+    tags: ["cleanup", "backup"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["advanced", "backup", "restore", "migration", "federation", "performance"]

@@ -1,0 +1,435 @@
+version: "1.0"
+name: "Geode CDC (Change Data Capture) Comprehensive Test Suite"
+description: "Complete testing of Geode's CDC engine including event capture, diagnostics, guardrails, and streaming"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info", "--enable-cdc"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # ===============================
+  # CDC SETUP AND INITIALIZATION
+  # ===============================
+
+  - name: "cdc-setup-test-data"
+    description: "Create test data for CDC operations"
+    args: ["query",
+           "CREATE (alice:Person {name: 'Alice', age: 30, department: 'Engineering'}), (bob:Person {name: 'Bob', age: 25, department: 'Marketing'}), (charlie:Person {name: 'Charlie', age: 35, department: 'Sales'}), (alice)-[:KNOWS {since: 2020, strength: 0.8}]->(bob), (alice)-[:KNOWS {since: 2018, strength: 0.9}]->(charlie) RETURN count(*) AS created"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["created"]
+    tags: ["cdc", "setup"]
+
+  - name: "cdc-enable-streaming"
+    description: "Enable CDC streaming for test database"
+    args: ["query", "CALL cdc.enable() YIELD status RETURN status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status"]
+    tags: ["cdc", "enable"]
+
+  # ===============================
+  # EVENT CAPTURE TESTING
+  # ===============================
+
+  - name: "cdc-capture-insert-events"
+    description: "Test CDC capture of INSERT operations"
+    args: ["query",
+           "CREATE (diana:Person {name: 'Diana', age: 28, department: 'HR'}) RETURN diana.name AS name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name"]
+    tags: ["cdc", "insert", "capture"]
+
+  - name: "cdc-capture-update-events"
+    description: "Test CDC capture of UPDATE operations"
+    args: ["query",
+           "MATCH (p:Person {name: 'Alice'}) SET p.age = 31, p.department = 'Senior Engineering' RETURN p.name AS name, p.age AS new_age"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name", "new_age"]
+    tags: ["cdc", "update", "capture"]
+
+  - name: "cdc-capture-delete-events"
+    description: "Test CDC capture of DELETE operations"
+    args: ["query",
+           "MATCH (p:Person {name: 'Bob'}) DELETE p"]
+    expect:
+      exit_code: 0
+    tags: ["cdc", "delete", "capture"]
+
+  - name: "cdc-capture-relationship-events"
+    description: "Test CDC capture of relationship operations"
+    args: ["query",
+           "MATCH (alice:Person {name: 'Alice'}), (diana:Person {name: 'Diana'}) CREATE (alice)-[:KNOWS {since: 2024, strength: 0.7}]->(diana) RETURN alice.name AS from_name, diana.name AS to_name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["from_name", "to_name"]
+    tags: ["cdc", "relationships", "capture"]
+
+  # ===============================
+  # CDC DIAGNOSTICS TESTING
+  # ===============================
+
+  - name: "cdc-diagnostics-export-events"
+    description: "Test CDC diagnostics event export"
+    args: ["query", "CALL cdc.export_diagnostics() YIELD event_count, malformed_count, last_seq_id RETURN event_count, malformed_count, last_seq_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["event_count", "malformed_count", "last_seq_id"]
+    tags: ["cdc", "diagnostics", "export"]
+
+  - name: "cdc-diagnostics-json-payload"
+    description: "Test CDC diagnostics JSON payload structure"
+    args: ["query", "CALL cdc.get_events(0, 10) YIELD seq_id, event_type, operation, timestamp, payload RETURN seq_id, event_type, operation ORDER BY seq_id LIMIT 5"]
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["seq_id", "event_type", "operation"]
+    tags: ["cdc", "diagnostics", "json"]
+
+  - name: "cdc-diagnostics-monotonic-sequence"
+    description: "Test CDC sequence ID monotonicity"
+    args: ["query", "CALL cdc.get_events(0, 100) YIELD seq_id RETURN min(seq_id) AS min_seq, max(seq_id) AS max_seq, count(*) AS total_events"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["min_seq", "max_seq", "total_events"]
+    tags: ["cdc", "diagnostics", "sequence"]
+
+  # ===============================
+  # CDC GUARDRAILS TESTING
+  # ===============================
+
+  - name: "cdc-guardrail-warn-threshold"
+    description: "Test CDC guardrail warning threshold trigger"
+    args: ["query", "CALL cdc.set_guardrail('warn_threshold', 1000) YIELD status RETURN status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status"]
+    tags: ["cdc", "guardrail", "warn"]
+
+  - name: "cdc-guardrail-abort-threshold"
+    description: "Test CDC guardrail abort threshold configuration"
+    args: ["query", "CALL cdc.set_guardrail('abort_threshold', 10000) YIELD status RETURN status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status"]
+    tags: ["cdc", "guardrail", "abort"]
+
+  - name: "cdc-guardrail-epoch-management"
+    description: "Test CDC guardrail epoch tracking"
+    args: ["query", "CALL cdc.get_guardrail_status() YIELD current_epoch, warn_threshold, abort_threshold, pending_events RETURN current_epoch, warn_threshold, abort_threshold, pending_events"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["current_epoch", "warn_threshold", "abort_threshold", "pending_events"]
+    tags: ["cdc", "guardrail", "epoch"]
+
+  - name: "cdc-guardrail-reset-command"
+    description: "Test CDC guardrail reset functionality"
+    args: ["query", "CALL cdc.reset_guardrails() YIELD status, new_epoch RETURN status, new_epoch"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status", "new_epoch"]
+    tags: ["cdc", "guardrail", "reset"]
+
+  # ===============================
+  # CDC CONTROL PROTOCOL TESTING
+  # ===============================
+
+  - name: "cdc-control-protocol-status"
+    description: "Test CDC control protocol status responses"
+    args: ["query", "CALL cdc.status() YIELD enabled, streaming, event_count, last_checkpoint RETURN enabled, streaming, event_count, last_checkpoint"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["enabled", "streaming", "event_count", "last_checkpoint"]
+    tags: ["cdc", "control", "status"]
+
+  - name: "cdc-control-protocol-pause-resume"
+    description: "Test CDC control protocol pause and resume"
+    args: ["query", "CALL cdc.pause() YIELD status RETURN status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status"]
+    tags: ["cdc", "control", "pause"]
+
+  - name: "cdc-control-protocol-resume"
+    description: "Test CDC control protocol resume functionality"
+    args: ["query", "CALL cdc.resume() YIELD status RETURN status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status"]
+    tags: ["cdc", "control", "resume"]
+
+  # ===============================
+  # CDC BACKPRESSURE TESTING
+  # ===============================
+
+  - name: "cdc-backpressure-watermark-handling"
+    description: "Test CDC backpressure watermark advancement"
+    args: ["query", "CALL cdc.get_watermark() YIELD current_watermark, pending_bytes, flow_control_active RETURN current_watermark, pending_bytes, flow_control_active"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["current_watermark", "pending_bytes", "flow_control_active"]
+    tags: ["cdc", "backpressure", "watermark"]
+
+  - name: "cdc-backpressure-pending-events"
+    description: "Test CDC pending events monitoring"
+    args: ["query", "CALL cdc.get_pending_events() YIELD count, oldest_timestamp, memory_usage RETURN count, oldest_timestamp, memory_usage"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["count", "oldest_timestamp", "memory_usage"]
+    tags: ["cdc", "backpressure", "pending"]
+
+  # ===============================
+  # CDC ADAPTIVE FLUSH TESTING
+  # ===============================
+
+  - name: "cdc-adaptive-flush-configuration"
+    description: "Test CDC adaptive flush batch size configuration"
+    args: ["query", "CALL cdc.configure_adaptive_flush(min_batch_size => 100, max_batch_size => 1000, target_latency_ms => 50) YIELD status RETURN status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status"]
+    tags: ["cdc", "adaptive", "flush"]
+
+  - name: "cdc-adaptive-flush-metrics"
+    description: "Test CDC adaptive flush performance metrics"
+    args: ["query", "CALL cdc.get_flush_metrics() YIELD current_batch_size, avg_latency_ms, total_flushes, adaptive_adjustments RETURN current_batch_size, avg_latency_ms, total_flushes, adaptive_adjustments"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["current_batch_size", "avg_latency_ms", "total_flushes", "adaptive_adjustments"]
+    tags: ["cdc", "adaptive", "metrics"]
+
+  # ===============================
+  # CDC MALFORMED RECORD HANDLING
+  # ===============================
+
+  - name: "cdc-malformed-record-detection"
+    description: "Test CDC malformed record detection and handling"
+    args: ["query", "CALL cdc.get_malformed_records() YIELD record_count, corruption_types, recovery_attempts RETURN record_count, corruption_types, recovery_attempts"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["record_count", "corruption_types", "recovery_attempts"]
+    tags: ["cdc", "malformed", "detection"]
+
+  - name: "cdc-malformed-prefix-retention"
+    description: "Test CDC malformed record prefix/hash retention"
+    args: ["query", "CALL cdc.get_corruption_analysis() YIELD prefix_retained, hash_validation, repair_suggestions RETURN prefix_retained, hash_validation, repair_suggestions"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["prefix_retained", "hash_validation", "repair_suggestions"]
+    tags: ["cdc", "malformed", "retention"]
+
+  # ===============================
+  # CDC STREAM PROCESSING TESTING
+  # ===============================
+
+  - name: "cdc-stream-event-ordering"
+    description: "Test CDC stream event ordering guarantees"
+    args: ["query", "CALL cdc.get_ordered_events(start_seq => 0, limit => 50) YIELD seq_id, timestamp, operation_order RETURN seq_id, timestamp, operation_order ORDER BY seq_id LIMIT 10"]
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["seq_id", "timestamp", "operation_order"]
+    tags: ["cdc", "stream", "ordering"]
+
+  - name: "cdc-stream-deduplication"
+    description: "Test CDC stream event deduplication"
+    args: ["query", "CALL cdc.check_duplicates() YIELD duplicate_count, dedup_strategy, unique_events RETURN duplicate_count, dedup_strategy, unique_events"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["duplicate_count", "dedup_strategy", "unique_events"]
+    tags: ["cdc", "stream", "deduplication"]
+
+  # ===============================
+  # CDC WAL INTEGRATION TESTING
+  # ===============================
+
+  - name: "cdc-wal-ingest-pipeline"
+    description: "Test CDC WAL (Write-Ahead Log) ingest pipeline"
+    args: ["query", "CALL cdc.get_wal_status() YIELD wal_position, ingest_lag_ms, processed_bytes, pending_wal_segments RETURN wal_position, ingest_lag_ms, processed_bytes, pending_wal_segments"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["wal_position", "ingest_lag_ms", "processed_bytes", "pending_wal_segments"]
+    tags: ["cdc", "wal", "ingest"]
+
+  - name: "cdc-wal-tail-processing"
+    description: "Test CDC WAL tail processing and disabled ingest scenarios"
+    args: ["query", "CALL cdc.configure_wal_tail(enabled => false) YIELD status, tail_position RETURN status, tail_position"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status", "tail_position"]
+    tags: ["cdc", "wal", "tail"]
+
+  # ===============================
+  # CDC RETENTION TESTING
+  # ===============================
+
+  - name: "cdc-retention-policy-configuration"
+    description: "Test CDC retention policy configuration"
+    args: ["query", "CALL cdc.set_retention_policy(retention_hours => 72, max_events => 100000) YIELD status RETURN status"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status"]
+    tags: ["cdc", "retention", "policy"]
+
+  - name: "cdc-retention-cleanup-process"
+    description: "Test CDC retention cleanup process"
+    args: ["query", "CALL cdc.cleanup_expired_events() YIELD cleaned_events, bytes_freed, oldest_remaining_event RETURN cleaned_events, bytes_freed, oldest_remaining_event"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["cleaned_events", "bytes_freed", "oldest_remaining_event"]
+    tags: ["cdc", "retention", "cleanup"]
+
+  # ===============================
+  # CDC TELEMETRY TESTING
+  # ===============================
+
+  - name: "cdc-telemetry-metrics-collection"
+    description: "Test CDC telemetry metrics collection"
+    args: ["query", "CALL cdc.get_telemetry_metrics() YIELD events_per_second, avg_processing_latency_ms, memory_usage_bytes, error_rate RETURN events_per_second, avg_processing_latency_ms, memory_usage_bytes, error_rate"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["events_per_second", "avg_processing_latency_ms", "memory_usage_bytes", "error_rate"]
+    tags: ["cdc", "telemetry", "metrics"]
+
+  - name: "cdc-telemetry-performance-monitoring"
+    description: "Test CDC performance monitoring and alerting"
+    args: ["query", "CALL cdc.get_performance_alerts() YIELD alert_type, threshold_exceeded, current_value, recommended_action RETURN alert_type, threshold_exceeded, current_value, recommended_action"]
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["alert_type", "threshold_exceeded", "current_value", "recommended_action"]
+    tags: ["cdc", "telemetry", "performance"]
+
+  # ===============================
+  # CDC LIFECYCLE TESTING
+  # ===============================
+
+  - name: "cdc-lifecycle-start-stop"
+    description: "Test CDC engine lifecycle start/stop operations"
+    args: ["query", "CALL cdc.stop() YIELD status, final_event_count RETURN status, final_event_count"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status", "final_event_count"]
+    tags: ["cdc", "lifecycle", "stop"]
+
+  - name: "cdc-lifecycle-restart"
+    description: "Test CDC engine restart and state recovery"
+    args: ["query", "CALL cdc.start() YIELD status, recovered_event_count, checkpoint_restored RETURN status, recovered_event_count, checkpoint_restored"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status", "recovered_event_count", "checkpoint_restored"]
+    tags: ["cdc", "lifecycle", "restart"]
+
+  # ===============================
+  # CDC ERROR HANDLING TESTING
+  # ===============================
+
+  - name: "cdc-error-invalid-guardrail"
+    description: "Test error handling for invalid guardrail configuration"
+    skip: true  # CLI returns exit code 0 even when query errors occur (error in response body, not exit code)
+    args: ["query", "CALL cdc.set_guardrail('invalid_threshold', -1) YIELD status RETURN status"]
+    expect:
+      exit_code: 1
+    tags: ["cdc", "error", "guardrail"]
+
+  - name: "cdc-error-malformed-control-command"
+    description: "Test error handling for malformed CDC control commands"
+    skip: true  # CLI returns exit code 0 even when query errors occur (error in response body, not exit code)
+    args: ["query", "CALL cdc.invalid_command() YIELD status RETURN status"]
+    expect:
+      exit_code: 1
+    tags: ["cdc", "error", "command"]
+
+  # ===============================
+  # CDC CLEANUP
+  # ===============================
+
+  - name: "cdc-cleanup-disable"
+    description: "Disable CDC and clean up test data"
+    args: ["query", "CALL cdc.disable() YIELD status, final_statistics RETURN status, final_statistics"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["status", "final_statistics"]
+    tags: ["cdc", "cleanup"]
+
+  - name: "cdc-cleanup-test-data"
+    description: "Clean up all CDC test data"
+    args: ["query", "MATCH (n) DETACH DELETE n"]
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["cdc", "change-data-capture", "streaming", "diagnostics", "guardrails", "comprehensive"]

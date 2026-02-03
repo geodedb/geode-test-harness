@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const GeodeClient = @import("geode_client").GeodeClient;
+const geode_client = @import("geode_client");
+const GeodeClient = geode_client.GeodeClient;
+const proto = geode_client.proto;
 const yaml = @import("yaml");
 
 const Allocator = std.mem.Allocator;
@@ -625,6 +627,33 @@ fn getTypeString(obj: JsonObject) []const u8 {
     return "";
 }
 
+fn protoValueToJson(allocator: Allocator, val: proto.Value) !JsonValue {
+    if (val.null_val) {
+        return JsonValue{ .null = {} };
+    } else if (val.string_val) |s| {
+        return JsonValue{ .string = try allocator.dupe(u8, s) };
+    } else if (val.int_val) |i| {
+        return JsonValue{ .integer = i };
+    } else if (val.double_val) |d| {
+        return JsonValue{ .float = d };
+    } else if (val.bool_val) |b| {
+        return JsonValue{ .bool = b };
+    }
+    return JsonValue{ .null = {} };
+}
+
+fn jsonValueToParamString(allocator: Allocator, val: JsonValue) ![]u8 {
+    return switch (val) {
+        .null => try allocator.dupe(u8, "null"),
+        .bool => |b| try allocator.dupe(u8, if (b) "true" else "false"),
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .string => |s| try allocator.dupe(u8, s),
+        .number_string => |s| try allocator.dupe(u8, s),
+        .array, .object => try jsonToString(allocator, val),
+    };
+}
+
 fn parseServer(allocator: Allocator, server: []const u8) !struct { host: []const u8, port: u16 } {
     var host_port = std.mem.splitScalar(u8, server, ':');
     const host_part = host_port.next() orelse "localhost";
@@ -688,14 +717,14 @@ const ClientContext = struct {
     }
 
     fn poolAcquire(self: *ClientContext, conn_id: []const u8, verbose: bool) !void {
-        var cli = GeodeClient.init(self.allocator, self.host, self.port, true);
+        var cli = GeodeClient.init(self.allocator, self.host, self.port, true, "", "");
         if (verbose) {
             std.debug.print("  Acquiring pool connection: {s}\n", .{conn_id});
         }
         try cli.connect();
         try cli.openStream();
-        try cli.sendHello("geode-zig-runner", "1.0.0");
-        _ = cli.receiveMessage(2000) catch {};
+        try cli.sendHello();
+        _ = cli.receiveProto(2000) catch {};
         try self.connections.put(try self.allocator.dupe(u8, conn_id), cli);
     }
 
@@ -709,22 +738,21 @@ const ClientContext = struct {
 
     fn ensureConnected(self: *ClientContext, verbose: bool) !void {
         if (self.client != null) return;
-        var cli = GeodeClient.init(self.allocator, self.host, self.port, true);
+        var cli = GeodeClient.init(self.allocator, self.host, self.port, true, "", "");
         if (verbose) {
             std.debug.print("  Connecting to {s}:{d}\n", .{ self.host, self.port });
         }
         try cli.connect();
         try cli.openStream();
-        try cli.sendHello("geode-zig-runner", "1.0.0");
+        try cli.sendHello();
         // Keep the client even if the HELLO ack is missing; subsequent messages should still flow.
         self.client = cli;
-        const hello = self.client.?.receiveMessage(2000) catch |err| {
+        _ = self.client.?.receiveProto(2000) catch |err| {
             if (verbose) {
                 std.debug.print("  HELLO receive skipped: {any}\n", .{err});
             }
             return;
         };
-        self.allocator.free(hello);
     }
 
     fn close(self: *ClientContext) void {
@@ -736,91 +764,116 @@ const ClientContext = struct {
 
     fn begin(self: *ClientContext) !void {
         try self.ensureConnected(false);
-        const msg = try buildSimpleMessage(self.allocator, "BEGIN");
-        defer self.allocator.free(msg);
-        try self.client.?.sendMessage(msg);
-        const ack = try self.client.?.receiveMessage(2000);
-        self.allocator.free(ack);
+        const msg = proto.QuicClientMessage{
+            .begin = proto.BeginRequest{ .read_only = false },
+        };
+        try self.client.?.sendProto(msg);
+        _ = try self.client.?.receiveProto(2000);
     }
 
     fn commit(self: *ClientContext) !void {
         try self.ensureConnected(false);
-        const msg = try buildSimpleMessage(self.allocator, "COMMIT");
-        defer self.allocator.free(msg);
-        try self.client.?.sendMessage(msg);
-        const ack = try self.client.?.receiveMessage(2000);
-        self.allocator.free(ack);
+        const msg = proto.QuicClientMessage{
+            .commit = proto.CommitRequest{},
+        };
+        try self.client.?.sendProto(msg);
+        _ = try self.client.?.receiveProto(2000);
     }
 
     fn rollback(self: *ClientContext) !void {
         try self.ensureConnected(false);
-        const msg = try buildSimpleMessage(self.allocator, "ROLLBACK");
-        defer self.allocator.free(msg);
-        try self.client.?.sendMessage(msg);
-        const ack = try self.client.?.receiveMessage(2000);
-        self.allocator.free(ack);
+        const msg = proto.QuicClientMessage{
+            .rollback = proto.RollbackRequest{},
+        };
+        try self.client.?.sendProto(msg);
+        _ = try self.client.?.receiveProto(2000);
     }
 
-    fn runQuery(self: *ClientContext, query: []const u8, params: ?JsonValue, verbose: bool) !QueryResult {
+    fn runQuery(self: *ClientContext, query_text: []const u8, params: ?JsonValue, verbose: bool) !QueryResult {
         try self.ensureConnected(verbose);
 
-        const run_msg = try buildRunMessage(self.allocator, query, params);
-        defer self.allocator.free(run_msg);
-        try self.client.?.sendMessage(run_msg);
+        // Build the ExecuteRequest protobuf message
+        var execute = proto.ExecuteRequest{
+            .session_id = "",
+            .query = query_text,
+        };
 
-        const schema_raw = try self.client.?.receiveMessage(3000);
-        defer self.allocator.free(schema_raw);
-        var schema_parsed = try std.json.parseFromSlice(JsonValue, self.allocator, schema_raw, .{});
-        defer schema_parsed.deinit();
-        const schema_obj = try extractResultObject(schema_parsed.value);
-        const res_type = getTypeString(schema_obj);
-        if (std.mem.eql(u8, res_type, "ERROR")) {
-            const msg = schema_obj.get("message");
-            if (msg != null and msg.? == .string) {
+        // Convert JSON params to string map if provided
+        var param_strings = try std.ArrayList([]u8).initCapacity(self.allocator, 0);
+        defer {
+            for (param_strings.items) |s| self.allocator.free(s);
+            param_strings.deinit(self.allocator);
+        }
+
+        if (params) |p| {
+            if (p == .object) {
+                var it = p.object.iterator();
+                while (it.next()) |entry| {
+                    const val_str = try jsonValueToParamString(self.allocator, entry.value_ptr.*);
+                    try param_strings.append(self.allocator, val_str);
+                    try execute.parameters.put(self.allocator, entry.key_ptr.*, val_str);
+                }
+            }
+        }
+        defer execute.parameters.deinit(self.allocator);
+
+        const msg = proto.QuicClientMessage{
+            .execute = execute,
+        };
+        try self.client.?.sendProto(msg);
+
+        // Receive the response
+        const response = try self.client.?.receiveProto(30000);
+
+        // Check for errors
+        if (response.execute) |exec| {
+            if (exec.err) |_| {
                 return error.QueryError;
             }
-            return error.QueryError;
-        }
 
-        const columns = try parseColumns(self.allocator, schema_obj);
-        errdefer {
-            for (columns) |col| self.allocator.free(col);
-            self.allocator.free(columns);
-        }
-
-        const pull_msg = try buildPullMessage(self.allocator, 1000);
-        defer self.allocator.free(pull_msg);
-        try self.client.?.sendMessage(pull_msg);
-
-        var all_rows = try std.ArrayList(JsonValue).initCapacity(self.allocator, 0);
-        errdefer {
-            for (all_rows.items) |*row| freeJsonValue(self.allocator, row);
-            all_rows.deinit(self.allocator);
-        }
-
-        while (true) {
-            const resp_raw = try self.client.?.receiveMessage(3000);
-            defer self.allocator.free(resp_raw);
-            var parsed = try std.json.parseFromSlice(JsonValue, self.allocator, resp_raw, .{});
-            defer parsed.deinit();
-            const res_obj = try extractResultObject(parsed.value);
-            const rtype = getTypeString(res_obj);
-            if (std.mem.eql(u8, rtype, "PROFILE") or std.mem.eql(u8, rtype, "RESULT") or std.mem.eql(u8, rtype, "STATUS")) {
-                break;
+            // Parse columns from schema
+            var columns = try std.ArrayList([]u8).initCapacity(self.allocator, 0);
+            errdefer {
+                for (columns.items) |col| self.allocator.free(col);
+                columns.deinit(self.allocator);
             }
-            if (!std.mem.eql(u8, rtype, "BINDINGS")) return error.UnexpectedFrame;
 
-            try appendRowsFromResult(self.allocator, res_obj, &all_rows);
-
-            const final_val = res_obj.get("final");
-            if (final_val != null and final_val.? == .bool and final_val.?.bool) {
-                break;
+            if (exec.schema) |schema| {
+                for (schema.columns.items) |col| {
+                    const col_name = try self.allocator.dupe(u8, col.name);
+                    try columns.append(self.allocator, col_name);
+                }
             }
-            try self.client.?.sendMessage(pull_msg);
+
+            // Parse rows from data page
+            var all_rows = try std.ArrayList(JsonValue).initCapacity(self.allocator, 0);
+            errdefer {
+                for (all_rows.items) |*row| freeJsonValue(self.allocator, row);
+                all_rows.deinit(self.allocator);
+            }
+
+            if (exec.page) |page| {
+                for (page.rows.items) |row| {
+                    // Convert each row to a JSON object with column names as keys
+                    var row_obj = JsonObject.init(self.allocator);
+                    errdefer row_obj.deinit();
+
+                    for (row.values.items, 0..) |val, idx| {
+                        const col_name = if (idx < columns.items.len) columns.items[idx] else "";
+                        const json_val = try protoValueToJson(self.allocator, val);
+                        const key_copy = try self.allocator.dupe(u8, col_name);
+                        try row_obj.put(key_copy, json_val);
+                    }
+                    try all_rows.append(self.allocator, JsonValue{ .object = row_obj });
+                }
+            }
+
+            const cols_slice = try columns.toOwnedSlice(self.allocator);
+            const rows_slice = try all_rows.toOwnedSlice(self.allocator);
+            return QueryResult{ .columns = cols_slice, .rows = rows_slice };
         }
 
-        const rows = try all_rows.toOwnedSlice(self.allocator);
-        return QueryResult{ .columns = columns, .rows = rows };
+        return error.InvalidResponse;
     }
 };
 

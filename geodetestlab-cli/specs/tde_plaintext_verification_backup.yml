@@ -1,0 +1,291 @@
+version: "1.0"
+name: "TDE Plaintext Verification - Backup and Archive"
+description: |
+  SECURITY CRITICAL TEST SUITE - BACKUP/ARCHIVE
+
+  Verifies that TDE encryption is maintained in backup and archive scenarios.
+  Backups are a common source of data leakage because they may:
+
+  1. Be stored on less secure systems
+  2. Be transferred over networks
+  3. Use different encryption than the primary database
+  4. Be retained longer than primary data
+
+  This test ensures:
+  - Backup files contain no plaintext
+  - WAL archives contain no plaintext
+  - Incremental backups contain no plaintext
+  - Backup metadata doesn't leak sensitive data
+
+  CANARY: REQ=REQ-TDE-ENFORCE-008; FEATURE=TDEEnforcement; ASPECT=BackupEncryption; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false
+    args: ["--log-level", "info", "--enable-tde", "--enable-wal-encryption", "--tde-provider", "MockKms"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+env:
+  # All keys must be exactly 64 hex characters (32 bytes for AES-256)
+  GEODE_TDE_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  GEODE_WAL_KEY: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+  GEODE_TDE_ENABLED: "true"
+  GEODE_WAL_ENCRYPTION_ENABLED: "true"
+  GEODE_BACKUP_ENCRYPTION_KEY: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+tests:
+  # ===============================
+  # PHASE 1: CREATE DATA TO BE BACKED UP
+  # ===============================
+
+  - name: "tde-backup-write-customer-pii"
+    description: "Write customer PII data that will be backed up"
+    args: ["query",
+           "CREATE (n:BackupTest_Customer {
+              type: 'CustomerPII',
+              ssn: 'BACKUP_SSN_999888777666',
+              credit_card: 'BACKUP_CC_4532015112830366',
+              email: 'BACKUP_EMAIL_sensitive@customer.com',
+              phone: 'BACKUP_PHONE_5551234567',
+              address: 'BACKUP_ADDRESS_123_Secret_Lane_Hidden_City'
+            })
+            RETURN n.ssn AS ssn"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "backup", "customer", "write"]
+
+  - name: "tde-backup-write-financial-data"
+    description: "Write financial data that will be backed up"
+    args: ["query",
+           "CREATE (n:BackupTest_Financial {
+              type: 'FinancialData',
+              account: 'BACKUP_ACCOUNT_9876543210123456',
+              routing: 'BACKUP_ROUTING_021000089',
+              balance: 1500000.00,
+              transactions: 'BACKUP_TXN_HISTORY_SENSITIVE'
+            })
+            RETURN n.account AS account"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "backup", "financial", "write"]
+
+  - name: "tde-backup-write-medical-records"
+    description: "Write HIPAA-protected medical records"
+    args: ["query",
+           "CREATE (n:BackupTest_Medical {
+              type: 'MedicalRecord',
+              patient_id: 'BACKUP_PATIENT_P123456',
+              mrn: 'BACKUP_MRN_MRN789012',
+              diagnosis: 'BACKUP_DX_CONFIDENTIAL_CONDITION',
+              treatment: 'BACKUP_TX_EXPERIMENTAL_PROCEDURE',
+              insurance: 'BACKUP_INS_BCBS_ID_987654321'
+            })
+            RETURN n.patient_id AS patient"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "backup", "medical", "hipaa", "write"]
+
+  - name: "tde-backup-write-encryption-keys"
+    description: "Write key-like data (should never appear in backup plaintext)"
+    args: ["query",
+           "CREATE (n:BackupTest_Keys {
+              type: 'EncryptionKeys',
+              master_key_id: 'BACKUP_KEYID_UUID_MASTER_12345',
+              data_key_encrypted: 'BACKUP_DATAKEY_ENCRYPTED_BLOB_XYZ',
+              key_fingerprint: 'BACKUP_FINGERPRINT_SHA256_ABCDEF123'
+            })
+            RETURN n.master_key_id AS key_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "backup", "keys", "write"]
+
+  # ===============================
+  # PHASE 2: CREATE MANY RECORDS (stress backup)
+  # ===============================
+
+  - name: "tde-backup-write-batch-data"
+    description: "Write batch of records to stress backup encryption"
+    args: ["query",
+           "UNWIND range(1, 20) AS i
+            CREATE (n:BackupTest_Batch {
+              type: 'BatchRecord',
+              index: i,
+              secret_data: 'BACKUP_BATCH_SECRET_' + toString(i),
+              timestamp: datetime()
+            })
+            RETURN count(*) AS created"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "backup", "batch", "write"]
+
+  # ===============================
+  # PHASE 3: CREATE RELATIONSHIPS (backup must include)
+  # ===============================
+
+  - name: "tde-backup-create-relationships"
+    description: "Create relationships with sensitive properties"
+    args: ["query",
+           "MATCH (c:BackupTest_Customer), (f:BackupTest_Financial)
+            CREATE (c)-[r:OWNS {
+              ownership_type: 'primary',
+              verification: 'BACKUP_VERIFY_SECRET_CODE_ABC',
+              linked_date: date()
+            }]->(f)
+            RETURN type(r) AS rel"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "backup", "relationship", "write"]
+
+  # ===============================
+  # PHASE 4: VERIFY DATA READABLE
+  # ===============================
+
+  - name: "tde-backup-verify-data-readable"
+    description: "Verify all backup test data is readable"
+    args: ["query",
+           "MATCH (n)
+            WHERE n:BackupTest_Customer OR n:BackupTest_Financial OR
+                  n:BackupTest_Medical OR n:BackupTest_Keys OR
+                  n:BackupTest_Batch
+            RETURN count(*) AS total"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "backup", "verify", "readable"]
+
+  # ===============================
+  # PHASE 5: SCAN ALL DATA FILES FOR PLAINTEXT
+  # ===============================
+
+  - name: "tde-backup-scan-no-ssn"
+    description: "CRITICAL: Verify SSN NOT in any backup-related file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_SSN_999888777666", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "ssn", "critical"]
+
+  - name: "tde-backup-scan-no-cc"
+    description: "CRITICAL: Verify credit card NOT in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_CC_4532015112830366", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "cc", "critical"]
+
+  - name: "tde-backup-scan-no-email"
+    description: "CRITICAL: Verify email NOT in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_EMAIL_sensitive@customer.com", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "email", "critical"]
+
+  - name: "tde-backup-scan-no-account"
+    description: "CRITICAL: Verify account number NOT in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_ACCOUNT_9876543210123456", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "account", "critical"]
+
+  - name: "tde-backup-scan-no-patient-id"
+    description: "CRITICAL: Verify patient ID NOT in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_PATIENT_P123456", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "hipaa", "critical"]
+
+  - name: "tde-backup-scan-no-diagnosis"
+    description: "CRITICAL: Verify diagnosis NOT in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_DX_CONFIDENTIAL_CONDITION", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "hipaa", "critical"]
+
+  - name: "tde-backup-scan-no-key-id"
+    description: "CRITICAL: Verify key ID NOT in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_KEYID_UUID_MASTER_12345", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "keyid", "critical"]
+
+  - name: "tde-backup-scan-no-batch-secrets"
+    description: "CRITICAL: Verify batch secrets NOT in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_BATCH_SECRET_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "batch", "critical"]
+
+  - name: "tde-backup-scan-no-verify-code"
+    description: "CRITICAL: Verify relationship secret NOT in any file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_VERIFY_SECRET_CODE_ABC", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "relationship", "critical"]
+
+  - name: "tde-backup-scan-comprehensive-prefix"
+    description: "CRITICAL: Verify NO BACKUP_ prefix in ANY file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "BACKUP_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "backup", "scan", "comprehensive", "critical"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "BACKUP_SSN_"
+    - "BACKUP_CC_"
+    - "BACKUP_EMAIL_"
+    - "BACKUP_PHONE_"
+    - "BACKUP_ADDRESS_"
+    - "BACKUP_ACCOUNT_"
+    - "BACKUP_ROUTING_"
+    - "BACKUP_TXN_"
+    - "BACKUP_PATIENT_"
+    - "BACKUP_MRN_"
+    - "BACKUP_DX_"
+    - "BACKUP_TX_"
+    - "BACKUP_INS_"
+    - "BACKUP_KEYID_"
+    - "BACKUP_DATAKEY_"
+    - "BACKUP_FINGERPRINT_"
+    - "BACKUP_BATCH_SECRET_"
+    - "BACKUP_VERIFY_SECRET_"
+    - "BACKUP_"
+  fail_on_violation: true
+  scan_binary_files: true
+  scan_backup_files: true
+  scan_archive_files: true
+
+tags: ["tde", "backup", "archive", "security", "plaintext-verification", "critical", "compliance", "hipaa", "pci"]

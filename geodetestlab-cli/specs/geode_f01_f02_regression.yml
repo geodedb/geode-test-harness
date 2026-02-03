@@ -1,0 +1,151 @@
+# Regression Tests for F01-F02 Issues (2025-12-28)
+# These tests verify fixes for issues discovered during enterprise_test_extended.gql testing
+
+name: F01-F02 Regression Tests
+version: "1.0"
+
+setup:
+  # Employee/Manager structure for F01 (NULLS LAST with DESC)
+  - |
+    CREATE (:Employee {id: 1, name: 'Alice', department: 'Engineering'});
+    CREATE (:Employee {id: 2, name: 'Bob', department: 'Engineering'});
+    CREATE (:Employee {id: 3, name: 'Carol', department: 'Sales'});
+    CREATE (:Employee {id: 4, name: 'Dave', department: 'HR'});
+
+  - |
+    CREATE (:Manager {id: 101, name: 'ManagerA', salary: 100000});
+    CREATE (:Manager {id: 102, name: 'ManagerB', salary: 80000});
+
+  - |
+    MATCH (e:Employee {name: 'Alice'}), (m:Manager {name: 'ManagerA'}) CREATE (e)-[:REPORTS_TO]->(m);
+    MATCH (e:Employee {name: 'Bob'}), (m:Manager {name: 'ManagerB'}) CREATE (e)-[:REPORTS_TO]->(m);
+
+  # User/Friendship structure for F02 (NOT EXISTS in cross-join)
+  - |
+    CREATE (:User {id: 1, name: 'Alice', city: 'NYC'});
+    CREATE (:User {id: 2, name: 'Bob', city: 'LA'});
+    CREATE (:User {id: 3, name: 'Carol', city: 'NYC'});
+    CREATE (:User {id: 4, name: 'Dave', city: 'LA'});
+    CREATE (:User {id: 5, name: 'Frank', city: 'NYC'});
+
+  - |
+    MATCH (a:User {name: 'Alice'}), (c:User {name: 'Carol'}) CREATE (a)-[:FRIENDS_WITH]->(c);
+    MATCH (b:User {name: 'Bob'}), (d:User {name: 'Dave'}) CREATE (b)-[:FRIENDS_WITH]->(d);
+
+tests:
+  # F01: NULLS LAST with DESC should put nulls at the end
+  # Bug was: NULLS LAST + DESC put nulls first due to DESC inverting the comparison
+  - name: "F01: ORDER BY DESC NULLS LAST puts nulls at end"
+    query: |
+      MATCH (e:Employee)
+      OPTIONAL MATCH (e)-[:REPORTS_TO]->(m:Manager)
+      RETURN e.name AS employee, m.salary AS manager_salary
+      ORDER BY manager_salary DESC NULLS LAST
+    expect:
+      row_count: 4
+      ordered:
+        - employee: "Alice"
+          manager_salary: 100000
+        - employee: "Bob"
+          manager_salary: 80000
+        - employee: "Carol"
+          manager_salary: null
+        - employee: "Dave"
+          manager_salary: null
+
+  - name: "F01: ORDER BY ASC NULLS LAST also works"
+    query: |
+      MATCH (e:Employee)
+      OPTIONAL MATCH (e)-[:REPORTS_TO]->(m:Manager)
+      RETURN e.name AS employee, m.salary AS manager_salary
+      ORDER BY manager_salary ASC NULLS LAST
+    expect:
+      row_count: 4
+      ordered:
+        - employee: "Bob"
+          manager_salary: 80000
+        - employee: "Alice"
+          manager_salary: 100000
+        - employee: "Carol"
+          manager_salary: null
+        - employee: "Dave"
+          manager_salary: null
+
+  - name: "F01: ORDER BY DESC NULLS FIRST puts nulls at beginning"
+    query: |
+      MATCH (e:Employee)
+      OPTIONAL MATCH (e)-[:REPORTS_TO]->(m:Manager)
+      RETURN e.name AS employee, m.salary AS manager_salary
+      ORDER BY manager_salary DESC NULLS FIRST
+    expect:
+      row_count: 4
+      ordered:
+        - employee: "Carol"
+          manager_salary: null
+        - employee: "Dave"
+          manager_salary: null
+        - employee: "Alice"
+          manager_salary: 100000
+        - employee: "Bob"
+          manager_salary: 80000
+
+  # F02: NOT EXISTS in cross-join should properly check specific bound target
+  # Bug was: EXISTS { (u1)-[:REL]->(u2) } matched ANY u2 instead of specific bound u2
+  - name: "F02: NOT EXISTS in cross-join with correlated variables"
+    query: |
+      MATCH (u1:User), (u2:User)
+      WHERE u1.city = u2.city AND u1.id < u2.id
+        AND NOT EXISTS { (u1)-[:FRIENDS_WITH]->(u2) }
+      RETURN u1.name AS user1, u2.name AS user2, u1.city AS city
+      ORDER BY u1.name, u2.name
+    expect:
+      row_count: 2
+      ordered:
+        - user1: "Alice"
+          user2: "Frank"
+          city: "NYC"
+        - user1: "Carol"
+          user2: "Frank"
+          city: "NYC"
+
+  - name: "F02: EXISTS in cross-join with correlated variables"
+    query: |
+      MATCH (u1:User), (u2:User)
+      WHERE u1.city = u2.city AND u1.id < u2.id
+        AND EXISTS { (u1)-[:FRIENDS_WITH]->(u2) }
+      RETURN u1.name AS user1, u2.name AS user2
+      ORDER BY u1.name
+    expect:
+      row_count: 1
+      contains:
+        - user1: "Alice"
+          user2: "Carol"
+
+  - name: "F02: NOT EXISTS with no matches returns all pairs"
+    query: |
+      MATCH (u1:User), (u2:User)
+      WHERE u1.city = u2.city AND u1.id < u2.id
+        AND NOT EXISTS { (u1)-[:BLOCKS]->(u2) }
+      RETURN count(*) AS pair_count
+    expect:
+      row_count: 1
+      contains:
+        - pair_count: 4
+
+  - name: "F02: Cross-join without NOT EXISTS returns all same-city pairs"
+    query: |
+      MATCH (u1:User), (u2:User)
+      WHERE u1.city = u2.city AND u1.id < u2.id
+      RETURN u1.name AS user1, u2.name AS user2
+      ORDER BY u1.name, u2.name
+    expect:
+      row_count: 4
+      ordered:
+        - user1: "Alice"
+          user2: "Carol"
+        - user1: "Alice"
+          user2: "Frank"
+        - user1: "Bob"
+          user2: "Dave"
+        - user1: "Carol"
+          user2: "Frank"

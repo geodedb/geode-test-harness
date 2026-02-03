@@ -1,0 +1,171 @@
+# Regression Tests for B01-B10 Issues (2025-12-28)
+# These tests verify fixes for issues discovered during enterprise_test_advanced.gql testing
+
+name: B01-B10 Regression Tests
+version: "1.0"
+
+setup:
+  - |
+    CREATE (:NumericTest {id: 1, label: 'positive', value: 42});
+    CREATE (:NumericTest {id: 2, label: 'negative', value: -10});
+    CREATE (:NumericTest {id: 3, label: 'zero', value: 0});
+    CREATE (:NumericTest {id: 4, label: 'large', value: 999999999});
+    CREATE (:NumericTest {id: 5, label: 'small', value: -999999999});
+
+  - |
+    CREATE (:Entity {id: 1, name: 'Alpha', type: 'A'});
+    CREATE (:Entity {id: 2, name: 'Beta', type: 'B'});
+    CREATE (:Entity {id: 3, name: 'Gamma', type: 'A'});
+
+  - |
+    CREATE (:TreeNode {id: 'root', name: 'Root', level: 0});
+    CREATE (:TreeNode {id: 'a', name: 'A', level: 1});
+    CREATE (:TreeNode {id: 'b', name: 'B', level: 1});
+    CREATE (:TreeNode {id: 'a1', name: 'A1', level: 2});
+    CREATE (:TreeNode {id: 'a2', name: 'A2', level: 2});
+
+  - |
+    MATCH (root:TreeNode {id: 'root'}), (a:TreeNode {id: 'a'}) CREATE (root)-[:CHILD]->(a);
+    MATCH (root:TreeNode {id: 'root'}), (b:TreeNode {id: 'b'}) CREATE (root)-[:CHILD]->(b);
+    MATCH (a:TreeNode {id: 'a'}), (a1:TreeNode {id: 'a1'}) CREATE (a)-[:CHILD]->(a1);
+    MATCH (a:TreeNode {id: 'a'}), (a2:TreeNode {id: 'a2'}) CREATE (a)-[:CHILD]->(a2);
+
+  - |
+    CREATE (:RelTest {id: 1})-[:TEST_REL {weight: -1}]->(:RelTest {id: 2});
+
+tests:
+  # B01: Aggregation without GROUP BY should return single row
+  - name: "B01: COUNT(*) without GROUP BY returns single row"
+    query: |
+      MATCH (n:NumericTest)
+      OPTIONAL MATCH (n)-[:FAKE]->(m)
+      RETURN count(*) AS count_star, count(m) AS count_col
+    expect:
+      row_count: 1
+      contains:
+        - count_star: 5
+        - count_col: 0
+
+  - name: "B01: SUM without GROUP BY returns single row"
+    query: |
+      MATCH (n:NumericTest)
+      RETURN sum(n.value) AS total
+    expect:
+      row_count: 1
+
+  # B02: COLLECT should return aggregated list
+  - name: "B02: COLLECT with NULL values returns single row"
+    query: |
+      MATCH (n:NumericTest)
+      OPTIONAL MATCH (n)-[:FAKE]->(m)
+      RETURN collect(m.name) AS collected
+    expect:
+      row_count: 1
+
+  - name: "B02: COLLECT actual values"
+    query: |
+      MATCH (n:NumericTest)
+      RETURN collect(n.label) AS labels
+    expect:
+      row_count: 1
+
+  # B03: DISTINCT should deduplicate NULLs
+  - name: "B03: DISTINCT deduplicates NULL values"
+    query: |
+      MATCH (n:Entity)
+      OPTIONAL MATCH (n)-[:MISSING]->(m)
+      RETURN DISTINCT m.name AS missing_name
+    expect:
+      row_count: 1
+
+  # B04: COUNT DISTINCT should return aggregated result
+  - name: "B04: COUNT DISTINCT returns single row"
+    query: |
+      MATCH (n:Entity)
+      RETURN count(DISTINCT n.type) AS type_count
+    expect:
+      row_count: 1
+      contains:
+        - type_count: 2
+
+  # B05: properties() function should return property map
+  - name: "B05: properties() returns property map for nodes"
+    query: |
+      MATCH (n:Entity)
+      RETURN n.name, properties(n) AS props
+      ORDER BY n.id
+      LIMIT 1
+    expect:
+      row_count: 1
+      not_null:
+        - props
+
+  # B06: keys() function should return property keys
+  - name: "B06: keys() returns property keys for nodes"
+    query: |
+      MATCH (n:Entity)
+      RETURN n.name, keys(n) AS prop_keys
+      ORDER BY n.id
+      LIMIT 1
+    expect:
+      row_count: 1
+      not_null:
+        - prop_keys
+
+  # B07: Path *0..N should include self-match (0-length path)
+  - name: "B07: Zero-length path includes self-match"
+    query: |
+      MATCH (n:TreeNode {id: 'root'})-[:CHILD*0..1]->(m:TreeNode)
+      RETURN n.name AS start, m.name AS reached
+      ORDER BY m.name
+    expect:
+      row_count_min: 3
+      contains:
+        - start: Root
+          reached: Root
+
+  # B08: Relationship aggregation should be correct
+  - name: "B08: Relationship aggregation correct count"
+    query: |
+      MATCH ()-[r:TEST_REL]->()
+      RETURN count(*) AS rel_count, sum(r.weight) AS total_weight
+    expect:
+      row_count: 1
+      contains:
+        - rel_count: 1
+        - total_weight: -1
+
+  # B09: Multiple OPTIONAL MATCH should chain correctly
+  - name: "B09: Multiple OPTIONAL MATCH cumulative results"
+    query: |
+      MATCH (n:TreeNode {id: 'a'})
+      OPTIONAL MATCH (n)-[:CHILD]->(child)
+      OPTIONAL MATCH (n)<-[:CHILD]-(parent)
+      RETURN n.name, child.name AS child_name, parent.name AS parent_name
+    expect:
+      row_count_min: 1
+      contains_any:
+        - parent_name: Root
+
+  # B10: Parser handles NOT (expr) correctly
+  - name: "B10: NOT with parenthesized property comparison"
+    query: |
+      MATCH (n:NumericTest)
+      WHERE NOT (n.value > 0)
+      RETURN n.label
+      ORDER BY n.value
+    expect:
+      row_count: 3
+
+  - name: "B10: De Morgan's law query"
+    query: |
+      MATCH (n:NumericTest)
+      WHERE NOT (n.value > 0 AND n.value < 100)
+      RETURN n.label
+      ORDER BY n.value
+    expect:
+      row_count: 4
+
+cleanup:
+  - |
+    MATCH (n) DETACH DELETE n

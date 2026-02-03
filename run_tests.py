@@ -957,6 +957,141 @@ class NodeJSRunner(ClientRunner):
         return True
 
 
+class ShellRunner(ClientRunner):
+    """Interactive shell test runner using pexpect."""
+
+    def __init__(self, server: str, geode_binary: str = None):
+        super().__init__("shell", server)
+        self.runner_path = Path(__file__).parent / "runners" / "shell_runner.py"
+        # Use venv Python if available
+        venv_python = Path(__file__).parent / ".venv" / "bin" / "python3"
+        self.python_exe = str(venv_python) if venv_python.exists() else sys.executable
+        # Find geode binary
+        if geode_binary:
+            self.geode_binary = geode_binary
+        else:
+            # Try to find geode binary in common locations
+            for path in [
+                Path(__file__).parent.parent / "geode" / "zig-out" / "bin" / "geode",
+                Path(__file__).parent.parent / "zig-out" / "bin" / "geode",
+                Path("/usr/local/bin/geode"),
+            ]:
+                if path.exists():
+                    self.geode_binary = str(path)
+                    break
+            else:
+                self.geode_binary = "geode"  # Hope it's in PATH
+
+    async def run_test(self, spec: Dict[str, Any], test: Dict[str, Any]) -> TestResult:
+        start_time = time.time()
+
+        try:
+            # Create temporary test file
+            test_spec = {
+                "manage_server": spec.get("manage_server", False),
+                "server_options": spec.get("server_options", {}),
+                "tests": [test],
+            }
+            test_file = Path("/tmp") / f"shell_test_{test['name']}.yaml"
+            test_file.write_text(yaml.dump(test_spec, Dumper=IndentedDumper, default_flow_style=False, sort_keys=False))
+
+            # Run shell runner
+            cmd = [
+                self.python_exe,
+                str(self.runner_path),
+                "--spec", str(test_file),
+                "--server", self.server,
+                "--geode-binary", self.geode_binary,
+                "--json",
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=test.get("timeout_ms", 300000) / 1000
+            )
+
+            duration_ms = (time.time() - start_time) * 1000
+
+            if stdout:
+                try:
+                    results = json.loads(stdout.decode())
+                    # Shell runner returns a list of results
+                    if isinstance(results, list) and len(results) > 0:
+                        result = results[0]
+                        status = result.get("status", "error")
+                        return TestResult(
+                            test_name=test["name"],
+                            client="shell",
+                            status=status,
+                            duration_ms=duration_ms,
+                            details=result.get("details", {}),
+                            error_message=result.get("error") if status != "passed" else None,
+                        )
+                except json.JSONDecodeError:
+                    pass
+
+            if proc.returncode != 0:
+                return TestResult(
+                    test_name=test["name"],
+                    client="shell",
+                    status="failed",
+                    duration_ms=duration_ms,
+                    error_message=stderr.decode() if stderr else "Unknown error",
+                )
+
+            return TestResult(
+                test_name=test["name"],
+                client="shell",
+                status="error",
+                duration_ms=duration_ms,
+                error_message="Runner produced no output",
+            )
+
+        except asyncio.TimeoutError:
+            return TestResult(
+                test_name=test["name"],
+                client="shell",
+                status="error",
+                duration_ms=(time.time() - start_time) * 1000,
+                error_message="Test timed out",
+            )
+        except Exception as e:
+            return TestResult(
+                test_name=test["name"],
+                client="shell",
+                status="error",
+                duration_ms=(time.time() - start_time) * 1000,
+                error_message=str(e),
+            )
+
+    async def setup(self) -> bool:
+        """Verify shell runner exists and pexpect is available."""
+        if not self.runner_path.exists():
+            print(f"Shell runner not found: {self.runner_path}")
+            return False
+
+        # Check if pexpect is available
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.python_exe, "-c", "import pexpect",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+            if proc.returncode != 0:
+                print("pexpect not installed - shell tests will be skipped")
+                return False
+        except Exception:
+            return False
+
+        return True
+
+
 class TestHarness:
     """Main test harness coordinator."""
 
@@ -987,7 +1122,7 @@ class TestHarness:
 
         # Initialize runners (will be configured with actual server address in setup())
         self.runners: Dict[str, ClientRunner] = {}
-        self.requested_clients = clients or ["python", "go", "rust", "zig", "nodejs"]
+        self.requested_clients = clients or ["python", "go", "rust", "zig", "nodejs", "shell"]
 
     async def setup(self) -> bool:
         """Setup all runners."""
@@ -1031,6 +1166,8 @@ class TestHarness:
             temp_runners["zig"] = ZigRunner(self.server)
         if "nodejs" in self.requested_clients:
             temp_runners["nodejs"] = NodeJSRunner(self.server)
+        if "shell" in self.requested_clients:
+            temp_runners["shell"] = ShellRunner(self.server)
 
         # Setup each runner
         available_runners = {}

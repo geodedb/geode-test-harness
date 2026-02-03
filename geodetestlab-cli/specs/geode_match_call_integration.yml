@@ -1,0 +1,193 @@
+version: "1.0"
+name: "Geode MATCH + CALL Integration Tests"
+description: "Tests for MATCH + CALL pattern with graph algorithms"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "error"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # Setup test graph
+  - name: "setup-graph-data"
+    description: "Create test graph for algorithm tests"
+    args: ["query", "-"]
+    stdin: |
+      CREATE
+        (a:AlgoNode {name: 'A', id: 1}),
+        (b:AlgoNode {name: 'B', id: 2}),
+        (c:AlgoNode {name: 'C', id: 3}),
+        (d:AlgoNode {name: 'D', id: 4}),
+        (e:AlgoNode {name: 'E', id: 5}),
+        (a)-[:ROAD {weight: 1.0}]->(b),
+        (b)-[:ROAD {weight: 2.0}]->(c),
+        (a)-[:ROAD {weight: 5.0}]->(c),
+        (c)-[:ROAD {weight: 1.0}]->(d),
+        (b)-[:ROAD {weight: 3.0}]->(d),
+        (d)-[:ROAD {weight: 2.0}]->(e)
+      RETURN count(*) AS created
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["created"]
+    tags: ["setup", "graph"]
+
+  # Test shortestPath function
+  - name: "shortest-path-basic"
+    description: "Test shortestPath() function"
+    args: ["query", "-"]
+    stdin: "MATCH p = shortestPath((a:AlgoNode {name: 'A'})-[*]-(c:AlgoNode {name: 'C'})) RETURN length(p) AS path_length"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["path_length"]
+    tags: ["shortestPath", "algorithm"]
+
+  # Test variable-length paths
+  - name: "variable-length-path-1-2"
+    description: "Test variable-length path [*1..2]"
+    args: ["query", "-"]
+    stdin: "MATCH (a:AlgoNode {name: 'A'})-[*1..2]->(b:AlgoNode) RETURN b.name AS reachable ORDER BY b.name"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["reachable"]
+    tags: ["paths", "variable-length"]
+
+  # Test COUNT with path patterns
+  - name: "count-paths"
+    description: "Count paths from A"
+    args: ["query", "-"]
+    stdin: "MATCH (a:AlgoNode {name: 'A'})-[*1..3]->(b:AlgoNode) RETURN count(DISTINCT b) AS reachable_count"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["reachable_count"]
+    tags: ["paths", "aggregation"]
+
+  # Test DETACH DELETE
+  - name: "detach-delete-test-setup"
+    description: "Create node for DETACH DELETE test"
+    args: ["query", "-"]
+    stdin: "CREATE (x:TempNode {id: 999})-[:TEMP_REL]->(y:TempNode2 {id: 998}) RETURN x.id AS created"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["created"]
+    tags: ["setup", "delete"]
+
+  - name: "detach-delete-test"
+    description: "Test DETACH DELETE"
+    args: ["query", "-"]
+    stdin: "MATCH (x:TempNode {id: 999}) DETACH DELETE x"
+    expect:
+      exit_code: 0
+    tags: ["delete", "detach"]
+
+  - name: "detach-delete-verify"
+    description: "Verify DETACH DELETE worked"
+    args: ["query", "-"]
+    stdin: "MATCH (x:TempNode {id: 999}) RETURN count(x) AS remaining"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["remaining"]
+    tags: ["delete", "verify"]
+
+  # Test MERGE
+  - name: "merge-create-new"
+    description: "Test MERGE creates new node"
+    args: ["query", "-"]
+    stdin: "MERGE (m:MergeTest {id: 1}) RETURN m.id AS id"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["id"]
+    tags: ["merge", "create"]
+
+  - name: "merge-match-existing"
+    description: "Test MERGE matches existing node"
+    args: ["query", "-"]
+    stdin: "MERGE (m:MergeTest {id: 1}) RETURN m.id AS id"
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["id"]
+    tags: ["merge", "match"]
+
+  # Test REMOVE
+  - name: "remove-setup"
+    description: "Create node for REMOVE test"
+    args: ["query", "-"]
+    stdin: "CREATE (r:RemoveTest {id: 1, tag: 'to-remove'}) RETURN r.id AS id"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["id"]
+    tags: ["setup", "remove"]
+
+  - name: "remove-property"
+    description: "Test REMOVE property"
+    args: ["query", "-"]
+    stdin: "MATCH (r:RemoveTest {id: 1}) REMOVE r.tag RETURN r.id AS id, r.tag AS tag"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["id", "tag"]
+    tags: ["remove", "property"]
+
+  # Test SET without RETURN
+  - name: "set-without-return-setup"
+    description: "Create node for SET test"
+    args: ["query", "-"]
+    stdin: "CREATE (s:SetTest {id: 1, value: 'before'}) RETURN s.id AS id"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["id"]
+    tags: ["setup", "set"]
+
+  - name: "set-without-return"
+    description: "Test SET without RETURN"
+    args: ["query", "-"]
+    stdin: "MATCH (s:SetTest {id: 1}) SET s.value = 'after'"
+    expect:
+      exit_code: 0
+    tags: ["set", "mutation"]
+
+  - name: "set-verify"
+    description: "Verify SET worked"
+    args: ["query", "-"]
+    stdin: "MATCH (s:SetTest {id: 1}) RETURN s.value AS value"
+    expect:
+      exit_code: 0
+      geode_query:
+        columns: ["value"]
+    tags: ["set", "verify"]
+
+  # Cleanup
+  - name: "cleanup-test-data"
+    description: "Clean up all test data"
+    args: ["query", "-"]
+    stdin: "MATCH (n) WHERE n:AlgoNode OR n:TempNode OR n:TempNode2 OR n:MergeTest OR n:RemoveTest OR n:SetTest DELETE n"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["integration", "algorithms", "match-call"]

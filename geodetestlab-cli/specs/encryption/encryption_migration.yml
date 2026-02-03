@@ -1,0 +1,22 @@
+# Plaintext to Encrypted Migration Tests
+# CANARY: REQ=REQ-FLE-TEST-004; FEATURE="FieldLevelEncryption"; ASPECT=TESTING; STATUS=TESTED; TEST=geodetestlab/specs/fle_comprehensive_security.yml; OWNER=security; UPDATED=2025-10-15
+
+suite: encryption_migration
+description: Field-level encryption migration workflow.
+setup:
+  - gql: |
+      CREATE GRAPH TYPE Patient AS {
+        id STRING PRIMARY KEY,
+        diagnosis STRING @encrypted(alg:"AES-256-GCM") @classify(tags:["PHI"])
+      }
+steps:
+  - name: insert_encrypted_data
+    gql: |
+      CREATE (p:Patient {id:"x", diagnosis:"hypertension"})
+  - name: verify_migration_command
+    cmd: geode fle migrate-encrypt default Patient diagnosis 1000
+  - name: read_after_migration
+    gql: |
+      MATCH (p:Patient) WHERE p.id = "x" RETURN p.diagnosis
+    expect:
+      json_contains: [{ "p.diagnosis": "hypertension" }]

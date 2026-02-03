@@ -1,0 +1,398 @@
+# MFA Comprehensive Security Tests
+# Tests MFA enrollment, enable/disable, code validation, and edge cases
+#
+# CANARY: REQ=REQ-MFA-TEST-COMPREHENSIVE; FEATURE="MFA Security Testing"; ASPECT=Security; STATUS=TESTED; TEST=geodetestlab/specs/mfa_comprehensive_security.yml; OWNER=security; UPDATED=2026-01-29
+# CANARY: REQ=REQ-MFA-ENROLL-001; FEATURE="MFA Enrollment"; ASPECT=Security; STATUS=TESTED; TEST=geodetestlab/specs/mfa_comprehensive_security.yml; OWNER=security; UPDATED=2026-01-29
+
+version: "1.0"
+name: "MFA Comprehensive Security Tests"
+description: |
+  Testing of Geode's Multi-Factor Authentication (MFA) implementation.
+
+  This spec covers:
+  - MFA enrollment workflows (mfa-setup command)
+  - MFA enable/disable commands
+  - TOTP code validation
+  - Recovery code generation
+  - Edge cases and error handling
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 30000
+    format: "json"
+
+invariants:
+  - type: "server_running"
+
+tests:
+  # =============================================================================
+  # SECTION 1: MFA ENROLLMENT - BASIC WORKFLOWS
+  # =============================================================================
+
+  - name: "mfa-enrollment-basic-user-create"
+    description: "Create test user for MFA enrollment tests"
+    args: ["user", "create", "mfa_basic_user", "mfa_basic@test.com", "--password", "MFA_Basic_Test_Passphrase_2026!"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["User 'mfa_basic_user' created successfully"]
+    tags: ["mfa", "enrollment", "setup"]
+
+  - name: "mfa-enrollment-generate-secret"
+    description: "Generate MFA enrollment secret for user"
+    args: ["user", "mfa-setup", "mfa_basic_user"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["MFA secret:", "Recovery codes:"]
+      # Should contain Base32-encoded secret
+      stdout_regex: ["[A-Z2-7]{32}"]
+    tags: ["mfa", "enrollment", "secret-generation"]
+
+  - name: "mfa-enrollment-show-provisioning-uri"
+    description: "Verify provisioning URI format for authenticator apps"
+    args: ["user", "mfa-setup", "mfa_basic_user", "--show-uri"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["otpauth://totp/Geode:", "secret=", "issuer=Geode"]
+    tags: ["mfa", "enrollment", "provisioning-uri"]
+
+  - name: "mfa-enrollment-recovery-codes-count"
+    description: "Verify recovery codes are generated"
+    args: ["user", "mfa-setup", "mfa_basic_user", "--show-recovery"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Recovery codes:"]
+      # Should contain recovery codes
+      stdout_regex: ["[A-Z2-7]{8}"]
+    tags: ["mfa", "enrollment", "recovery-codes"]
+
+  - name: "mfa-enrollment-cleanup-basic"
+    description: "Clean up basic MFA test user"
+    args: ["user", "delete", "mfa_basic_user", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 2: MFA ADMIN OPERATIONS
+  # =============================================================================
+
+  - name: "mfa-admin-user-create"
+    description: "Create user for admin MFA tests"
+    args: ["user", "create", "mfa_admin_test", "mfa_admin@test.com", "--password", "Admin_MFA_Test_Passphrase_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "admin", "setup"]
+
+  - name: "mfa-admin-enable-for-user"
+    description: "Admin can enable MFA for user"
+    args: ["user", "mfa", "enable", "mfa_admin_test"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["MFA", "enabled"]
+    tags: ["mfa", "admin", "enable"]
+
+  - name: "mfa-admin-disable-for-user"
+    description: "Admin can disable MFA for user"
+    args: ["user", "mfa", "disable", "mfa_admin_test"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["MFA", "disabled"]
+    tags: ["mfa", "admin", "disable"]
+
+  - name: "mfa-admin-view-status"
+    description: "Admin can view user details"
+    args: ["user", "show", "mfa_admin_test"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "admin", "status"]
+
+  - name: "mfa-admin-cleanup"
+    description: "Clean up admin MFA test user"
+    args: ["user", "delete", "mfa_admin_test", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 3: RECOVERY CODES
+  # =============================================================================
+
+  - name: "mfa-recovery-user-create"
+    description: "Create user for recovery code tests"
+    args: ["user", "create", "mfa_recovery_user", "recovery@test.com", "--password", "Recovery_Test_Passphrase_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "recovery", "setup"]
+
+  - name: "mfa-recovery-codes-displayed"
+    description: "Recovery codes are displayed during MFA setup"
+    args: ["user", "mfa-setup", "mfa_recovery_user", "--show-recovery"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Recovery codes:"]
+      stdout_regex: ["[A-Z2-7]{8}"]
+    tags: ["mfa", "recovery", "display"]
+
+  - name: "mfa-recovery-codes-regenerate"
+    description: "Recovery codes can be regenerated"
+    args: ["user", "mfa-setup", "mfa_recovery_user", "--regenerate"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["MFA secret:", "Recovery codes:"]
+    tags: ["mfa", "recovery", "regenerate"]
+
+  - name: "mfa-recovery-cleanup"
+    description: "Clean up recovery test user"
+    args: ["user", "delete", "mfa_recovery_user", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 4: EDGE CASES - NONEXISTENT USERS
+  # =============================================================================
+
+  - name: "mfa-edge-nonexistent-user-setup"
+    description: "MFA setup for non-existent user should fail"
+    args: ["user", "mfa-setup", "definitely_does_not_exist_12345"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["does not exist"]
+    tags: ["mfa", "edge-case", "nonexistent"]
+
+  - name: "mfa-edge-nonexistent-user-enable"
+    description: "MFA enable for non-existent user should fail"
+    args: ["user", "mfa", "enable", "definitely_does_not_exist_12345"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["does not exist"]
+    tags: ["mfa", "edge-case", "nonexistent"]
+
+  - name: "mfa-edge-nonexistent-user-disable"
+    description: "MFA disable for non-existent user should fail"
+    args: ["user", "mfa", "disable", "definitely_does_not_exist_12345"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["does not exist"]
+    tags: ["mfa", "edge-case", "nonexistent"]
+
+  # =============================================================================
+  # SECTION 5: EDGE CASES - INVALID CODES
+  # =============================================================================
+
+  - name: "mfa-edge-invalid-code-user-create"
+    description: "Create user for invalid code tests"
+    args: ["user", "create", "mfa_invalid_code", "invalid@test.com", "--password", "Invalid_Code_Test_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "edge-case", "setup"]
+
+  - name: "mfa-edge-invalid-code-too-short"
+    description: "TOTP code with less than 6 digits should fail"
+    args: ["user", "mfa", "enable", "mfa_invalid_code", "--code", "123"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["invalid", "code"]
+    tags: ["mfa", "edge-case", "invalid-code"]
+
+  - name: "mfa-edge-invalid-code-too-long"
+    description: "TOTP code with more than 6 digits should fail"
+    args: ["user", "mfa", "enable", "mfa_invalid_code", "--code", "12345678"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["invalid", "code"]
+    tags: ["mfa", "edge-case", "invalid-code"]
+
+  - name: "mfa-edge-invalid-code-non-numeric"
+    description: "TOTP code with non-numeric characters should fail"
+    args: ["user", "mfa", "enable", "mfa_invalid_code", "--code", "abcdef"]
+    expect:
+      exit_code: 1
+      stderr_contains: ["invalid", "code"]
+    tags: ["mfa", "edge-case", "invalid-code"]
+
+  - name: "mfa-edge-invalid-code-cleanup"
+    description: "Clean up invalid code test user"
+    args: ["user", "delete", "mfa_invalid_code", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 6: EDGE CASES - DOUBLE ENABLE
+  # =============================================================================
+
+  - name: "mfa-edge-double-enable-user-create"
+    description: "Create user for double enable tests"
+    args: ["user", "create", "mfa_double_user", "double@test.com", "--password", "Double_Enable_Test_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "edge-case", "setup"]
+
+  - name: "mfa-edge-double-enable-first"
+    description: "First MFA enable should succeed"
+    args: ["user", "mfa", "enable", "mfa_double_user"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "edge-case", "double-enable"]
+
+  - name: "mfa-edge-double-enable-second"
+    description: "Second MFA enable should also succeed (idempotent)"
+    args: ["user", "mfa", "enable", "mfa_double_user"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "edge-case", "double-enable"]
+
+  - name: "mfa-edge-double-enable-cleanup"
+    description: "Clean up double enable test user"
+    args: ["user", "delete", "mfa_double_user", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 7: EDGE CASES - DISABLED MFA
+  # =============================================================================
+
+  - name: "mfa-edge-disabled-user-create"
+    description: "Create user for disabled MFA tests"
+    args: ["user", "create", "mfa_disabled_user", "disabled@test.com", "--password", "Disabled_MFA_Test_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "edge-case", "setup"]
+
+  - name: "mfa-edge-disabled-disable-again"
+    description: "Disabling MFA on user without MFA should be idempotent"
+    args: ["user", "mfa", "disable", "mfa_disabled_user"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "edge-case", "idempotent"]
+
+  - name: "mfa-edge-disabled-cleanup"
+    description: "Clean up disabled MFA test user"
+    args: ["user", "delete", "mfa_disabled_user", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 8: AUDIT LOGGING
+  # =============================================================================
+
+  - name: "mfa-audit-user-create"
+    description: "Create user for audit logging tests"
+    args: ["user", "create", "mfa_audit_user", "audit@test.com", "--password", "Audit_Logging_Test_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "audit", "setup"]
+
+  - name: "mfa-audit-enable-event"
+    description: "MFA enable should succeed"
+    args: ["user", "mfa", "enable", "mfa_audit_user"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "audit", "enable"]
+
+  - name: "mfa-audit-disable-event"
+    description: "MFA disable should succeed"
+    args: ["user", "mfa", "disable", "mfa_audit_user"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "audit", "disable"]
+
+  - name: "mfa-audit-cleanup"
+    description: "Clean up audit test user"
+    args: ["user", "delete", "mfa_audit_user", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 9: SPECIAL CHARACTERS IN USERNAME
+  # =============================================================================
+
+  - name: "mfa-special-user-email-create"
+    description: "Create user with email containing special characters"
+    args: ["user", "create", "mfa_special_user", "test+mfa@example.com", "--password", "Special_Char_Test_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "special-chars", "setup"]
+
+  - name: "mfa-special-provisioning-uri-encoded"
+    description: "Provisioning URI should properly URL-encode special characters"
+    args: ["user", "mfa-setup", "mfa_special_user", "--show-uri"]
+    expect:
+      exit_code: 0
+      # @ should be encoded
+      stdout_contains: ["otpauth://"]
+    tags: ["mfa", "special-chars", "url-encoding"]
+
+  - name: "mfa-special-cleanup"
+    description: "Clean up special characters test user"
+    args: ["user", "delete", "mfa_special_user", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 10: CONCURRENT ACCESS
+  # =============================================================================
+
+  - name: "mfa-concurrent-user-create"
+    description: "Create user for concurrent access tests"
+    args: ["user", "create", "mfa_concurrent", "concurrent@test.com", "--password", "Concurrent_Access_Test_2026!"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "concurrent", "setup"]
+
+  - name: "mfa-concurrent-enable"
+    description: "Enable MFA for concurrent test user"
+    args: ["user", "mfa", "enable", "mfa_concurrent"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "concurrent", "enable"]
+
+  - name: "mfa-concurrent-cleanup"
+    description: "Clean up concurrent test user"
+    args: ["user", "delete", "mfa_concurrent", "--yes"]
+    expect:
+      exit_code: 0
+    tags: ["mfa", "cleanup"]
+
+  # =============================================================================
+  # SECTION 11: HELP AND DOCUMENTATION
+  # =============================================================================
+
+  - name: "mfa-help-main"
+    description: "MFA help command should display available options"
+    args: ["user", "mfa", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["enable", "disable"]
+    tags: ["mfa", "help"]
+
+  - name: "mfa-help-setup"
+    description: "MFA setup help should explain enrollment process"
+    args: ["user", "mfa-setup", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["secret", "recovery", "authenticator"]
+    tags: ["mfa", "help"]
+
+  - name: "mfa-help-verify"
+    description: "MFA verify help should explain verification process"
+    args: ["user", "mfa-verify", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["token", "verify"]
+    tags: ["mfa", "help"]
+
+tags: ["mfa", "security", "authentication", "2fa", "totp"]

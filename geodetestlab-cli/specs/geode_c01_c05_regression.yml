@@ -1,0 +1,332 @@
+# Regression Tests for C01-C05 Issues (2025-12-28)
+# These tests verify fixes for issues discovered during enterprise_test_advanced.gql testing (Run 11)
+
+name: C01-C05 Regression Tests
+version: "1.0"
+
+setup:
+  # TreeNode hierarchy for C04 test: Root -> (A, B), A -> (A1, A2)
+  - |
+    CREATE (:TreeNode {id: 'root', name: 'Root', level: 0});
+    CREATE (:TreeNode {id: 'a', name: 'A', level: 1});
+    CREATE (:TreeNode {id: 'b', name: 'B', level: 1});
+    CREATE (:TreeNode {id: 'a1', name: 'A1', level: 2});
+    CREATE (:TreeNode {id: 'a2', name: 'A2', level: 2});
+    CREATE (:TreeNode {id: 'b1', name: 'B1', level: 2});
+
+  - |
+    MATCH (root:TreeNode {id: 'root'}), (a:TreeNode {id: 'a'}) CREATE (root)-[:CHILD]->(a);
+    MATCH (root:TreeNode {id: 'root'}), (b:TreeNode {id: 'b'}) CREATE (root)-[:CHILD]->(b);
+    MATCH (a:TreeNode {id: 'a'}), (a1:TreeNode {id: 'a1'}) CREATE (a)-[:CHILD]->(a1);
+    MATCH (a:TreeNode {id: 'a'}), (a2:TreeNode {id: 'a2'}) CREATE (a)-[:CHILD]->(a2);
+    MATCH (b:TreeNode {id: 'b'}), (b1:TreeNode {id: 'b1'}) CREATE (b)-[:CHILD]->(b1);
+
+  # Entity for C05 tests
+  - |
+    CREATE (:Entity {id: 1, name: 'Alpha', type: 'A'});
+    CREATE (:Entity {id: 2, name: 'Beta', type: 'B'});
+    CREATE (:Entity {id: 3, name: 'Gamma', type: 'A'});
+
+  # NumericTest for C03 tests
+  - |
+    CREATE (:NumericTest {id: 1, label: 'positive', value: 42});
+    CREATE (:NumericTest {id: 2, label: 'negative', value: -10});
+    CREATE (:NumericTest {id: 3, label: 'zero', value: 0});
+
+  # Person network for C01/C02 tests (EXISTS and COUNT subquery with variable-length paths)
+  - |
+    CREATE (:Person {name: 'Alice', age: 30});
+    CREATE (:Person {name: 'Bob', age: 25});
+    CREATE (:Person {name: 'Charlie', age: 35});
+    CREATE (:Person {name: 'Dave', age: 28});
+
+  - |
+    MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS]->(b);
+    MATCH (a:Person {name: 'Alice'}), (c:Person {name: 'Charlie'}) CREATE (a)-[:KNOWS]->(c);
+    MATCH (b:Person {name: 'Bob'}), (d:Person {name: 'Dave'}) CREATE (b)-[:KNOWS]->(d);
+
+tests:
+  # C04: Required MATCH after OPTIONAL MATCH must expand to all matches
+  # Bug was: only returning first match, missing A2
+  - name: "C04: Required MATCH after OPTIONAL expands to all targets"
+    query: |
+      MATCH (n:TreeNode {id: 'root'})
+      OPTIONAL MATCH (n)-[:CHILD]->(c:TreeNode)
+      MATCH (c)-[:CHILD]->(gc:TreeNode)
+      RETURN n.name AS root, c.name AS child, gc.name AS grandchild
+      ORDER BY c.name, gc.name
+    expect:
+      row_count: 3
+      contains:
+        - root: "Root"
+          child: "A"
+          grandchild: "A1"
+        - root: "Root"
+          child: "A"
+          grandchild: "A2"
+        - root: "Root"
+          child: "B"
+          grandchild: "B1"
+
+  - name: "C04: Verify all grandchildren are found"
+    query: |
+      MATCH (n:TreeNode {id: 'root'})
+      OPTIONAL MATCH (n)-[:CHILD]->(c:TreeNode)
+      MATCH (c)-[:CHILD]->(gc:TreeNode)
+      RETURN count(*) AS total_grandchild_paths
+    expect:
+      row_count: 1
+      contains:
+        - total_grandchild_paths: 3
+
+  # C05: COUNT(DISTINCT) should return 0 for empty sets, not null
+  - name: "C05: COUNT(DISTINCT) returns 0 for NULL values"
+    query: |
+      MATCH (n:Entity)
+      OPTIONAL MATCH (n)-[:MISSING]->(m)
+      RETURN count(DISTINCT m.name) AS distinct_count, count(m.name) AS total_count
+    expect:
+      row_count: 1
+      contains:
+        - distinct_count: 0
+        - total_count: 0
+
+  - name: "C05: COUNT(DISTINCT) with actual values"
+    query: |
+      MATCH (n:Entity)
+      RETURN count(DISTINCT n.type) AS type_count
+    expect:
+      row_count: 1
+      contains:
+        - type_count: 2
+
+  # C03: CASE expression with ORDER BY (was syntax error, fixed by B10)
+  - name: "C03: CASE expression with ORDER BY works"
+    query: |
+      MATCH (n:NumericTest)
+      RETURN n.label,
+        CASE WHEN n.value >= 0 THEN 'non-negative' ELSE 'negative' END AS sign_category
+      ORDER BY n.value
+    expect:
+      row_count: 3
+      ordered:
+        - label: "negative"
+          sign_category: "negative"
+        - label: "zero"
+          sign_category: "non-negative"
+        - label: "positive"
+          sign_category: "non-negative"
+
+  - name: "C03: CASE with multiple WHEN clauses"
+    query: |
+      MATCH (n:NumericTest)
+      RETURN n.label,
+        CASE
+          WHEN n.value > 0 THEN 'positive'
+          WHEN n.value < 0 THEN 'negative'
+          ELSE 'zero'
+        END AS sign
+      ORDER BY n.id
+    expect:
+      row_count: 3
+      ordered:
+        - label: "positive"
+          sign: "positive"
+        - label: "negative"
+          sign: "negative"
+        - label: "zero"
+          sign: "zero"
+
+  # C01: EXISTS with outer variable and variable-length paths
+  # Bug was: EXISTS { (a)-[:KNOWS*1..2]->(:Person) } returned 0 rows
+  - name: "C01: EXISTS with variable-length path works"
+    query: |
+      MATCH (a:Person)
+      WHERE EXISTS { (a)-[:KNOWS*1..2]->(:Person) }
+      RETURN a.name
+      ORDER BY a.name
+    expect:
+      row_count: 2
+      ordered:
+        - name: "Alice"
+        - name: "Bob"
+
+  - name: "C01: EXISTS with single-hop path still works"
+    query: |
+      MATCH (a:Person)
+      WHERE EXISTS { (a)-[:KNOWS]->(:Person) }
+      RETURN a.name
+      ORDER BY a.name
+    expect:
+      row_count: 2
+      ordered:
+        - name: "Alice"
+        - name: "Bob"
+
+  # C02: COUNT subquery with WHERE clause inside
+  # Bug was: COUNT { MATCH pattern WHERE expr } was syntax error
+  - name: "C02: COUNT subquery filters correctly"
+    query: |
+      MATCH (a:Person)
+      WHERE COUNT { (a)-[:KNOWS]->(:Person) } > 0
+      RETURN a.name
+      ORDER BY a.name
+    expect:
+      row_count: 2
+      ordered:
+        - name: "Alice"
+        - name: "Bob"
+
+  - name: "C02: COUNT subquery with WHERE inside"
+    query: |
+      MATCH (a:Person)
+      WHERE COUNT { (a)-[:KNOWS]->(b:Person) WHERE b.age > 25 } > 0
+      RETURN a.name
+      ORDER BY a.name
+    expect:
+      row_count: 2
+      ordered:
+        - name: "Alice"
+        - name: "Bob"
+
+  - name: "C02: COUNT returns exact number of matches"
+    query: |
+      MATCH (a:Person {name: 'Alice'})
+      RETURN COUNT { (a)-[:KNOWS]->(:Person) } AS knows_count
+    expect:
+      row_count: 1
+      contains:
+        - knows_count: 2
+
+  # D03: OPTIONAL MATCH property filter on target node must be applied
+  # Bug was: {level: 999} filter was ignored, returning all children
+  - name: "D03: OPTIONAL MATCH with impossible property filter returns null"
+    query: |
+      MATCH (n:TreeNode)
+      OPTIONAL MATCH (n)-[:CHILD]->(c:TreeNode {level: 999})
+      RETURN n.name, c.name AS impossible_child
+      ORDER BY n.name
+      LIMIT 5
+    expect:
+      row_count: 5
+      ordered:
+        - name: "A"
+          impossible_child: null
+        - name: "A1"
+          impossible_child: null
+        - name: "A2"
+          impossible_child: null
+        - name: "B"
+          impossible_child: null
+        - name: "B1"
+          impossible_child: null
+
+  - name: "D03: OPTIONAL MATCH with matching property filter returns values"
+    query: |
+      MATCH (n:TreeNode {id: 'root'})
+      OPTIONAL MATCH (n)-[:CHILD]->(c:TreeNode {level: 1})
+      RETURN n.name, c.name AS child
+      ORDER BY c.name
+    expect:
+      row_count: 2
+      ordered:
+        - name: "Root"
+          child: "A"
+        - name: "Root"
+          child: "B"
+
+  # D04: ORDER BY must be applied in OPTIONAL MATCH code path
+  # Bug was: executeMatchWithOptionalPatterns didn't call sortRows
+  - name: "D04: ORDER BY on string columns in OPTIONAL MATCH"
+    query: |
+      MATCH (n:Person)
+      OPTIONAL MATCH (n)-[:KNOWS]->(f:Person)
+      RETURN n.name AS person, f.name AS friend
+      ORDER BY n.name, f.name
+    expect:
+      row_count: 5
+      ordered:
+        - person: "Alice"
+          friend: "Bob"
+        - person: "Alice"
+          friend: "Charlie"
+        - person: "Bob"
+          friend: "Dave"
+        - person: "Charlie"
+          friend: null
+        - person: "Dave"
+          friend: null
+
+  - name: "D04: LIMIT with ORDER BY in OPTIONAL MATCH"
+    query: |
+      MATCH (n:TreeNode)
+      OPTIONAL MATCH (n)-[:CHILD]->(c:TreeNode)
+      RETURN n.name AS parent, c.name AS child
+      ORDER BY n.name
+      LIMIT 3
+    expect:
+      row_count: 3
+      ordered:
+        - parent: "A"
+          child: "A1"
+        - parent: "A"
+          child: "A2"
+        - parent: "A1"
+          child: null
+
+  # D05: ORDER BY on aliased columns in simple MATCH
+  # Bug was: ORDER BY n.name failed when column was aliased as "persons"
+  - name: "D05: ORDER BY with aliased column in simple MATCH"
+    query: |
+      MATCH (n:Person)
+      RETURN n.name AS persons
+      ORDER BY n.name
+    expect:
+      row_count: 4
+      ordered:
+        - persons: "Alice"
+        - persons: "Bob"
+        - persons: "Charlie"
+        - persons: "Dave"
+
+  - name: "D05: ORDER BY with aliased column DESC"
+    query: |
+      MATCH (n:Person)
+      RETURN n.name AS person_name
+      ORDER BY n.name DESC
+    expect:
+      row_count: 4
+      ordered:
+        - person_name: "Dave"
+        - person_name: "Charlie"
+        - person_name: "Bob"
+        - person_name: "Alice"
+
+  - name: "D05: ORDER BY with aliased column and LIMIT"
+    query: |
+      MATCH (n:TreeNode)
+      RETURN n.name AS node
+      ORDER BY n.name
+      LIMIT 4
+    expect:
+      row_count: 4
+      ordered:
+        - node: "A"
+        - node: "A1"
+        - node: "A1X"
+        - node: "A1Y"
+
+  - name: "D05: ORDER BY aliased expression with function call"
+    query: |
+      MATCH (n:Entity)
+      RETURN n.id AS entity_id, n.name AS entity_name
+      ORDER BY n.id
+    expect:
+      row_count: 3
+      ordered:
+        - entity_id: 1
+          entity_name: "Alpha"
+        - entity_id: 2
+          entity_name: "Beta"
+        - entity_id: 3
+          entity_name: "Gamma"

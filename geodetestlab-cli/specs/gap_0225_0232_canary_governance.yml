@@ -1,0 +1,101 @@
+# Gap 0225-0232 Regression Tests: CANARY Governance and CI Enforcement
+# CANARY: REQ=REQ-CI-CANARY-GOV-001; FEATURE="CANARY Governance Testing"; ASPECT=RegressionTesting; STATUS=TESTED; TEST=gap_0225_0232_canary_governance.yml; OWNER=governance; UPDATED=2026-01-17
+
+name: "GAP-0225-0232: CANARY Governance Regression Tests"
+description: |
+  Regression tests to ensure CANARY marker governance remains compliant.
+  These tests validate:
+  - GAP-0225: Repo-wide CANARY lint passes
+  - GAP-0226: No STATUS=IMPLEMENTED markers exist
+  - GAP-0227: canaryscan verify integration
+  - GAP-0228: Conformance sync scanner enforcement
+  - GAP-0230: REQ-GQL-TYPE-CONV-001 in status.csv
+  - GAP-0231: REQ-GQL-VALUES-MATCH-001 is TESTED
+  - GAP-0232: REQ-PERF-PHASE5-003 is BENCHED
+
+skip_server: true  # These tests run local tools, no server needed
+
+tests:
+  # GAP-0225: CANARY lint passes repo-wide
+  - name: "GAP-0225-001: CANARY lint passes repo-wide"
+    type: shell
+    command: "python3 tools/canary_lint.py --repo . --fail-on-issues"
+    expected_exit_code: 0
+    expected_output_contains:
+      - "CANARY Lint: OK"
+
+  # GAP-0226: No STATUS=IMPLEMENTED markers
+  - name: "GAP-0226-001: No STATUS=IMPLEMENTED in docs"
+    type: shell
+    command: "grep -r 'STATUS=IMPLEMENTED' docs/ || echo 'NO_MATCHES_FOUND'"
+    expected_output_contains:
+      - "NO_MATCHES_FOUND"
+
+  - name: "GAP-0226-002: No STATUS=IMPLEMENTED in src"
+    type: shell
+    command: "grep -r 'STATUS=IMPLEMENTED' src/ || echo 'NO_MATCHES_FOUND'"
+    expected_output_contains:
+      - "NO_MATCHES_FOUND"
+
+  # GAP-0230: REQ-GQL-TYPE-CONV-001 in status.csv
+  - name: "GAP-0230-001: REQ-GQL-TYPE-CONV-001 exists in status.csv"
+    type: shell
+    command: "grep 'REQ-GQL-TYPE-CONV-001' docs/status.csv | wc -l"
+    expected_output_contains:
+      - "2"  # Should have at least 2 entries
+
+  - name: "GAP-0230-002: REQ-GQL-TYPE-CONV-001 has TESTED status"
+    type: shell
+    command: "grep 'REQ-GQL-TYPE-CONV-001.*TESTED' docs/status.csv | wc -l"
+    expected_output_contains:
+      - "2"
+
+  # GAP-0231: REQ-GQL-VALUES-MATCH-001 is TESTED
+  - name: "GAP-0231-001: REQ-GQL-VALUES-MATCH-001 not IMPL"
+    type: shell
+    command: "grep 'REQ-GQL-VALUES-MATCH-001.*,IMPL,' docs/status.csv | wc -l"
+    expected_output_contains:
+      - "0"
+
+  - name: "GAP-0231-002: REQ-GQL-VALUES-MATCH-001 has TESTED status"
+    type: shell
+    command: "grep 'REQ-GQL-VALUES-MATCH-001.*TESTED' docs/status.csv | wc -l"
+    expected_output_contains:
+      - "2"
+
+  # GAP-0232: REQ-PERF-PHASE5-003 STRING_CONCAT is BENCHED
+  - name: "GAP-0232-001: REQ-PERF-PHASE5-003 STRING_CONCAT not IMPL"
+    type: shell
+    command: "grep 'REQ-PERF-PHASE5-003.*STRING_CONCAT.*,IMPL,' docs/status.csv | wc -l"
+    expected_output_contains:
+      - "0"
+
+  - name: "GAP-0232-002: REQ-PERF-PHASE5-003 STRING_CONCAT has BENCHED status"
+    type: shell
+    command: "grep 'REQ-PERF-PHASE5-003.*STRING_CONCAT.*BENCHED' docs/status.csv | wc -l"
+    expected_output_contains:
+      - "1"
+
+  # General governance checks
+  - name: "GOV-001: status.csv has >3500 entries"
+    type: shell
+    command: "wc -l < docs/status.csv"
+    expected_output_pattern: "^[3-9][0-9][0-9][0-9]"
+
+  - name: "GOV-002: No STUB entries in status.csv"
+    type: shell
+    command: "awk -F',' '$4 == \"STUB\"' docs/status.csv | wc -l"
+    expected_output_contains:
+      - "0"
+
+  - name: "GOV-003: canary_lint.py handles multiple TEST fields"
+    type: shell
+    command: "echo 'CANARY: REQ=REQ-TEST-001; FEATURE=\"Test\"; ASPECT=Unit; STATUS=TESTED; TEST=a; TEST=b; OWNER=test; UPDATED=2026-01-17' | python3 -c \"import re; import sys; pattern = __import__('importlib.util').util.spec_from_file_location('m', 'tools/canary_lint.py').loader.load_module().CANARY_COMPLETE_PATTERN; print('MATCH' if pattern.search(sys.stdin.read()) else 'NO_MATCH')\""
+    expected_output_contains:
+      - "MATCH"
+
+  - name: "GOV-004: canary_lint.py handles escaped quotes"
+    type: shell
+    command: "echo 'CANARY: REQ=REQ-TEST-001; FEATURE=\\\"Test\\\"; ASPECT=Unit; STATUS=TESTED; OWNER=test; UPDATED=2026-01-17' | python3 -c \"import re; import sys; pattern = __import__('importlib.util').util.spec_from_file_location('m', 'tools/canary_lint.py').loader.load_module().CANARY_COMPLETE_PATTERN; print('MATCH' if pattern.search(sys.stdin.read()) else 'NO_MATCH')\""
+    expected_output_contains:
+      - "MATCH"

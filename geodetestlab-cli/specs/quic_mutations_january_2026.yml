@@ -1,0 +1,138 @@
+version: "1.0"
+name: "QUIC Mutations Tests (January 2026)"
+description: "Tests for GAP-0018 - QUIC server mutation execution (CREATE/INSERT/DELETE/MERGE)"
+
+cli:
+  binary: "/usr/local/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+secrets:
+  admin_password:
+    source: "env"
+    key: "GEODE_ADMIN_PASSWORD"
+    required: false
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+  provider: "mock"
+  max_cases: 5
+  seed: 42
+  geode_specific: true
+  include_gql: true
+  include_auth: false
+
+tests:
+  # Test CREATE node via QUIC
+  - name: "quic-create-node"
+    description: "Verify CREATE node mutation works via QUIC server"
+    args: ["query", "-"]
+    stdin: "CREATE (:Person {name: 'Alice', age: 30}) RETURN 'created' AS status"
+    expect:
+      exit_code: 0
+      stdout_contains: ["created"]
+    tags: ["quic", "create", "mutation", "gap-0018"]
+
+  # Test CREATE node with multiple labels via QUIC
+  - name: "quic-create-node-multi-label"
+    description: "Create node with multiple labels"
+    args: ["query", "-"]
+    stdin: "CREATE (:Person:Employee {name: 'Bob', department: 'Engineering'}) RETURN 'created' AS status"
+    expect:
+      exit_code: 0
+      stdout_contains: ["created"]
+    tags: ["quic", "create", "mutation", "gap-0018"]
+
+  # Test CREATE relationship via QUIC
+  - name: "quic-create-relationship"
+    description: "Create relationship between nodes"
+    args: ["query", "-"]
+    stdin: "CREATE (:Manager {name: 'Carol'})-[:MANAGES]->(:Worker {name: 'Dave'}) RETURN 'created' AS status"
+    expect:
+      exit_code: 0
+      stdout_contains: ["created"]
+    tags: ["quic", "create", "relationship", "gap-0018"]
+
+  # Test query after create
+  - name: "quic-verify-created-nodes"
+    description: "Verify created nodes exist"
+    args: ["query", "-"]
+    stdin: "MATCH (p:Person) RETURN count(p) AS person_count"
+    expect:
+      exit_code: 0
+      stdout_contains: ["person_count"]
+    tags: ["quic", "query", "gap-0018"]
+
+  # Test CREATE with RETURN
+  - name: "quic-create-with-return"
+    description: "Create node and return created entity"
+    args: ["query", "-"]
+    stdin: "CREATE (n:TestQuic {value: 42}) RETURN n.value AS val"
+    expect:
+      exit_code: 0
+      stdout_contains: ["42"]
+    tags: ["quic", "create", "return", "gap-0018"]
+
+  # Test DELETE via QUIC
+  - name: "quic-delete-node"
+    description: "Delete a node via QUIC"
+    args: ["query", "-"]
+    stdin: "MATCH (t:TestQuic) DELETE t RETURN 'deleted' AS status"
+    expect:
+      exit_code: 0
+    tags: ["quic", "delete", "mutation", "gap-0018"]
+
+  # Test MERGE via QUIC (upsert behavior)
+  - name: "quic-merge-create"
+    description: "MERGE creates node if not exists"
+    args: ["query", "-"]
+    stdin: "MERGE (u:QuicUser {email: 'test@example.com'}) ON CREATE SET u.created = true RETURN u.email AS email"
+    expect:
+      exit_code: 0
+      stdout_contains: ["test@example.com"]
+    tags: ["quic", "merge", "mutation", "gap-0018"]
+
+  # Test MERGE match existing
+  - name: "quic-merge-match"
+    description: "MERGE matches existing node"
+    args: ["query", "-"]
+    stdin: "MERGE (u:QuicUser {email: 'test@example.com'}) ON MATCH SET u.updated = true RETURN u.email AS email"
+    expect:
+      exit_code: 0
+      stdout_contains: ["test@example.com"]
+    tags: ["quic", "merge", "mutation", "gap-0018"]
+
+  # Test INSERT syntax via QUIC
+  - name: "quic-insert-node"
+    description: "INSERT syntax for node creation"
+    args: ["query", "-"]
+    stdin: "INSERT (:QuicItem {sku: 'ABC123', price: 19.99}) RETURN 'inserted' AS status"
+    expect:
+      exit_code: 0
+    tags: ["quic", "insert", "mutation", "gap-0018"]
+
+  # Cleanup test nodes
+  - name: "quic-cleanup-test-nodes"
+    description: "Clean up all test nodes"
+    args: ["query", "-"]
+    stdin: "MATCH (n) WHERE n:QuicUser OR n:QuicItem OR n:Manager OR n:Worker DELETE n"
+    expect:
+      exit_code: 0
+    tags: ["cleanup", "gap-0018"]

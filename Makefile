@@ -11,6 +11,10 @@
 .PHONY: analyze-perf analyze-coverage test-with-coverage
 .PHONY: migrate migrate-status migrate-create test-graph
 .PHONY: route-failures route-failures-dry-run
+.PHONY: test-cli test-cli-comprehensive geodetestlab-setup geodetestlab-run
+.PHONY: test-shell test-shell-all test-shell-comprehensive
+.PHONY: test-full test-full-parallel
+.PHONY: test-unit test-unit-verbose
 
 # Default target: run full test suite with Docker
 all: clean docker-start test-all docker-stop
@@ -96,6 +100,25 @@ help:
 	@echo "  test-auth        - Run authentication tests"
 	@echo "  test-perf        - Run performance benchmarks"
 	@echo "  test-graph       - Run graph query tests (requires migrations)"
+	@echo ""
+	@echo "CLI Tests (geodetestlab-cli):"
+	@echo "  geodetestlab-setup      - Setup geodetestlab-cli environment"
+	@echo "  test-cli                - Run CLI tests"
+	@echo "  test-cli-comprehensive  - Run comprehensive CLI tests"
+	@echo "  geodetestlab-run SPEC=  - Run specific CLI spec file"
+	@echo ""
+	@echo "Shell Tests (shell_runner.py):"
+	@echo "  test-shell              - Run all shell tests (each manages own server)"
+	@echo "  test-shell-spec SPEC=   - Run single shell spec"
+	@echo "  test-shell-all          - Run all shell tests with JSON output"
+	@echo ""
+	@echo "Combined Tests:"
+	@echo "  test-full               - Run geodetestlab + shell tests sequentially"
+	@echo "  test-full-parallel      - Run geodetestlab + shell tests in parallel"
+	@echo ""
+	@echo "Unit Tests (test harness internals):"
+	@echo "  test-unit               - Run unit tests for shared lib modules"
+	@echo "  test-unit-verbose       - Run unit tests with verbose output"
 	@echo ""
 	@echo "Analysis:"
 	@echo "  test-with-coverage - Run tests and generate coverage report"
@@ -340,6 +363,159 @@ test-graph: setup
 	@echo "Running graph query tests (with migrations)..."
 	@mkdir -p reports
 	$(RUN_PYTHON) run_tests.py --spec specs/graph.yaml --verbose --report-json reports/graph_results.json
+
+# ==============================================================================
+# CLI Tests (geodetestlab-cli)
+# ==============================================================================
+
+# Path to geodetestlab-cli
+GEODETESTLAB_CLI := geodetestlab-cli
+GEODETESTLAB_VENV := $(GEODETESTLAB_CLI)/.venv
+GEODETESTLAB_PYTHON := $(GEODETESTLAB_VENV)/bin/python3
+GEODETESTLAB_PIP := $(GEODETESTLAB_VENV)/bin/pip
+
+# Setup geodetestlab-cli environment
+geodetestlab-setup:
+	@echo "Setting up geodetestlab-cli..."
+	@if [ ! -d "$(GEODETESTLAB_VENV)" ]; then \
+		$(PYTHON) -m venv $(GEODETESTLAB_VENV); \
+	fi
+	@$(GEODETESTLAB_PIP) install --upgrade pip
+	@$(GEODETESTLAB_PIP) install -e $(GEODETESTLAB_CLI)
+	@echo "geodetestlab-cli setup complete"
+
+# Run geodetestlab CLI tests (requires server)
+test-cli: geodetestlab-setup
+	@echo "Running CLI tests with geodetestlab..."
+	@mkdir -p reports
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_results.json
+
+# Run comprehensive CLI tests
+test-cli-comprehensive: geodetestlab-setup
+	@echo "Running comprehensive CLI tests with geodetestlab..."
+	@mkdir -p reports
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_comprehensive.json --verbose
+
+# Run specific CLI spec
+geodetestlab-run: geodetestlab-setup
+	@if [ -z "$(SPEC)" ]; then \
+		echo "Usage: make geodetestlab-run SPEC=spec_name.yml"; \
+		exit 1; \
+	fi
+	@echo "Running $(SPEC)..."
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs/$(SPEC) --verbose
+
+# ==============================================================================
+# Shell Tests (shell_runner.py - manages own server)
+# ==============================================================================
+
+# Shell test configuration
+SHELL_RUNNER := runners/shell_runner.py
+SHELL_SPECS := $(wildcard specs/shell*.yaml)
+GEODE_BINARY ?= ../geode/zig-out/bin/geode
+
+# Run all shell tests (each spec manages its own server)
+test-shell: setup
+	@echo "Running shell tests..."
+	@mkdir -p reports
+	@PASSED=0; FAILED=0; \
+	for spec in $(SHELL_SPECS); do \
+		echo "Running: $$spec"; \
+		if $(RUN_PYTHON) $(SHELL_RUNNER) --spec $$spec --geode-binary $(GEODE_BINARY) --verbose; then \
+			PASSED=$$((PASSED + 1)); \
+		else \
+			FAILED=$$((FAILED + 1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "Shell Tests: $$PASSED passed, $$FAILED failed"; \
+	[ $$FAILED -eq 0 ]
+
+# Run a single shell spec
+test-shell-spec: setup
+	@if [ -z "$(SPEC)" ]; then \
+		echo "Usage: make test-shell-spec SPEC=shell_basic.yaml"; \
+		exit 1; \
+	fi
+	@echo "Running shell spec: $(SPEC)"
+	$(RUN_PYTHON) $(SHELL_RUNNER) --spec specs/$(SPEC) --geode-binary $(GEODE_BINARY) --verbose --json
+
+# Run shell tests with JSON output
+test-shell-all: setup
+	@echo "Running all shell tests with JSON reports..."
+	@mkdir -p reports
+	@for spec in $(SHELL_SPECS); do \
+		name=$$(basename $$spec .yaml); \
+		echo "Running: $$name"; \
+		$(RUN_PYTHON) $(SHELL_RUNNER) --spec $$spec --geode-binary $(GEODE_BINARY) --json > reports/$${name}_results.json 2>&1 || true; \
+	done
+	@echo "Shell test reports written to reports/"
+
+# ==============================================================================
+# Combined Tests (geodetestlab + shell tests in parallel)
+# ==============================================================================
+
+# Run both geodetestlab and shell tests sequentially
+test-full: geodetestlab-setup setup
+	@echo "Running full test suite (geodetestlab + shell tests)..."
+	@mkdir -p reports
+	@echo ""
+	@echo "=== Running geodetestlab CLI tests ==="
+	-$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_results.json --verbose
+	@echo ""
+	@echo "=== Running shell tests ==="
+	-$(MAKE) test-shell
+	@echo ""
+	@echo "Full test suite complete. Reports in reports/"
+
+# Run both geodetestlab and shell tests in parallel (background jobs)
+test-full-parallel: geodetestlab-setup setup
+	@echo "Running full test suite in PARALLEL (geodetestlab + shell tests)..."
+	@mkdir -p reports
+	@echo ""
+	@echo "Starting geodetestlab CLI tests in background..."
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_results.json --verbose > reports/geodetestlab.log 2>&1 &
+	@CLI_PID=$$!; \
+	echo "geodetestlab PID: $$CLI_PID"; \
+	echo ""; \
+	echo "Starting shell tests in background..."; \
+	$(MAKE) test-shell > reports/shell_tests.log 2>&1 & \
+	SHELL_PID=$$!; \
+	echo "shell tests PID: $$SHELL_PID"; \
+	echo ""; \
+	echo "Waiting for both test suites to complete..."; \
+	CLI_EXIT=0; SHELL_EXIT=0; \
+	wait $$CLI_PID || CLI_EXIT=$$?; \
+	wait $$SHELL_PID || SHELL_EXIT=$$?; \
+	echo ""; \
+	echo "=== Test Results ==="; \
+	if [ $$CLI_EXIT -eq 0 ]; then \
+		echo "geodetestlab: PASSED"; \
+	else \
+		echo "geodetestlab: FAILED (see reports/geodetestlab.log)"; \
+	fi; \
+	if [ $$SHELL_EXIT -eq 0 ]; then \
+		echo "shell tests:  PASSED"; \
+	else \
+		echo "shell tests:  FAILED (see reports/shell_tests.log)"; \
+	fi; \
+	echo ""; \
+	echo "Full test logs: reports/geodetestlab.log, reports/shell_tests.log"; \
+	[ $$CLI_EXIT -eq 0 ] && [ $$SHELL_EXIT -eq 0 ]
+
+# ==============================================================================
+# Unit Tests (for test harness internals)
+# ==============================================================================
+
+# Run unit tests for shared lib modules
+test-unit: setup
+	@echo "Running unit tests..."
+	$(VENV_PYTHON) -m pytest tests/ -v
+
+# Run unit tests with verbose output
+test-unit-verbose: setup
+	@echo "Running unit tests (verbose)..."
+	$(VENV_PYTHON) -m pytest tests/ -v --tb=long
 
 # ==============================================================================
 # Reporting & Analysis

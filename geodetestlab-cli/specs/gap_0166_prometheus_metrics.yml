@@ -1,0 +1,91 @@
+# CANARY: REQ=REQ-PROMETHEUS-WIRE-005; FEATURE="Prometheus Metrics Endpoint Testing"; ASPECT=Integration; STATUS=TESTED; TEST=geodetestlab/specs/gap_0166_prometheus_metrics.yml; OWNER=monitoring; UPDATED=2026-01-14
+# GAP-0166: Prometheus metrics exporter wired to runtime endpoint
+# This spec tests that the Prometheus metrics endpoint is functional
+
+name: gap_0166_prometheus_metrics
+description: Tests for GAP-0166 Prometheus metrics endpoint wiring
+version: "1.0"
+
+# Test environment configuration
+environment:
+  server:
+    mode: embedded
+    metrics_enabled: true
+    metrics_port: 9091
+  cleanup: true
+
+tests:
+  # Test 1: Verify metrics endpoint responds
+  - name: metrics_endpoint_available
+    description: Prometheus metrics endpoint should respond with 200
+    type: http
+    requests:
+      - method: GET
+        url: "http://localhost:9091/metrics"
+        expect:
+          status_code: 200
+          content_type: "text/plain"
+          body_contains:
+            - "geode_queries_total"
+            - "geode_connections_active"
+
+  # Test 2: Verify health endpoint responds
+  - name: health_endpoint_available
+    description: Health check endpoint should respond with 200
+    type: http
+    requests:
+      - method: GET
+        url: "http://localhost:9091/health"
+        expect:
+          status_code: 200
+          content_type: "application/json"
+          body_contains:
+            - "status"
+            - "ok"
+
+  # Test 3: Verify query metrics are updated
+  - name: query_metrics_increment
+    description: Query execution should increment metrics
+    type: sequential
+    steps:
+      # Execute some queries
+      - type: gql
+        query: "RETURN 1 AS x"
+        expect:
+          status_class: "00000"
+      - type: gql
+        query: "RETURN 2 AS y"
+        expect:
+          status_class: "00000"
+      # Check metrics were updated
+      - type: http
+        method: GET
+        url: "http://localhost:9091/metrics"
+        expect:
+          status_code: 200
+          body_contains:
+            - "geode_queries_total"
+
+  # Test 4: Verify 404 for unknown paths
+  - name: unknown_path_returns_404
+    description: Unknown paths should return 404
+    type: http
+    requests:
+      - method: GET
+        url: "http://localhost:9091/unknown"
+        expect:
+          status_code: 404
+
+  # Test 5: Verify metric types are correct
+  - name: metric_types_correct
+    description: Metric types should follow Prometheus format
+    type: http
+    requests:
+      - method: GET
+        url: "http://localhost:9091/metrics"
+        expect:
+          status_code: 200
+          body_contains:
+            - "# TYPE geode_queries_total counter"
+            - "# TYPE geode_connections_active gauge"
+            - "# HELP geode_queries_total"

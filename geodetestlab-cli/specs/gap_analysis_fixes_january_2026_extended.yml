@@ -1,0 +1,228 @@
+version: "1.0"
+name: "Gap Analysis Fixes Extended Tests (January 2026)"
+description: "Tests for GAP-0020 through GAP-0025 implementations: constraints, PITR, multi-tenancy, FLE rewriting, TDE page storage"
+
+cli:
+  binary: "/usr/local/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+secrets:
+  admin_password:
+    source: "env"
+    key: "GEODE_ADMIN_PASSWORD"
+    required: false
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+  provider: "mock"
+  max_cases: 5
+  seed: 42
+  geode_specific: true
+  include_gql: true
+  include_auth: false
+
+tests:
+  # GAP-0020: CREATE CONSTRAINT Tests
+  - name: "constraint-create-unique"
+    description: "Create a UNIQUE constraint on a label property"
+    skip: true
+    skip_reason: "CREATE CONSTRAINT syntax not yet implemented"
+    args: ["query", "-"]
+    stdin: "CREATE CONSTRAINT unique_person_email IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS UNIQUE"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Constraint"]
+    tags: ["constraint", "unique", "gap-0020"]
+
+  - name: "constraint-create-node-key"
+    description: "Create a NODE KEY constraint"
+    skip: true
+    skip_reason: "CREATE CONSTRAINT syntax not yet implemented"
+    args: ["query", "-"]
+    stdin: "CREATE CONSTRAINT person_key IF NOT EXISTS FOR (p:Person) REQUIRE (p.id) IS NODE KEY"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Constraint"]
+    tags: ["constraint", "node-key", "gap-0020"]
+
+  - name: "constraint-create-not-null"
+    description: "Create a NOT NULL constraint"
+    skip: true
+    skip_reason: "CREATE CONSTRAINT syntax not yet implemented"
+    args: ["query", "-"]
+    stdin: "CREATE CONSTRAINT person_name_required IF NOT EXISTS FOR (p:Person) REQUIRE p.name IS NOT NULL"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Constraint"]
+    tags: ["constraint", "not-null", "gap-0020"]
+
+  - name: "constraint-show-all"
+    description: "Show all constraints in the database"
+    skip: true
+    skip_reason: "SHOW CONSTRAINTS not yet implemented"
+    args: ["query", "-"]
+    stdin: "SHOW CONSTRAINTS"
+    expect:
+      exit_code: 0
+    tags: ["constraint", "show", "gap-0020"]
+
+  - name: "constraint-drop"
+    description: "Drop a constraint by name"
+    skip: true
+    skip_reason: "DROP CONSTRAINT syntax not yet implemented"
+    args: ["query", "-"]
+    stdin: "DROP CONSTRAINT unique_person_email IF EXISTS"
+    expect:
+      exit_code: 0
+    tags: ["constraint", "drop", "gap-0020"]
+
+  # GAP-0021: Recursive CTE Tests
+  - name: "recursive-cte-simple"
+    description: "Simple recursive CTE for number sequence"
+    args: ["query", "-"]
+    stdin: "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums"
+    expect:
+      exit_code: 0
+    skip: true  # Parser scaffold - advanced recursive CTE execution pending
+    tags: ["cte", "recursive", "gap-0021"]
+
+  - name: "variable-length-path"
+    description: "Variable-length path as CTE alternative"
+    args: ["query", "-"]
+    stdin: "MATCH path = (a:Person)-[:KNOWS*1..3]->(b:Person) WHERE a.name = 'Alice' RETURN length(path) AS hops, b.name AS reachable"
+    expect:
+      exit_code: 0
+    tags: ["path", "variable-length", "gap-0021"]
+
+  - name: "shortest-path-query"
+    description: "Shortest path computation"
+    args: ["query", "-"]
+    stdin: "MATCH p = SHORTEST (a:Person)-[:KNOWS*]->(b:Person) WHERE a.name = 'Alice' AND b.name = 'Bob' RETURN length(p) AS distance"
+    expect:
+      exit_code: 0
+    tags: ["path", "shortest", "gap-0021"]
+
+  # GAP-0022: Point-in-Time Recovery Tests
+  - name: "backup-create-full"
+    description: "Create a full backup"
+    args: ["backup", "create", "--destination", "/tmp/geode_test_backup"]
+    expect:
+      exit_code: 0
+    skip: true  # Requires proper backup directory setup
+    tags: ["backup", "pitr", "gap-0022"]
+
+  - name: "backup-list"
+    description: "List available backups"
+    args: ["backup", "list"]
+    expect:
+      exit_code: 0
+    tags: ["backup", "list", "gap-0022"]
+
+  # GAP-0023: Multi-Tenancy Tests
+  - name: "session-set-tenant"
+    description: "Set tenant context for session"
+    args: ["query", "-"]
+    stdin: "SESSION SET tenant_id = 'tenant_001'"
+    expect:
+      exit_code: 0
+    skip: true  # Session tenant not yet exposed in GQL syntax
+    tags: ["multi-tenancy", "session", "gap-0023"]
+
+  - name: "create-tenant-node"
+    description: "Create node in default tenant context"
+    args: ["query", "-"]
+    stdin: "CREATE (n:TenantTest {tenant: 'default', name: 'test_node'}) RETURN n.name AS name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["test_node"]
+    tags: ["multi-tenancy", "create", "gap-0023"]
+
+  # GAP-0024: FLE Predicate Rewriting Tests
+  - name: "fle-create-encrypted-type"
+    description: "Create a type with encrypted field annotations"
+    args: ["query", "-"]
+    stdin: "CREATE (n:SecureRecord {ssn: '123-45-6789', name: 'Test User'}) RETURN n.name AS name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Test User"]
+    tags: ["fle", "encryption", "gap-0024"]
+
+  - name: "fle-query-encrypted-field"
+    description: "Query on encrypted field (should use blind index if configured)"
+    args: ["query", "-"]
+    stdin: "MATCH (n:SecureRecord) WHERE n.name = 'Test User' RETURN n.name AS name"
+    expect:
+      exit_code: 0
+    tags: ["fle", "query", "gap-0024"]
+
+  # GAP-0025: TDE Page Storage Tests
+  - name: "tde-status-check"
+    description: "Check TDE encryption status"
+    args: ["query", "-"]
+    stdin: "CALL db.encryption.status()"
+    expect:
+      exit_code: 0
+    skip: true  # TDE status procedure not yet exposed
+    tags: ["tde", "encryption", "gap-0025"]
+
+  - name: "create-and-read-node"
+    description: "Create and read node to verify page storage round-trip"
+    args: ["query", "-"]
+    stdin: "CREATE (n:StorageTest {id: 12345, data: 'encrypted_content'}) RETURN n.id AS id, n.data AS data"
+    expect:
+      exit_code: 0
+      stdout_contains: ["12345", "encrypted_content"]
+    tags: ["tde", "storage", "gap-0025"]
+
+  - name: "read-created-node"
+    description: "Read back the created node to verify storage persistence"
+    args: ["query", "-"]
+    stdin: "MATCH (n:StorageTest) WHERE n.id = 12345 RETURN n.data AS data"
+    expect:
+      exit_code: 0
+      stdout_contains: ["encrypted_content"]
+    tags: ["tde", "storage", "gap-0025"]
+
+  # Combined Integration Tests
+  - name: "integration-constraint-and-insert"
+    description: "Test constraint with data insertion"
+    args: ["query", "-"]
+    stdin: "CREATE (n:ConstraintedNode {unique_id: 'int_test_001', value: 100}) RETURN n.unique_id AS id"
+    expect:
+      exit_code: 0
+      stdout_contains: ["int_test_001"]
+    tags: ["integration", "constraint"]
+
+  - name: "integration-multi-tenant-isolation"
+    description: "Verify tenant isolation in queries"
+    args: ["query", "-"]
+    stdin: "MATCH (n:TenantTest) RETURN count(n) AS count"
+    expect:
+      exit_code: 0
+    tags: ["integration", "multi-tenancy"]
+
+  - name: "cleanup-test-nodes"
+    description: "Clean up test nodes"
+    args: ["query", "-"]
+    stdin: "MATCH (n) WHERE n.name = 'test_node' OR n:StorageTest OR n:ConstraintedNode OR n:SecureRecord OR n:TenantTest DELETE n"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]

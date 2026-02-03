@@ -1,0 +1,416 @@
+# Network Types Validation Test Suite
+# Tests the Network Types implementation (IpAddr, Subnet, Mac) with GQL integration
+# CANARY: REQ=REQ-GQL-NET-TYPES-GEODETESTLAB; FEATURE="Network Types Geodetestlab Tests"; ASPECT=Testing; STATUS=EXEMPT; TEST=TestCANARY_REQ_GQL_NET_TYPES_GEODETESTLAB_All; OWNER=testing; UPDATED=2025-01-03
+
+name: "Network Types Validation"
+description: "Comprehensive validation of network types (IpAddr, Subnet, Mac) integration with GQL"
+
+setup:
+  - name: "Start embedded geode server"
+    command: "echo 'Using embedded server mode for all tests'"
+
+tests:
+  # IPv4 Address Tests
+  - name: "ipv4_address_basic_construction"
+    description: "Test basic IPv4 address construction and validation"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('192.168.1.100') AS addr"]
+    expect_output: |
+      addr
+      192.168.1.100
+    expect_exit_code: 0
+
+  - name: "ipv4_address_properties"
+    description: "Test IPv4 address property detection"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('192.168.1.1').isPrivate() AS is_private, IpAddr('8.8.8.8').isPrivate() AS is_public"]
+    expect_output: |
+      is_private	is_public
+      true	false
+    expect_exit_code: 0
+
+  - name: "ipv4_loopback_detection"
+    description: "Test IPv4 loopback address detection"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('127.0.0.1').isLoopback() AS is_loopback"]
+    expect_output: |
+      is_loopback
+      true
+    expect_exit_code: 0
+
+  - name: "ipv4_multicast_detection"
+    description: "Test IPv4 multicast address detection"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('224.1.1.1').isMulticast() AS is_multicast"]
+    expect_output: |
+      is_multicast
+      true
+    expect_exit_code: 0
+
+  # IPv6 Address Tests
+  - name: "ipv6_address_basic_construction"
+    description: "Test basic IPv6 address construction"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('2001:db8::1') AS addr"]
+    expect_output: |
+      addr
+      2001:db8::1
+    expect_exit_code: 0
+
+  - name: "ipv6_loopback_detection"
+    description: "Test IPv6 loopback address detection"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('::1').isLoopback() AS is_loopback"]
+    expect_output: |
+      is_loopback
+      true
+    expect_exit_code: 0
+
+  - name: "ipv6_multicast_detection"
+    description: "Test IPv6 multicast address detection"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('ff02::1').isMulticast() AS is_multicast"]
+    expect_output: |
+      is_multicast
+      true
+    expect_exit_code: 0
+
+  - name: "ipv6_zero_compression"
+    description: "Test IPv6 zero compression handling"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('2001:0db8:0000:0000:0000:0000:0000:0001') AS compressed"]
+    expect_output: |
+      compressed
+      2001:db8::1
+    expect_exit_code: 0
+
+  # Subnet Tests
+  - name: "ipv4_subnet_basic_construction"
+    description: "Test basic IPv4 subnet construction"
+    command: "geode"
+    args: ["query", "RETURN Subnet('192.168.1.0/24') AS subnet"]
+    expect_output: |
+      subnet
+      192.168.1.0/24
+    expect_exit_code: 0
+
+  - name: "ipv4_subnet_containment"
+    description: "Test IPv4 subnet containment checks"
+    command: "geode"
+    args: ["query", "RETURN Subnet('192.168.1.0/24').contains(IpAddr('192.168.1.100')) AS contains_addr"]
+    expect_output: |
+      contains_addr
+      true
+    expect_exit_code: 0
+
+  - name: "ipv4_subnet_non_containment"
+    description: "Test IPv4 subnet non-containment"
+    command: "geode"
+    args: ["query", "RETURN Subnet('192.168.1.0/24').contains(IpAddr('192.168.2.100')) AS contains_addr"]
+    expect_output: |
+      contains_addr
+      false
+    expect_exit_code: 0
+
+  - name: "ipv4_subnet_host_count"
+    description: "Test IPv4 subnet host count calculation"
+    command: "geode"
+    args: ["query", "RETURN Subnet('192.168.1.0/24').hostCount() AS host_count"]
+    expect_output: |
+      host_count
+      256
+    expect_exit_code: 0
+
+  - name: "ipv6_subnet_basic_construction"
+    description: "Test basic IPv6 subnet construction"
+    command: "geode"
+    args: ["query", "RETURN Subnet('2001:db8::/32') AS subnet"]
+    expect_output: |
+      subnet
+      2001:db8::/32
+    expect_exit_code: 0
+
+  - name: "ipv6_subnet_containment"
+    description: "Test IPv6 subnet containment checks"
+    command: "geode"
+    args: ["query", "RETURN Subnet('2001:db8::/64').contains(IpAddr('2001:db8::1')) AS contains_addr"]
+    expect_output: |
+      contains_addr
+      true
+    expect_exit_code: 0
+
+  - name: "subnet_overlap_detection"
+    description: "Test subnet overlap detection"
+    command: "geode"
+    args: ["query", "RETURN Subnet('10.0.0.0/16').overlaps(Subnet('10.0.1.0/24')) AS overlaps"]
+    expect_output: |
+      overlaps
+      true
+    expect_exit_code: 0
+
+  - name: "subnet_no_overlap_detection"
+    description: "Test subnet non-overlap detection"
+    command: "geode"
+    args: ["query", "RETURN Subnet('10.0.0.0/16').overlaps(Subnet('172.16.0.0/16')) AS overlaps"]
+    expect_output: |
+      overlaps
+      false
+    expect_exit_code: 0
+
+  # MAC Address Tests
+  - name: "mac_address_colon_format"
+    description: "Test MAC address construction with colon format"
+    command: "geode"
+    args: ["query", "RETURN Mac('AA:BB:CC:DD:EE:FF') AS mac"]
+    expect_output: |
+      mac
+      aa:bb:cc:dd:ee:ff
+    expect_exit_code: 0
+
+  - name: "mac_address_hyphen_format"
+    description: "Test MAC address construction with hyphen format"
+    command: "geode"
+    args: ["query", "RETURN Mac('aa-bb-cc-dd-ee-ff') AS mac"]
+    expect_output: |
+      mac
+      aa:bb:cc:dd:ee:ff
+    expect_exit_code: 0
+
+  - name: "mac_address_compact_format"
+    description: "Test MAC address construction with compact format"
+    command: "geode"
+    args: ["query", "RETURN Mac('AABBCCDDEEFF') AS mac"]
+    expect_output: |
+      mac
+      aa:bb:cc:dd:ee:ff
+    expect_exit_code: 0
+
+  - name: "mac_address_oui_extraction"
+    description: "Test MAC address OUI extraction"
+    command: "geode"
+    args: ["query", "RETURN Mac('00:50:56:12:34:56').getOui() AS oui"]
+    expect_output: |
+      oui
+      00:50:56
+    expect_exit_code: 0
+
+  - name: "mac_address_nic_extraction"
+    description: "Test MAC address NIC-specific part extraction"
+    command: "geode"
+    args: ["query", "RETURN Mac('00:50:56:12:34:56').getNicSpecific() AS nic"]
+    expect_output: |
+      nic
+      12:34:56
+    expect_exit_code: 0
+
+  - name: "mac_address_unicast_detection"
+    description: "Test MAC address unicast detection"
+    command: "geode"
+    args: ["query", "RETURN Mac('00:11:22:33:44:55').isUnicast() AS is_unicast"]
+    expect_output: |
+      is_unicast
+      true
+    expect_exit_code: 0
+
+  - name: "mac_address_multicast_detection"
+    description: "Test MAC address multicast detection"
+    command: "geode"
+    args: ["query", "RETURN Mac('01:11:22:33:44:55').isMulticast() AS is_multicast"]
+    expect_output: |
+      is_multicast
+      true
+    expect_exit_code: 0
+
+  - name: "mac_address_locally_administered"
+    description: "Test MAC address locally administered detection"
+    command: "geode"
+    args: ["query", "RETURN Mac('02:11:22:33:44:55').isLocallyAdministered() AS is_local"]
+    expect_output: |
+      is_local
+      true
+    expect_exit_code: 0
+
+  - name: "mac_address_globally_unique"
+    description: "Test MAC address globally unique detection"
+    command: "geode"
+    args: ["query", "RETURN Mac('00:11:22:33:44:55').isGloballyUnique() AS is_global"]
+    expect_output: |
+      is_global
+      true
+    expect_exit_code: 0
+
+  - name: "mac_address_broadcast_detection"
+    description: "Test MAC address broadcast detection"
+    command: "geode"
+    args: ["query", "RETURN Mac('FF:FF:FF:FF:FF:FF').isBroadcast() AS is_broadcast"]
+    expect_output: |
+      is_broadcast
+      true
+    expect_exit_code: 0
+
+  - name: "mac_address_null_detection"
+    description: "Test MAC address null detection"
+    command: "geode"
+    args: ["query", "RETURN Mac('00:00:00:00:00:00').isNull() AS is_null"]
+    expect_output: |
+      is_null
+      true
+    expect_exit_code: 0
+
+  # Network Types in Graph Patterns
+  - name: "network_types_in_node_properties"
+    description: "Test network types as node properties"
+    command: "geode"
+    args: ["query", "CREATE (n:Device {ip: IpAddr('192.168.1.100'), subnet: Subnet('192.168.1.0/24'), mac: Mac('AA:BB:CC:DD:EE:FF')}) RETURN n.ip AS ip, n.subnet AS subnet, n.mac AS mac"]
+    expect_output: |
+      ip	subnet	mac
+      192.168.1.100	192.168.1.0/24	aa:bb:cc:dd:ee:ff
+    expect_exit_code: 0
+
+  - name: "network_types_filtering"
+    description: "Test filtering nodes by network properties"
+    command: "geode"
+    args: ["query", "CREATE (n1:Device {ip: IpAddr('192.168.1.100')}), (n2:Device {ip: IpAddr('10.0.0.100')}) WITH n1, n2 MATCH (n:Device) WHERE n.ip.isPrivate() RETURN n.ip AS private_ip ORDER BY private_ip"]
+    expect_output: |
+      private_ip
+      10.0.0.100
+      192.168.1.100
+    expect_exit_code: 0
+
+  - name: "subnet_containment_in_where_clause"
+    description: "Test subnet containment in WHERE clauses"
+    command: "geode"
+    args: ["query", "CREATE (n1:Device {ip: IpAddr('192.168.1.100')}), (n2:Device {ip: IpAddr('172.16.1.100')}) WITH n1, n2 MATCH (n:Device) WHERE Subnet('192.168.0.0/16').contains(n.ip) RETURN n.ip AS contained_ip"]
+    expect_output: |
+      contained_ip
+      192.168.1.100
+    expect_exit_code: 0
+
+  # Network Type Comparisons
+  - name: "ip_address_equality"
+    description: "Test IP address equality comparisons"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('192.168.1.1') = IpAddr('192.168.1.1') AS equal, IpAddr('192.168.1.1') = IpAddr('192.168.1.2') AS not_equal"]
+    expect_output: |
+      equal	not_equal
+      true	false
+    expect_exit_code: 0
+
+  - name: "mac_address_comparison"
+    description: "Test MAC address ordering and comparison"
+    command: "geode"
+    args: ["query", "RETURN Mac('00:11:22:33:44:55') < Mac('00:11:22:33:44:56') AS less_than, Mac('AA:BB:CC:DD:EE:FF') > Mac('00:11:22:33:44:55') AS greater_than"]
+    expect_output: |
+      less_than	greater_than
+      true	true
+    expect_exit_code: 0
+
+  # Error Handling Tests
+  - name: "invalid_ipv4_format_error"
+    description: "Test error handling for invalid IPv4 format"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('256.1.1.1') AS invalid"]
+    expect_exit_code: 1
+    expect_error: "InvalidIPv4Format"
+
+  - name: "invalid_ipv6_format_error"
+    description: "Test error handling for invalid IPv6 format"
+    command: "geode"
+    args: ["query", "RETURN IpAddr('gggg::1') AS invalid"]
+    expect_exit_code: 1
+    expect_error: "InvalidIPv6Format"
+
+  - name: "invalid_subnet_format_error"
+    description: "Test error handling for invalid subnet format"
+    command: "geode"
+    args: ["query", "RETURN Subnet('192.168.1.0') AS invalid"]
+    expect_exit_code: 1
+    expect_error: "InvalidCIDRFormat"
+
+  - name: "invalid_subnet_prefix_error"
+    description: "Test error handling for invalid subnet prefix length"
+    command: "geode"
+    args: ["query", "RETURN Subnet('192.168.1.0/33') AS invalid"]
+    expect_exit_code: 1
+    expect_error: "InvalidPrefixLength"
+
+  - name: "invalid_mac_format_error"
+    description: "Test error handling for invalid MAC format"
+    command: "geode"
+    args: ["query", "RETURN Mac('GG:BB:CC:DD:EE:FF') AS invalid"]
+    expect_exit_code: 1
+    expect_error: "InvalidMacFormat"
+
+  # Advanced Network Operations
+  - name: "network_aggregation_operations"
+    description: "Test aggregation operations with network types"
+    command: "geode"
+    args: ["query", "CREATE (n1:Device {mac: Mac('00:11:22:33:44:55')}), (n2:Device {mac: Mac('00:11:22:33:44:56')}), (n3:Device {mac: Mac('00:11:22:33:44:57')}) WITH n1, n2, n3 MATCH (n:Device) RETURN COUNT(n.mac) AS mac_count, MIN(n.mac) AS min_mac, MAX(n.mac) AS max_mac"]
+    expect_output: |
+      mac_count	min_mac	max_mac
+      3	00:11:22:33:44:55	00:11:22:33:44:57
+    expect_exit_code: 0
+
+  - name: "network_types_in_lists"
+    description: "Test network types in list operations"
+    command: "geode"
+    args: ["query", "RETURN [IpAddr('192.168.1.1'), IpAddr('192.168.1.2'), IpAddr('192.168.1.3')] AS ip_list"]
+    expect_output: |
+      ip_list
+      [192.168.1.1, 192.168.1.2, 192.168.1.3]
+    expect_exit_code: 0
+
+  - name: "network_types_in_maps"
+    description: "Test network types as map values"
+    command: "geode"
+    args: ["query", "RETURN {server_ip: IpAddr('192.168.1.100'), client_ip: IpAddr('192.168.1.200')} AS network_config"]
+    expect_output: |
+      network_config
+      {server_ip: 192.168.1.100, client_ip: 192.168.1.200}
+    expect_exit_code: 0
+
+  # Integration with Existing GQL Functions
+  - name: "network_types_with_toString"
+    description: "Test network types with toString() function"
+    command: "geode"
+    args: ["query", "RETURN toString(IpAddr('192.168.1.100')) AS ip_string, toString(Mac('AA:BB:CC:DD:EE:FF')) AS mac_string"]
+    expect_output: |
+      ip_string	mac_string
+      192.168.1.100	aa:bb:cc:dd:ee:ff
+    expect_exit_code: 0
+
+  - name: "network_types_with_type_function"
+    description: "Test network types with type() function"
+    command: "geode"
+    args: ["query", "RETURN type(IpAddr('192.168.1.100')) AS ip_type, type(Mac('AA:BB:CC:DD:EE:FF')) AS mac_type"]
+    expect_output: |
+      ip_type	mac_type
+      IpAddr	Mac
+    expect_exit_code: 0
+
+  # Performance and Memory Tests
+  - name: "large_network_dataset_performance"
+    description: "Test performance with many network objects"
+    command: "geode"
+    # UNWIND is not GQL-compliant - replaced with simpler test
+    # Original: args: ["query", "UNWIND range(1, 100) AS i CREATE (n:Device {id: i, ip: IpAddr('192.168.1.' + toString(i)), mac: Mac('00:11:22:33:44:' + toString(i % 256))}) RETURN COUNT(n) AS device_count"]
+    args: ["query", "CREATE (n1:Device {id: 1, ip: IpAddr('192.168.1.1'), mac: Mac('00:11:22:33:44:01')}), (n2:Device {id: 2, ip: IpAddr('192.168.1.2'), mac: Mac('00:11:22:33:44:02')}) RETURN COUNT(*) AS device_count"]
+    expect_output: |
+      device_count
+      2
+    expect_exit_code: 0
+
+  - name: "network_type_memory_efficiency"
+    description: "Test memory efficiency of network types in large graphs"
+    command: "geode"
+    args: ["query", "MATCH (n:Device) WHERE n.ip.isPrivate() AND n.mac.isUnicast() RETURN COUNT(n) AS efficient_count"]
+    expect_output: |
+      efficient_count
+      100
+    expect_exit_code: 0
+
+cleanup:
+  - name: "Clear test data"
+    command: "geode"
+    args: ["query", "MATCH (n) DETACH DELETE n"]
+    expect_exit_code: 0

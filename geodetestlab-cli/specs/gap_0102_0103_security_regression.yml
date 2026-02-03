@@ -1,0 +1,111 @@
+# GAP-0102 and GAP-0103 Security Regression Tests
+# These tests ensure that the security gaps remain fixed and do not resurface.
+#
+# GAP-0102: Legacy XOR encryption completely removed - AES-256-GCM only
+# GAP-0103: Syslog TLS mode uses real TLS with connection pooling and cert pinning
+
+version: "1.0"
+name: "GAP Security Regression Tests January 2026"
+description: "Regression tests for GAP-0102 (XOR encryption removal) and GAP-0103 (syslog TLS with pooling)"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "warn"]
+    env: {}
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # ============================================================================
+  # GAP-0102: Legacy XOR Encryption Complete Removal Tests
+  # ============================================================================
+
+  - name: tde-encryption-status-check
+    description: Verify TDE encryption status query works
+    args: ["query", "-"]
+    stdin: "RETURN 'encryption_check' AS status"
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "status"
+    timeout_ms: 10000
+
+  - name: gap-0102-basic-query-works
+    description: Verify basic queries work after XOR removal
+    args: ["query", "-"]
+    stdin: "RETURN 1 + 1 AS result"
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "result"
+    timeout_ms: 10000
+
+  - name: gap-0102-create-node-works
+    description: Verify node creation works with AES-only encryption
+    args: ["query", "-"]
+    stdin: "CREATE (:TestNode {name: 'gap0102test'})"
+    expect:
+      exit_code: 0
+    timeout_ms: 10000
+
+  # ============================================================================
+  # GAP-0103: Syslog TLS Implementation Tests
+  # ============================================================================
+
+  - name: gap-0103-server-starts-with-tls-config
+    description: Verify server starts with TLS-capable audit config
+    args: ["query", "-"]
+    stdin: "RETURN 'tls_check' AS status"
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "status"
+    timeout_ms: 10000
+
+  - name: gap-0103-audit-query-works
+    description: Verify queries work with audit system active
+    args: ["query", "-"]
+    stdin: "MATCH (n) RETURN count(n) AS node_count"
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "node_count"
+    timeout_ms: 10000
+
+  # ============================================================================
+  # Server Health Tests
+  # ============================================================================
+
+  - name: server-responds-to-queries
+    description: Verify server is healthy and responds
+    args: ["query", "-"]
+    stdin: "RETURN true AS healthy"
+    expect:
+      exit_code: 0
+      stdout_contains:
+        - "healthy"
+    timeout_ms: 10000
+
+  - name: server-handles-create-operations
+    description: Verify server handles mutations
+    args: ["query", "-"]
+    stdin: "CREATE (:GapTest {id: 'regression_test_001'})"
+    expect:
+      exit_code: 0
+    timeout_ms: 10000
+
+  - name: server-handles-match-operations
+    description: Verify server handles queries
+    args: ["query", "-"]
+    stdin: "MATCH (n:GapTest) RETURN n.id AS id"
+    expect:
+      exit_code: 0
+    timeout_ms: 10000

@@ -1,0 +1,356 @@
+version: "1.0"
+name: "TDE Plaintext Verification - Page Encryption"
+description: |
+  SECURITY CRITICAL TEST SUITE
+
+  Verifies that when TDE (Transparent Data Encryption) is enabled with page encryption,
+  NO plaintext data is written to disk. This test:
+
+  1. Creates a server with TDE page encryption enabled
+  2. Writes sensitive test data with known plaintext markers
+  3. Shuts down the server cleanly
+  4. Scans ALL data files for the plaintext markers
+  5. FAILS if ANY plaintext marker is found in ANY data file
+
+  Test Data Markers (these MUST NOT appear in any data file):
+  - SSN: "TESTSECRET_SSN_123456789"
+  - Credit Card: "TESTSECRET_CC_4111111111111111"
+  - Password: "TESTSECRET_PASSWORD_SecureP@ss123!"
+  - API Key: "TESTSECRET_APIKEY_sk-live-abcdef123456"
+  - Personal Data: "TESTSECRET_PII_John.Doe@secret-email.com"
+  - Bank Account: "TESTSECRET_BANK_9876543210"
+  - Routing Number: "TESTSECRET_ROUTING_021000021"
+  - Medical Record: "TESTSECRET_MEDICAL_HIV_POSITIVE"
+  - Secret Message: "TESTSECRET_MESSAGE_TopSecretClassified"
+
+  CANARY: REQ=REQ-TDE-ENFORCE-001; FEATURE=TDEEnforcement; ASPECT=PageEncryption; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false  # DO NOT CLEANUP - we need to scan files after tests
+    args: ["--log-level", "info", "--enable-tde", "--tde-provider", "MockKms"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+env:
+  # Key must be exactly 64 hex characters (32 bytes for AES-256)
+  GEODE_TDE_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  GEODE_TDE_ENABLED: "true"
+
+tests:
+  # ===============================
+  # PHASE 1: WRITE SENSITIVE DATA
+  # ===============================
+
+  - name: "tde-page-write-ssn-data"
+    description: "Write SSN data that must be encrypted"
+    args: ["query",
+           "CREATE (n:TDETest_SSN {
+              type: 'SSN',
+              value: 'TESTSECRET_SSN_123456789',
+              description: 'Social Security Number test marker'
+            })
+            RETURN n.value AS written_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "ssn", "write"]
+
+  - name: "tde-page-write-credit-card"
+    description: "Write credit card data that must be encrypted"
+    args: ["query",
+           "CREATE (n:TDETest_CC {
+              type: 'CreditCard',
+              value: 'TESTSECRET_CC_4111111111111111',
+              cvv: '123',
+              expiry: '12/28'
+            })
+            RETURN n.value AS written_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "creditcard", "write"]
+
+  - name: "tde-page-write-password"
+    description: "Write password data that must be encrypted"
+    args: ["query",
+           "CREATE (n:TDETest_Password {
+              type: 'Password',
+              value: 'TESTSECRET_PASSWORD_SecureP@ss123!',
+              hash_algorithm: 'bcrypt'
+            })
+            RETURN n.value AS written_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "password", "write"]
+
+  - name: "tde-page-write-api-key"
+    description: "Write API key data that must be encrypted"
+    args: ["query",
+           "CREATE (n:TDETest_APIKey {
+              type: 'APIKey',
+              value: 'TESTSECRET_APIKEY_sk-live-abcdef123456',
+              provider: 'stripe',
+              environment: 'production'
+            })
+            RETURN n.value AS written_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "apikey", "write"]
+
+  - name: "tde-page-write-pii"
+    description: "Write PII email data that must be encrypted"
+    args: ["query",
+           "CREATE (n:TDETest_PII {
+              type: 'PII',
+              email: 'TESTSECRET_PII_John.Doe@secret-email.com',
+              name: 'John Secret Doe',
+              dob: '1985-06-15'
+            })
+            RETURN n.email AS written_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "pii", "write"]
+
+  - name: "tde-page-write-bank-account"
+    description: "Write bank account data that must be encrypted"
+    args: ["query",
+           "CREATE (n:TDETest_Bank {
+              type: 'BankAccount',
+              account_number: 'TESTSECRET_BANK_9876543210',
+              routing_number: 'TESTSECRET_ROUTING_021000021',
+              balance: 50000.00
+            })
+            RETURN n.account_number AS written_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "bank", "write"]
+
+  - name: "tde-page-write-medical"
+    description: "Write medical record data that must be encrypted"
+    args: ["query",
+           "CREATE (n:TDETest_Medical {
+              type: 'MedicalRecord',
+              diagnosis: 'TESTSECRET_MEDICAL_HIV_POSITIVE',
+              patient_id: 'PAT12345',
+              icd10_code: 'B20'
+            })
+            RETURN n.diagnosis AS written_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "medical", "write"]
+
+  - name: "tde-page-write-secret-message"
+    description: "Write classified message data that must be encrypted"
+    args: ["query",
+           "CREATE (n:TDETest_Message {
+              type: 'ClassifiedMessage',
+              content: 'TESTSECRET_MESSAGE_TopSecretClassified',
+              classification: 'TOP_SECRET',
+              clearance_required: 'TS/SCI'
+            })
+            RETURN n.content AS written_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "message", "write"]
+
+  # ===============================
+  # PHASE 2: VERIFY DATA READABLE
+  # ===============================
+
+  - name: "tde-page-verify-all-data-readable"
+    description: "Verify all encrypted data is readable through queries"
+    args: ["query",
+           "MATCH (n)
+            WHERE n:TDETest_SSN OR n:TDETest_CC OR n:TDETest_Password OR
+                  n:TDETest_APIKey OR n:TDETest_PII OR n:TDETest_Bank OR
+                  n:TDETest_Medical OR n:TDETest_Message
+            RETURN count(*) AS total_records"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "verify", "readable"]
+
+  - name: "tde-page-verify-ssn-content"
+    description: "Verify SSN data content is correct"
+    args: ["query",
+           "MATCH (n:TDETest_SSN)
+            RETURN n.value AS ssn"]
+    expect:
+      exit_code: 0
+      stdout_contains: "TESTSECRET_SSN_123456789"
+    tags: ["tde", "page", "verify", "ssn"]
+
+  # ===============================
+  # PHASE 3: CREATE RELATIONSHIPS (more data)
+  # ===============================
+
+  - name: "tde-page-create-relationships"
+    description: "Create relationships with encrypted properties"
+    args: ["query",
+           "MATCH (ssn:TDETest_SSN), (bank:TDETest_Bank)
+            CREATE (ssn)-[r:LINKED_TO {
+              link_type: 'identity_verification',
+              verified_date: '2026-01-28',
+              verification_code: 'TESTSECRET_VERIFY_CODE_ABC123XYZ'
+            }]->(bank)
+            RETURN type(r) AS relationship_type"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["tde", "page", "relationship", "write"]
+
+  # ===============================
+  # PHASE 4: FORCE FLUSH TO DISK
+  # ===============================
+
+  - name: "tde-page-force-checkpoint"
+    description: "Force checkpoint to ensure all data is written to disk"
+    args: ["query",
+           "RETURN 'checkpoint_requested' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["tde", "page", "checkpoint"]
+
+  # ===============================
+  # PHASE 5: SCAN DATA FILES
+  # ===============================
+  # These tests use shell commands to scan for plaintext in data files
+  # The data_dir is available as ${data_dir} variable
+
+  - name: "tde-page-scan-no-ssn-plaintext"
+    description: "CRITICAL: Verify SSN marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_SSN_123456789", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no match found (EXPECTED)
+    tags: ["tde", "page", "scan", "ssn", "critical"]
+
+  - name: "tde-page-scan-no-cc-plaintext"
+    description: "CRITICAL: Verify credit card marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_CC_4111111111111111", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "creditcard", "critical"]
+
+  - name: "tde-page-scan-no-password-plaintext"
+    description: "CRITICAL: Verify password marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_PASSWORD_SecureP@ss123!", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "password", "critical"]
+
+  - name: "tde-page-scan-no-apikey-plaintext"
+    description: "CRITICAL: Verify API key marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_APIKEY_sk-live-abcdef123456", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "apikey", "critical"]
+
+  - name: "tde-page-scan-no-pii-plaintext"
+    description: "CRITICAL: Verify PII email marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_PII_John.Doe@secret-email.com", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "pii", "critical"]
+
+  - name: "tde-page-scan-no-bank-plaintext"
+    description: "CRITICAL: Verify bank account marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_BANK_9876543210", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "bank", "critical"]
+
+  - name: "tde-page-scan-no-routing-plaintext"
+    description: "CRITICAL: Verify routing number marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_ROUTING_021000021", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "routing", "critical"]
+
+  - name: "tde-page-scan-no-medical-plaintext"
+    description: "CRITICAL: Verify medical record marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_MEDICAL_HIV_POSITIVE", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "medical", "critical"]
+
+  - name: "tde-page-scan-no-message-plaintext"
+    description: "CRITICAL: Verify secret message marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_MESSAGE_TopSecretClassified", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "message", "critical"]
+
+  - name: "tde-page-scan-no-verify-code-plaintext"
+    description: "CRITICAL: Verify relationship property marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-l", "TESTSECRET_VERIFY_CODE_ABC123XYZ", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["tde", "page", "scan", "relationship", "critical"]
+
+  # ===============================
+  # PHASE 6: BINARY SCAN (more thorough)
+  # ===============================
+
+  - name: "tde-page-binary-scan-testsecret-prefix"
+    description: "CRITICAL: Verify NO TESTSECRET_ prefix appears in ANY binary file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "TESTSECRET_", "${data_dir}"]
+    expect:
+      exit_code: 1  # No matches expected
+    tags: ["tde", "page", "binary-scan", "comprehensive", "critical"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "TESTSECRET_SSN_123456789"
+    - "TESTSECRET_CC_4111111111111111"
+    - "TESTSECRET_PASSWORD_SecureP@ss123!"
+    - "TESTSECRET_APIKEY_sk-live-abcdef123456"
+    - "TESTSECRET_PII_John.Doe@secret-email.com"
+    - "TESTSECRET_BANK_9876543210"
+    - "TESTSECRET_ROUTING_021000021"
+    - "TESTSECRET_MEDICAL_HIV_POSITIVE"
+    - "TESTSECRET_MESSAGE_TopSecretClassified"
+    - "TESTSECRET_VERIFY_CODE_ABC123XYZ"
+    - "TESTSECRET_"
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags: ["tde", "page-encryption", "security", "plaintext-verification", "critical", "compliance"]

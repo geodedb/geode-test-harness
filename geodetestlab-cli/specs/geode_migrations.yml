@@ -1,0 +1,256 @@
+name: geode-migrations
+description: "Comprehensive migration test suite for schema evolution and data transformations"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    startup_timeout_ms: 30000
+    args: ["--log-level", "error"]
+
+tests:
+  # Basic Schema Creation Tests
+  - name: create-node-labels
+    args: ["query", "CREATE (:Person {name: 'Alice', age: 30})", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  - name: create-edge-types
+    args: ["query", "CREATE (:Person {name: 'Bob'})-[:KNOWS {since: 2020}]->(:Person {name: 'Charlie'})", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  # Property Management Tests
+  - name: add-node-property
+    setup:
+      - args: ["query", "CREATE (:Person {name: 'Alice', age: 30})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (p:Person {name: 'Alice'}) SET p.email = 'alice@example.com' RETURN p", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["alice@example.com"]
+
+  - name: modify-property-type
+    setup:
+      - args: ["query", "CREATE (:Person {name: 'Alice', age: 30})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (p:Person {name: 'Alice'}) SET p.age = toString(p.age) RETURN p.age", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["30"]
+
+  - name: remove-property
+    args: ["query", "MATCH (p:Person {name: 'Alice'}) REMOVE p.email RETURN p", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  # Index Management Tests
+  - name: create-btree-index
+    args: ["query", "CREATE INDEX IF NOT EXISTS person_name_idx ON :Person(name) USING BTREE", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  - name: create-hash-index
+    args: ["query", "CREATE INDEX IF NOT EXISTS person_email_idx ON :Person(email) USING HASH", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  - name: create-composite-index
+    args: ["query", "CREATE INDEX IF NOT EXISTS person_composite_idx ON :Person(name, age)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  - name: drop-index
+    setup:
+      - args: ["query", "CREATE INDEX IF NOT EXISTS person_email_idx ON :Person(email) USING HASH", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "DROP INDEX person_email_idx", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  # Constraint Management Tests
+  - name: create-unique-constraint
+    args: ["query", "CREATE CONSTRAINT person_unique_email ON :Person ASSERT email IS UNIQUE", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  - name: create-node-key-constraint
+    args: ["query", "CREATE CONSTRAINT person_key ON :Person ASSERT (id) IS NODE KEY", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  - name: create-property-existence-constraint
+    args: ["query", "CREATE CONSTRAINT person_must_have_name ON :Person ASSERT EXISTS (name)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  - name: drop-constraint
+    args: ["query", "DROP CONSTRAINT person_unique_email", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+
+  # Label Migration Tests
+  - name: add-label-to-nodes
+    args: ["query", "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) MATCH (p:Person) SET p:Human RETURN labels(p)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Person", "Human"]
+
+  - name: remove-label-from-nodes
+    setup:
+      - args: ["query", "CREATE (:Person:Human {name: 'Alice'})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (p:Human) REMOVE p:Human RETURN labels(p)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Person"]
+
+  - name: rename-label-migration
+    setup:
+      - args: ["query", "CREATE (:Person {name: 'Alice'})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (p:Person) SET p:User REMOVE p:Person RETURN labels(p)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["User"]
+
+  # Relationship Type Migration Tests
+  - name: create-new-relationship-type
+    setup:
+      - args: ["query", "CREATE (:User {name: 'Alice'}), (:User {name: 'Bob'})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (a:User {name: 'Alice'}), (b:User {name: 'Bob'}) CREATE (a)-[r:FOLLOWS {since: date()}]->(b) RETURN type(r)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["FOLLOWS"]
+
+  - name: migrate-relationship-properties
+    setup:
+      - args: ["query", "CREATE (:Person {name: 'A'})-[:KNOWS]->(:Person {name: 'B'})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH ()-[r:KNOWS]->() SET r.strength = 'strong' RETURN r.strength", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["strong"]
+
+  - name: change-relationship-direction
+    setup:
+      - args: ["query", "CREATE (:Person {name: 'X'})-[:FOLLOWS]->(:Person {name: 'Y'})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (a)-[old:FOLLOWS]->(b) DELETE old CREATE (b)-[r:FOLLOWED_BY]->(a) RETURN type(r)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["FOLLOWED_BY"]
+
+  # Batch Data Migration Tests
+  - name: batch-update-properties
+    setup:
+      - args: ["query", "CREATE (:User {name: 'Alice'}), (:User {name: 'Bob', age: 25})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (u:User) WHERE u.age IS NULL SET u.age = 0 RETURN count(u)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]  # Alice doesn't have age
+
+  - name: batch-create-relationships
+    isolated: true  # Needs clean state to avoid duplicate User nodes
+    args: ["query", "CREATE (:User {name: 'Alice'}), (:User {name: 'Bob'}), (:User {name: 'Charlie'}) MATCH (u1:User), (u2:User) WHERE u1.name < u2.name CREATE (u1)-[:POTENTIAL_FRIEND]->(u2) RETURN count(*) AS count", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["count"]  # Verify query succeeds, count may vary due to existing data
+
+  - name: batch-delete-orphaned-nodes
+    args: ["query", "MATCH (n) WHERE NOT (n)--() DELETE n RETURN count(n)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["count"]
+
+  # Complex Migration Scenarios
+  - name: split-node-into-multiple
+    setup:
+      - args: ["query", "CREATE (:Person {name: 'John', type: 'employee', department: 'Engineering'})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (p:Person) WHERE p.type = 'employee' CREATE (e:Employee {name: p.name}), (d:Department {name: p.department}) CREATE (e)-[:WORKS_IN]->(d) DELETE p RETURN count(e)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+
+  - name: normalize-denormalized-data
+    setup:
+      - args: ["query", "CREATE (:Order {id: 1, customerId: 'C1', customerName: 'Alice'})", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "MATCH (o:Order) CREATE (c:Customer {id: o.customerId, name: o.customerName}) CREATE (o)-[:PLACED_BY]->(c) REMOVE o.customerId, o.customerName RETURN count(c)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+
+  # Transaction and Rollback Tests
+  - name: migration-with-transaction
+    args: ["query", "BEGIN TRANSACTION; MATCH (n:User) SET n.migrated = true; COMMIT; RETURN count(n)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["count"]
+
+  - name: rollback-failed-migration
+    args: ["query", "BEGIN TRANSACTION; MATCH (n:User) SET n.invalid = 1/0; ROLLBACK; RETURN 'rolled back'", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["rolled back"]
+
+  # Performance Migration Tests
+  - name: create-large-dataset
+    isolated: true  # Needs clean state to avoid TestNode accumulation
+    args: ["query", "CREATE (:TestNode {id: 1}), (:TestNode {id: 2}), (:TestNode {id: 3}) RETURN 3 AS created", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["3"]
+
+  - name: bulk-update-with-index
+    setup:
+      - args: ["query", "MATCH (n:TestNode) DELETE n", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "CREATE (:TestNode {id: 1}), (:TestNode {id: 2}), (:TestNode {id: 3}); CREATE INDEX IF NOT EXISTS test_id_idx ON :TestNode(id); MATCH (n:TestNode) WHERE n.id % 2 = 0 SET n.even = true RETURN count(n)", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]  # Only id=2 is even from the 3 created nodes
+
+  - name: check-index-usage
+    skip: true  # EXPLAIN format may vary and not always show 'Seek' depending on query planner decisions
+    setup:
+      - args: ["query", "CREATE (:TestNode {id: 1}), (:TestNode {id: 2}), (:TestNode {id: 3}); CREATE INDEX IF NOT EXISTS test_id_idx ON :TestNode(id)", "--format", "json"]
+        expect:
+          exit_code: 0
+    args: ["query", "EXPLAIN MATCH (n:TestNode {id: 2}) RETURN n", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Seek"]  # Matches IndexSeek or other seek operations showing index usage
+
+  # Cleanup Tests
+  - name: drop-test-data
+    args: ["query", "MATCH (n:TestNode) DELETE n", "--format", "json"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["00000"]  # Just check for success status

@@ -1,0 +1,460 @@
+version: "1.0"
+name: "Shell Advanced Edge Case Tests"
+description: "Advanced edge case tests from enterprise_test_advanced.gql covering NULL semantics, numeric edge cases, path patterns, aggregation corner cases"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+
+tests:
+  # Section 1: Setup
+  - name: "setup-advanced-graph"
+    description: "Create advanced test graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "CREATE GRAPH IF NOT EXISTS advanced_test; USE GRAPH advanced_test; MATCH (n) DETACH DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["setup"]
+
+  - name: "create-entity-nodes"
+    description: "Create entity nodes with edge case properties"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; CREATE (:Entity {id: 1, name: '', type: 'empty_name'}); CREATE (:Entity {id: 2, name: 'Normal', type: 'standard'}); CREATE (:Entity {id: 3, name: 'A', type: 'single_char'});"
+    expect:
+      exit_code: 0
+    tags: ["setup", "create"]
+
+  - name: "create-numeric-test-nodes"
+    description: "Create numeric test nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; CREATE (:NumericTest {id: 1, value: 0, label: 'zero'}); CREATE (:NumericTest {id: 2, value: -1, label: 'negative_one'}); CREATE (:NumericTest {id: 3, value: 1, label: 'one'}); CREATE (:NumericTest {id: 4, value: 999999999, label: 'large'});"
+    expect:
+      exit_code: 0
+    tags: ["setup", "create"]
+
+  - name: "create-bool-test-nodes"
+    description: "Create boolean test nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; CREATE (:BoolTest {id: 1, flag: true, name: 'true_flag'}); CREATE (:BoolTest {id: 2, flag: false, name: 'false_flag'});"
+    expect:
+      exit_code: 0
+    tags: ["setup", "create"]
+
+  - name: "create-list-nodes"
+    description: "Create list property nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; CREATE (:ListNode {id: 1, tags: ['a', 'b', 'c'], scores: [1, 2, 3]}); CREATE (:ListNode {id: 2, tags: [], scores: []}); CREATE (:ListNode {id: 3, tags: ['single'], scores: [42]});"
+    expect:
+      exit_code: 0
+    tags: ["setup", "create"]
+
+  # Section 2: NULL Semantics (Three-Valued Logic)
+  - name: "null-and-true"
+    description: "NULL AND true"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN null AND true AS result;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["null", "logic"]
+
+  - name: "null-and-false"
+    description: "NULL AND false = false"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN null AND false AS result;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["false"]
+    tags: ["null", "logic"]
+
+  - name: "null-or-true"
+    description: "NULL OR true = true"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN null OR true AS result;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["null", "logic"]
+
+  - name: "null-or-false"
+    description: "NULL OR false"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN null OR false AS result;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["null", "logic"]
+
+  - name: "not-null"
+    description: "NOT null = null"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN NOT null AS negated_null;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["null", "logic"]
+
+  - name: "null-equals-null"
+    description: "null = null returns null"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN null = null AS result;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["null", "comparison"]
+
+  - name: "null-comparison"
+    description: "NULL in comparison"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN null > 5 AS gt, null < 5 AS lt;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["null", "comparison"]
+
+  - name: "coalesce-with-nulls"
+    description: "COALESCE with multiple NULLs"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN coalesce(null, null, null, 'found') AS first_non_null;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["found"]
+    tags: ["null", "coalesce"]
+
+  - name: "coalesce-all-nulls"
+    description: "COALESCE all NULLs"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN coalesce(null, null, null) AS all_nulls;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["null", "coalesce"]
+
+  - name: "null-arithmetic"
+    description: "NULL in arithmetic"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN null + 1 AS null_plus, 5 * null AS null_mult;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["null", "arithmetic"]
+
+  # Section 3: Numeric Edge Cases
+  - name: "division-behavior"
+    description: "Division behavior"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 10 / 3 AS int_div, 10.0 / 3 AS float_div;"
+    expect:
+      exit_code: 0
+    tags: ["numeric", "division"]
+
+  - name: "modulo-negative"
+    description: "Modulo with negative numbers"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN -10 % 3 AS neg_mod, 10 % -3 AS mod_neg;"
+    expect:
+      exit_code: 0
+    tags: ["numeric", "modulo"]
+
+  - name: "sign-function"
+    description: "Sign function edge cases"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN sign(0) AS zero_sign, sign(100) AS pos_sign, sign(-100) AS neg_sign;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["zero_sign", "pos_sign", "neg_sign"]
+    tags: ["numeric", "function"]
+
+  - name: "power-operator"
+    description: "Power operator"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 2 ^ 10 AS two_pow_ten, 10 ^ 0 AS any_pow_zero, 0 ^ 5 AS zero_pow;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1024", "1", "0"]
+    tags: ["numeric", "power"]
+
+  - name: "floor-ceil-behavior"
+    description: "Floor and ceil behavior"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN floor(3.7) AS f1, floor(-3.7) AS f2, ceil(3.2) AS c1, ceil(-3.2) AS c2;"
+    expect:
+      exit_code: 0
+    tags: ["numeric", "rounding"]
+
+  # Section 4: String Edge Cases
+  - name: "empty-string-ops"
+    description: "Empty string operations"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN '' = '' AS empty_eq, size('') AS empty_size, '' + 'x' AS empty_concat;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true", "0"]
+    tags: ["string", "edge"]
+
+  - name: "case-conversion"
+    description: "Case conversion edge cases"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN upper('') AS upper_empty, lower('') AS lower_empty;"
+    expect:
+      exit_code: 0
+    tags: ["string", "case"]
+
+  - name: "contains-empty"
+    description: "String contains with empty"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 'hello' CONTAINS '' AS contains_empty;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["string", "predicate"]
+
+  - name: "starts-ends-empty"
+    description: "Starts/ends with empty"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 'hello' STARTS WITH '' AS starts_empty, 'hello' ENDS WITH '' AS ends_empty;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["string", "predicate"]
+
+  - name: "ltrim-rtrim"
+    description: "LTRIM and RTRIM functions"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN ltrim('  hello  ') AS ltrimmed, rtrim('  hello  ') AS rtrimmed;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["hello"]
+    tags: ["string", "function"]
+
+  - name: "left-right-zero"
+    description: "LEFT/RIGHT with 0"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN left('hello', 0) AS left_zero, right('hello', 0) AS right_zero;"
+    expect:
+      exit_code: 0
+    tags: ["string", "function"]
+
+  # Section 5: List Edge Cases
+  - name: "empty-list-concat"
+    description: "Empty list concatenation"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [] + [] AS empty_concat, [] + [1] AS empty_plus;"
+    expect:
+      exit_code: 0
+    tags: ["list", "concat"]
+
+  - name: "list-with-null"
+    description: "List with NULL elements"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [1, null, 3] AS with_null;"
+    expect:
+      exit_code: 0
+    tags: ["list", "null"]
+
+  - name: "nested-lists"
+    description: "Nested lists"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [[1,2], [3,4]] AS nested, [[]] AS nested_empty, [[[1]]] AS triple_nested;"
+    expect:
+      exit_code: 0
+    tags: ["list", "nested"]
+
+  - name: "list-index-edge"
+    description: "List indexing edge cases"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [1,2,3][10] AS beyond_idx, [][0] AS empty_idx;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["list", "index"]
+
+  - name: "in-empty-list"
+    description: "IN empty list"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 1 IN [] AS in_empty;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["false"]
+    tags: ["list", "predicate"]
+
+  - name: "list-reverse"
+    description: "List reverse"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN reverse([]) AS rev_empty, reverse([1]) AS rev_single, reverse([1,2,3]) AS rev_multi;"
+    expect:
+      exit_code: 0
+    tags: ["list", "function"]
+
+  - name: "list-property-size"
+    description: "List property size"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:ListNode) RETURN n.id, size(n.tags) AS tag_count ORDER BY n.id;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["tag_count"]
+    tags: ["list", "property"]
+
+  - name: "list-property-access"
+    description: "List property element access"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:ListNode) WHERE size(n.tags) > 0 RETURN n.id, n.tags[0] AS first_tag ORDER BY n.id;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["first_tag"]
+    tags: ["list", "property"]
+
+  # Section 6: Label Expressions
+  - name: "in-labels"
+    description: "IN with labels() function"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; CREATE (:Person:Employee {name: 'Jane'}); CREATE (:Person {name: 'John'}); MATCH (n) WHERE 'Person' IN labels(n) RETURN n.name ORDER BY n.name;"
+    expect:
+      exit_code: 0
+    tags: ["label", "predicate"]
+
+  # Section 7: Aggregation Edge Cases
+  - name: "aggregation-empty-set"
+    description: "Aggregation on empty set"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:NonExistent) RETURN count(*) AS cnt, sum(n.value) AS total;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["0"]
+    tags: ["aggregation", "empty"]
+
+  - name: "count-with-null"
+    description: "COUNT with NULL values"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:Entity) OPTIONAL MATCH (n)-[:MISSING]->(m) RETURN count(m) AS count_null, count(*) AS count_all;"
+    expect:
+      exit_code: 0
+    tags: ["aggregation", "null"]
+
+  - name: "min-max-strings"
+    description: "MIN/MAX on strings"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:Entity) RETURN min(n.type) AS min_type, max(n.type) AS max_type;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["min_type", "max_type"]
+    tags: ["aggregation", "string"]
+
+  - name: "sum-with-case"
+    description: "SUM with CASE"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:NumericTest) RETURN sum(CASE WHEN n.value > 0 THEN n.value ELSE 0 END) AS positive_sum;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["positive_sum"]
+    tags: ["aggregation", "case"]
+
+  # Section 8: Boolean and Short-circuit
+  - name: "short-circuit-and"
+    description: "Short-circuit AND evaluation"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:NumericTest) WHERE n.value <> 0 AND 100 / n.value > 1 RETURN n.label LIMIT 3;"
+    expect:
+      exit_code: 0
+    tags: ["boolean", "shortcircuit"]
+
+  - name: "bool-to-int"
+    description: "Boolean to integer coercion"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN true + 0 AS bool_true, false + 0 AS bool_false;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1", "0"]
+    tags: ["type", "coercion"]
+
+  # Section 9: ORDER BY Edge Cases
+  - name: "order-nulls-first"
+    description: "ORDER BY with NULLS FIRST"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:Entity) OPTIONAL MATCH (n)-[:MISSING]->(m) RETURN n.name, m.name AS missing ORDER BY m.name NULLS FIRST LIMIT 3;"
+    expect:
+      exit_code: 0
+    tags: ["order", "null"]
+
+  - name: "order-nulls-last"
+    description: "ORDER BY with NULLS LAST"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:Entity) OPTIONAL MATCH (n)-[:MISSING]->(m) RETURN n.name, m.name AS missing ORDER BY m.name NULLS LAST LIMIT 3;"
+    expect:
+      exit_code: 0
+    tags: ["order", "null"]
+
+  - name: "limit-zero"
+    description: "LIMIT 0"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:Entity) RETURN n.name LIMIT 0;"
+    expect:
+      exit_code: 0
+    tags: ["pagination", "edge"]
+
+  # Section 10: OPTIONAL MATCH Edge Cases
+  - name: "optional-match-no-result"
+    description: "OPTIONAL MATCH with no matches"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:Entity) OPTIONAL MATCH (n)-[:NONEXISTENT]->(m) RETURN n.name, m.name AS optional_name LIMIT 3;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["null"]
+    tags: ["optional", "match"]
+
+  # Section 11: Set Operations Edge Cases
+  - name: "union-both-empty"
+    description: "UNION with both empty"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:NonExistent1) RETURN n.name AS name UNION MATCH (m:NonExistent2) RETURN m.name AS name;"
+    expect:
+      exit_code: 0
+    tags: ["set", "empty"]
+
+  - name: "except-all"
+    description: "EXCEPT removing all"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n:NumericTest) RETURN n.label AS label EXCEPT MATCH (n:NumericTest) RETURN n.label AS label;"
+    expect:
+      exit_code: 0
+    tags: ["set", "except"]
+
+  # Cleanup
+  - name: "cleanup-advanced-graph"
+    description: "Clean up advanced graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH advanced_test; MATCH (n) DETACH DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "drop-advanced-graph"
+    description: "Drop advanced graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "DROP GRAPH IF EXISTS advanced_test;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup", "graph"]
+
+tags: ["advanced", "edge-case", "null", "shell", "gql"]

@@ -1,0 +1,115 @@
+# External KMS Integration Tests
+# GAP-0086: Tests for Vault Transit and AWS KMS integration
+#
+# These tests verify that the External KMS providers work correctly
+# for key wrapping/unwrapping operations in TDE scenarios.
+#
+# Prerequisites:
+# - Vault dev container: docker run -d -p 8200:8200 -e 'VAULT_DEV_ROOT_TOKEN_ID=geode-test-token' hashicorp/vault
+# - Transit engine enabled: vault secrets enable transit
+# - Test key created: vault write -f transit/keys/geode-test-key type=aes256-gcm96
+# - local-kms: docker run -d -p 8080:8080 nsmithuk/local-kms
+#
+# Environment variables required:
+# - VAULT_ADDR=http://127.0.0.1:8200
+# - VAULT_TOKEN=geode-test-token
+# - AWS_KMS_ENDPOINT=http://127.0.0.1:8080
+
+name: external_kms_integration
+description: "External KMS Integration Tests - Vault Transit and AWS KMS"
+version: "1.0"
+tags:
+  - kms
+  - security
+  - enterprise
+  - tde
+
+server:
+  start_command: "./zig-out/bin/geode serve --listen 127.0.0.1:18000"
+  stop_signal: SIGTERM
+  startup_timeout: 10
+  startup_check: "tcp:18000"
+
+env:
+  GEODE_LOG_LEVEL: "info"
+
+tests:
+  # Basic KMS configuration tests
+  - name: kms-local-provider-basic
+    description: "Test local KMS provider wrap/unwrap"
+    command: "./zig-out/bin/geode query --server 127.0.0.1:18000 --insecure -"
+    stdin: |
+      RETURN geode.security.kmsProviderStatus('local') AS status
+    expected_output:
+      contains:
+        - "status"
+    timeout: 10
+
+  - name: kms-tde-status
+    description: "Check TDE status with KMS provider"
+    command: "./zig-out/bin/geode query --server 127.0.0.1:18000 --insecure -"
+    stdin: |
+      RETURN geode.security.tdeStatus() AS tde_status
+    expected_output:
+      contains:
+        - "tde_status"
+    timeout: 10
+
+  # Enterprise KMS tests (require external services)
+  - name: kms-vault-provider-check
+    description: "Check Vault Transit provider availability"
+    command: "./zig-out/bin/geode query --server 127.0.0.1:18000 --insecure -"
+    stdin: |
+      RETURN geode.security.kmsProviderAvailable('vault') AS available
+    expected_output:
+      contains:
+        - "available"
+    timeout: 10
+    skip_if_env_missing:
+      - VAULT_ADDR
+      - VAULT_TOKEN
+
+  - name: kms-aws-provider-check
+    description: "Check AWS KMS provider availability"
+    command: "./zig-out/bin/geode query --server 127.0.0.1:18000 --insecure -"
+    stdin: |
+      RETURN geode.security.kmsProviderAvailable('aws') AS available
+    expected_output:
+      contains:
+        - "available"
+    timeout: 10
+    skip_if_env_missing:
+      - AWS_KMS_ENDPOINT
+
+  # Key rotation tests
+  - name: kms-key-rotation-status
+    description: "Test key rotation status query"
+    command: "./zig-out/bin/geode query --server 127.0.0.1:18000 --insecure -"
+    stdin: |
+      RETURN geode.security.keyRotationStatus() AS rotation_info
+    expected_output:
+      contains:
+        - "rotation_info"
+    timeout: 10
+
+  # Encryption at rest validation
+  - name: tde-encryption-verify
+    description: "Verify TDE encryption is active"
+    command: "./zig-out/bin/geode query --server 127.0.0.1:18000 --insecure -"
+    stdin: |
+      RETURN geode.security.isEncryptionActive() AS encrypted
+    expected_output:
+      contains:
+        - "encrypted"
+    timeout: 10
+
+  # Data key generation
+  - name: kms-generate-data-key
+    description: "Test data key generation through KMS"
+    command: "./zig-out/bin/geode query --server 127.0.0.1:18000 --insecure -"
+    stdin: |
+      RETURN geode.security.generateDataKey() AS key_info
+    expected_output:
+      contains:
+        - "key_info"
+    timeout: 10

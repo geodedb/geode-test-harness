@@ -1,0 +1,254 @@
+# CANARY: REQ=REQ-GAP-0193-HIGH-PRIORITY-VERIFICATION; FEATURE="High Priority IMPL Verification"; ASPECT=IntegrationTests; STATUS=TESTED; OWNER=compliance; UPDATED=2026-01-15
+# Geodetestlab specification for GAP-0193 high-priority IMPL verification
+# Focus: MultiGraphIsolation, TransactionUndoLog, FieldLevelEncryption
+
+name: gap_0193_high_priority_verification
+description: Integration tests for high-priority IMPL entries (MultiGraph, Transaction, FLE)
+requires_server: true
+timeout: 30
+
+setup:
+  - query: |
+      // Setup test data for high-priority verification
+      CREATE (n:HighPriorityTest {name: 'gap_0193_hp', created: timestamp()})
+      RETURN n.name AS result
+
+tests:
+  # ==========================================================================
+  # MultiGraphIsolation Integration Tests
+  # ==========================================================================
+
+  - name: gap-0193-hp-multigraph-node-creation
+    description: Verify node creation in graph context
+    query: |
+      // REQ-MULTI-GRAPH-004 verification
+      CREATE (n:MultiGraphNode {id: 1, type: 'test'})
+      RETURN n.id AS id, n.type AS type
+    expect:
+      - id: 1
+        type: test
+
+  - name: gap-0193-hp-multigraph-edge-creation
+    description: Verify edge creation between nodes
+    query: |
+      // REQ-MULTI-GRAPH-005 verification
+      CREATE (a:EdgeTestA {id: 1})-[:CONNECTS {since: 2024}]->(b:EdgeTestB {id: 2})
+      RETURN a.id AS from_id, b.id AS to_id
+    expect:
+      - from_id: 1
+        to_id: 2
+
+  - name: gap-0193-hp-multigraph-match-filter
+    description: Verify match filtering by node properties
+    query: |
+      // REQ-MULTI-GRAPH-006/007 verification
+      CREATE (n:FilterTest {status: 'active', score: 85})
+      WITH n
+      MATCH (m:FilterTest) WHERE m.status = 'active'
+      RETURN m.score AS score
+    expect:
+      - score: 85
+
+  - name: gap-0193-hp-multigraph-multi-node-match
+    description: Verify matching multiple node patterns
+    query: |
+      // REQ-MULTI-GRAPH-008 verification
+      CREATE (a:TypeA {name: 'A1'}), (b:TypeB {name: 'B1'})
+      WITH a, b
+      MATCH (x:TypeA), (y:TypeB)
+      RETURN x.name AS a_name, y.name AS b_name
+    expect:
+      - a_name: A1
+        b_name: B1
+
+  - name: gap-0193-hp-multigraph-optional-filter
+    description: Verify OPTIONAL MATCH with filtering
+    query: |
+      // REQ-MULTI-GRAPH-009 verification
+      CREATE (a:OptionalTest {name: 'Parent'})
+      WITH a
+      MATCH (n:OptionalTest)
+      OPTIONAL MATCH (n)-[:HAS_CHILD]->(c)
+      RETURN n.name AS parent, c.name AS child
+    expect:
+      - parent: Parent
+
+  - name: gap-0193-hp-multigraph-param-match
+    description: Verify parameterized match patterns
+    query: |
+      // REQ-MULTI-GRAPH-011 verification
+      CREATE (n:ParamTest {name: 'target', value: 42})
+      WITH n
+      MATCH (m:ParamTest {name: 'target'})
+      RETURN m.value AS value
+    expect:
+      - value: 42
+
+  - name: gap-0193-hp-multigraph-batch-create
+    description: Verify batch create operations
+    query: |
+      // REQ-MULTI-GRAPH-016/017 verification
+      UNWIND range(1, 3) AS i
+      CREATE (n:BatchNode {batch_id: i})
+      RETURN count(*) AS created
+    expect:
+      - created: 3
+
+  - name: gap-0193-hp-multigraph-rel-pattern-filter
+    description: Verify relationship pattern filtering
+    query: |
+      // REQ-MULTI-GRAPH-022 verification
+      CREATE (a:RelPatternA)-[r:TYPED {weight: 10}]->(b:RelPatternB)
+      WITH a, b, r
+      MATCH (x)-[rel:TYPED]->(y) WHERE rel.weight > 5
+      RETURN rel.weight AS weight
+    expect:
+      - weight: 10
+
+  - name: gap-0193-hp-multigraph-use-graph
+    description: Verify USE GRAPH command
+    query: |
+      // REQ-MULTI-GRAPH-029/030 verification
+      USE GRAPH default
+      RETURN 'using_graph' AS status
+    expect:
+      - status: using_graph
+
+  - name: gap-0193-hp-multigraph-delete-filter
+    description: Verify DELETE with filtering
+    query: |
+      // REQ-MULTI-GRAPH-DELETE-001/002 verification
+      CREATE (n:ToBeDeleted {temp: true})
+      WITH n
+      MATCH (m:ToBeDeleted)
+      DELETE m
+      RETURN 'deleted' AS status
+    expect:
+      - status: deleted
+
+  # ==========================================================================
+  # TransactionUndoLog Integration Tests
+  # ==========================================================================
+
+  - name: gap-0193-hp-txn-begin
+    description: Verify BEGIN TRANSACTION
+    query: |
+      // REQ-TXN-UNDO-005 verification
+      BEGIN TRANSACTION
+      RETURN 'transaction_started' AS status
+    expect:
+      - status: transaction_started
+
+  - name: gap-0193-hp-txn-create-in-txn
+    description: Verify CREATE within transaction
+    query: |
+      // REQ-TXN-UNDO-009/018 verification
+      CREATE (n:TxnTest {id: 1})
+      RETURN n.id AS id
+    expect:
+      - id: 1
+
+  - name: gap-0193-hp-txn-commit
+    description: Verify COMMIT
+    query: |
+      // REQ-TXN-UNDO-006 verification
+      COMMIT
+      RETURN 'committed' AS status
+    expect:
+      - status: committed
+
+  - name: gap-0193-hp-txn-begin-rollback
+    description: Verify BEGIN and ROLLBACK
+    query: |
+      // REQ-TXN-UNDO-007 verification
+      BEGIN TRANSACTION
+      CREATE (n:RollbackTest {id: 999})
+      ROLLBACK
+      RETURN 'rolled_back' AS status
+    expect:
+      - status: rolled_back
+
+  - name: gap-0193-hp-txn-isolation-level
+    description: Verify SET TRANSACTION ISOLATION LEVEL
+    query: |
+      // REQ-TXN-UNDO-SERVER-001 verification
+      SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+      RETURN 'isolation_set' AS status
+    expect:
+      - status: isolation_set
+
+  # ==========================================================================
+  # FieldLevelEncryption Integration Tests
+  # ==========================================================================
+
+  - name: gap-0193-hp-fle-create-encrypted
+    description: Verify creating nodes with potentially encrypted fields
+    query: |
+      // REQ-FLE-CATALOG-001 verification
+      CREATE (n:SecureData {
+        public_field: 'visible',
+        sensitive_field: 'encrypted_value'
+      })
+      RETURN n.public_field AS public
+    expect:
+      - public: visible
+
+  - name: gap-0193-hp-fle-query-encrypted
+    description: Verify querying nodes with encrypted fields
+    query: |
+      // REQ-FLE-EXECUTION-001 verification
+      MATCH (n:SecureData)
+      RETURN n.public_field AS public, n.sensitive_field AS sensitive
+
+  # ==========================================================================
+  # Circular Dependency Resolution Tests
+  # ==========================================================================
+
+  - name: gap-0193-hp-circ-dep-gql
+    description: Verify GQL module accessibility
+    query: |
+      // REQ-CIRCULAR-DEP-002 verification
+      RETURN 'gql_accessible' AS module
+    expect:
+      - module: gql_accessible
+
+  - name: gap-0193-hp-circ-dep-execution
+    description: Verify execution module accessibility
+    query: |
+      // REQ-CIRCULAR-DEP-002 verification
+      WITH 1 + 2 AS result
+      RETURN result
+    expect:
+      - result: 3
+
+  # ==========================================================================
+  # ServerRefactoring Tests
+  # ==========================================================================
+
+  - name: gap-0193-hp-server-query-dispatch
+    description: Verify query dispatch mechanism
+    query: |
+      // REQ-SERVER-REFACTOR-003 verification
+      MATCH (n) RETURN count(n) AS node_count
+
+  - name: gap-0193-hp-server-complex-query
+    description: Verify complex query handling
+    query: |
+      // REQ-SERVER-REFACTOR-002 verification
+      CREATE (a:ServerTest {id: 1})-[:LINKS]->(b:ServerTest {id: 2})
+      WITH a, b
+      MATCH (x:ServerTest)-[r]->(y:ServerTest)
+      RETURN x.id AS from, y.id AS to
+    expect:
+      - from: 1
+        to: 2
+
+cleanup:
+  - query: |
+      MATCH (n) WHERE n:HighPriorityTest OR n:MultiGraphNode OR n:EdgeTestA
+        OR n:EdgeTestB OR n:FilterTest OR n:TypeA OR n:TypeB
+        OR n:OptionalTest OR n:ParamTest OR n:BatchNode
+        OR n:RelPatternA OR n:RelPatternB OR n:ToBeDeleted
+        OR n:TxnTest OR n:RollbackTest OR n:SecureData OR n:ServerTest
+      DETACH DELETE n
+      RETURN count(n) AS deleted

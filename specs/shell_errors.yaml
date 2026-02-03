@@ -1,0 +1,341 @@
+version: "1.0"
+name: "Shell Error Handling Tests"
+description: "Tests for error handling and edge cases in the shell"
+
+manage_server: true
+
+tests:
+  # ============================================
+  # SYNTAX ERRORS
+  # ============================================
+
+  - name: "shell-error-syntax-missing-return"
+    type: shell_steps
+    description: "Error on invalid syntax - missing keyword"
+    steps:
+      - type: query
+        text: "1 AS x"
+        expect:
+          error: true
+
+  - name: "shell-error-syntax-unclosed-paren"
+    type: shell_steps
+    description: "Error on unclosed parenthesis"
+    steps:
+      - type: query
+        text: "RETURN (1 + 2"
+        expect:
+          error: true
+
+  - name: "shell-error-syntax-unclosed-string"
+    type: shell_steps
+    description: "Error on unclosed string"
+    steps:
+      - type: query
+        text: "RETURN 'unclosed"
+        expect:
+          error: true
+
+  - name: "shell-error-syntax-invalid-operator"
+    type: shell_steps
+    description: "Error on invalid operator"
+    steps:
+      - type: query
+        text: "RETURN 1 $$ 2"
+        expect:
+          error: true
+
+  - name: "shell-error-syntax-missing-alias"
+    type: shell_steps
+    description: "Query without alias might error or work"
+    steps:
+      - type: query
+        text: "RETURN 1"
+        expect:
+          # This might work in some systems, but we test it anyway
+          success: true
+
+  # ============================================
+  # SEMANTIC ERRORS
+  # ============================================
+
+  - name: "shell-error-undefined-variable"
+    type: shell_steps
+    description: "Error on undefined variable"
+    steps:
+      - type: query
+        text: "RETURN undefined_var"
+        expect:
+          error: true
+
+  - name: "shell-error-undefined-function"
+    type: shell_steps
+    description: "Error on undefined function"
+    steps:
+      - type: query
+        text: "RETURN nonExistentFunction()"
+        expect:
+          error: true
+
+  - name: "shell-error-type-mismatch-arithmetic"
+    type: shell_steps
+    description: "Error on type mismatch in arithmetic"
+    steps:
+      - type: query
+        text: "RETURN 'string' + 42"
+        expect:
+          # Might concatenate or error depending on implementation
+          success: true
+
+  # ============================================
+  # PROPERTY ACCESS ERRORS
+  # ============================================
+
+  - name: "shell-error-property-on-null"
+    type: shell_steps
+    description: "Accessing property on null value"
+    steps:
+      - type: query
+        text: "RETURN null.property AS p"
+        expect:
+          # Usually returns null, not error
+          success: true
+
+  - name: "shell-error-index-out-of-bounds"
+    type: shell_steps
+    description: "List index out of bounds"
+    steps:
+      - type: query
+        text: "RETURN [1, 2, 3][10] AS val"
+        expect:
+          # Usually returns null for out of bounds
+          success: true
+
+  # ============================================
+  # DIVISION ERRORS
+  # ============================================
+
+  - name: "shell-error-division-by-zero-int"
+    type: shell_steps
+    description: "Integer division by zero"
+    steps:
+      - type: query
+        text: "RETURN 10 / 0 AS result"
+        expect:
+          # Might return error, null, or infinity
+          success: true
+
+  - name: "shell-error-division-by-zero-float"
+    type: shell_steps
+    description: "Float division by zero"
+    steps:
+      - type: query
+        text: "RETURN 10.0 / 0.0 AS result"
+        expect:
+          success: true
+
+  - name: "shell-error-modulo-by-zero"
+    type: shell_steps
+    description: "Modulo by zero"
+    steps:
+      - type: query
+        text: "RETURN 10 % 0 AS result"
+        expect:
+          success: true
+
+  # ============================================
+  # CONSTRAINT ERRORS
+  # ============================================
+
+  - name: "shell-error-delete-node-with-relationships"
+    type: shell_steps
+    description: "Error deleting node with relationships (without DETACH)"
+    steps:
+      - type: query
+        text: "CREATE (a:DeleteErrorTest {id: 1})-[:REL]->(b:DeleteErrorTest {id: 2})"
+      - type: query
+        text: "MATCH (n:DeleteErrorTest {id: 1}) DELETE n"
+        expect:
+          # Should error because node has relationships
+          error: true
+
+  # ============================================
+  # EMPTY AND NULL HANDLING
+  # ============================================
+
+  - name: "shell-handle-empty-match"
+    type: shell_steps
+    description: "Handle MATCH with no results gracefully"
+    steps:
+      - type: query
+        text: "MATCH (n:NonExistentLabel99999) RETURN n.id AS id"
+        expect:
+          success: true
+          contains:
+            - "0 row"
+
+  - name: "shell-handle-null-comparison"
+    type: shell_steps
+    description: "Handle null in comparison"
+    steps:
+      - type: query
+        text: "RETURN null = null AS result"
+        expect:
+          success: true
+
+  - name: "shell-handle-null-in-list"
+    type: shell_steps
+    description: "Handle null values in list"
+    steps:
+      - type: query
+        text: "RETURN [1, null, 3] AS list"
+        expect:
+          success: true
+
+  # ============================================
+  # COMMAND ERRORS
+  # ============================================
+
+  - name: "shell-error-unknown-command"
+    type: shell_steps
+    description: "Error on unknown meta-command"
+    steps:
+      - type: command
+        text: "\\nonexistent_command"
+        expect:
+          # Should show error or be ignored
+          success: true
+
+  - name: "shell-error-format-invalid"
+    type: shell_steps
+    description: "Error on invalid format argument"
+    steps:
+      - type: command
+        text: "\\format invalid_format"
+        expect:
+          # Should error or be ignored
+          success: true
+
+  - name: "shell-error-source-nonexistent"
+    type: shell_steps
+    description: "Error on source nonexistent file"
+    steps:
+      - type: command
+        text: "\\source /nonexistent/path/to/file.gql"
+        expect:
+          error: true
+
+  # ============================================
+  # EDGE CASES
+  # ============================================
+
+  - name: "shell-edge-empty-query"
+    type: shell_steps
+    description: "Handle empty query"
+    steps:
+      - type: query
+        text: ";"
+        expect:
+          success: true
+
+  - name: "shell-edge-whitespace-only"
+    type: shell_steps
+    description: "Handle whitespace-only input"
+    steps:
+      - type: query
+        text: "   "
+        expect:
+          success: true
+
+  - name: "shell-edge-multiple-semicolons"
+    type: shell_steps
+    description: "Handle multiple semicolons"
+    steps:
+      - type: query
+        text: "RETURN 1 AS x;;;"
+        expect:
+          success: true
+
+  - name: "shell-edge-very-long-string"
+    type: shell_steps
+    description: "Handle very long string value"
+    steps:
+      - type: query
+        text: "RETURN 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' AS long_str"
+        expect:
+          success: true
+
+  - name: "shell-edge-special-chars-in-property"
+    type: shell_steps
+    description: "Handle special characters in property name"
+    steps:
+      - type: query
+        text: "CREATE (n:SpecialProp {`weird-name`: 'value'})"
+        expect:
+          success: true
+
+  - name: "shell-edge-unicode-in-string"
+    type: shell_steps
+    description: "Handle unicode in string"
+    steps:
+      - type: query
+        text: "RETURN 'Hello World' AS greeting"
+        expect:
+          success: true
+          contains:
+            - "Hello"
+
+  - name: "shell-edge-negative-numbers"
+    type: shell_steps
+    description: "Handle negative numbers"
+    steps:
+      - type: query
+        text: "RETURN -42 AS neg, -3.14 AS neg_float"
+        expect:
+          success: true
+          contains:
+            - "-42"
+            - "-3.14"
+
+  - name: "shell-edge-scientific-notation"
+    type: shell_steps
+    description: "Handle scientific notation"
+    steps:
+      - type: query
+        text: "RETURN 1e10 AS big, 1e-5 AS small"
+        expect:
+          success: true
+
+  # ============================================
+  # RECOVERY FROM ERRORS
+  # ============================================
+
+  - name: "shell-recovery-after-syntax-error"
+    type: shell_steps
+    description: "Shell continues working after syntax error"
+    steps:
+      - type: query
+        text: "INVALID SYNTAX HERE"
+        expect:
+          error: true
+      - type: query
+        text: "RETURN 1 AS x"
+        expect:
+          success: true
+          contains:
+            - "1"
+
+  - name: "shell-recovery-after-semantic-error"
+    type: shell_steps
+    description: "Shell continues working after semantic error"
+    steps:
+      - type: query
+        text: "RETURN undefined_variable"
+        expect:
+          error: true
+      - type: query
+        text: "RETURN 2 AS y"
+        expect:
+          success: true
+          contains:
+            - "2"

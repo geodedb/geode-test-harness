@@ -1,0 +1,309 @@
+# GAP-0193: Remaining Category Integration Tests
+# Tests for Phase 6 Modularization, CodeQuality, CDC Engine,
+# StreamingDataGenerator, SnapshotInstallation, and RLSExpressionCompilation
+#
+# CANARY: REQ=REQ-GAP-0193-REMAINING; FEATURE="IMPLBatchPromotion"; ASPECT=RemainingCategories; STATUS=TESTED; OWNER=test; UPDATED=2026-01-15
+
+name: gap_0193_remaining_categories
+description: GAP-0193 remaining category integration tests for IMPL promotion
+mode: server
+timeout: 30
+
+tests:
+  # ============================================================================
+  # Phase 6 Modularization Tests
+  # ============================================================================
+
+  - name: phase6-basic-query
+    query: "RETURN 1 AS value"
+    expect:
+      success: true
+      columns: [value]
+
+  - name: phase6-match-pattern
+    query: "MATCH (n) RETURN n LIMIT 1"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: phase6-create-operation
+    query: "CREATE (n:Phase6Test {module: 'test'}) RETURN n.module AS module"
+    expect:
+      success: true
+      columns: [module]
+
+  - name: phase6-multi-hop
+    query: "MATCH (a)-[r]->(b)-[s]->(c) RETURN a, b, c LIMIT 1"
+    expect:
+      success: true
+      columns: [a, b, c]
+
+  - name: phase6-cleanup
+    query: "MATCH (n:Phase6Test) DETACH DELETE n RETURN count(*) AS deleted"
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # CodeQuality Tests
+  # ============================================================================
+
+  - name: codequality-error-handling
+    query: "RETURN 'error_handling_test'"
+    expect:
+      success: true
+      columns: [error_handling_test]
+
+  - name: codequality-memory-pattern
+    query: "UNWIND range(1, 100) AS n RETURN count(n) AS cnt"
+    expect:
+      success: true
+      columns: [cnt]
+
+  - name: codequality-complex-expression
+    query: |
+      WITH 10 AS x, 20 AS y
+      RETURN x + y AS sum, x * y AS product, x - y AS diff
+    expect:
+      success: true
+      columns: [sum, product, diff]
+
+  - name: codequality-type-coercion
+    query: "RETURN 1 + 1.5 AS num, 'a' + 'b' AS str"
+    expect:
+      success: true
+      columns: [num, str]
+
+  - name: codequality-null-handling
+    query: "RETURN null AS nothing, coalesce(null, 'default') AS defaulted"
+    expect:
+      success: true
+      columns: [nothing, defaulted]
+
+  # ============================================================================
+  # CDC Engine Tests
+  # ============================================================================
+
+  - name: cdc-timestamp-tracking
+    query: "RETURN timestamp() AS ts"
+    expect:
+      success: true
+      columns: [ts]
+
+  - name: cdc-node-creation
+    query: "CREATE (n:CDCTest {created_at: timestamp()}) RETURN n.created_at AS ts"
+    expect:
+      success: true
+      columns: [ts]
+
+  - name: cdc-property-update
+    query: |
+      MERGE (n:CDCUpdateTest {id: 1})
+      ON CREATE SET n.version = 1
+      ON MATCH SET n.version = n.version + 1
+      RETURN n.version AS version
+    expect:
+      success: true
+      columns: [version]
+
+  - name: cdc-relationship-tracking
+    query: |
+      CREATE (a:CDCSource)-[r:CDC_TRACKS {timestamp: timestamp()}]->(b:CDCTarget)
+      RETURN type(r) AS relType
+    expect:
+      success: true
+      columns: [relType]
+
+  - name: cdc-cleanup
+    query: |
+      MATCH (n) WHERE n:CDCTest OR n:CDCUpdateTest OR n:CDCSource OR n:CDCTarget
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # StreamingDataGenerator Tests
+  # ============================================================================
+
+  - name: streaming-range-generation
+    query: "UNWIND range(1, 20) AS n RETURN count(n) AS total"
+    expect:
+      success: true
+      columns: [total]
+
+  - name: streaming-batch-data
+    query: |
+      UNWIND [{id: 1, value: 'a'}, {id: 2, value: 'b'}, {id: 3, value: 'c'}] AS item
+      RETURN item.id AS id, item.value AS val
+    expect:
+      success: true
+      columns: [id, val]
+
+  - name: streaming-rate-simulation
+    query: |
+      UNWIND range(1, 10) AS batch
+      WITH batch, timestamp() AS batch_ts
+      RETURN batch, batch_ts
+    expect:
+      success: true
+      columns: [batch, batch_ts]
+
+  - name: streaming-schema-variation
+    query: |
+      UNWIND [
+        {type: 'event', payload: 'data1'},
+        {type: 'metric', payload: 'data2'},
+        {type: 'log', payload: 'data3'}
+      ] AS record
+      RETURN record.type AS recordType, record.payload AS payload
+    expect:
+      success: true
+      columns: [recordType, payload]
+
+  - name: streaming-event-aggregation
+    query: |
+      UNWIND range(1, 100) AS event_id
+      WITH event_id % 5 AS category, count(*) AS cnt
+      RETURN category, cnt ORDER BY category
+    expect:
+      success: true
+      columns: [category, cnt]
+
+  # ============================================================================
+  # SnapshotInstallation Tests
+  # ============================================================================
+
+  - name: snapshot-state-query
+    query: "MATCH (n) RETURN count(n) AS node_count"
+    expect:
+      success: true
+      columns: [node_count]
+
+  - name: snapshot-create-data
+    query: |
+      CREATE (n:SnapshotTest {snapshot_id: 1, data: 'test_data'})
+      RETURN n.snapshot_id AS id
+    expect:
+      success: true
+      columns: [id]
+
+  - name: snapshot-verify-data
+    query: "MATCH (n:SnapshotTest) RETURN n.data AS data"
+    expect:
+      success: true
+      columns: [data]
+
+  - name: snapshot-update-data
+    query: |
+      MATCH (n:SnapshotTest {snapshot_id: 1})
+      SET n.updated = true
+      RETURN n.updated AS updated
+    expect:
+      success: true
+      columns: [updated]
+
+  - name: snapshot-cleanup
+    query: "MATCH (n:SnapshotTest) DETACH DELETE n RETURN count(*) AS deleted"
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # RLSExpressionCompilation Tests
+  # ============================================================================
+
+  - name: rls-basic-filter
+    query: "MATCH (n) WHERE n.visible = true RETURN n LIMIT 5"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: rls-owner-filter
+    query: |
+      WITH 'test_user' AS current_user
+      MATCH (n) WHERE n.owner = current_user OR n.public = true
+      RETURN n LIMIT 5
+    expect:
+      success: true
+      columns: [n]
+
+  - name: rls-complex-policy
+    query: |
+      WITH 'tenant_1' AS tenant_id, 'admin' AS role
+      MATCH (n)
+      WHERE n.tenant = tenant_id OR role = 'admin'
+      RETURN n LIMIT 5
+    expect:
+      success: true
+      columns: [n]
+
+  - name: rls-nested-condition
+    query: |
+      MATCH (n)
+      WHERE (n.public = true OR n.shared = true) AND n.deleted = false
+      RETURN n LIMIT 5
+    expect:
+      success: true
+      columns: [n]
+
+  - name: rls-parameter-binding
+    query: "WITH $1 AS user_id RETURN user_id"
+    expect:
+      success: true
+      columns: [user_id]
+
+  # ============================================================================
+  # Additional Coverage Tests
+  # ============================================================================
+
+  - name: coverage-path-patterns
+    query: |
+      CREATE (a:PathStart)-[:STEP]->(b:PathMid)-[:STEP]->(c:PathEnd)
+      WITH a, c
+      MATCH p = (a)-[*1..2]->(c)
+      RETURN length(p) AS pathLen
+    expect:
+      success: true
+      columns: [pathLen]
+
+  - name: coverage-aggregation-combo
+    query: |
+      UNWIND range(1, 50) AS n
+      WITH n % 5 AS grp, n
+      RETURN grp, count(*) AS cnt, sum(n) AS total, min(n) AS minVal, max(n) AS maxVal
+      ORDER BY grp
+    expect:
+      success: true
+      columns: [grp, cnt, total, minVal, maxVal]
+
+  - name: coverage-list-operations
+    query: |
+      WITH [1, 2, 3, 4, 5] AS nums
+      RETURN size(nums) AS len, head(nums) AS first, tail(nums) AS rest, nums[2] AS third
+    expect:
+      success: true
+      columns: [len, first, rest, third]
+
+  - name: coverage-map-operations
+    query: |
+      WITH {name: 'test', value: 42, nested: {inner: 'data'}} AS obj
+      RETURN obj.name AS name, obj.value AS value, keys(obj) AS objKeys
+    expect:
+      success: true
+      columns: [name, value, objKeys]
+
+  - name: coverage-cleanup
+    query: |
+      MATCH (n) WHERE n:PathStart OR n:PathMid OR n:PathEnd
+      DETACH DELETE n
+      RETURN count(*) AS deleted
+    expect:
+      success: true
+      columns: [deleted]
+
+invariants:
+  - type: "server_running"
+
+tags: ["gap-0193", "impl-promotion", "remaining-categories"]

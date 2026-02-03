@@ -1,0 +1,471 @@
+version: "1.0"
+name: "Geode Advanced Data Types Comprehensive Test Suite"
+description: "Complete testing of Geode's 50+ advanced data types including network, cryptographic, geographic, temporal, and vector types"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "info"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # ===============================
+  # NETWORK TYPES TESTING
+  # ===============================
+
+  - name: "network-ipaddr-ipv4-basic"
+    description: "Test IPv4 address construction and validation"
+    args: ["query",
+           "RETURN IpAddr('192.168.1.1') AS ip4, IpAddr('10.0.0.0') AS private_ip4, ip_family(IpAddr('192.168.1.1')) AS family"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["ip4", "private_ip4", "family"]
+    tags: ["network", "ipv4", "types"]
+
+  - name: "network-ipaddr-ipv6-basic"
+    description: "Test IPv6 address construction and canonicalization"
+    args: ["query",
+           "RETURN IpAddr('2001:db8::1') AS ip6, IpAddr('::1') AS localhost6, ip_family(IpAddr('2001:db8::1')) AS family"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["ip6", "localhost6", "family"]
+    tags: ["network", "ipv6", "types"]
+
+  - name: "network-subnet-cidr-operations"
+    description: "Test CIDR subnet operations and containment"
+    args: ["query",
+           "RETURN Subnet('192.168.0.0/24') AS subnet, ip_contains(Subnet('192.168.0.0/24'), IpAddr('192.168.0.100')) AS contains, ip_overlaps(Subnet('192.168.0.0/24'), Subnet('192.168.0.128/25')) AS overlaps"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["subnet", "contains", "overlaps"]
+    tags: ["network", "cidr", "operations"]
+
+  - name: "network-mac-address-operations"
+    description: "Test MAC address operations and format conversion"
+    args: ["query",
+           "RETURN Mac('AA:BB:CC:DD:EE:FF') AS mac, Mac('aa-bb-cc-dd-ee-ff') AS mac_dash, mac_is_local(Mac('02:00:00:00:00:01')) AS is_local, oui(Mac('AA:BB:CC:DD:EE:FF')) AS oui_part"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["mac", "mac_dash", "is_local", "oui_part"]
+    tags: ["network", "mac", "operations"]
+
+  - name: "network-ip-private-ranges"
+    description: "Test IP private range detection"
+    args: ["query",
+           "RETURN ip_is_private(IpAddr('10.0.0.1')) AS private_10, ip_is_private(IpAddr('172.16.0.1')) AS private_172, ip_is_private(IpAddr('192.168.0.1')) AS private_192, ip_is_private(IpAddr('8.8.8.8')) AS public_ip"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["private_10", "private_172", "private_192", "public_ip"]
+    tags: ["network", "private", "validation"]
+
+  # ===============================
+  # CRYPTOGRAPHIC TYPES TESTING
+  # ===============================
+
+  - name: "crypto-hash-sha3-256"
+    description: "Test SHA3-256 hash construction and comparison"
+    args: ["query",
+           "RETURN Hash('SHA3-256', 'a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a') AS hash256, hash_alg(Hash('SHA3-256', 'a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a')) AS algorithm"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["hash256", "algorithm"]
+    tags: ["crypto", "hash", "sha3"]
+
+  - name: "crypto-hash-sha3-512"
+    description: "Test SHA3-512 hash operations"
+    args: ["query",
+           "RETURN Hash('SHA3-512', 'b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0') AS hash512"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["hash512"]
+    tags: ["crypto", "hash", "sha3-512"]
+
+  - name: "crypto-hash-blake3"
+    description: "Test BLAKE3 hash operations"
+    args: ["query",
+           "RETURN Hash('BLAKE3', 'af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262') AS blake3_hash"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["blake3_hash"]
+    tags: ["crypto", "hash", "blake3"]
+
+  - name: "crypto-hash-constant-time-comparison"
+    description: "Test constant-time hash comparison for security"
+    args: ["query",
+           "RETURN hash_equals(Hash('SHA3-256', 'a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a'), Hash('SHA3-256', 'a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a')) AS same_hash, hash_equals(Hash('SHA3-256', 'a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a'), Hash('SHA3-256', 'b7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434b')) AS diff_hash"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["same_hash", "diff_hash"]
+    tags: ["crypto", "hash", "comparison"]
+
+  # ===============================
+  # GEOGRAPHIC TYPES TESTING
+  # ===============================
+
+  - name: "geo-latlon-basic-operations"
+    description: "Test LatLon coordinate operations"
+    args: ["query",
+           "RETURN LatLon(37.7749, -122.4194) AS sf_coords, latitude(LatLon(37.7749, -122.4194)) AS lat, longitude(LatLon(37.7749, -122.4194)) AS lon"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["sf_coords", "lat", "lon"]
+    tags: ["geo", "latlon", "coordinates"]
+
+  - name: "geo-latlonalt-with-elevation"
+    description: "Test LatLonAlt with altitude and reference systems"
+    args: ["query",
+           "RETURN LatLonAlt(37.7749, -122.4194, 52.0, 0) AS sf_elevation, altitude(LatLonAlt(37.7749, -122.4194, 52.0, 0)) AS alt, alt_ref(LatLonAlt(37.7749, -122.4194, 52.0, 0)) AS ref_system"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["sf_elevation", "alt", "ref_system"]
+    tags: ["geo", "altitude", "reference"]
+
+  - name: "geo-geometry-wkt-operations"
+    description: "Test WKT geometry operations and spatial queries"
+    args: ["query",
+           "RETURN GeometryFromText('POINT(0 0)') AS point, GeometryFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))') AS square, st_contains(GeometryFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))'), GeometryFromText('POINT(0.5 0.5)')) AS contains_point"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["point", "square", "contains_point"]
+    tags: ["geo", "geometry", "spatial"]
+
+  - name: "geo-spatial-relationships"
+    description: "Test spatial relationship operations"
+    args: ["query",
+           "RETURN st_intersects(GeometryFromText('LINESTRING(0 0, 1 1)'), GeometryFromText('LINESTRING(0 1, 1 0)')) AS intersects, st_within(GeometryFromText('POINT(0.5 0.5)'), GeometryFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))')) AS within"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["intersects", "within"]
+    tags: ["geo", "spatial", "relationships"]
+
+  # ===============================
+  # TEMPORAL TYPES TESTING
+  # ===============================
+
+  - name: "temporal-date-operations"
+    description: "Test Date type operations and ISO-8601 format"
+    args: ["query",
+           "RETURN Date('2024-01-15') AS date_val, Date('1970-01-01') AS epoch_date, Date('2024-12-31') AS year_end"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["date_val", "epoch_date", "year_end"]
+    tags: ["temporal", "date", "iso8601"]
+
+  - name: "temporal-time-precision"
+    description: "Test Time type with microsecond precision"
+    args: ["query",
+           "RETURN Time('14:30:00') AS time_basic, Time('14:30:00.123456') AS time_micros, Time('23:59:59.999999') AS time_max"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["time_basic", "time_micros", "time_max"]
+    tags: ["temporal", "time", "precision"]
+
+  - name: "temporal-timezone-operations"
+    description: "Test TimeTZ and TimestampTZ with timezone handling"
+    args: ["query",
+           "RETURN TimeTZ('14:30:00', 3600) AS time_tz_plus1, TimestampTZ('2024-01-15 14:30:00 +01:00') AS timestamp_tz"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["time_tz_plus1", "timestamp_tz"]
+    tags: ["temporal", "timezone", "offset"]
+
+  - name: "temporal-interval-operations"
+    description: "Test Interval type with ISO-8601 duration format"
+    args: ["query",
+           "RETURN Interval('P1Y2M3DT4H5M6S') AS interval_full, MakeInterval(14, 7, 3600000000) AS interval_constructed"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["interval_full", "interval_constructed"]
+    tags: ["temporal", "interval", "duration"]
+
+  # ===============================
+  # PHYSICAL QUANTITIES TESTING
+  # ===============================
+
+  - name: "physical-temperature-conversions"
+    description: "Test Temperature type with unit conversions"
+    args: ["query",
+           "RETURN Temperature(273.15, 0) AS kelvin, Temperature(0, 1) AS celsius, Temperature(32, 2) AS fahrenheit"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["kelvin", "celsius", "fahrenheit"]
+    tags: ["physical", "temperature", "units"]
+
+  - name: "physical-pressure-units"
+    description: "Test Pressure type with various units"
+    args: ["query",
+           "RETURN Pressure(101325, 0) AS pascal, Pressure(101.325, 1) AS kilopascal, Pressure(1.01325, 2) AS bar, Pressure(1, 3) AS atmosphere"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["pascal", "kilopascal", "bar", "atmosphere"]
+    tags: ["physical", "pressure", "units"]
+
+  # ===============================
+  # VECTOR TYPES TESTING
+  # ===============================
+
+  - name: "vector-f32-basic-operations"
+    description: "Test VectorF32 construction and basic operations"
+    args: ["query",
+           "RETURN VectorF32([1.0, 2.0, 3.0]) AS vec1, VectorF32([4.0, 5.0, 6.0]) AS vec2, vector_dot(VectorF32([1.0, 2.0, 3.0]), VectorF32([4.0, 5.0, 6.0])) AS dot_product"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["vec1", "vec2", "dot_product"]
+    tags: ["vector", "f32", "operations"]
+
+  - name: "vector-distance-metrics"
+    description: "Test vector distance calculations"
+    args: ["query",
+           "RETURN vector_l2(VectorF32([1.0, 2.0, 3.0]), VectorF32([4.0, 5.0, 6.0])) AS l2_distance, vector_cosine(VectorF32([1.0, 0.0]), VectorF32([0.0, 1.0])) AS cosine_distance"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["l2_distance", "cosine_distance"]
+    tags: ["vector", "distance", "metrics"]
+
+  # ===============================
+  # ADVANCED TYPES TESTING
+  # ===============================
+
+  - name: "advanced-uuid-operations"
+    description: "Test UUID generation and validation"
+    args: ["query",
+           "RETURN UUID('550e8400-e29b-41d4-a716-446655440000') AS uuid_val, uuid_version(UUID('550e8400-e29b-41d4-a716-446655440000')) AS version"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["uuid_val", "version"]
+    tags: ["advanced", "uuid", "validation"]
+
+  - name: "advanced-url-parsing"
+    description: "Test URL/URI parsing with IDNA support"
+    args: ["query",
+           "RETURN URL('https://example.com/path?query=value') AS url, url_scheme(URL('https://example.com/path?query=value')) AS scheme, url_host(URL('https://example.com/path?query=value')) AS host"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["url", "scheme", "host"]
+    tags: ["advanced", "url", "parsing"]
+
+  - name: "advanced-currency-iso4217"
+    description: "Test Currency type with ISO-4217 codes"
+    args: ["query",
+           "RETURN Currency('USD') AS usd, Currency('EUR') AS eur, Currency('JPY') AS jpy, minor_units(Currency('USD')) AS usd_decimals, minor_units(Currency('JPY')) AS jpy_decimals"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["usd", "eur", "jpy", "usd_decimals", "jpy_decimals"]
+    tags: ["advanced", "currency", "iso4217"]
+
+  - name: "advanced-language-tag-bcp47"
+    description: "Test LanguageTag with BCP-47 canonicalization"
+    args: ["query",
+           "RETURN LanguageTag('en-US') AS lang_us, LanguageTag('zh-Hans-CN') AS lang_cn, lang_canonicalize('en-us') AS canonical"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["lang_us", "lang_cn", "canonical"]
+    tags: ["advanced", "language", "bcp47"]
+
+  # ===============================
+  # BINARY AND JSON TYPES TESTING
+  # ===============================
+
+  - name: "binary-bytea-hex-operations"
+    description: "Test Bytea type with hex encoding/decoding"
+    args: ["query",
+           "RETURN Bytea('\\xDEADBEEF') AS bytea_val, to_hex(Bytea('\\xDEADBEEF')) AS hex_string, from_hex('DEADBEEF') AS from_hex_val"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["bytea_val", "hex_string", "from_hex_val"]
+    tags: ["binary", "bytea", "hex"]
+
+  - name: "json-jsonb-operations"
+    description: "Test JSON and JSONB operations with path access"
+    args: ["query",
+           "RETURN Json('{\"name\": \"Alice\", \"age\": 30}') AS json_val, Jsonb('{\"name\": \"Alice\", \"age\": 30}') AS jsonb_val, jsonb_get(Jsonb('{\"name\": \"Alice\", \"age\": 30}'), 'name') AS name_value"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["json_val", "jsonb_val", "name_value"]
+    tags: ["json", "jsonb", "path"]
+
+  - name: "json-path-operations"
+    description: "Test JSONB path operations and existence checks"
+    args: ["query",
+           "RETURN jsonb_exists(Jsonb('{\"name\": \"Alice\", \"age\": 30}'), 'name') AS name_exists, jsonb_typeof(jsonb_get(Jsonb('{\"name\": \"Alice\", \"age\": 30}'), 'age')) AS age_type"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["name_exists", "age_type"]
+    tags: ["json", "path", "operations"]
+
+  - name: "xml-well-formedness"
+    description: "Test XML type with well-formedness validation"
+    args: ["query",
+           "RETURN Xml('<root><child>content</child></root>') AS xml_val, xml_is_well_formed('<root><child>content</child></root>') AS is_valid"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["xml_val", "is_valid"]
+    tags: ["xml", "validation", "wellformed"]
+
+  # ===============================
+  # COMPLEX TYPES TESTING
+  # ===============================
+
+  - name: "complex-arrays-operations"
+    description: "Test Array types with various element types"
+    args: ["query",
+           "RETURN [1, 2, 3, 4, 5] AS int_array, ['alice', 'bob', 'charlie'] AS string_array, array_length([1, 2, 3, 4, 5]) AS array_len"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["int_array", "string_array", "array_len"]
+    tags: ["complex", "arrays", "operations"]
+
+  - name: "complex-ranges-operations"
+    description: "Test Range types with different bounds"
+    args: ["query",
+           "RETURN IntRange(1, 10, true, false) AS range_inclusive, DateRange(Date('2024-01-01'), Date('2024-12-31'), true, true) AS date_range"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["range_inclusive", "date_range"]
+    tags: ["complex", "ranges", "bounds"]
+
+  # ===============================
+  # NUMERIC PRECISION TESTING
+  # ===============================
+
+  - name: "numeric-decimal128-precision"
+    description: "Test Decimal128 with high precision arithmetic"
+    args: ["query",
+           "RETURN Decimal('123456789012345678901234567890.12345678', 8) AS high_precision, decimal_add(Decimal('1.23', 2), Decimal('4.56', 2)) AS decimal_sum"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["high_precision", "decimal_sum"]
+    tags: ["numeric", "decimal", "precision"]
+
+  - name: "numeric-float-constraints"
+    description: "Test Float constraints (no NaN/Inf)"
+    args: ["query",
+           "RETURN Real(3.14159) AS real_val, Double(2.718281828459045) AS double_val"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+        columns: ["real_val", "double_val"]
+    tags: ["numeric", "float", "constraints"]
+
+  # ===============================
+  # ERROR CASES AND EDGE TESTING
+  # (Geode handles errors gracefully with exit code 0 and returns null/error in result)
+  # ===============================
+
+  - name: "error-invalid-ip-address"
+    description: "Test error handling for invalid IP addresses (returns error message)"
+    args: ["query", "RETURN IpAddr('999.999.999.999') AS invalid_ip"]
+    expect:
+      exit_code: 0
+      # Geode returns error message instead of null for invalid IP addresses
+      geode_query:
+        row_count: 1
+    tags: ["error", "ip", "validation"]
+
+  - name: "error-invalid-mac-address"
+    description: "Test error handling for invalid MAC addresses (returns error message)"
+    args: ["query", "RETURN Mac('ZZ:ZZ:ZZ:ZZ:ZZ:ZZ') AS invalid_mac"]
+    expect:
+      exit_code: 0
+      # Geode returns error message instead of null for invalid MAC addresses
+      geode_query:
+        row_count: 1
+    tags: ["error", "mac", "validation"]
+
+  - name: "error-char-length-exceeded"
+    description: "Test CHAR(n) length constraint enforcement (truncates or returns null)"
+    args: ["query", "RETURN Char('this string is too long', 5) AS invalid_char"]
+    expect:
+      exit_code: 0
+      geode_query:
+        status_class: "00000"
+    tags: ["error", "char", "length"]
+
+  - name: "error-decimal-division-by-zero"
+    description: "Test Decimal division by zero error handling (returns null or error in status)"
+    args: ["query", "RETURN decimal_div(Decimal('1.0', 1), Decimal('0.0', 1)) AS div_zero"]
+    expect:
+      exit_code: 0
+      # Decimal division by zero returns null (standard behavior for most math errors)
+      geode_query:
+        row_count: 1
+        columns: ["div_zero"]
+    tags: ["error", "decimal", "division"]
+
+invariants:
+  - type: "server_running"
+
+tags: ["types", "advanced", "network", "crypto", "geo", "temporal", "vector", "comprehensive"]

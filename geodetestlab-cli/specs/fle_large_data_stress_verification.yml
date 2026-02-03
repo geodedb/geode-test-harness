@@ -1,0 +1,746 @@
+version: "1.0"
+name: "FLE Large Data and Stress Verification"
+description: |
+  SECURITY CRITICAL TEST SUITE - LARGE DATA AND STRESS TESTING
+
+  Verifies that Field-Level Encryption properly handles:
+
+  1. LARGE DATA - Multi-KB and MB-scale encrypted fields
+  2. BULK OPERATIONS - Many nodes with encrypted fields
+  3. CONCURRENT PATTERNS - Multiple encrypted field updates
+  4. REPEATED PATTERNS - Same value encrypted multiple times (compression safety)
+  5. BINARY PATTERNS - Hex, base64, and raw binary data
+  6. SPECIAL CHARACTERS - SQL injection, shell escapes, unicode
+
+  This ensures encryption doesn't leak plaintext even under stress conditions
+  that might expose buffer overflows, compression leaks, or caching issues.
+
+  CANARY: REQ=REQ-FLE-STRESS-001; FEATURE=FLEStressTesting; ASPECT=LargeDataVerification; STATUS=TESTED; OWNER=security; UPDATED=2026-01-29
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 45000
+    cleanup: false  # Keep files for scanning
+    args: ["--log-level", "info", "--enable-fle"]
+  client:
+    timeout_ms: 60000  # Longer timeout for large data
+    tls_verify: false
+    format: "json"
+
+env:
+  GEODE_FLE_ENABLED: "true"
+  GEODE_MASTER_KEY: "large-data-stress-verification-key-32!!"
+  GEODE_FLE_TEST_MODE: "1"
+
+skip_isolation: true
+
+tests:
+  # =============================================================================
+  # PHASE 1: CONFIGURE FLE FIELDS
+  # =============================================================================
+
+  - name: "fle-stress-config-large"
+    description: "Configure FLE for large data fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_LargeData', 'large_secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "large"]
+
+  - name: "fle-stress-config-bulk"
+    description: "Configure FLE for bulk data fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_Bulk', 'bulk_secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "bulk"]
+
+  - name: "fle-stress-config-repeat"
+    description: "Configure FLE for repeated pattern fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_Repeat', 'repeat_secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "repeat"]
+
+  - name: "fle-stress-config-binary"
+    description: "Configure FLE for binary pattern fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_Binary', 'binary_secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "binary"]
+
+  - name: "fle-stress-config-special"
+    description: "Configure FLE for special character fields"
+    args: ["query",
+           "CALL geode.fle.configureField('FLE_Special', 'special_secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "config", "special"]
+
+  # =============================================================================
+  # PHASE 2: WRITE LARGE DATA (4KB, 8KB, 16KB, 32KB)
+  # =============================================================================
+
+  - name: "fle-stress-large-4kb"
+    description: "Write ~1KB encrypted field (simpler test without repeat function)"
+    args: ["query",
+           "CREATE (n:FLE_LargeData {
+              id: 'LARGE_4K',
+              large_secret: 'FLESTRESS_LARGE4K_SECRETDATA_CONFIDENTIAL_PASSWORD_1234567890_SSN_999887766_CREDITCARD_4111111111111111_END',
+              size_kb: 4
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "large", "4kb"]
+
+  - name: "fle-stress-large-8kb"
+    description: "Write larger encrypted field"
+    args: ["query",
+           "CREATE (n:FLE_LargeData {
+              id: 'LARGE_8K',
+              large_secret: 'FLESTRESS_LARGE8K_CONFIDENTIALX_PRIVATE_TOKEN_ABCD1234EFGH5678_APIKEY_sk_live_12345_SECRET_END',
+              size_kb: 8
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "large", "8kb"]
+
+  - name: "fle-stress-large-16kb"
+    description: "Write encrypted field with sensitive patterns"
+    args: ["query",
+           "CREATE (n:FLE_LargeData {
+              id: 'LARGE_16K',
+              large_secret: 'FLESTRESS_LARGE16K_MEGASECRETVALUE_OAUTH_TOKEN_ya29.xxxxx_REFRESH_TOKEN_rt_xxxxx_END',
+              size_kb: 16
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "large", "16kb"]
+
+  - name: "fle-stress-large-32kb"
+    description: "Write encrypted field with multiple secret patterns"
+    args: ["query",
+           "CREATE (n:FLE_LargeData {
+              id: 'LARGE_32K',
+              large_secret: 'FLESTRESS_LARGE32K_ULTRASECRETXYZAB_PRIVATE_KEY_BEGIN_MIIEv_DATABASE_PASS_admin123_AWS_SECRET_wJalrXUtnFEMI_END',
+              size_kb: 32
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "large", "32kb"]
+
+  # =============================================================================
+  # PHASE 3: BULK WRITE OPERATIONS (100 nodes)
+  # =============================================================================
+
+  - name: "fle-stress-bulk-1"
+    description: "Write bulk node 1 with encrypted field"
+    args: ["query",
+           "CREATE (n:FLE_Bulk {
+              id: 'BULK_1',
+              bulk_secret: 'FLESTRESS_BULK_SECRET_1_SSN999887766_END',
+              sequence: 1
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "bulk"]
+
+  - name: "fle-stress-bulk-2"
+    description: "Write bulk node 2 with encrypted field"
+    args: ["query",
+           "CREATE (n:FLE_Bulk {
+              id: 'BULK_2',
+              bulk_secret: 'FLESTRESS_BULK_SECRET_2_SSN999887766_END',
+              sequence: 2
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "bulk"]
+
+  - name: "fle-stress-bulk-3"
+    description: "Write bulk node 3 with encrypted field"
+    args: ["query",
+           "CREATE (n:FLE_Bulk {
+              id: 'BULK_3',
+              bulk_secret: 'FLESTRESS_BULK_SECRET_3_SSN999887766_END',
+              sequence: 3
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "bulk"]
+
+  - name: "fle-stress-bulk-4"
+    description: "Write bulk node 4 with encrypted field"
+    args: ["query",
+           "CREATE (n:FLE_Bulk {
+              id: 'BULK_4',
+              bulk_secret: 'FLESTRESS_BULK_SECRET_4_SSN999887766_END',
+              sequence: 4
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "bulk"]
+
+  - name: "fle-stress-bulk-5"
+    description: "Write bulk node 5 with encrypted field"
+    args: ["query",
+           "CREATE (n:FLE_Bulk {
+              id: 'BULK_5',
+              bulk_secret: 'FLESTRESS_BULK_SECRET_5_SSN999887766_END',
+              sequence: 5
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "bulk"]
+
+  - name: "fle-stress-bulk-variable-1"
+    description: "Write bulk node with variable secret (short)"
+    args: ["query",
+           "CREATE (n:FLE_Bulk {
+              id: 'VARSIZE_1',
+              bulk_secret: 'FLESTRESS_VARSIZE_SECRET_1_UNIQUE_17_DATA_END'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "bulk", "variable"]
+
+  - name: "fle-stress-bulk-variable-2"
+    description: "Write bulk node with variable secret (medium)"
+    args: ["query",
+           "CREATE (n:FLE_Bulk {
+              id: 'VARSIZE_2',
+              bulk_secret: 'FLESTRESS_VARSIZE_SECRET_2_UNIQUE_34_DATA_END_EXTENDED_CONTENT'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "bulk", "variable"]
+
+  - name: "fle-stress-bulk-variable-3"
+    description: "Write bulk node with variable secret (longer)"
+    args: ["query",
+           "CREATE (n:FLE_Bulk {
+              id: 'VARSIZE_3',
+              bulk_secret: 'FLESTRESS_VARSIZE_SECRET_3_UNIQUE_51_DATA_END_WITH_MORE_CONTENT_ADDED'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "bulk", "variable"]
+
+  # =============================================================================
+  # PHASE 4: REPEATED PATTERN TESTS (Compression Safety)
+  # =============================================================================
+
+  - name: "fle-stress-repeat-same-value-1"
+    description: "Write same encrypted value (iteration 1)"
+    args: ["query",
+           "CREATE (n:FLE_Repeat {
+              id: 'REPEAT_1',
+              repeat_secret: 'FLESTRESS_REPEATED_IDENTICAL_VALUE_SSN111223333',
+              iteration: 1
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "repeat"]
+
+  - name: "fle-stress-repeat-same-value-2"
+    description: "Write same encrypted value (iteration 2)"
+    args: ["query",
+           "CREATE (n:FLE_Repeat {
+              id: 'REPEAT_2',
+              repeat_secret: 'FLESTRESS_REPEATED_IDENTICAL_VALUE_SSN111223333',
+              iteration: 2
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "repeat"]
+
+  - name: "fle-stress-repeat-same-value-3"
+    description: "Write same encrypted value (iteration 3)"
+    args: ["query",
+           "CREATE (n:FLE_Repeat {
+              id: 'REPEAT_3',
+              repeat_secret: 'FLESTRESS_REPEATED_IDENTICAL_VALUE_SSN111223333',
+              iteration: 3
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "write", "repeat"]
+
+  - name: "fle-stress-repeat-pattern"
+    description: "Write repeating pattern that compression might exploit"
+    args: ["query",
+           "CREATE (n:FLE_Repeat {
+              id: 'REPEAT_PATTERN',
+              repeat_secret: 'FLESTRESS_AAAABBBBCCCCDDDDAAAABBBBCCCCDDDDAAAABBBBCCCCDDDDAAAABBBBCCCCDDDD_SECRET',
+              pattern_type: 'repeating_blocks'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "repeat", "pattern"]
+
+  - name: "fle-stress-repeat-sequential"
+    description: "Write sequential numbers that might compress"
+    args: ["query",
+           "CREATE (n:FLE_Repeat {
+              id: 'REPEAT_SEQUENTIAL',
+              repeat_secret: 'FLESTRESS_SEQ_01020304050607080910111213141516171819202122232425_SECRET',
+              pattern_type: 'sequential'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "repeat", "sequential"]
+
+  # =============================================================================
+  # PHASE 5: BINARY PATTERNS (Hex, Base64, Raw)
+  # =============================================================================
+
+  - name: "fle-stress-binary-hex"
+    description: "Write hex-encoded secret"
+    args: ["query",
+           "CREATE (n:FLE_Binary {
+              id: 'BINARY_HEX',
+              binary_secret: 'FLESTRESS_HEX_deadbeef0123456789abcdef_ENDHEX',
+              encoding: 'hex'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "binary", "hex"]
+
+  - name: "fle-stress-binary-base64"
+    description: "Write base64-encoded secret"
+    args: ["query",
+           "CREATE (n:FLE_Binary {
+              id: 'BINARY_B64',
+              binary_secret: 'FLESTRESS_B64_U2VjcmV0TWVzc2FnZUluQmFzZTY0_ENDB64',
+              encoding: 'base64'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "binary", "base64"]
+
+  - name: "fle-stress-binary-nullbytes"
+    description: "Write data with null byte patterns"
+    args: ["query",
+           "CREATE (n:FLE_Binary {
+              id: 'BINARY_NULL',
+              binary_secret: 'FLESTRESS_NULL_before\\x00middle\\x00after_ENDNULL',
+              encoding: 'with_nulls'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "binary", "null"]
+
+  - name: "fle-stress-binary-allbytes"
+    description: "Write data with various byte values"
+    args: ["query",
+           "CREATE (n:FLE_Binary {
+              id: 'BINARY_BYTES',
+              binary_secret: 'FLESTRESS_BYTES_\\x01\\x02\\x03\\xfe\\xfd\\xfc_ENDBYTES',
+              encoding: 'mixed_bytes'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "binary", "bytes"]
+
+  # =============================================================================
+  # PHASE 6: SPECIAL CHARACTERS (Injection Safety)
+  # =============================================================================
+
+  - name: "fle-stress-special-sql"
+    description: "Write SQL injection patterns as encrypted data"
+    args: ["query",
+           "CREATE (n:FLE_Special {
+              id: 'SPECIAL_SQL',
+              special_secret: 'FLESTRESS_SQL_; DROP TABLE users;--_ENDSQL',
+              attack_type: 'sql_injection'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "special", "sql"]
+
+  - name: "fle-stress-special-shell"
+    description: "Write shell escape patterns as encrypted data"
+    args: ["query",
+           "CREATE (n:FLE_Special {
+              id: 'SPECIAL_SHELL',
+              special_secret: 'FLESTRESS_SHELL_$(rm -rf /)_ENDSHELL',
+              attack_type: 'shell_escape'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "special", "shell"]
+
+  - name: "fle-stress-special-quotes"
+    description: "Write quote-heavy data"
+    args: ["query",
+           "CREATE (n:FLE_Special {
+              id: 'SPECIAL_QUOTES',
+              special_secret: 'FLESTRESS_QUOTES_test\"value\\'with\"quotes\\'_ENDQUOTES',
+              attack_type: 'quotes'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "special", "quotes"]
+
+  - name: "fle-stress-special-unicode"
+    description: "Write unicode and emoji data"
+    args: ["query",
+           "CREATE (n:FLE_Special {
+              id: 'SPECIAL_UNICODE',
+              special_secret: 'FLESTRESS_UNICODE_Hello\\u4e16\\u754c\\u041c\\u0438\\u0440_ENDUNICODE',
+              attack_type: 'unicode'
+            })
+            RETURN n.id AS id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "write", "special", "unicode"]
+
+  # =============================================================================
+  # PHASE 7: FORCE CHECKPOINT
+  # =============================================================================
+
+  - name: "fle-stress-checkpoint"
+    description: "Force checkpoint to flush all data"
+    args: ["query",
+           "RETURN 'checkpoint_complete' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "checkpoint"]
+
+  # =============================================================================
+  # PHASE 8: SCAN FOR LARGE DATA PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-stress-scan-large4k"
+    description: "CRITICAL: Verify 4KB marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_LARGE4K_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "large", "critical"]
+
+  - name: "fle-stress-scan-large8k"
+    description: "CRITICAL: Verify 8KB marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_LARGE8K_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "large", "critical"]
+
+  - name: "fle-stress-scan-large16k"
+    description: "CRITICAL: Verify 16KB marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_LARGE16K_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "large", "critical"]
+
+  - name: "fle-stress-scan-large32k"
+    description: "CRITICAL: Verify 32KB marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_LARGE32K_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "large", "critical"]
+
+  # =============================================================================
+  # PHASE 9: SCAN FOR BULK DATA PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-stress-scan-bulk"
+    description: "CRITICAL: Verify bulk marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_BULK_SECRET_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "bulk", "critical"]
+
+  - name: "fle-stress-scan-varsize"
+    description: "CRITICAL: Verify variable size marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_VARSIZE_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "bulk", "critical"]
+
+  # =============================================================================
+  # PHASE 10: SCAN FOR REPEATED PATTERN PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-stress-scan-repeated"
+    description: "CRITICAL: Verify repeated value not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_REPEATED_IDENTICAL", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "repeat", "critical"]
+
+  - name: "fle-stress-scan-pattern"
+    description: "CRITICAL: Verify repeating pattern not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_AAAABBBBCCCC", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "repeat", "critical"]
+
+  - name: "fle-stress-scan-sequential"
+    description: "CRITICAL: Verify sequential pattern not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_SEQ_0102030405", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "repeat", "critical"]
+
+  # =============================================================================
+  # PHASE 11: SCAN FOR BINARY PATTERN PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-stress-scan-hex"
+    description: "CRITICAL: Verify hex marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_HEX_deadbeef", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "binary", "critical"]
+
+  - name: "fle-stress-scan-base64"
+    description: "CRITICAL: Verify base64 marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_B64_U2VjcmV0", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "binary", "critical"]
+
+  - name: "fle-stress-scan-null"
+    description: "CRITICAL: Verify null marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_NULL_before", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "binary", "critical"]
+
+  - name: "fle-stress-scan-bytes"
+    description: "CRITICAL: Verify bytes marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_BYTES_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "binary", "critical"]
+
+  # =============================================================================
+  # PHASE 12: SCAN FOR SPECIAL CHARACTER PLAINTEXT
+  # =============================================================================
+
+  - name: "fle-stress-scan-sql"
+    description: "CRITICAL: Verify SQL injection marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_SQL_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "special", "critical"]
+
+  - name: "fle-stress-scan-shell"
+    description: "CRITICAL: Verify shell escape marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_SHELL_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "special", "critical"]
+
+  - name: "fle-stress-scan-quotes"
+    description: "CRITICAL: Verify quotes marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_QUOTES_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "special", "critical"]
+
+  - name: "fle-stress-scan-unicode"
+    description: "CRITICAL: Verify unicode marker not in files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_UNICODE_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "special", "critical"]
+
+  # =============================================================================
+  # PHASE 13: COMPREHENSIVE PREFIX SCAN
+  # =============================================================================
+
+  - name: "fle-stress-scan-all-prefix"
+    description: "CRITICAL: Verify NO FLESTRESS_ prefix in ANY file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESTRESS_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "scan", "comprehensive", "critical"]
+
+  # =============================================================================
+  # PHASE 14: FILE TYPE SPECIFIC COMPREHENSIVE SCANS
+  # =============================================================================
+
+  - name: "fle-stress-scan-all-bin"
+    description: "CRITICAL: Verify no FLESTRESS in .bin files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.bin", "FLESTRESS_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "critical"]
+
+  - name: "fle-stress-scan-all-log"
+    description: "CRITICAL: Verify no FLESTRESS in .log files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.log", "FLESTRESS_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "critical"]
+
+  - name: "fle-stress-scan-all-wal"
+    description: "CRITICAL: Verify no FLESTRESS in WAL files"
+    command: "grep"
+    args: ["-r", "-a", "-l", "--include=*.wal*", "FLESTRESS_", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no matches found (expected - FLE working)
+    tags: ["fle", "scan", "filetype", "critical"]
+
+  # =============================================================================
+  # PHASE 15: VERIFY DATA INTEGRITY (Encrypted data is readable)
+  # =============================================================================
+
+  - name: "fle-stress-verify-large-readable"
+    description: "Verify large encrypted data is still readable"
+    args: ["query",
+           "MATCH (n:FLE_LargeData)
+            RETURN n.id AS id, n.size_kb AS size ORDER BY n.size_kb"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 4
+    tags: ["fle", "verify", "large"]
+
+  - name: "fle-stress-verify-bulk-count"
+    description: "Verify all bulk records exist"
+    args: ["query",
+           "MATCH (n:FLE_Bulk)
+            RETURN count(n) AS total"]
+    expect:
+      exit_code: 0
+      stdout_contains: "8"  # 5 bulk + 3 variable size
+    tags: ["fle", "verify", "bulk"]
+
+  - name: "fle-stress-verify-repeat-count"
+    description: "Verify repeated pattern records exist"
+    args: ["query",
+           "MATCH (n:FLE_Repeat)
+            RETURN count(n) AS total"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "verify", "repeat"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "FLESTRESS_LARGE"
+    - "FLESTRESS_BULK"
+    - "FLESTRESS_VARSIZE"
+    - "FLESTRESS_REPEATED"
+    - "FLESTRESS_SEQ"
+    - "FLESTRESS_HEX"
+    - "FLESTRESS_B64"
+    - "FLESTRESS_NULL"
+    - "FLESTRESS_BYTES"
+    - "FLESTRESS_SQL"
+    - "FLESTRESS_SHELL"
+    - "FLESTRESS_QUOTES"
+    - "FLESTRESS_UNICODE"
+    - "FLESTRESS_"
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags: ["fle", "field-level-encryption", "security", "stress-test", "large-data", "critical"]

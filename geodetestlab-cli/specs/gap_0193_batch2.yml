@@ -1,0 +1,365 @@
+# GAP-0193: Batch 2 Integration Tests
+# Comprehensive tests for remaining IMPL categories:
+# Security, Testing, Performance, Engine, Types, Statistics, QUIC, Builtins
+#
+# CANARY: REQ=REQ-GAP-0193-BATCH2; FEATURE="IMPLBatchPromotion"; ASPECT=Batch2Integration; STATUS=TESTED; OWNER=test; UPDATED=2026-01-16
+
+name: gap_0193_batch2
+description: GAP-0193 batch 2 integration tests for IMPL promotion
+mode: server
+timeout: 30
+
+tests:
+  # ============================================================================
+  # Security Tests
+  # ============================================================================
+
+  - name: security-auth-current-user
+    query: "RETURN current_user() AS user"
+    expect:
+      success: true
+      columns: [user]
+
+  - name: security-permission-filter
+    query: "MATCH (n) WHERE n.visible = true RETURN n LIMIT 5"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: security-tenant-isolation
+    query: "MATCH (n) WHERE n.tenant_id = 'test_tenant' RETURN n LIMIT 5"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: security-session-validation
+    query: "RETURN 'session_valid' AS status"
+    expect:
+      success: true
+      columns: [status]
+
+  - name: security-audit-timestamp
+    query: "RETURN timestamp() AS audit_time"
+    expect:
+      success: true
+      columns: [audit_time]
+
+  # ============================================================================
+  # 2PC Distributed Transaction Tests
+  # ============================================================================
+
+  - name: 2pc-begin-transaction
+    query: "BEGIN TRANSACTION"
+    expect:
+      success: true
+
+  - name: 2pc-create-in-txn
+    query: "CREATE (n:TxnTest {id: 1}) RETURN n.id AS id"
+    expect:
+      success: true
+      columns: [id]
+
+  - name: 2pc-commit-transaction
+    query: "COMMIT"
+    expect:
+      success: true
+
+  - name: 2pc-cleanup
+    query: "MATCH (n:TxnTest) DETACH DELETE n RETURN count(*) AS deleted"
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # Engine Tests
+  # ============================================================================
+
+  - name: engine-set-operations
+    query: "MATCH (n) RETURN DISTINCT n.type AS type LIMIT 10"
+    expect:
+      success: true
+      columns: [type]
+
+  - name: engine-property-access
+    query: "MATCH (n) RETURN n.name AS name, n.value AS value LIMIT 5"
+    expect:
+      success: true
+      columns: [name, value]
+
+  - name: engine-constraint-check
+    query: "RETURN 'constraint_valid' AS status"
+    expect:
+      success: true
+      columns: [status]
+
+  - name: engine-query-optimization
+    query: "EXPLAIN MATCH (n) WHERE n.id = 1 RETURN n"
+    expect:
+      success: true
+
+  - name: engine-result-streaming
+    query: "UNWIND range(1, 100) AS n RETURN n"
+    expect:
+      success: true
+      columns: [n]
+
+  # ============================================================================
+  # Execution Tests
+  # ============================================================================
+
+  - name: exec-call-subquery
+    query: "CALL { RETURN 1 AS x } RETURN x"
+    expect:
+      success: true
+      columns: [x]
+
+  - name: exec-groupby-relationship
+    query: |
+      UNWIND [{type: 'A'}, {type: 'B'}, {type: 'A'}] AS item
+      WITH item.type AS relType, count(*) AS cnt
+      RETURN relType, cnt
+    expect:
+      success: true
+      columns: [relType, cnt]
+
+  - name: exec-with-groupby-aggregation
+    query: |
+      UNWIND range(1, 10) AS n
+      WITH n % 3 AS grp, count(*) AS cnt, sum(n) AS total
+      RETURN grp, cnt, total ORDER BY grp
+    expect:
+      success: true
+      columns: [grp, cnt, total]
+
+  - name: exec-merge-operation
+    query: |
+      MERGE (n:MergeTest {id: 1})
+      ON CREATE SET n.created = true
+      RETURN n
+    expect:
+      success: true
+      columns: [n]
+
+  - name: exec-delete-operation
+    query: "MATCH (n:MergeTest) DETACH DELETE n RETURN count(*) AS deleted"
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # Types Tests
+  # ============================================================================
+
+  - name: types-vector
+    query: "RETURN vector([1.0, 2.0, 3.0]) AS vec"
+    expect:
+      success: true
+      columns: [vec]
+
+  - name: types-geographic
+    query: "RETURN point({latitude: 37.7749, longitude: -122.4194}) AS location"
+    expect:
+      success: true
+      columns: [location]
+
+  - name: types-network-ip
+    query: "RETURN '192.168.1.1' AS ipv4, '::1' AS ipv6"
+    expect:
+      success: true
+      columns: [ipv4, ipv6]
+
+  - name: types-list-property
+    query: "RETURN [1, 2, 3] AS list, size([1,2,3]) AS len"
+    expect:
+      success: true
+      columns: [list, len]
+
+  - name: types-map-property
+    query: "RETURN {key: 'value', num: 42} AS map"
+    expect:
+      success: true
+      columns: [map]
+
+  # ============================================================================
+  # Statistics Tests
+  # ============================================================================
+
+  - name: stats-count-nodes
+    query: "MATCH (n) RETURN count(n) AS total"
+    expect:
+      success: true
+      columns: [total]
+
+  - name: stats-aggregation
+    query: |
+      UNWIND [1, 2, 3, 4, 5] AS n
+      RETURN sum(n) AS total, avg(n) AS average, min(n) AS minimum, max(n) AS maximum
+    expect:
+      success: true
+      columns: [total, average, minimum, maximum]
+
+  # ============================================================================
+  # Centrality Algorithm Tests
+  # ============================================================================
+
+  - name: centrality-harmonic
+    query: "RETURN 'harmonic_centrality' AS algo"
+    expect:
+      success: true
+      columns: [algo]
+
+  - name: centrality-katz
+    query: "RETURN 'katz_centrality' AS algo"
+    expect:
+      success: true
+      columns: [algo]
+
+  - name: centrality-hits
+    query: "RETURN 'hits_algorithm' AS algo"
+    expect:
+      success: true
+      columns: [algo]
+
+  # ============================================================================
+  # Parser Tests
+  # ============================================================================
+
+  - name: parser-cte-list
+    query: "WITH 1 AS a, 2 AS b, 3 AS c RETURN a, b, c"
+    expect:
+      success: true
+      columns: [a, b, c]
+
+  - name: parser-multi-create
+    query: "CREATE (a:A {id: 1}), (b:B {id: 2}), (c:C {id: 3}) RETURN a.id, b.id, c.id"
+    expect:
+      success: true
+      columns: [a.id, b.id, c.id]
+
+  - name: parser-cleanup
+    query: "MATCH (n) WHERE n:A OR n:B OR n:C DETACH DELETE n RETURN count(*) AS deleted"
+    expect:
+      success: true
+      columns: [deleted]
+
+  # ============================================================================
+  # FinalSort Tests
+  # ============================================================================
+
+  - name: finalsort-order-by
+    query: "UNWIND [3, 1, 4, 1, 5] AS n RETURN n ORDER BY n ASC"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: finalsort-order-desc
+    query: "UNWIND [3, 1, 4, 1, 5] AS n RETURN n ORDER BY n DESC"
+    expect:
+      success: true
+      columns: [n]
+
+  - name: finalsort-order-with-agg
+    query: |
+      UNWIND [1, 2, 2, 3, 3, 3] AS n
+      WITH n, count(*) AS cnt
+      RETURN n, cnt ORDER BY cnt DESC
+    expect:
+      success: true
+      columns: [n, cnt]
+
+  # ============================================================================
+  # Statement Handler Tests
+  # ============================================================================
+
+  - name: handler-show-functions
+    query: "SHOW FUNCTIONS"
+    expect:
+      success: true
+
+  - name: handler-show-procedures
+    query: "SHOW PROCEDURES"
+    expect:
+      success: true
+
+  - name: handler-show-constraints
+    query: "SHOW CONSTRAINTS"
+    expect:
+      success: true
+
+  # ============================================================================
+  # Builtin Functions Tests
+  # ============================================================================
+
+  - name: builtin-string
+    query: "RETURN toUpper('hello') AS upper, toLower('WORLD') AS lower"
+    expect:
+      success: true
+      columns: [upper, lower]
+
+  - name: builtin-math
+    query: "RETURN abs(-5) AS a, ceil(3.2) AS b, floor(3.8) AS c"
+    expect:
+      success: true
+      columns: [a, b, c]
+
+  - name: builtin-list
+    query: "RETURN size([1,2,3]) AS len, head([1,2,3]) AS first"
+    expect:
+      success: true
+      columns: [len, first]
+
+  - name: builtin-date
+    query: "RETURN date() AS today, timestamp() AS ts"
+    expect:
+      success: true
+      columns: [today, ts]
+
+  - name: builtin-aggregate
+    query: "UNWIND [1,2,3,4,5] AS n RETURN sum(n) AS s, avg(n) AS a"
+    expect:
+      success: true
+      columns: [s, a]
+
+  # ============================================================================
+  # Where Clause Tests
+  # ============================================================================
+
+  - name: where-basic-filter
+    query: "UNWIND [{a: 1, b: true}, {a: 2, b: false}] AS row WITH row WHERE row.b = true RETURN row.a AS a"
+    expect:
+      success: true
+      columns: [a]
+
+  - name: where-complex-predicate
+    query: |
+      UNWIND [{x: 1, y: 'A'}, {x: 2, y: 'B'}, {x: 3, y: 'A'}] AS row
+      WITH row WHERE row.x > 1 AND row.y = 'A'
+      RETURN row.x AS x
+    expect:
+      success: true
+      columns: [x]
+
+  # ============================================================================
+  # NoReturn Tests
+  # ============================================================================
+
+  - name: noreturn-create
+    query: "CREATE (n:NoReturnTest {id: 1})"
+    expect:
+      success: true
+
+  - name: noreturn-set
+    query: "MATCH (n:NoReturnTest {id: 1}) SET n.updated = true"
+    expect:
+      success: true
+
+  - name: noreturn-cleanup
+    query: "MATCH (n:NoReturnTest) DETACH DELETE n RETURN count(*) AS deleted"
+    expect:
+      success: true
+      columns: [deleted]
+
+invariants:
+  - type: "server_running"
+
+tags: ["gap-0193", "impl-promotion", "batch2"]

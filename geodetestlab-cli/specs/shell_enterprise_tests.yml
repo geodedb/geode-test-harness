@@ -1,0 +1,499 @@
+version: "1.0"
+name: "Shell Enterprise Tests"
+description: "Enterprise-level tests from enterprise_test.gql covering multi-graph, aggregations, set operations, patterns, subqueries, and transactions"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+secrets:
+  admin_password:
+    source: "env"
+    key: "GEODE_ADMIN_PASSWORD"
+    required: false
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+
+tests:
+  # Section 1: Multi-Graph Management
+  - name: "create-graph-hr"
+    description: "Create enterprise_hr graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "CREATE GRAPH IF NOT EXISTS enterprise_hr;"
+    expect:
+      exit_code: 0
+    tags: ["graph", "create"]
+
+  - name: "create-graph-sales"
+    description: "Create enterprise_sales graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "CREATE GRAPH IF NOT EXISTS enterprise_sales;"
+    expect:
+      exit_code: 0
+    tags: ["graph", "create"]
+
+  - name: "use-graph-hr"
+    description: "Switch to HR graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr;"
+    expect:
+      exit_code: 0
+    tags: ["graph", "use"]
+
+  - name: "create-employee-alice"
+    description: "Create Alice employee node"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; CREATE (e:Employee {id: 'EMP001', name: 'Alice Johnson', department: 'Engineering', salary: 95000});"
+    expect:
+      exit_code: 0
+    tags: ["create", "node"]
+
+  - name: "create-employee-bob"
+    description: "Create Bob employee node"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; CREATE (e:Employee {id: 'EMP002', name: 'Bob Smith', department: 'Engineering', salary: 105000});"
+    expect:
+      exit_code: 0
+    tags: ["create", "node"]
+
+  - name: "create-employee-carol"
+    description: "Create Carol employee node"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; CREATE (e:Employee {id: 'EMP003', name: 'Carol Williams', department: 'Sales', salary: 85000});"
+    expect:
+      exit_code: 0
+    tags: ["create", "node"]
+
+  - name: "create-department-engineering"
+    description: "Create Engineering department"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; CREATE (d:Department {name: 'Engineering', budget: 5000000});"
+    expect:
+      exit_code: 0
+    tags: ["create", "node"]
+
+  - name: "create-department-sales"
+    description: "Create Sales department"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; CREATE (d:Department {name: 'Sales', budget: 3000000});"
+    expect:
+      exit_code: 0
+    tags: ["create", "node"]
+
+  # Section 2: Advanced Query Patterns - WITH Clause
+  - name: "with-order-limit"
+    description: "WITH clause with ORDER BY and LIMIT"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WITH e ORDER BY e.salary DESC LIMIT 2 RETURN e.name AS top_earner, e.salary AS salary;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["top_earner", "salary"]
+    tags: ["with", "order", "limit"]
+
+  - name: "with-aggregation"
+    description: "WITH clause with aggregation"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WITH e.department AS dept, count(*) AS emp_count RETURN dept, emp_count ORDER BY emp_count DESC;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["dept", "emp_count"]
+    tags: ["with", "aggregation"]
+
+  # Section 3: Aggregation and Grouping
+  - name: "basic-aggregations"
+    description: "Basic aggregation functions"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN count(*) AS total, sum(e.salary) AS total_payroll, avg(e.salary) AS avg_salary;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["total", "total_payroll", "avg_salary"]
+    tags: ["aggregation"]
+
+  - name: "group-by-department"
+    description: "GROUP BY department"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN e.department AS dept, count(*) AS headcount GROUP BY e.department ORDER BY headcount DESC;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["dept", "headcount"]
+    tags: ["aggregation", "groupby"]
+
+  - name: "count-distinct"
+    description: "COUNT DISTINCT"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN count(DISTINCT e.department) AS unique_departments;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["unique_departments"]
+    tags: ["aggregation", "distinct"]
+
+  # Section 4: Set Operations
+  - name: "union-operation"
+    description: "UNION of two queries"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WHERE e.department = 'Engineering' RETURN e.name AS person UNION MATCH (e:Employee) WHERE e.salary > 100000 RETURN e.name AS person;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["person"]
+    tags: ["set", "union"]
+
+  - name: "union-all-operation"
+    description: "UNION ALL preserving duplicates"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WHERE e.department = 'Engineering' RETURN e.name AS person UNION ALL MATCH (e:Employee) WHERE e.salary > 90000 RETURN e.name AS person;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["person"]
+    tags: ["set", "union"]
+
+  - name: "intersect-operation"
+    description: "INTERSECT of two queries"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WHERE e.department = 'Engineering' RETURN e.name AS person INTERSECT MATCH (e:Employee) WHERE e.salary > 100000 RETURN e.name AS person;"
+    expect:
+      exit_code: 0
+    tags: ["set", "intersect"]
+
+  - name: "except-operation"
+    description: "EXCEPT operation"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WHERE e.department = 'Engineering' RETURN e.name AS person EXCEPT MATCH (e:Employee) WHERE e.salary > 100000 RETURN e.name AS person;"
+    expect:
+      exit_code: 0
+    tags: ["set", "except"]
+
+  # Section 5: Pattern Matching
+  - name: "simple-match"
+    description: "Simple node match"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN e.name ORDER BY e.name LIMIT 5;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+    tags: ["match", "pattern"]
+
+  - name: "match-with-where"
+    description: "Match with WHERE clause"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WHERE e.salary > 90000 RETURN e.name, e.salary ORDER BY e.salary DESC;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["name", "salary"]
+    tags: ["match", "where"]
+
+  # Section 6: Ordering and Pagination
+  - name: "order-by-asc"
+    description: "ORDER BY ascending"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN e.name, e.salary ORDER BY e.salary ASC;"
+    expect:
+      exit_code: 0
+    tags: ["order"]
+
+  - name: "order-by-desc"
+    description: "ORDER BY descending"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN e.name, e.salary ORDER BY e.salary DESC;"
+    expect:
+      exit_code: 0
+    tags: ["order"]
+
+  - name: "skip-limit"
+    description: "SKIP and LIMIT"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN e.name ORDER BY e.name SKIP 1 LIMIT 2;"
+    expect:
+      exit_code: 0
+    tags: ["pagination"]
+
+  # Section 7: CASE Expressions
+  - name: "simple-case"
+    description: "Simple CASE expression"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN e.name, CASE e.department WHEN 'Engineering' THEN 'Tech' WHEN 'Sales' THEN 'Revenue' ELSE 'Other' END AS team;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["name", "team"]
+    tags: ["case"]
+
+  - name: "searched-case"
+    description: "Searched CASE expression"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) RETURN e.name, CASE WHEN e.salary >= 100000 THEN 'Senior' WHEN e.salary >= 80000 THEN 'Mid' ELSE 'Junior' END AS level;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["name", "level"]
+    tags: ["case"]
+
+  # Section 8: String Functions
+  - name: "upper-function"
+    description: "UPPER function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN upper('hello') AS upper_case;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["HELLO"]
+    tags: ["string", "function"]
+
+  - name: "lower-function"
+    description: "LOWER function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN lower('WORLD') AS lower_case;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["world"]
+    tags: ["string", "function"]
+
+  - name: "trim-function"
+    description: "TRIM function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN trim('  spaces  ') AS trimmed;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["spaces"]
+    tags: ["string", "function"]
+
+  - name: "substring-function"
+    description: "SUBSTRING function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN substring('enterprise', 0, 5) AS substr;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["enter"]
+    tags: ["string", "function"]
+
+  - name: "replace-function"
+    description: "REPLACE function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN replace('hello world', 'world', 'geode') AS replaced;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["geode"]
+    tags: ["string", "function"]
+
+  # Section 9: List Operations
+  - name: "list-literal"
+    description: "List literal"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [1, 2, 3, 4, 5] AS numbers;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["numbers"]
+    tags: ["list"]
+
+  - name: "list-index"
+    description: "List indexing"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN [1, 2, 3, 4, 5][0] AS first;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+    tags: ["list"]
+
+  - name: "list-size"
+    description: "List size"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN size([1, 2, 3]) AS list_size;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["3"]
+    tags: ["list", "function"]
+
+  - name: "list-head"
+    description: "List head"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN head([1, 2, 3]) AS first;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+    tags: ["list", "function"]
+
+  - name: "list-tail"
+    description: "List tail"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN tail([1, 2, 3]) AS rest;"
+    expect:
+      exit_code: 0
+    tags: ["list", "function"]
+
+  - name: "in-predicate"
+    description: "IN predicate"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN 3 IN [1, 2, 3, 4, 5] AS is_in;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["list", "predicate"]
+
+  # Section 10: Math Functions
+  - name: "round-function"
+    description: "ROUND function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN round(3.7) AS rounded;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["4"]
+    tags: ["math", "function"]
+
+  - name: "floor-function"
+    description: "FLOOR function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN floor(3.7) AS floored;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["3"]
+    tags: ["math", "function"]
+
+  - name: "ceil-function"
+    description: "CEIL function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN ceil(3.2) AS ceiled;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["4"]
+    tags: ["math", "function"]
+
+  - name: "abs-function"
+    description: "ABS function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN abs(-42) AS absolute;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["42"]
+    tags: ["math", "function"]
+
+  - name: "sqrt-function"
+    description: "SQRT function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN sqrt(16) AS square_root;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["4"]
+    tags: ["math", "function"]
+
+  - name: "power-function"
+    description: "POWER function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN power(2, 10) AS power_of_two;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1024"]
+    tags: ["math", "function"]
+
+  # Section 11: Type Coercion
+  - name: "to-integer"
+    description: "toInteger function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN toInteger('42') AS str_to_int;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["42"]
+    tags: ["type", "coercion"]
+
+  - name: "to-float"
+    description: "toFloat function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN toFloat('3.14') AS str_to_float;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["3.14"]
+    tags: ["type", "coercion"]
+
+  - name: "to-string"
+    description: "toString function"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN toString(42) AS int_to_str;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["42"]
+    tags: ["type", "coercion"]
+
+  # Section 12: Date/Time
+  - name: "current-date"
+    description: "Current date"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN date() AS current_date;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["current_date"]
+    tags: ["date"]
+
+  - name: "current-datetime"
+    description: "Current datetime"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN datetime() AS current_datetime;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["current_datetime"]
+    tags: ["date"]
+
+  - name: "parse-date"
+    description: "Parse date string"
+    args: ["query", "--insecure", "-"]
+    stdin: "RETURN date('2024-01-15') AS parsed_date;"
+    expect:
+      exit_code: 0
+    tags: ["date"]
+
+  # Section 14: Subqueries
+  - name: "exists-subquery"
+    description: "EXISTS subquery"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WHERE EXISTS { MATCH (e)-[:REPORTS_TO]->(:Employee) } RETURN e.name AS has_manager;"
+    expect:
+      exit_code: 0
+    tags: ["subquery", "exists"]
+
+  - name: "not-exists-subquery"
+    description: "NOT EXISTS subquery"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (e:Employee) WHERE NOT EXISTS { MATCH (e)-[:REPORTS_TO]->(:Employee) } RETURN e.name AS top_level;"
+    expect:
+      exit_code: 0
+    tags: ["subquery", "exists"]
+
+  # Cleanup
+  - name: "cleanup-hr-graph"
+    description: "Clean up HR graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH enterprise_hr; MATCH (n) DETACH DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "drop-hr-graph"
+    description: "Drop HR graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "DROP GRAPH IF EXISTS enterprise_hr;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup", "graph"]
+
+  - name: "drop-sales-graph"
+    description: "Drop Sales graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "DROP GRAPH IF EXISTS enterprise_sales;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup", "graph"]
+
+tags: ["enterprise", "shell", "gql"]

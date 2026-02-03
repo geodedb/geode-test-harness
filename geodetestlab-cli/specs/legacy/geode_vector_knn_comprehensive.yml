@@ -1,0 +1,195 @@
+name: "Vector K-NN Search Comprehensive Tests"
+description: "Comprehensive testing of HNSW vector index functionality and K-NN search optimization"
+
+setup:
+  server_mode: embedded
+  timeout: 30
+
+teardown:
+  cleanup_data: true
+
+tests:
+  # Basic vector index creation and population
+  - name: "vector_index_creation"
+    description: "Create HNSW vector index and verify creation"
+    steps:
+      - command: query
+        input: "CREATE INDEX vector_embeddings_idx ON Document (embedding) USING vector_f32"
+        expect:
+          status_class: "00000"
+          message_contains: "Index created successfully"
+
+  - name: "vector_data_insertion"
+    description: "Insert documents with vector embeddings"
+    steps:
+      - command: query
+        input: "CREATE (doc1:Document {title: 'AI Research Paper', embedding: vectorf32('[0.1, 0.8, -0.2, 0.9, 0.3]')})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "CREATE (doc2:Document {title: 'Machine Learning Guide', embedding: vectorf32('[0.2, 0.7, -0.1, 0.8, 0.4]')})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "CREATE (doc3:Document {title: 'Deep Learning Fundamentals', embedding: vectorf32('[0.3, 0.6, 0.0, 0.7, 0.5]')})"
+        expect:
+          status_class: "00000"
+
+  # Vector similarity search with different distance metrics
+  - name: "cosine_similarity_search"
+    description: "Test cosine similarity vector search"
+    steps:
+      - command: query
+        input: "MATCH (d:Document) WHERE vector_cosine(d.embedding, vectorf32('[0.15, 0.75, -0.15, 0.85, 0.35]')) > 0.8 RETURN d.title, vector_cosine(d.embedding, vectorf32('[0.15, 0.75, -0.15, 0.85, 0.35]')) AS similarity ORDER BY similarity DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "AI Research Paper"
+            - "similarity"
+
+  - name: "euclidean_distance_search"
+    description: "Test L2 (Euclidean) distance vector search"
+    steps:
+      - command: query
+        input: "MATCH (d:Document) WHERE vector_l2(d.embedding, vectorf32('[0.2, 0.7, -0.1, 0.8, 0.4]')) < 0.5 RETURN d.title, vector_l2(d.embedding, vectorf32('[0.2, 0.7, -0.1, 0.8, 0.4]')) AS distance ORDER BY distance ASC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "Machine Learning Guide"
+            - "distance"
+
+  - name: "dot_product_search"
+    description: "Test dot product vector search"
+    steps:
+      - command: query
+        input: "MATCH (d:Document) WHERE vector_dot(d.embedding, vectorf32('[1.0, 1.0, 1.0, 1.0, 1.0]')) > 2.0 RETURN d.title, vector_dot(d.embedding, vectorf32('[1.0, 1.0, 1.0, 1.0, 1.0]')) AS dot_product ORDER BY dot_product DESC"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "title"
+            - "dot_product"
+
+  # K-NN optimization and index utilization
+  - name: "knn_optimization_explain"
+    description: "Verify K-NN optimization in query plan"
+    steps:
+      - command: query
+        input: "EXPLAIN MATCH (d:Document) WHERE vector_cosine(d.embedding, vectorf32('[0.1, 0.8, -0.2, 0.9, 0.3]')) > 0.7 RETURN d.title ORDER BY vector_cosine(d.embedding, vectorf32('[0.1, 0.8, -0.2, 0.9, 0.3]')) DESC LIMIT 5"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "Index"
+            - "vector_embeddings_idx"
+            - "cost"
+
+  - name: "knn_with_limit"
+    description: "Test K-NN search with result limiting"
+    steps:
+      - command: query
+        input: "MATCH (d:Document) RETURN d.title, vector_cosine(d.embedding, vectorf32('[0.2, 0.7, 0.0, 0.8, 0.4]')) AS similarity ORDER BY similarity DESC LIMIT 2"
+        expect:
+          status_class: "00000"
+          max_results: 2
+
+  # Vector type validation and error handling
+  - name: "vector_dimension_validation"
+    description: "Test vector dimension validation"
+    steps:
+      - command: query
+        input: "CREATE (invalid:Document {title: 'Invalid', embedding: vectorf32('[1.0, 2.0]')})"
+        expect:
+          status_class: "00000"  # Should succeed, dimension validation may be application-level
+
+  - name: "vector_type_validation"
+    description: "Test vector type validation in queries"
+    steps:
+      - command: query
+        input: "MATCH (d:Document) WHERE vector_cosine(d.embedding, 'invalid_vector') > 0.5 RETURN d.title"
+        expect:
+          status_class: "22000"  # Should fail with invalid vector type
+
+  # Multi-dimensional vector operations
+  - name: "high_dimensional_vectors"
+    description: "Test with higher dimensional vectors"
+    steps:
+      - command: query
+        input: "CREATE (hd:Document {title: 'High Dimensional', embedding: vectorf32('[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]')})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "MATCH (d:Document {title: 'High Dimensional'}) RETURN d.title, vector_l2(d.embedding, vectorf32('[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]')) AS distance"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "High Dimensional"
+            - "distance"
+
+  # Composite vector queries with other filters
+  - name: "vector_with_property_filter"
+    description: "Test vector search combined with property filtering"
+    steps:
+      - command: query
+        input: "MATCH (d:Document) WHERE d.title CONTAINS 'Learning' AND vector_cosine(d.embedding, vectorf32('[0.2, 0.7, -0.1, 0.8, 0.4]')) > 0.5 RETURN d.title, vector_cosine(d.embedding, vectorf32('[0.2, 0.7, -0.1, 0.8, 0.4]')) AS similarity"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "Learning"
+            - "similarity"
+
+  # Vector index performance and statistics
+  - name: "vector_index_statistics"
+    description: "Test vector index statistics and performance"
+    steps:
+      - command: query
+        input: "CALL index.statistics('vector_embeddings_idx') YIELD index_name, index_type, total_entries, unique_values"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "vector_embeddings_idx"
+            - "vector_f32"
+
+  # Vector index dropping
+  - name: "vector_index_drop"
+    description: "Test dropping vector index"
+    steps:
+      - command: query
+        input: "DROP INDEX vector_embeddings_idx"
+        expect:
+          status_class: "00000"
+          message_contains: "Index dropped successfully"
+
+  # Vector operations without index (fallback)
+  - name: "vector_operations_no_index"
+    description: "Test vector operations without index (sequential scan)"
+    steps:
+      - command: query
+        input: "MATCH (d:Document) WHERE vector_cosine(d.embedding, vectorf32('[0.1, 0.8, -0.2, 0.9, 0.3]')) > 0.6 RETURN d.title, vector_cosine(d.embedding, vectorf32('[0.1, 0.8, -0.2, 0.9, 0.3]')) AS similarity"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "title"
+            - "similarity"
+
+  # Large dataset vector search performance
+  - name: "vector_search_performance"
+    description: "Test vector search performance with multiple documents"
+    steps:
+      - command: query
+        input: "CREATE INDEX perf_vector_idx ON Document (embedding) USING vector_f32"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "CREATE (d1:Document {title: 'Doc1', embedding: vectorf32('[0.1, 0.2, 0.3, 0.4, 0.5]')}), (d2:Document {title: 'Doc2', embedding: vectorf32('[0.2, 0.3, 0.4, 0.5, 0.6]')}), (d3:Document {title: 'Doc3', embedding: vectorf32('[0.3, 0.4, 0.5, 0.6, 0.7]')}), (d4:Document {title: 'Doc4', embedding: vectorf32('[0.4, 0.5, 0.6, 0.7, 0.8]')}), (d5:Document {title: 'Doc5', embedding: vectorf32('[0.5, 0.6, 0.7, 0.8, 0.9]')})"
+        expect:
+          status_class: "00000"
+      - command: query
+        input: "MATCH (d:Document) WHERE vector_cosine(d.embedding, vectorf32('[0.3, 0.4, 0.5, 0.6, 0.7]')) > 0.8 RETURN COUNT(d) AS similar_docs"
+        expect:
+          status_class: "00000"
+          result_contains:
+            - "similar_docs"
+
+validation:
+  - check_no_memory_leaks: true
+  - verify_index_cleanup: true
+  - validate_vector_operations: true

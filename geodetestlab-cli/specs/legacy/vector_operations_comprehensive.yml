@@ -1,0 +1,313 @@
+# Comprehensive Vector Operations Test Specification
+# Tests advanced vector distance metrics, query optimization, and HNSW integration
+
+metadata:
+  version: "1.0"
+  description: "Comprehensive testing of advanced vector operations with IndexOptimizer integration"
+  created: "2025-10-04"
+  updated: "2025-10-04"
+  category: "vector-operations"
+  priority: "high"
+
+# Test configuration
+config:
+  timeout: 30
+  retries: 2
+  setup_commands: []
+  teardown_commands: []
+
+tests:
+  # Test 1: Vector Type Creation and Basic Operations
+  - name: "vector_types_basic_creation"
+    description: "Test basic vector type creation and validation"
+    command: ["geode", "query"]
+    input: |
+      CREATE (doc1:Document {
+        title: 'AI Research Paper',
+        embedding_f32: vectorf32('[0.1, 0.2, -0.3, 0.8, 0.4]'),
+        features_i32: vectori32('[5, 3, 8, 2, 9]')
+      })
+      RETURN doc1.title, doc1.embedding_f32, doc1.features_i32
+    expected_patterns:
+      - "AI Research Paper"
+      - "\\[vector\\]"  # Vector types show as [vector] in output
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 2: L2 (Euclidean) Distance Operations
+  - name: "vector_l2_distance_operations"
+    description: "Test L2 distance calculations and queries"
+    command: ["geode", "query"]
+    input: |
+      CREATE (v1:Vector {id: 1, data: vectorf32('[1.0, 2.0, 3.0]')})
+      CREATE (v2:Vector {id: 2, data: vectorf32('[4.0, 5.0, 6.0]')})
+      CREATE (v3:Vector {id: 3, data: vectorf32('[1.1, 2.1, 3.1]')})
+      MATCH (v:Vector)
+      WHERE vector_l2(v.data, vectorf32('[1.0, 2.0, 3.0]')) < 2.0
+      RETURN v.id, vector_l2(v.data, vectorf32('[1.0, 2.0, 3.0]')) AS distance
+      ORDER BY distance
+    expected_patterns:
+      - "\"id\":\\s*1"
+      - "\"distance\":\\s*0"  # Exact match should have distance 0
+      - "\"id\":\\s*3"        # Close vector should be included
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 3: Cosine Similarity Operations
+  - name: "vector_cosine_similarity_operations"
+    description: "Test cosine similarity calculations for normalized embeddings"
+    command: ["geode", "query"]
+    input: |
+      CREATE (doc1:Document {title: 'Machine Learning', embedding: vectorf32('[0.8, 0.6, 0.0]')})
+      CREATE (doc2:Document {title: 'Deep Learning', embedding: vectorf32('[0.6, 0.8, 0.0]')})
+      CREATE (doc3:Document {title: 'Statistics', embedding: vectorf32('[0.0, 0.0, 1.0]')})
+      MATCH (d:Document)
+      WHERE vector_cosine(d.embedding, vectorf32('[1.0, 0.0, 0.0]')) > 0.5
+      RETURN d.title, vector_cosine(d.embedding, vectorf32('[1.0, 0.0, 0.0]')) AS similarity
+      ORDER BY similarity DESC
+    expected_patterns:
+      - "Machine Learning"
+      - "similarity"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 4: Dot Product Operations
+  - name: "vector_dot_product_operations"
+    description: "Test dot product calculations for unnormalized similarity"
+    command: ["geode", "query"]
+    input: |
+      CREATE (item1:Item {name: 'Product A', attributes: vectorf32('[2.0, 3.0, 1.0]')})
+      CREATE (item2:Item {name: 'Product B', attributes: vectorf32('[1.0, 4.0, 2.0]')})
+      CREATE (item3:Item {name: 'Product C', attributes: vectorf32('[3.0, 1.0, 3.0]')})
+      MATCH (i:Item)
+      WHERE vector_dot(i.attributes, vectorf32('[1.0, 1.0, 1.0]')) > 5.0
+      RETURN i.name, vector_dot(i.attributes, vectorf32('[1.0, 1.0, 1.0]')) AS dot_score
+      ORDER BY dot_score DESC
+    expected_patterns:
+      - "Product"
+      - "dot_score"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 5: Manhattan Distance Operations
+  - name: "vector_manhattan_distance_operations"
+    description: "Test Manhattan (L1) distance for sparse high-dimensional vectors"
+    command: ["geode", "query"]
+    input: |
+      CREATE (user1:User {name: 'Alice', preferences: vectori32('[1, 0, 1, 0, 1]')})
+      CREATE (user2:User {name: 'Bob', preferences: vectori32('[0, 1, 1, 1, 0]')})
+      CREATE (user3:User {name: 'Charlie', preferences: vectori32('[1, 1, 0, 0, 1]')})
+      MATCH (u:User)
+      WHERE manhattan_distance(u.preferences, vectori32('[1, 0, 1, 0, 1]')) <= 2
+      RETURN u.name, manhattan_distance(u.preferences, vectori32('[1, 0, 1, 0, 1]')) AS distance
+      ORDER BY distance
+    expected_patterns:
+      - "Alice"
+      - "distance"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 6: Hamming Distance Operations
+  - name: "vector_hamming_distance_operations"
+    description: "Test Hamming distance for binary feature vectors"
+    command: ["geode", "query"]
+    input: |
+      CREATE (sig1:BinarySignature {id: 1, bits: vectori32('[1, 0, 1, 1, 0]')})
+      CREATE (sig2:BinarySignature {id: 2, bits: vectori32('[1, 1, 1, 0, 0]')})
+      CREATE (sig3:BinarySignature {id: 3, bits: vectori32('[0, 0, 1, 1, 1]')})
+      MATCH (s:BinarySignature)
+      WHERE hamming_distance(s.bits, vectori32('[1, 0, 1, 1, 0]')) <= 2
+      RETURN s.id, hamming_distance(s.bits, vectori32('[1, 0, 1, 1, 0]')) AS hamming
+      ORDER BY hamming
+    expected_patterns:
+      - "\"id\":\\s*1"
+      - "hamming"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 7: Jaccard Similarity Operations
+  - name: "vector_jaccard_similarity_operations"
+    description: "Test Jaccard similarity for set-based similarity measures"
+    command: ["geode", "query"]
+    input: |
+      CREATE (cat1:Category {name: 'Tech', features: vectori32('[1, 1, 0, 1, 0]')})
+      CREATE (cat2:Category {name: 'Science', features: vectori32('[1, 0, 1, 1, 0]')})
+      CREATE (cat3:Category {name: 'Business', features: vectori32('[0, 1, 0, 0, 1]')})
+      MATCH (c:Category)
+      WHERE jaccard_similarity(c.features, vectori32('[1, 1, 0, 1, 0]')) > 0.5
+      RETURN c.name, jaccard_similarity(c.features, vectori32('[1, 1, 0, 1, 0]')) AS jaccard
+      ORDER BY jaccard DESC
+    expected_patterns:
+      - "Tech"
+      - "jaccard"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 8: Vector Index Creation
+  - name: "vector_index_creation"
+    description: "Test creation of vector indexes for optimization"
+    command: ["geode", "query"]
+    input: |
+      CREATE INDEX vector_embeddings_idx ON Document (embedding) USING vector_f32
+    expected_patterns:
+      - "Index created successfully"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 9: HNSW Vector Index Creation
+  - name: "hnsw_vector_index_creation"
+    description: "Test creation of HNSW vector indexes for K-NN optimization"
+    command: ["geode", "query"]
+    input: |
+      CREATE INDEX hnsw_embeddings_idx ON Document (embedding) USING vector_hnsw
+    expected_patterns:
+      - "Index created successfully"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 10: Advanced Vector Query with Multiple Metrics
+  - name: "multi_metric_vector_comparison"
+    description: "Test query using multiple distance metrics in one query"
+    command: ["geode", "query"]
+    input: |
+      CREATE (item:Item {
+        name: 'Test Item',
+        dense_features: vectorf32('[0.5, 0.8, 0.3, 0.9]'),
+        sparse_features: vectori32('[1, 0, 1, 0, 1, 1, 0]')
+      })
+      MATCH (i:Item)
+      RETURN
+        i.name,
+        vector_l2(i.dense_features, vectorf32('[0.5, 0.8, 0.3, 0.9]')) AS l2_dist,
+        vector_cosine(i.dense_features, vectorf32('[0.5, 0.8, 0.3, 0.9]')) AS cosine_sim,
+        manhattan_distance(i.sparse_features, vectori32('[1, 0, 1, 0, 1, 1, 0]')) AS manhattan_dist,
+        hamming_distance(i.sparse_features, vectori32('[1, 0, 1, 0, 1, 1, 0]')) AS hamming_dist
+    expected_patterns:
+      - "Test Item"
+      - "l2_dist"
+      - "cosine_sim"
+      - "manhattan_dist"
+      - "hamming_dist"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 11: Vector Function Error Handling
+  - name: "vector_function_error_handling"
+    description: "Test error handling for invalid vector operations"
+    command: ["geode", "query"]
+    input: |
+      RETURN vector_l2(vectorf32('[1.0, 2.0]'), vectorf32('[1.0, 2.0, 3.0]'))
+    expected_patterns:
+      - "error"
+    success_criteria:
+      - exit_code: 1  # Should fail due to dimension mismatch
+
+  # Test 12: Vector Index Performance Test
+  - name: "vector_index_performance_basic"
+    description: "Basic performance test for vector operations"
+    command: ["geode", "query"]
+    input: |
+      CREATE (v1:Vector {data: vectorf32('[0.1, 0.2, 0.3, 0.4, 0.5]')})
+      CREATE (v2:Vector {data: vectorf32('[0.6, 0.7, 0.8, 0.9, 1.0]')})
+      CREATE (v3:Vector {data: vectorf32('[0.2, 0.4, 0.6, 0.8, 1.0]')})
+      CREATE (v4:Vector {data: vectorf32('[0.1, 0.3, 0.5, 0.7, 0.9]')})
+      CREATE (v5:Vector {data: vectorf32('[0.5, 0.4, 0.3, 0.2, 0.1]')})
+      MATCH (v:Vector)
+      WHERE vector_cosine(v.data, vectorf32('[0.5, 0.5, 0.5, 0.5, 0.5]')) > 0.8
+      RETURN COUNT(v) AS similar_vectors
+    expected_patterns:
+      - "similar_vectors"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 13: Vector Operations with Complex Queries
+  - name: "vector_operations_complex_queries"
+    description: "Test vector operations in complex query patterns"
+    command: ["geode", "query"]
+    input: |
+      CREATE (doc1:Document {title: 'ML Paper 1', embedding: vectorf32('[0.8, 0.2, 0.1]'), category: 'AI'})
+      CREATE (doc2:Document {title: 'Stats Paper 1', embedding: vectorf32('[0.1, 0.8, 0.1]'), category: 'Statistics'})
+      CREATE (doc3:Document {title: 'ML Paper 2', embedding: vectorf32('[0.7, 0.3, 0.0]'), category: 'AI'})
+      MATCH (d:Document)
+      WHERE d.category = 'AI'
+        AND vector_cosine(d.embedding, vectorf32('[1.0, 0.0, 0.0]')) > 0.7
+      WITH d, vector_cosine(d.embedding, vectorf32('[1.0, 0.0, 0.0]')) AS similarity
+      RETURN d.title, similarity
+      ORDER BY similarity DESC
+      LIMIT 2
+    expected_patterns:
+      - "ML Paper"
+      - "similarity"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 14: Vector Aggregation Operations
+  - name: "vector_aggregation_operations"
+    description: "Test aggregation functions with vector distance metrics"
+    command: ["geode", "query"]
+    input: |
+      CREATE (p1:Point {location: vectorf32('[1.0, 1.0]'), cluster: 'A'})
+      CREATE (p2:Point {location: vectorf32('[1.1, 0.9]'), cluster: 'A'})
+      CREATE (p3:Point {location: vectorf32('[5.0, 5.0]'), cluster: 'B'})
+      CREATE (p4:Point {location: vectorf32('[5.1, 4.9]'), cluster: 'B'})
+      MATCH (p:Point)
+      WITH p.cluster AS cluster,
+           AVG(vector_l2(p.location, vectorf32('[0.0, 0.0]'))) AS avg_distance
+      RETURN cluster, avg_distance
+      ORDER BY cluster
+    expected_patterns:
+      - "cluster"
+      - "avg_distance"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+  # Test 15: Vector Index Drop Operations
+  - name: "vector_index_drop_operations"
+    description: "Test dropping vector indexes"
+    command: ["geode", "query"]
+    input: |
+      CREATE INDEX test_vector_idx ON TestNode (vector_data) USING vector_f32;
+      DROP INDEX test_vector_idx
+    expected_patterns:
+      - "Index created successfully"
+      - "Index dropped successfully"
+    success_criteria:
+      - exit_code: 0
+      - output_contains_all: true
+
+# Summary and reporting
+summary:
+  total_tests: 15
+  categories:
+    - basic_operations: 4
+    - distance_metrics: 6
+    - index_management: 3
+    - advanced_queries: 2
+  estimated_runtime: "5-8 minutes"
+
+# Performance benchmarks
+benchmarks:
+  - name: "vector_l2_performance"
+    description: "L2 distance calculation performance"
+    target_time_ms: 100
+
+  - name: "vector_cosine_performance"
+    description: "Cosine similarity calculation performance"
+    target_time_ms: 120
+
+  - name: "vector_index_creation_performance"
+    description: "Vector index creation performance"
+    target_time_ms: 500

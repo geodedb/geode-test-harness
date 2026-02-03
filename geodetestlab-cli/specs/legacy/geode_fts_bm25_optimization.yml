@@ -1,0 +1,291 @@
+name: "Geode Full-Text Search BM25 and IndexOptimizer Integration"
+description: "Comprehensive testing of enhanced FTS capabilities with BM25 scoring, IndexOptimizer integration, and production-ready search optimization"
+version: "1.0"
+author: "Geode Development Team"
+created: "2025-10-04"
+
+# Test configuration
+test_config:
+  timeout_seconds: 120
+  retry_attempts: 2
+  parallel_execution: false
+  temp_data_dir: "./test_data/fts_bm25"
+
+# Setup phase: Prepare test environment
+setup:
+  commands:
+    - name: "Create test data directory"
+      command: "mkdir -p ./test_data/fts_bm25"
+    - name: "Initialize test database"
+      command: "./zig-out/bin/geode query 'CREATE (doc:Document {id: 1})'"
+
+# Test cases for FTS BM25 and IndexOptimizer integration
+tests:
+  # Functional Tests
+  - name: "fts_bm25_basic_search"
+    description: "Test basic BM25 scoring functionality"
+    command: |
+      ./zig-out/bin/geode query "
+      CREATE (doc1:Document {id: 1, title: 'Machine Learning Fundamentals', content: 'Introduction to machine learning algorithms and data science techniques'})
+      CREATE (doc2:Document {id: 2, title: 'Database Systems', content: 'Relational database design and query optimization strategies'})
+      CREATE (doc3:Document {id: 3, title: 'Advanced Algorithms', content: 'Complex algorithmic techniques for machine learning and optimization'})
+      CREATE INDEX fts_content_idx ON Document (content) USING fulltext
+      "
+    expected_output:
+      contains: ["Index created successfully", "fts_content_idx"]
+    success_criteria:
+      - exit_code: 0
+      - output_contains: "Index created successfully"
+
+  - name: "fts_bm25_phrase_query_optimization"
+    description: "Test phrase query optimization with high selectivity"
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (doc:Document)
+      WHERE doc.content CONTAINS 'machine learning'
+      RETURN doc.title, doc.id
+      ORDER BY doc.id
+      "
+    expected_output:
+      contains: ["Machine Learning Fundamentals", "Advanced Algorithms"]
+    performance_check:
+      max_duration_ms: 50
+    success_criteria:
+      - exit_code: 0
+      - performance_check: true
+
+  - name: "fts_bm25_boolean_query_optimization"
+    description: "Test boolean query optimization with medium selectivity"
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (doc:Document)
+      WHERE doc.content CONTAINS 'algorithms' OR doc.content CONTAINS 'optimization'
+      RETURN doc.title
+      ORDER BY doc.title
+      "
+    expected_output:
+      contains: ["Advanced Algorithms", "Database Systems"]
+    performance_check:
+      max_duration_ms: 75
+    success_criteria:
+      - exit_code: 0
+      - performance_check: true
+
+  - name: "fts_bm25_wildcard_query_optimization"
+    description: "Test wildcard query optimization with lower selectivity"
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (doc:Document)
+      WHERE doc.content =~ '.*data.*'
+      RETURN doc.title
+      ORDER BY doc.title
+      "
+    expected_output:
+      contains: ["Database Systems", "Machine Learning Fundamentals"]
+    performance_check:
+      max_duration_ms: 100
+    success_criteria:
+      - exit_code: 0
+      - performance_check: true
+
+  # IndexOptimizer Integration Tests
+  - name: "fts_index_cost_optimization"
+    description: "Test IndexOptimizer cost-based FTS query planning"
+    command: |
+      ./zig-out/bin/geode query "
+      CREATE (article1:Article {id: 1, content: 'Artificial intelligence and machine learning research'})
+      CREATE (article2:Article {id: 2, content: 'Database indexing and query performance optimization'})
+      CREATE (article3:Article {id: 3, content: 'Graph databases and distributed query processing'})
+      CREATE (article4:Article {id: 4, content: 'Natural language processing using machine learning'})
+      CREATE (article5:Article {id: 5, content: 'Information retrieval and search engine optimization'})
+      CREATE INDEX article_content_fts ON Article (content) USING fulltext
+      "
+    expected_output:
+      contains: ["Index created successfully"]
+    success_criteria:
+      - exit_code: 0
+
+  - name: "fts_query_plan_selection"
+    description: "Test automatic query plan selection for FTS queries"
+    command: |
+      ./zig-out/bin/geode query "
+      EXPLAIN MATCH (article:Article)
+      WHERE article.content CONTAINS 'machine learning'
+      RETURN article.id, article.content
+      "
+    expected_output:
+      contains: ["Index Scan", "article_content_fts", "cost"]
+    success_criteria:
+      - exit_code: 0
+      - output_contains: "Index Scan"
+
+  - name: "fts_multi_term_optimization"
+    description: "Test multi-term query optimization with selectivity analysis"
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (article:Article)
+      WHERE article.content CONTAINS 'machine' AND article.content CONTAINS 'learning'
+      RETURN article.id
+      ORDER BY article.id
+      "
+    expected_output:
+      contains: ["1", "4"]
+    performance_check:
+      max_duration_ms: 60
+    success_criteria:
+      - exit_code: 0
+      - performance_check: true
+
+  # Performance Benchmarks
+  - name: "fts_bm25_performance_benchmark"
+    description: "Benchmark BM25 scoring performance on larger dataset"
+    setup_commands:
+      - |
+        ./zig-out/bin/geode query "
+        CREATE (p1:Paper {id: 1, abstract: 'Deep neural networks for computer vision and image recognition applications'})
+        CREATE (p2:Paper {id: 2, abstract: 'Machine learning algorithms for natural language processing and text analysis'})
+        CREATE (p3:Paper {id: 3, abstract: 'Database query optimization using cost-based planning and index selection'})
+        CREATE (p4:Paper {id: 4, abstract: 'Distributed systems architecture and scalability for large-scale applications'})
+        CREATE (p5:Paper {id: 5, abstract: 'Information retrieval systems using vector space models and relevance scoring'})
+        CREATE (p6:Paper {id: 6, abstract: 'Graph database performance and query optimization strategies'})
+        CREATE (p7:Paper {id: 7, abstract: 'Search engine architecture and full-text indexing methodologies'})
+        CREATE (p8:Paper {id: 8, abstract: 'Natural language understanding with transformer neural network models'})
+        CREATE INDEX paper_abstract_fts ON Paper (abstract) USING fulltext
+        "
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (paper:Paper)
+      WHERE paper.abstract CONTAINS 'neural networks' OR paper.abstract CONTAINS 'machine learning'
+      RETURN paper.id, paper.abstract
+      ORDER BY paper.id
+      "
+    expected_output:
+      contains: ["1", "2", "8"]
+    performance_check:
+      max_duration_ms: 100
+    success_criteria:
+      - exit_code: 0
+      - performance_check: true
+
+  - name: "fts_scalability_stress_test"
+    description: "Stress test FTS with multiple concurrent queries"
+    setup_commands:
+      - |
+        for i in {9..20}; do
+          ./zig-out/bin/geode query "
+          CREATE (p$i:Paper {id: $i, abstract: 'Research paper number $i discussing various computational methods and algorithms'})
+          "
+        done
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (paper:Paper)
+      WHERE paper.abstract CONTAINS 'computational' OR paper.abstract CONTAINS 'algorithms'
+      RETURN COUNT(paper) AS total_papers
+      "
+    expected_output:
+      contains: ["total_papers"]
+    performance_check:
+      max_duration_ms: 150
+    success_criteria:
+      - exit_code: 0
+      - performance_check: true
+
+  # Advanced Features Tests
+  - name: "fts_bm25_ranking_accuracy"
+    description: "Test BM25 ranking accuracy and relevance scoring"
+    command: |
+      ./zig-out/bin/geode query "
+      CREATE (doc1:TextDoc {id: 1, text: 'machine learning machine learning machine learning'})
+      CREATE (doc2:TextDoc {id: 2, text: 'machine learning algorithms and data science'})
+      CREATE (doc3:TextDoc {id: 3, text: 'various machine topics and learning concepts'})
+      CREATE INDEX text_fts ON TextDoc (text) USING fulltext
+      "
+    expected_output:
+      contains: ["Index created successfully"]
+    success_criteria:
+      - exit_code: 0
+
+  - name: "fts_bm25_tf_idf_scoring"
+    description: "Test term frequency and inverse document frequency scoring"
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (doc:TextDoc)
+      WHERE doc.text CONTAINS 'machine learning'
+      RETURN doc.id, doc.text
+      ORDER BY doc.id
+      "
+    expected_output:
+      contains: ["1", "2", "3"]
+    success_criteria:
+      - exit_code: 0
+
+  - name: "fts_query_type_performance_comparison"
+    description: "Compare performance across different FTS query types"
+    command: |
+      ./zig-out/bin/geode query "
+      EXPLAIN MATCH (doc:TextDoc)
+      WHERE doc.text =~ 'machine.*learning'
+      RETURN doc.id
+      "
+    expected_output:
+      contains: ["cost", "selectivity"]
+    success_criteria:
+      - exit_code: 0
+
+  # Error Handling Tests
+  - name: "fts_invalid_index_handling"
+    description: "Test error handling for invalid FTS index operations"
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (doc:NonExistent)
+      WHERE doc.content CONTAINS 'test'
+      RETURN doc.id
+      "
+    expected_output:
+      contains: ["error", "not found"]
+    success_criteria:
+      - exit_code: 1
+
+  - name: "fts_empty_query_handling"
+    description: "Test handling of empty or malformed FTS queries"
+    command: |
+      ./zig-out/bin/geode query "
+      MATCH (doc:TextDoc)
+      WHERE doc.text CONTAINS ''
+      RETURN doc.id
+      "
+    expected_output:
+      contains: ["error", "empty"]
+    success_criteria:
+      - exit_code: 1
+
+# Cleanup phase
+cleanup:
+  commands:
+    - name: "Remove test data directory"
+      command: "rm -rf ./test_data/fts_bm25"
+
+# Performance baselines and expectations
+performance_baseline:
+  fts_phrase_query: "Sub-50ms for small corpus (5-10 documents)"
+  fts_boolean_query: "Sub-75ms for medium complexity queries"
+  fts_wildcard_query: "Sub-100ms for pattern matching queries"
+  fts_multi_term: "Sub-60ms for conjunctive term queries"
+  fts_scalability: "Sub-150ms for 20+ document corpus"
+  index_optimization: "Automatic index vs sequential scan selection"
+
+# Expected improvements over baseline
+optimization_targets:
+  bm25_scoring_accuracy: "95%+ relevance ranking precision"
+  query_plan_optimization: "10-50x performance improvement over sequential scan"
+  index_selectivity_estimation: "±20% accuracy in cost estimation"
+  multi_query_type_support: "Phrase, Boolean, Wildcard, Fuzzy query types"
+  large_corpus_performance: "Linear scaling up to 10,000 documents"
+
+# Test metrics and success criteria
+success_metrics:
+  functionality_tests_passed: "13/13 functional tests must pass"
+  performance_benchmarks_met: "All performance checks under specified limits"
+  error_handling_robust: "Graceful failure for invalid inputs"
+  optimization_effectiveness: "Index scan preferred for selective queries"
+  scalability_maintained: "Performance scales linearly with corpus size"

@@ -1,0 +1,280 @@
+version: "1.0"
+name: "FLE Plaintext Verification - Multiple Encrypted Fields"
+description: |
+  SECURITY CRITICAL TEST SUITE
+
+  Verifies that nodes with MULTIPLE encrypted fields are all properly encrypted:
+  1. All fields configured for encryption ARE encrypted
+  2. Non-encrypted fields remain unencrypted (for performance)
+  3. Mixed encryption algorithms work correctly
+  4. Key versioning works across multiple fields
+
+  Test scenario: User profile node with multiple sensitive fields:
+  - SSN (encrypted, AES-256-GCM)
+  - password_hash (encrypted, ChaCha20-Poly1305)
+  - credit_score (encrypted, AES-256-GCM)
+  - medical_id (encrypted, ChaCha20-Poly1305)
+  - name (NOT encrypted - public)
+  - email (NOT encrypted - public)
+
+  CANARY: REQ=REQ-FLE-ENFORCE-008; FEATURE=FLEEnforcement; ASPECT=MultipleFields; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false  # DO NOT CLEANUP - we need to scan files after tests
+    args: ["--log-level", "info", "--enable-fle"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+env:
+  GEODE_FLE_ENABLED: "true"
+  GEODE_MASTER_KEY: "fle-multi-field-master-key-32byt!"
+
+# Skip isolation suffix for FLE tests - the CALL geode.fle.configureField
+# must match the exact label names used in CREATE statements
+skip_isolation: true
+
+tests:
+  # ===============================
+  # PHASE 1: CONFIGURE MULTIPLE FLE FIELDS
+  # ===============================
+
+  - name: "fle-multi-configure-ssn"
+    description: "Configure SSN field for FLE (AES-256-GCM)"
+    args: ["query",
+           "CALL geode.fle.configureField('FLETest_Profile', 'ssn', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin', 'hr']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "multi", "configure", "ssn"]
+
+  - name: "fle-multi-configure-password"
+    description: "Configure password_hash field for FLE (ChaCha20)"
+    args: ["query",
+           "CALL geode.fle.configureField('FLETest_Profile', 'password_hash', {
+              algorithm: 'ChaCha20-Poly1305',
+              keyVersion: 1,
+              visibility: ['security']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "multi", "configure", "password"]
+
+  - name: "fle-multi-configure-credit-score"
+    description: "Configure credit_score field for FLE (AES-256-GCM)"
+    args: ["query",
+           "CALL geode.fle.configureField('FLETest_Profile', 'credit_score', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['finance', 'credit_bureau']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "multi", "configure", "credit"]
+
+  - name: "fle-multi-configure-medical-id"
+    description: "Configure medical_id field for FLE (ChaCha20)"
+    args: ["query",
+           "CALL geode.fle.configureField('FLETest_Profile', 'medical_id', {
+              algorithm: 'ChaCha20-Poly1305',
+              keyVersion: 1,
+              visibility: ['healthcare', 'hipaa_officer']
+            })
+            RETURN 'configured' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "multi", "configure", "medical"]
+
+  # ===============================
+  # PHASE 2: WRITE NODES WITH MULTIPLE ENCRYPTED FIELDS
+  # ===============================
+
+  - name: "fle-multi-write-profile-1"
+    description: "Write first user profile with multiple encrypted fields"
+    args: ["query",
+           "CREATE (n:FLETest_Profile {
+              user_id: 'USR001',
+              name: 'Alice Smith',
+              email: 'alice@example.com',
+              ssn: 'FLESECRET_MULTI_SSN_111223333',
+              password_hash: 'FLESECRET_MULTI_PWD_$2b$12$abc123',
+              credit_score: 'FLESECRET_MULTI_CREDIT_750',
+              medical_id: 'FLESECRET_MULTI_MED_MRN00001'
+            })
+            RETURN n.user_id AS user_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "multi", "write", "profile1"]
+
+  - name: "fle-multi-write-profile-2"
+    description: "Write second user profile with multiple encrypted fields"
+    args: ["query",
+           "CREATE (n:FLETest_Profile {
+              user_id: 'USR002',
+              name: 'Bob Jones',
+              email: 'bob@example.com',
+              ssn: 'FLESECRET_MULTI_SSN_444556666',
+              password_hash: 'FLESECRET_MULTI_PWD_$2b$12$def456',
+              credit_score: 'FLESECRET_MULTI_CREDIT_680',
+              medical_id: 'FLESECRET_MULTI_MED_MRN00002'
+            })
+            RETURN n.user_id AS user_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "multi", "write", "profile2"]
+
+  - name: "fle-multi-write-profile-3"
+    description: "Write third user profile with multiple encrypted fields"
+    args: ["query",
+           "CREATE (n:FLETest_Profile {
+              user_id: 'USR003',
+              name: 'Charlie Brown',
+              email: 'charlie@example.com',
+              ssn: 'FLESECRET_MULTI_SSN_777889999',
+              password_hash: 'FLESECRET_MULTI_PWD_$2b$12$ghi789',
+              credit_score: 'FLESECRET_MULTI_CREDIT_820',
+              medical_id: 'FLESECRET_MULTI_MED_MRN00003'
+            })
+            RETURN n.user_id AS user_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "multi", "write", "profile3"]
+
+  # ===============================
+  # PHASE 3: VERIFY DATA READABLE
+  # ===============================
+
+  - name: "fle-multi-verify-profiles-readable"
+    description: "Verify all profiles are readable"
+    args: ["query",
+           "MATCH (n:FLETest_Profile)
+            RETURN count(*) AS total_profiles"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "multi", "verify", "readable"]
+
+  - name: "fle-multi-verify-public-fields-visible"
+    description: "Verify non-encrypted fields are readable without decryption"
+    args: ["query",
+           "MATCH (n:FLETest_Profile {user_id: 'USR001'})
+            RETURN n.name AS name, n.email AS email"]
+    expect:
+      exit_code: 0
+      stdout_contains: "Alice Smith"
+      stdout_contains: "alice@example.com"
+    tags: ["fle", "multi", "verify", "public"]
+
+  # ===============================
+  # PHASE 4: FORCE FLUSH TO DISK
+  # ===============================
+
+  - name: "fle-multi-force-checkpoint"
+    description: "Force checkpoint to ensure all data is written to disk"
+    args: ["query",
+           "RETURN 'checkpoint_requested' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "multi", "checkpoint"]
+
+  # ===============================
+  # PHASE 5: SCAN DATA FILES FOR ALL MARKERS
+  # ===============================
+
+  - name: "fle-multi-scan-no-ssn1-plaintext"
+    description: "CRITICAL: Verify SSN #1 marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_MULTI_SSN_111223333", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no match found (EXPECTED)
+    tags: ["fle", "multi", "scan", "ssn1", "critical"]
+
+  - name: "fle-multi-scan-no-ssn2-plaintext"
+    description: "CRITICAL: Verify SSN #2 marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_MULTI_SSN_444556666", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "multi", "scan", "ssn2", "critical"]
+
+  - name: "fle-multi-scan-no-ssn3-plaintext"
+    description: "CRITICAL: Verify SSN #3 marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_MULTI_SSN_777889999", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "multi", "scan", "ssn3", "critical"]
+
+  - name: "fle-multi-scan-no-pwd1-plaintext"
+    description: "CRITICAL: Verify password #1 marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_MULTI_PWD_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "multi", "scan", "pwd", "critical"]
+
+  - name: "fle-multi-scan-no-credit-plaintext"
+    description: "CRITICAL: Verify credit score marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_MULTI_CREDIT_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "multi", "scan", "credit", "critical"]
+
+  - name: "fle-multi-scan-no-medical-plaintext"
+    description: "CRITICAL: Verify medical ID marker does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_MULTI_MED_", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "multi", "scan", "medical", "critical"]
+
+  # ===============================
+  # PHASE 6: COMPREHENSIVE BINARY SCAN
+  # ===============================
+
+  - name: "fle-multi-binary-scan-flesecret-prefix"
+    description: "CRITICAL: Verify NO FLESECRET_MULTI_ prefix appears in ANY binary file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_MULTI_", "${data_dir}"]
+    expect:
+      exit_code: 1  # No matches expected
+    tags: ["fle", "multi", "binary-scan", "comprehensive", "critical"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "FLESECRET_MULTI_SSN_111223333"
+    - "FLESECRET_MULTI_SSN_444556666"
+    - "FLESECRET_MULTI_SSN_777889999"
+    - "FLESECRET_MULTI_PWD_"
+    - "FLESECRET_MULTI_CREDIT_"
+    - "FLESECRET_MULTI_MED_"
+    - "FLESECRET_MULTI_"
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags: ["fle", "field-level-encryption", "security", "multiple-fields", "plaintext-verification", "critical"]

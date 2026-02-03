@@ -1,0 +1,262 @@
+version: "1.0"
+name: "October 2025 GQL Feature Tests"
+description: "Comprehensive tests for October 2025 feature implementations: FILTER clause, type() function, SET label operations, variable-length paths, session management, and transaction management"
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null  # Auto-allocate
+    data_dir: null  # Use temporary directory
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # FILTER Clause Tests
+  - name: "filter-basic"
+    description: "Test basic FILTER clause functionality"
+    skip: true  # FILTER clause not yet implemented
+    setup:
+      - args: ["CREATE (a:Person {name: 'Alice', city: 'Seattle'})"]
+      - args: ["CREATE (b:Person {name: 'Bob', city: 'Portland'})"]
+      - args: ["MATCH (a:Person), (b:Person) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+    args: ["MATCH (a:Person)-[r]->(b:Person) WHERE a.name = 'Alice' FILTER b.city = 'Seattle' RETURN b.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 0
+    tags: ["filter", "october-2025"]
+
+  - name: "filter-with-where"
+    description: "Test FILTER WHERE syntax"
+    skip: true  # FILTER clause not yet implemented
+    setup:
+      - args: ["CREATE (alice:Person {name: 'Alice', age: 30})"]
+      - args: ["CREATE (bob:Person {name: 'Bob', age: 25})"]
+      - args: ["CREATE (carol:Person {name: 'Carol', age: 35})"]
+      - args: ["MATCH (a:Person), (b:Person) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+      - args: ["MATCH (a:Person), (c:Person) WHERE a.name = 'Alice' AND c.name = 'Carol' CREATE (a)-[:KNOWS]->(c)"]
+    args: ["MATCH (a:Person)-[r:KNOWS]->(friend) WHERE a.name = 'Alice' FILTER WHERE friend.age > 30 RETURN friend.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["filter", "october-2025"]
+
+  # type() Function Tests
+  - name: "type-function-basic"
+    description: "Test type() function returns relationship type"
+    skip: true  # type() function for relationships not yet implemented
+    setup:
+      - args: ["CREATE (a {name: 'Alice'})"]
+      - args: ["CREATE (b {name: 'Bob'})"]
+      - args: ["MATCH (a), (b) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+    args: ["MATCH (a)-[r]->(b) WHERE a.name = 'Alice' RETURN type(r) AS rel_type"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["KNOWS"]
+      geode_query:
+        row_count: 1
+    tags: ["type-function", "october-2025"]
+
+  - name: "type-function-multiple-types"
+    description: "Test type() function with different relationship types"
+    skip: true  # type() function for relationships not yet implemented
+    setup:
+      - args: ["CREATE (a {name: 'Alice'})"]
+      - args: ["CREATE (b {name: 'Bob'})"]
+      - args: ["CREATE (c {name: 'Charlie'})"]
+      - args: ["MATCH (a), (b) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+      - args: ["MATCH (a), (c) WHERE a.name = 'Alice' AND c.name = 'Charlie' CREATE (a)-[:LIKES]->(c)"]
+    args: ["MATCH (a)-[r]->(x) WHERE a.name = 'Alice' RETURN type(r) AS rel_type"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+    tags: ["type-function", "october-2025"]
+
+  # SET Label Operations Tests
+  - name: "set-label-single"
+    description: "Test SET operation for adding single label"
+    skip: true  # SET label operations not yet implemented
+    args: ["CREATE (n:Person {name: 'Alice'}) SET n:Employee RETURN n"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["set-label", "october-2025"]
+
+  - name: "set-label-multiple"
+    description: "Test SET operation for adding multiple labels"
+    skip: true  # SET label operations not yet implemented
+    args: ["CREATE (n:Person {name: 'Alice'}) SET n:Employee:Manager RETURN n"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["set-label", "october-2025"]
+
+  - name: "set-label-match"
+    description: "Test SET label with MATCH clause"
+    skip: true  # SET label operations not yet implemented
+    setup:
+      - args: ["CREATE (alice:Person {name: 'Alice'})"]
+    args: ["MATCH (n:Person) WHERE n.name = 'Alice' SET n:Employee RETURN n"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["set-label", "october-2025"]
+
+  # Variable-Length Paths Tests
+  - name: "varlen-path-basic"
+    description: "Test variable-length path with specific range"
+    setup:
+      - args: ["query", "CREATE (a {name: 'Alice'})"]
+      - args: ["query", "CREATE (b {name: 'Bob'})"]
+      - args: ["query", "CREATE (c {name: 'Carol'})"]
+      - args: ["query", "MATCH (a), (b) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+      - args: ["query", "MATCH (b), (c) WHERE b.name = 'Bob' AND c.name = 'Carol' CREATE (b)-[:KNOWS]->(c)"]
+    args: ["query", "MATCH (a)-[:KNOWS*1..2]->(friend) WHERE a.name = 'Alice' RETURN friend.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+    tags: ["variable-length", "october-2025"]
+
+  - name: "varlen-path-unbounded"
+    description: "Test variable-length path with unbounded range"
+    setup:
+      - args: ["query", "CREATE (a {name: 'A'})"]
+      - args: ["query", "CREATE (b {name: 'B'})"]
+      - args: ["query", "CREATE (c {name: 'C'})"]
+      - args: ["query", "MATCH (a), (b) WHERE a.name = 'A' AND b.name = 'B' CREATE (a)-[:NEXT]->(b)"]
+      - args: ["query", "MATCH (b), (c) WHERE b.name = 'B' AND c.name = 'C' CREATE (b)-[:NEXT]->(c)"]
+    args: ["query", "MATCH (a)-[:NEXT*]->(x) WHERE a.name = 'A' RETURN x.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 2
+    tags: ["variable-length", "october-2025"]
+
+  - name: "varlen-path-cycle-detection"
+    description: "Test variable-length path handles cycles correctly"
+    setup:
+      - args: ["query", "CREATE (a {name: 'Alice'})"]
+      - args: ["query", "CREATE (b {name: 'Bob'})"]
+      - args: ["query", "MATCH (a), (b) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+      - args: ["query", "MATCH (a), (b) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (b)-[:KNOWS]->(a)"]
+    args: ["query", "MATCH (a)-[:KNOWS*1..5]->(x) WHERE a.name = 'Alice' RETURN x.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["variable-length", "october-2025"]
+
+  # Session Management Tests
+  - name: "session-set-graph"
+    description: "Test SESSION SET GRAPH command"
+    args: ["query", "SESSION SET GRAPH test_graph"]
+    expect:
+      exit_code: 0
+    tags: ["session", "october-2025"]
+
+  - name: "session-set-schema"
+    description: "Test SESSION SET SCHEMA command"
+    args: ["query", "SESSION SET SCHEMA test_schema"]
+    expect:
+      exit_code: 0
+    tags: ["session", "october-2025"]
+
+  - name: "session-set-timezone"
+    description: "Test SESSION SET TIME ZONE command"
+    args: ["query", "SESSION SET TIME ZONE 'UTC'"]
+    expect:
+      exit_code: 0
+    tags: ["session", "october-2025"]
+
+  - name: "session-reset"
+    description: "Test SESSION RESET command"
+    args: ["query", "SESSION RESET"]
+    expect:
+      exit_code: 0
+    tags: ["session", "october-2025"]
+
+  - name: "session-close"
+    description: "Test SESSION CLOSE command"
+    args: ["query", "SESSION CLOSE"]
+    expect:
+      exit_code: 0
+    tags: ["session", "october-2025"]
+
+  # Transaction Management Tests
+  - name: "transaction-start"
+    description: "Test START TRANSACTION command"
+    args: ["query", "START TRANSACTION"]
+    expect:
+      exit_code: 0
+    tags: ["transaction", "october-2025"]
+
+  - name: "transaction-begin-alias"
+    description: "Test BEGIN as alias for START TRANSACTION"
+    args: ["query", "BEGIN"]
+    expect:
+      exit_code: 0
+    tags: ["transaction", "october-2025"]
+
+  # Combined Feature Tests
+  - name: "combined-filter-varlen"
+    description: "Test FILTER with variable-length paths"
+    skip: true  # FILTER clause and variable-length paths not yet implemented
+    setup:
+      - args: ["CREATE (alice:Person {name: 'Alice', city: 'Seattle'})"]
+      - args: ["CREATE (bob:Person {name: 'Bob', city: 'Portland'})"]
+      - args: ["CREATE (carol:Person {name: 'Carol', city: 'Seattle'})"]
+      - args: ["MATCH (a:Person), (b:Person) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+      - args: ["MATCH (b:Person), (c:Person) WHERE b.name = 'Bob' AND c.name = 'Carol' CREATE (b)-[:KNOWS]->(c)"]
+    args: ["MATCH (a:Person)-[:KNOWS*1..2]->(friend) WHERE a.name = 'Alice' FILTER friend.city = 'Seattle' RETURN friend.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["combined", "filter", "variable-length", "october-2025"]
+
+  - name: "combined-type-filter"
+    description: "Test type() function with FILTER clause"
+    skip: true  # type() function and FILTER clause not yet implemented
+    setup:
+      - args: ["CREATE (a {name: 'Alice'})"]
+      - args: ["CREATE (b {name: 'Bob'})"]
+      - args: ["CREATE (c {name: 'Charlie'})"]
+      - args: ["MATCH (a), (b) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+      - args: ["MATCH (a), (c) WHERE a.name = 'Alice' AND c.name = 'Charlie' CREATE (a)-[:LIKES]->(c)"]
+    args: ["MATCH (a)-[r]->(x) WHERE a.name = 'Alice' FILTER type(r) = 'KNOWS' RETURN x.name"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["combined", "type-function", "filter", "october-2025"]
+
+  - name: "combined-set-varlen"
+    description: "Test SET label with variable-length path results"
+    skip: true  # SET label and variable-length paths not yet implemented
+    setup:
+      - args: ["CREATE (a:Person {name: 'Alice'})"]
+      - args: ["CREATE (b:Person {name: 'Bob'})"]
+      - args: ["MATCH (a:Person), (b:Person) WHERE a.name = 'Alice' AND b.name = 'Bob' CREATE (a)-[:KNOWS]->(b)"]
+    args: ["MATCH (a:Person)-[:KNOWS*1]->(friend) WHERE a.name = 'Alice' SET friend:Verified RETURN friend"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["combined", "set-label", "variable-length", "october-2025"]

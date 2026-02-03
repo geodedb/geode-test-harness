@@ -1,0 +1,263 @@
+description: "Test suite focused on currently working features and critical issues"
+binary: /usr/local/bin/geode
+timeout: 30
+
+cli:
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args: ["--log-level", "error"]
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+tests:
+  # Working Features
+  - name: "create-simple-node"
+    description: "Create a simple node"
+    args: ["query", "-"]
+    stdin: "CREATE (n:Person {name: 'Test'})"
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+    tags: ["create", "basic"]
+
+  - name: "create-with-return"
+    description: "Create node with RETURN"
+    args: ["query", "-"]
+    stdin: "CREATE (n:Person {name: 'Alice', age: 30}) RETURN n.name, n.age"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Alice", "30"]
+    tags: ["create", "return"]
+
+  - name: "match-all-nodes"
+    description: "Match all nodes"
+    args: ["query", "-"]
+    stdin: "MATCH (n) RETURN count(n)"
+    expect:
+      exit_code: 0
+      stdout_contains: ["count"]
+    tags: ["match", "count"]
+
+  - name: "match-with-filter"
+    description: "Match with WHERE filter"
+    args: ["query", "-"]
+    stdin: "MATCH (n:Person) WHERE n.age > 25 RETURN n.name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+    tags: ["match", "where"]
+
+  - name: "create-relationship"
+    description: "Create relationship"
+    args: ["query", "-"]
+    stdin: "CREATE (a:Person {name: 'A'})-[:KNOWS]->(b:Person {name: 'B'})"
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+    tags: ["create", "relationship"]
+
+  - name: "match-path-pattern"
+    description: "Match path pattern"
+    args: ["query", "-"]
+    stdin: "MATCH (a)-[r]->(b) RETURN count(r)"
+    expect:
+      exit_code: 0
+      stdout_contains: ["count"]
+    tags: ["match", "path"]
+
+  - name: "delete-nodes"
+    description: "Delete nodes"
+    args: ["query", "-"]
+    stdin: "MATCH (n:Test) DELETE n"
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+    tags: ["delete"]
+
+  # Critical Missing Features - These should be implemented
+  - name: "set-node-property"
+    description: "Set node property"
+    args: ["query", "-"]
+    stdin: "CREATE (n:Test {value: 1}) WITH n SET n.updated = true RETURN n"
+    expect:
+      exit_code: 0
+      stdout_contains: ["updated", "true"]
+    tags: ["set", "property"]
+
+  - name: "remove-property"
+    description: "Remove property"
+    args: ["query", "-"]
+    stdin: "CREATE (n:Test {a: 1, b: 2}) WITH n REMOVE n.b RETURN n"
+    expect:
+      exit_code: 0
+      stdout_contains: ["a"]
+    tags: ["remove", "property"]
+
+  - name: "update-multiple-properties"
+    description: "Update multiple properties"
+    args: ["query", "-"]
+    stdin: "CREATE (n:Test {x: 1}) WITH n SET n.x = 2, n.y = 3 RETURN n"
+    expect:
+      exit_code: 0
+      stdout_contains: ["x", "2", "y", "3"]
+    tags: ["set", "multiple"]
+
+  # Other Important Features
+  - name: "merge-pattern"
+    description: "MERGE pattern"
+    args: ["query", "-"]
+    stdin: "MERGE (n:Person {name: 'Unique'}) RETURN n"
+    expect:
+      exit_code: 0
+      stdout_contains: ["Unique"]
+    tags: ["merge"]
+
+  - name: "merge-with-on-create"
+    description: "MERGE with ON CREATE"
+    args: ["query", "-"]
+    stdin: "MERGE (n:Person {name: 'TestOnCreate'}) ON CREATE SET n.created = true RETURN n"
+    expect:
+      exit_code: 0
+      stdout_contains: ["created"]
+    tags: ["merge", "oncreate"]
+
+  - name: "merge-with-on-match"
+    description: "MERGE with ON MATCH"
+    args: ["query", "-"]
+    stdin: |
+      CREATE (n:PersonMatch {name: 'TestMatch'})
+      MERGE (n:PersonMatch {name: 'TestMatch'}) ON MATCH SET n.updated = true RETURN n
+    expect:
+      exit_code: 0
+      stdout_contains: ["updated"]
+    tags: ["merge", "onmatch"]
+
+  - name: "multiple-creates"
+    description: "Multiple creates in one query"
+    args: ["query", "-"]
+    stdin: "CREATE (n1:Number {value: 1}), (n2:Number {value: 2}), (n3:Number {value: 3}) RETURN 3 AS created"
+    expect:
+      exit_code: 0
+      stdout_contains: ["3"]
+    tags: ["create", "multiple"]
+
+  # Transaction Support
+  - name: "begin-transaction"
+    description: "Begin transaction"
+    args: ["query", "-"]
+    stdin: "BEGIN"
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+    tags: ["transaction", "begin"]
+
+  - name: "commit-transaction"
+    description: "Commit transaction"
+    args: ["query", "-"]
+    stdin: "COMMIT"
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+    tags: ["transaction", "commit"]
+
+  - name: "rollback-transaction"
+    description: "Rollback transaction"
+    args: ["query", "-"]
+    stdin: "ROLLBACK"
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+    tags: ["transaction", "rollback"]
+
+  # Index Operations
+  - name: "create-simple-index"
+    description: "Create simple index"
+    args: ["query", "-"]
+    stdin: "CREATE INDEX IF NOT EXISTS idx_person_name ON :Person(name)"
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+    tags: ["index", "create"]
+
+  - name: "drop-index"
+    description: "Drop index"
+    args: ["query", "-"]
+    stdin: |
+      CREATE INDEX IF NOT EXISTS idx_drop_test ON :Person(name)
+      DROP INDEX idx_drop_test
+    expect:
+      exit_code: 0
+      stdout_contains: ["status_class\":\"00000"]
+    tags: ["index", "drop"]
+
+  # Working Aggregations
+  - name: "count-nodes"
+    description: "Count nodes"
+    args: ["query", "-"]
+    stdin: "MATCH (n) RETURN count(n) AS total"
+    expect:
+      exit_code: 0
+      stdout_contains: ["total"]
+    tags: ["aggregation", "count"]
+
+  - name: "sum-values"
+    description: "Sum values"
+    args: ["query", "-"]
+    stdin: "MATCH (n:Number) RETURN sum(n.value) AS total"
+    expect:
+      exit_code: 0
+      stdout_contains: ["total"]
+    tags: ["aggregation", "sum"]
+
+  - name: "avg-values"
+    description: "Average values"
+    args: ["query", "-"]
+    stdin: "MATCH (n:Number) RETURN avg(n.value) AS average"
+    expect:
+      exit_code: 0
+      stdout_contains: ["average"]
+    tags: ["aggregation", "avg"]
+
+  # List and Map Support
+  - name: "return-list"
+    description: "Return list"
+    args: ["query", "-"]
+    stdin: "RETURN [1, 2, 3, 4, 5] AS numbers"
+    expect:
+      exit_code: 0
+      stdout_contains: ["numbers"]
+    tags: ["list"]
+
+  - name: "return-map"
+    description: "Return map"
+    args: ["query", "-"]
+    stdin: "RETURN {name: 'test', value: 42} AS data"
+    expect:
+      exit_code: 0
+      stdout_contains: ["name", "test", "value", "42"]
+    tags: ["map"]
+
+  # UNION/INTERSECT/EXCEPT
+  - name: "union-queries"
+    description: "Union queries"
+    args: ["query", "-"]
+    stdin: "MATCH (a:Person) RETURN a.name AS name UNION MATCH (b:User) RETURN b.name AS name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+    tags: ["union"]
+
+  - name: "union-all-queries"
+    description: "Union all queries"
+    args: ["query", "-"]
+    stdin: "MATCH (a:Person) RETURN a.name AS name UNION ALL MATCH (b:Person) RETURN b.name AS name"
+    expect:
+      exit_code: 0
+      stdout_contains: ["name"]
+    tags: ["union"]

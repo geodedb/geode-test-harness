@@ -1,0 +1,273 @@
+version: "1.0"
+name: "Shell Automatic Reconnection Tests"
+description: "Tests for automatic reconnection and transaction recovery in geode shell"
+
+# CANARY: REQ=REQ-SHELL-RECONNECT-016; FEATURE="ShellAutoReconnect"; ASPECT=E2ETests; STATUS=TESTED; OWNER=cli; UPDATED=2026-01-29
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "info"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "info"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+
+tests:
+  # Setup tests
+  - name: "setup-reconnect-test-graph"
+    description: "Create graph for reconnection tests"
+    args: ["query", "--insecure", "-"]
+    stdin: "DROP GRAPH IF EXISTS reconnect_test; CREATE GRAPH reconnect_test;"
+    expect:
+      exit_code: 0
+    tags: ["setup"]
+
+  # Connection establishment tests (verify basic connectivity works)
+  - name: "connection-basic-query"
+    description: "Verify basic query execution works"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; RETURN 1 AS x;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["1"]
+    tags: ["connection", "basic"]
+
+  - name: "connection-multiple-queries"
+    description: "Execute multiple queries in sequence"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; RETURN 1 AS a; RETURN 2 AS b; RETURN 3 AS c;"
+    expect:
+      exit_code: 0
+    tags: ["connection", "sequence"]
+
+  - name: "connection-create-node"
+    description: "Create a node to verify write operations"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; CREATE (n:ReconnectTest {id: 1, created: true});"
+    expect:
+      exit_code: 0
+    tags: ["connection", "write"]
+
+  - name: "connection-verify-node"
+    description: "Verify the node was created"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:ReconnectTest {id: 1}) RETURN n.created AS created;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["true"]
+    tags: ["connection", "verify"]
+
+  # Transaction state tests (test transaction behavior that would need recovery)
+  - name: "txn-begin-and-create"
+    description: "Start transaction and create nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; BEGIN; CREATE (t1:TxnTest {seq: 1}); CREATE (t2:TxnTest {seq: 2}); COMMIT;"
+    expect:
+      exit_code: 0
+    tags: ["transaction", "commit"]
+
+  - name: "txn-verify-committed"
+    description: "Verify committed transaction nodes exist"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:TxnTest) RETURN count(n) AS cnt;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["2"]
+    tags: ["transaction", "verify"]
+
+  - name: "txn-rollback-test"
+    description: "Test explicit rollback"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; BEGIN; CREATE (r:RollbackNode {id: 999}); ROLLBACK;"
+    expect:
+      exit_code: 0
+    tags: ["transaction", "rollback"]
+
+  - name: "txn-rollback-verify"
+    description: "Verify rollback prevented node creation"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:RollbackNode) RETURN count(n) AS cnt;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["0"]
+    tags: ["transaction", "verify"]
+
+  # Graph context tests (test USE GRAPH persistence that would need recovery)
+  - name: "graph-context-switch"
+    description: "Test graph context switching"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; CREATE (g:GraphContext {name: 'test'});"
+    expect:
+      exit_code: 0
+    tags: ["graph", "context"]
+
+  - name: "graph-context-verify"
+    description: "Verify graph context is maintained"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:GraphContext) RETURN n.name AS name;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["test"]
+    tags: ["graph", "verify"]
+
+  # Multi-statement batch tests (complex operations that benefit from reconnection)
+  - name: "batch-multiple-creates"
+    description: "Create multiple nodes in a batch"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; CREATE (b1:BatchTest {id: 1}); CREATE (b2:BatchTest {id: 2}); CREATE (b3:BatchTest {id: 3}); CREATE (b4:BatchTest {id: 4}); CREATE (b5:BatchTest {id: 5});"
+    expect:
+      exit_code: 0
+    tags: ["batch", "create"]
+
+  - name: "batch-verify-count"
+    description: "Verify all batch nodes were created"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:BatchTest) RETURN count(n) AS cnt;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["5"]
+    tags: ["batch", "verify"]
+
+  - name: "batch-with-relationships"
+    description: "Create nodes with relationships in batch"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; CREATE (a:RelTest {name: 'A'})-[:LINKS_TO]->(b:RelTest {name: 'B'})-[:LINKS_TO]->(c:RelTest {name: 'C'});"
+    expect:
+      exit_code: 0
+    tags: ["batch", "relationships"]
+
+  - name: "batch-verify-relationships"
+    description: "Verify relationships were created"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH ()-[r:LINKS_TO]->() RETURN count(r) AS cnt;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["2"]
+    tags: ["batch", "verify"]
+
+  # Long-running query simulation (queries that benefit from stable connection)
+  - name: "long-query-setup"
+    description: "Create nodes for long query test"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; CREATE (l1:LongQuery {id: 1}); CREATE (l2:LongQuery {id: 2}); CREATE (l3:LongQuery {id: 3}); CREATE (l4:LongQuery {id: 4}); CREATE (l5:LongQuery {id: 5}); CREATE (l6:LongQuery {id: 6}); CREATE (l7:LongQuery {id: 7}); CREATE (l8:LongQuery {id: 8}); CREATE (l9:LongQuery {id: 9}); CREATE (l10:LongQuery {id: 10});"
+    expect:
+      exit_code: 0
+    tags: ["long-query", "setup"]
+
+  - name: "long-query-aggregate"
+    description: "Run aggregate query on multiple nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:LongQuery) RETURN count(n) AS total, min(n.id) AS min_id, max(n.id) AS max_id;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["10", "1"]
+    tags: ["long-query", "aggregate"]
+
+  # Error recovery tests (test behavior after errors)
+  - name: "error-invalid-syntax"
+    description: "Test recovery after syntax error"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; INVALID SYNTAX HERE;"
+    expect:
+      exit_code: 0
+    tags: ["error", "recovery"]
+
+  - name: "error-recovery-valid-query"
+    description: "Verify valid query works after error"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; RETURN 'recovered' AS status;"
+    expect:
+      exit_code: 0
+      stdout_contains: ["recovered"]
+    tags: ["error", "verify"]
+
+  # Authenticated connection tests (verify auth credentials are handled)
+  - name: "auth-create-test-user"
+    description: "Create a test user for auth tests"
+    args: ["query", "--insecure", "-"]
+    stdin: "CREATE USER reconnect_user IF NOT EXISTS SET PASSWORD 'test123';"
+    expect:
+      exit_code: 0
+    tags: ["auth", "setup"]
+
+  # Cleanup tests
+  - name: "cleanup-reconnect-test"
+    description: "Clean up ReconnectTest nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:ReconnectTest) DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-txn-test"
+    description: "Clean up TxnTest nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:TxnTest) DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-graph-context"
+    description: "Clean up GraphContext nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:GraphContext) DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-batch-test"
+    description: "Clean up BatchTest nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:BatchTest) DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-rel-test"
+    description: "Clean up RelTest nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:RelTest) DETACH DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-long-query"
+    description: "Clean up LongQuery nodes"
+    args: ["query", "--insecure", "-"]
+    stdin: "USE GRAPH reconnect_test; MATCH (n:LongQuery) DELETE n;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-test-user"
+    description: "Drop test user"
+    args: ["query", "--insecure", "-"]
+    stdin: "DROP USER IF EXISTS reconnect_user;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]
+
+  - name: "cleanup-reconnect-graph"
+    description: "Drop test graph"
+    args: ["query", "--insecure", "-"]
+    stdin: "DROP GRAPH IF EXISTS reconnect_test;"
+    expect:
+      exit_code: 0
+    tags: ["cleanup"]

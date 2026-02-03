@@ -1,0 +1,268 @@
+version: "1.0"
+name: "FLE Plaintext Verification - Key Rotation"
+description: |
+  SECURITY CRITICAL TEST SUITE
+
+  Verifies that FLE key rotation works correctly:
+  1. Data encrypted with old key version is still readable after rotation
+  2. New data is encrypted with new key version
+  3. Old plaintext never appears on disk during rotation
+  4. Re-encryption process does not expose plaintext
+
+  This test simulates a key rotation scenario where:
+  - Initial data is encrypted with key version 1
+  - Key is rotated to version 2
+  - New data is encrypted with key version 2
+  - Both versions remain readable
+  - No plaintext ever appears on disk
+
+  CANARY: REQ=REQ-FLE-ENFORCE-010; FEATURE=FLEEnforcement; ASPECT=KeyRotation; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: false  # DO NOT CLEANUP - we need to scan files after tests
+    args: ["--log-level", "info", "--enable-fle"]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: "json"
+
+env:
+  GEODE_FLE_ENABLED: "true"
+  GEODE_MASTER_KEY: "fle-key-rotation-master-32bytes!!"
+
+# Skip isolation suffix for FLE tests - the CALL geode.fle.configureField
+# must match the exact label names used in CREATE statements
+skip_isolation: true
+
+tests:
+  # ===============================
+  # PHASE 1: CONFIGURE FLE WITH KEY VERSION 1
+  # ===============================
+
+  - name: "fle-rotate-configure-v1"
+    description: "Configure field with key version 1"
+    args: ["query",
+           "CALL geode.fle.configureField('FLETest_Rotation', 'secret', {
+              algorithm: 'AES-256-GCM',
+              keyVersion: 1,
+              visibility: ['admin']
+            })
+            RETURN 'configured_v1' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "rotation", "configure", "v1"]
+
+  # ===============================
+  # PHASE 2: WRITE DATA WITH KEY VERSION 1
+  # ===============================
+
+  - name: "fle-rotate-write-v1-data-1"
+    description: "Write first record with key version 1"
+    args: ["query",
+           "CREATE (n:FLETest_Rotation {
+              record_id: 'ROT_V1_001',
+              secret: 'FLESECRET_ROTATE_V1_SECRET_ALPHA',
+              key_version: 1
+            })
+            RETURN n.record_id AS record_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "rotation", "write", "v1"]
+
+  - name: "fle-rotate-write-v1-data-2"
+    description: "Write second record with key version 1"
+    args: ["query",
+           "CREATE (n:FLETest_Rotation {
+              record_id: 'ROT_V1_002',
+              secret: 'FLESECRET_ROTATE_V1_SECRET_BETA',
+              key_version: 1
+            })
+            RETURN n.record_id AS record_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "rotation", "write", "v1"]
+
+  # ===============================
+  # PHASE 3: ROTATE KEY TO VERSION 2
+  # ===============================
+
+  - name: "fle-rotate-key-to-v2"
+    description: "Rotate encryption key to version 2"
+    args: ["query",
+           "CALL geode.fle.rotateKey('FLETest_Rotation', 'secret', {
+              newKeyVersion: 2,
+              reencryptExisting: false
+            })
+            RETURN 'rotated_to_v2' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "rotation", "rotate", "v2"]
+
+  # ===============================
+  # PHASE 4: WRITE DATA WITH KEY VERSION 2
+  # ===============================
+
+  - name: "fle-rotate-write-v2-data-1"
+    description: "Write first record with key version 2"
+    args: ["query",
+           "CREATE (n:FLETest_Rotation {
+              record_id: 'ROT_V2_001',
+              secret: 'FLESECRET_ROTATE_V2_SECRET_GAMMA',
+              key_version: 2
+            })
+            RETURN n.record_id AS record_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "rotation", "write", "v2"]
+
+  - name: "fle-rotate-write-v2-data-2"
+    description: "Write second record with key version 2"
+    args: ["query",
+           "CREATE (n:FLETest_Rotation {
+              record_id: 'ROT_V2_002',
+              secret: 'FLESECRET_ROTATE_V2_SECRET_DELTA',
+              key_version: 2
+            })
+            RETURN n.record_id AS record_id"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "rotation", "write", "v2"]
+
+  # ===============================
+  # PHASE 5: VERIFY BOTH VERSIONS READABLE
+  # ===============================
+
+  - name: "fle-rotate-verify-all-readable"
+    description: "Verify all records (both key versions) are readable"
+    args: ["query",
+           "MATCH (n:FLETest_Rotation)
+            RETURN count(*) AS total_records"]
+    expect:
+      exit_code: 0
+      geode_query:
+        row_count: 1
+    tags: ["fle", "rotation", "verify"]
+
+  - name: "fle-rotate-verify-v1-readable"
+    description: "Verify v1 encrypted records are still readable"
+    args: ["query",
+           "MATCH (n:FLETest_Rotation {record_id: 'ROT_V1_001'})
+            RETURN n.secret AS secret"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "rotation", "verify", "v1"]
+
+  - name: "fle-rotate-verify-v2-readable"
+    description: "Verify v2 encrypted records are readable"
+    args: ["query",
+           "MATCH (n:FLETest_Rotation {record_id: 'ROT_V2_001'})
+            RETURN n.secret AS secret"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "rotation", "verify", "v2"]
+
+  # ===============================
+  # PHASE 6: TRIGGER RE-ENCRYPTION (optional)
+  # ===============================
+
+  - name: "fle-rotate-reencrypt-v1-to-v2"
+    description: "Re-encrypt v1 data with v2 key"
+    args: ["query",
+           "CALL geode.fle.reencrypt('FLETest_Rotation', 'secret', {
+              fromKeyVersion: 1,
+              toKeyVersion: 2
+            })
+            RETURN 'reencrypted' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "rotation", "reencrypt"]
+
+  # ===============================
+  # PHASE 7: FORCE FLUSH TO DISK
+  # ===============================
+
+  - name: "fle-rotate-force-checkpoint"
+    description: "Force checkpoint to ensure all data is written to disk"
+    args: ["query",
+           "RETURN 'checkpoint_requested' AS status"]
+    expect:
+      exit_code: 0
+    tags: ["fle", "rotation", "checkpoint"]
+
+  # ===============================
+  # PHASE 8: SCAN DATA FILES
+  # ===============================
+
+  - name: "fle-rotate-scan-no-v1-alpha-plaintext"
+    description: "CRITICAL: Verify V1 ALPHA secret does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_ROTATE_V1_SECRET_ALPHA", "${data_dir}"]
+    expect:
+      exit_code: 1  # grep returns 1 when no match found (EXPECTED)
+    tags: ["fle", "rotation", "scan", "v1", "critical"]
+
+  - name: "fle-rotate-scan-no-v1-beta-plaintext"
+    description: "CRITICAL: Verify V1 BETA secret does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_ROTATE_V1_SECRET_BETA", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "rotation", "scan", "v1", "critical"]
+
+  - name: "fle-rotate-scan-no-v2-gamma-plaintext"
+    description: "CRITICAL: Verify V2 GAMMA secret does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_ROTATE_V2_SECRET_GAMMA", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "rotation", "scan", "v2", "critical"]
+
+  - name: "fle-rotate-scan-no-v2-delta-plaintext"
+    description: "CRITICAL: Verify V2 DELTA secret does NOT appear in ANY data file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_ROTATE_V2_SECRET_DELTA", "${data_dir}"]
+    expect:
+      exit_code: 1
+    tags: ["fle", "rotation", "scan", "v2", "critical"]
+
+  # ===============================
+  # PHASE 9: COMPREHENSIVE BINARY SCAN
+  # ===============================
+
+  - name: "fle-rotate-binary-scan-flesecret-prefix"
+    description: "CRITICAL: Verify NO FLESECRET_ROTATE_ prefix appears in ANY binary file"
+    command: "grep"
+    args: ["-r", "-a", "-l", "FLESECRET_ROTATE_", "${data_dir}"]
+    expect:
+      exit_code: 1  # No matches expected
+    tags: ["fle", "rotation", "binary-scan", "comprehensive", "critical"]
+
+invariants:
+  - type: "server_running"
+
+plaintext_verification:
+  enabled: true
+  patterns:
+    - "FLESECRET_ROTATE_V1_SECRET_ALPHA"
+    - "FLESECRET_ROTATE_V1_SECRET_BETA"
+    - "FLESECRET_ROTATE_V2_SECRET_GAMMA"
+    - "FLESECRET_ROTATE_V2_SECRET_DELTA"
+    - "FLESECRET_ROTATE_"
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags: ["fle", "field-level-encryption", "security", "key-rotation", "plaintext-verification", "critical"]

@@ -1,0 +1,149 @@
+version: "1.0"
+name: "CLI Issue Fixes January 2026"
+description: "Tests for CLI bug fixes from GitLab issues #385-395"
+
+# CANARY: REQ=REQ-CLI-BUGFIXES-2026-01; FEATURE="CLI Bug Fixes"; ASPECT=TestSpec; STATUS=TESTED; OWNER=cli; UPDATED=2026-01-28
+
+cli:
+  binary: "./zig-out/bin/geode"
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: "error"
+  server:
+    enabled: true
+    port: null  # Auto-allocate
+    data_dir: null  # Use temporary directory
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: ["--log-level", "error"]
+    env: {}
+  client:
+    server_address: "127.0.0.1:3141"  # Will be overridden by managed server
+    timeout_ms: 30000
+    tls_verify: false
+    format: "json"
+
+secrets:
+  admin_password:
+    source: "env"
+    key: "GEODE_ADMIN_PASSWORD"
+    required: false
+
+invariants:
+  - type: "server_running"
+
+fuzz:
+  enabled: false
+  provider: "mock"
+  max_cases: 5
+  seed: 42
+
+tests:
+  # Issue #393: --graph flag for query command
+  - name: "query-graph-flag-help"
+    description: "Test that --graph flag is documented in query help"
+    args: ["query", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["--graph", "-g"]
+    tags: ["cli", "graph-flag", "issue-393"]
+
+  - name: "query-graph-flag-short"
+    description: "Test -g short flag syntax in help"
+    args: ["query", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["-g, --graph"]
+    tags: ["cli", "graph-flag", "issue-393"]
+
+  # Issue #389: Improved authentication help
+  - name: "query-auth-help-examples"
+    description: "Test that authentication examples are clear in help"
+    args: ["query", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["--user geode --password", "Authentication:", "-U geode -P"]
+    tags: ["cli", "auth", "issue-389"]
+
+  - name: "query-auth-environment-warning"
+    description: "Test that help clarifies environment variables are not used for auth"
+    args: ["query", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Environment variables are NOT used for authentication"]
+    tags: ["cli", "auth", "issue-389"]
+
+  # Issue #385: Password prompt when -P used without value
+  - name: "query-password-prompt-help"
+    description: "Test that password prompt behavior is documented"
+    args: ["query", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["prompted if not provided"]
+    tags: ["cli", "password", "issue-385"]
+
+  # Basic query execution tests (non-auth)
+  - name: "query-basic-return"
+    description: "Test basic RETURN query"
+    args: ["query", "--insecure", "RETURN 1 AS x"]
+    expect:
+      exit_code: 0
+      stdout_contains: ['"x"']
+    tags: ["cli", "query", "basic"]
+
+  - name: "query-format-option"
+    description: "Test query with format option"
+    args: ["query", "--insecure", "--format", "json", "RETURN 'hello' AS greeting"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["greeting", "hello"]
+    tags: ["cli", "query", "format"]
+
+  # Issue #395: Debug log removal is verified via unit tests in txn_undo_log.zig
+  # The removal of std.debug.print statements ensures no debug logs in production
+
+  # Additional query tests to verify clean output
+  - name: "query-no-debug-output"
+    description: "Test that queries don't produce debug output"
+    args: ["query", "--insecure", "RETURN 42 AS answer"]
+    expect:
+      exit_code: 0
+      stdout_not_contains: ["[UNDO]", "Main loop iteration", "logCreateNode"]
+    tags: ["cli", "debug-logs", "issue-395"]
+
+  # Issue #387: Shell authentication options
+  - name: "shell-auth-help"
+    description: "Test that shell help shows authentication options"
+    args: ["shell", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["--username", "-U", "--password", "-P"]
+    tags: ["cli", "shell", "auth", "issue-387"]
+
+  - name: "shell-auth-docs"
+    description: "Test that shell help explains authentication requirement"
+    args: ["shell", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["Authentication:", "Both username and password must be provided"]
+    tags: ["cli", "shell", "auth", "issue-387"]
+
+  - name: "shell-auth-example"
+    description: "Test that shell help includes authentication example"
+    args: ["shell", "--help"]
+    expect:
+      exit_code: 0
+      stdout_contains: ["-U admin -P secret"]
+    tags: ["cli", "shell", "auth", "issue-387"]
+
+  # Issue #380: GitLab URL references
+  - name: "docs-gitlab-reference"
+    description: "Test that help points to GitLab for issues"
+    args: ["--help"]
+    expect:
+      exit_code: 0
+      # Just verify basic help works - GitLab URLs are in docs, not CLI help
+    tags: ["cli", "docs", "issue-380"]
+
+  # Issue #382: localhost normalization (verified via unit tests and QUIC tests)
+  # The fix normalizes "localhost" to "127.0.0.1" in QUIC transport

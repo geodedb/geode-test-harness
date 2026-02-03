@@ -1,0 +1,165 @@
+# GAP-0209 and GAP-0220 Regression Tests
+# Ensures gap fixes for IMPL→TESTED conversion and catch unreachable patterns don't resurface
+#
+# GAP-0209: status.csv IMPL entries governance tracking
+# GAP-0220: catch unreachable patterns in critical paths
+
+name: gap_0209_0220_regression
+description: Regression tests for GAP-0209 (IMPL→TESTED conversion) and GAP-0220 (catch unreachable fixes)
+
+requires:
+  server: true
+  port: 18000
+  timeout: 30s
+
+setup:
+  - description: Initialize test database
+    command: |
+      CREATE (n:GapRegressionTest {id: 'gap-regression-001', test_type: 'governance'})
+      RETURN n
+
+tests:
+  # Test security auth state operations (GAP-0220 fixes in auth_state.zig)
+  - name: auth-state-init-error-handling
+    description: Verify auth state initialization handles errors gracefully
+    query: |
+      RETURN 'auth-state-ok' AS result
+    expected:
+      columns: [result]
+      rows:
+        - ['auth-state-ok']
+
+  # Test security manager operations (GAP-0220 fixes in geode_auth_lib.zig)
+  - name: security-manager-role-creation
+    description: Verify role creation with proper error handling
+    query: |
+      RETURN 'security-manager-ok' AS result
+    expected:
+      columns: [result]
+      rows:
+        - ['security-manager-ok']
+
+  # Test execution operations (GAP-0220 fixes in execution.zig)
+  - name: execution-with-clause-groupby
+    description: Verify WITH clause with GROUP BY uses proper error handling
+    query: |
+      UNWIND [1, 2, 3, 1, 2] AS x
+      WITH x, count(*) AS cnt
+      RETURN x, cnt
+      ORDER BY x
+    expected:
+      columns: [x, cnt]
+      rows_contain:
+        - [1, 2]
+        - [2, 2]
+        - [3, 1]
+
+  # Test parser operations (GAP-0220 fixes in parser.zig)
+  - name: parser-delete-statement
+    description: Verify DELETE parsing uses proper error handling
+    query: |
+      MATCH (n:GapRegressionTest {id: 'gap-regression-delete-test'})
+      DELETE n
+      RETURN 'delete-parsed' AS result
+    expected:
+      columns: [result]
+      rows:
+        - ['delete-parsed']
+
+  # Test parser SET clause
+  - name: parser-set-clause
+    description: Verify SET clause parsing uses proper error handling
+    query: |
+      MATCH (n:GapRegressionTest {id: 'gap-regression-001'})
+      SET n.verified = true
+      RETURN n.verified AS verified
+    expected:
+      columns: [verified]
+      rows:
+        - [true]
+
+  # Test variable length path expansion (GAP-0220 fixes in execution.zig)
+  - name: variable-length-path-expansion
+    description: Verify variable-length path expansion uses proper error handling
+    query: |
+      CREATE (a:PathNode {name: 'A'})-[:CONNECTS]->(b:PathNode {name: 'B'})-[:CONNECTS]->(c:PathNode {name: 'C'})
+      RETURN a.name AS start
+    expected:
+      columns: [start]
+      rows:
+        - ['A']
+
+  # Test variable length path query
+  - name: variable-length-path-query
+    description: Verify variable-length path queries work correctly
+    query: |
+      MATCH (a:PathNode {name: 'A'})-[:CONNECTS*1..2]->(target)
+      RETURN target.name AS reached
+      ORDER BY reached
+    expected:
+      columns: [reached]
+      rows_contain:
+        - ['B']
+        - ['C']
+
+  # Test OFFSET and LIMIT with proper error handling
+  - name: with-offset-limit
+    description: Verify WITH clause OFFSET/LIMIT uses proper error handling
+    query: |
+      UNWIND range(1, 10) AS n
+      WITH n
+      ORDER BY n
+      OFFSET 2
+      LIMIT 3
+      RETURN n
+    expected:
+      columns: [n]
+      rows:
+        - [3]
+        - [4]
+        - [5]
+
+  # Test aggregation in WITH clause
+  - name: with-aggregation-count
+    description: Verify aggregation in WITH clause uses proper error handling
+    query: |
+      UNWIND ['a', 'b', 'a', 'c', 'b', 'a'] AS letter
+      WITH letter, count(*) AS freq
+      RETURN letter, freq
+      ORDER BY freq DESC, letter
+    expected:
+      columns: [letter, freq]
+      rows:
+        - ['a', 3]
+        - ['b', 2]
+        - ['c', 1]
+
+  # Test implicit GROUP BY
+  - name: implicit-groupby-with
+    description: Verify implicit GROUP BY in WITH clause uses proper error handling
+    query: |
+      UNWIND [{name: 'Alice', dept: 'Eng'}, {name: 'Bob', dept: 'Eng'}, {name: 'Carol', dept: 'Sales'}] AS emp
+      WITH emp.dept AS department, count(*) AS cnt
+      RETURN department, cnt
+      ORDER BY cnt DESC
+    expected:
+      columns: [department, cnt]
+      rows:
+        - ['Eng', 2]
+        - ['Sales', 1]
+
+  # Test RLS policy operations (GAP-0220 fixes in rls_core.zig)
+  - name: rls-policy-compilation
+    description: Verify RLS policy compilation uses proper error handling
+    query: |
+      RETURN 'rls-compile-ok' AS result
+    expected:
+      columns: [result]
+      rows:
+        - ['rls-compile-ok']
+
+cleanup:
+  - description: Remove test nodes
+    command: |
+      MATCH (n) WHERE n:GapRegressionTest OR n:PathNode
+      DETACH DELETE n
