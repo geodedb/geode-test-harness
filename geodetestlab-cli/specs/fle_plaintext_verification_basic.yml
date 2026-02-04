@@ -1,275 +1,322 @@
-version: "1.0"
-name: "FLE Plaintext Verification - Basic Field Encryption"
-description: |
-  SECURITY CRITICAL TEST SUITE
+version: '1.0'
+name: FLE Plaintext Verification - Basic Field Encryption
+description: 'SECURITY CRITICAL TEST SUITE
+
 
   Verifies that when Field-Level Encryption (FLE) is enabled for specific fields,
+
   NO plaintext data for those fields is written to disk. This test:
 
+
   1. Creates a schema with FLE-enabled fields
+
   2. Writes sensitive test data with known plaintext markers
+
   3. Shuts down the server cleanly
+
   4. Scans ALL data files for the plaintext markers
+
   5. FAILS if ANY plaintext marker is found in ANY data file
 
+
   Test Data Markers (these MUST NOT appear in any data file):
+
   - SSN: "FLESECRET_SSN_999888777"
+
   - Password: "FLESECRET_PASSWORD_MyS3cur3P@ssw0rd!"
+
   - API Key: "FLESECRET_APIKEY_sk_live_xyzabc123456789"
+
   - Credit Card: "FLESECRET_CC_5555444433332222"
+
   - Private Key: "FLESECRET_PRIVKEY_BEGIN_RSA_PRIVATE"
 
-  CANARY: REQ=REQ-FLE-ENFORCE-001; FEATURE=FLEEnforcement; ASPECT=BasicEncryption; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
 
+  CANARY: REQ=REQ-FLE-ENFORCE-001; FEATURE=FLEEnforcement; ASPECT=BasicEncryption;
+  STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
-    cleanup: false  # DO NOT CLEANUP - we need to scan files after tests
-    args: ["--log-level", "info", "--enable-fle"]
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 env:
-  GEODE_FLE_ENABLED: "true"
-  GEODE_MASTER_KEY: "fle-test-master-key-32-bytes-long!"
-
-# Skip isolation suffix for FLE tests - the CALL geode.fle.configureField
-# must match the exact label names used in CREATE statements
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: fle-test-master-key-32-bytes-long!
 skip_isolation: true
-
 tests:
-  # ===============================
-  # PHASE 1: CONFIGURE FLE SCHEMA
-  # ===============================
-
-  - name: "fle-basic-configure-schema-ssn"
-    description: "Configure SSN field for FLE encryption"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_User', 'ssn', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: ['admin', 'security_officer']
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "schema", "configure"]
-
-  - name: "fle-basic-configure-schema-password"
-    description: "Configure password field for FLE encryption"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_User', 'password', {
-              algorithm: 'ChaCha20-Poly1305',
-              keyVersion: 1,
-              visibility: ['admin']
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "schema", "configure"]
-
-  - name: "fle-basic-configure-schema-apikey"
-    description: "Configure API key field for FLE encryption"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_Service', 'api_key', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: ['service_admin']
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "schema", "configure"]
-
-  # ===============================
-  # PHASE 2: WRITE SENSITIVE DATA
-  # ===============================
-
-  - name: "fle-basic-write-ssn-data"
-    description: "Write SSN data that must be field-level encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_User {
-              username: 'john_doe',
-              ssn: 'FLESECRET_SSN_999888777',
-              email: 'john@example.com'
-            })
-            RETURN n.username AS username"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "basic", "ssn", "write"]
-
-  - name: "fle-basic-write-password-data"
-    description: "Write password data that must be field-level encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_User {
-              username: 'jane_doe',
-              password: 'FLESECRET_PASSWORD_MyS3cur3P@ssw0rd!',
-              email: 'jane@example.com'
-            })
-            RETURN n.username AS username"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "basic", "password", "write"]
-
-  - name: "fle-basic-write-apikey-data"
-    description: "Write API key data that must be field-level encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_Service {
-              name: 'payment_service',
-              api_key: 'FLESECRET_APIKEY_sk_live_xyzabc123456789',
-              environment: 'production'
-            })
-            RETURN n.name AS service_name"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "basic", "apikey", "write"]
-
-  - name: "fle-basic-write-creditcard-data"
-    description: "Write credit card data that must be field-level encrypted"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_Payment', 'card_number', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: ['pci_admin']
-            });
-            CREATE (n:FLETest_Payment {
-              payment_id: 'PAY001',
-              card_number: 'FLESECRET_CC_5555444433332222',
-              amount: 99.99
-            })
-            RETURN n.payment_id AS payment_id"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "basic", "creditcard", "write"]
-
-  - name: "fle-basic-write-privatekey-data"
-    description: "Write private key data that must be field-level encrypted"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_Credential', 'private_key', {
-              algorithm: 'ChaCha20-Poly1305',
-              keyVersion: 1,
-              visibility: ['key_custodian']
-            });
-            CREATE (n:FLETest_Credential {
-              credential_id: 'CRED001',
-              private_key: 'FLESECRET_PRIVKEY_BEGIN_RSA_PRIVATE',
-              algorithm: 'RSA-4096'
-            })
-            RETURN n.credential_id AS credential_id"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "basic", "privatekey", "write"]
-
-  # ===============================
-  # PHASE 3: VERIFY DATA READABLE
-  # ===============================
-
-  - name: "fle-basic-verify-data-readable"
-    description: "Verify all FLE-protected data is readable through queries"
-    args: ["query",
-           "MATCH (n)
-            WHERE n:FLETest_User OR n:FLETest_Service OR
-                  n:FLETest_Payment OR n:FLETest_Credential
-            RETURN count(*) AS total_records"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "basic", "verify", "readable"]
-
-  # ===============================
-  # PHASE 4: FORCE FLUSH TO DISK
-  # ===============================
-
-  - name: "fle-basic-force-checkpoint"
-    description: "Force checkpoint to ensure all data is written to disk"
-    args: ["query",
-           "RETURN 'checkpoint_requested' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "basic", "checkpoint"]
-
-  # ===============================
-  # PHASE 5: SCAN DATA FILES
-  # ===============================
-
-  - name: "fle-basic-scan-no-ssn-plaintext"
-    description: "CRITICAL: Verify SSN marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_SSN_999888777", "${data_dir}"]
-    expect:
-      exit_code: 1  # grep returns 1 when no match found (EXPECTED)
-    tags: ["fle", "basic", "scan", "ssn", "critical"]
-
-  - name: "fle-basic-scan-no-password-plaintext"
-    description: "CRITICAL: Verify password marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_PASSWORD_MyS3cur3P@ssw0rd!", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "basic", "scan", "password", "critical"]
-
-  - name: "fle-basic-scan-no-apikey-plaintext"
-    description: "CRITICAL: Verify API key marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_APIKEY_sk_live_xyzabc123456789", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "basic", "scan", "apikey", "critical"]
-
-  - name: "fle-basic-scan-no-creditcard-plaintext"
-    description: "CRITICAL: Verify credit card marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_CC_5555444433332222", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "basic", "scan", "creditcard", "critical"]
-
-  - name: "fle-basic-scan-no-privatekey-plaintext"
-    description: "CRITICAL: Verify private key marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_PRIVKEY_BEGIN_RSA_PRIVATE", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "basic", "scan", "privatekey", "critical"]
-
-  # ===============================
-  # PHASE 6: BINARY SCAN (comprehensive)
-  # ===============================
-
-  - name: "fle-basic-binary-scan-flesecret-prefix"
-    description: "CRITICAL: Verify NO FLESECRET_ prefix appears in ANY binary file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_", "${data_dir}"]
-    expect:
-      exit_code: 1  # No matches expected
-    tags: ["fle", "basic", "binary-scan", "comprehensive", "critical"]
-
+- name: fle-basic-configure-schema-ssn
+  description: Configure SSN field for FLE encryption
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_User'', ''ssn'', { algorithm: ''AES-256-GCM'',
+    keyVersion: 1, visibility: [''admin'', ''security_officer''] }) RETURN ''configured''
+    AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - schema
+  - configure
+- name: fle-basic-configure-schema-password
+  description: Configure password field for FLE encryption
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_User'', ''password'', { algorithm: ''ChaCha20-Poly1305'',
+    keyVersion: 1, visibility: [''admin''] }) RETURN ''configured'' AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - schema
+  - configure
+- name: fle-basic-configure-schema-apikey
+  description: Configure API key field for FLE encryption
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_Service'', ''api_key'', { algorithm:
+    ''AES-256-GCM'', keyVersion: 1, visibility: [''service_admin''] }) RETURN ''configured''
+    AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - schema
+  - configure
+- name: fle-basic-write-ssn-data
+  description: Write SSN data that must be field-level encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_User { username: ''john_doe'', ssn: ''FLESECRET_SSN_999888777'',
+    email: ''john@example.com'' }) RETURN n.username AS username'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - basic
+  - ssn
+  - write
+- name: fle-basic-write-password-data
+  description: Write password data that must be field-level encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_User { username: ''jane_doe'', password: ''FLESECRET_PASSWORD_MyS3cur3P@ssw0rd!'',
+    email: ''jane@example.com'' }) RETURN n.username AS username'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - basic
+  - password
+  - write
+- name: fle-basic-write-apikey-data
+  description: Write API key data that must be field-level encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_Service { name: ''payment_service'', api_key: ''FLESECRET_APIKEY_sk_live_xyzabc123456789'',
+    environment: ''production'' }) RETURN n.name AS service_name'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - basic
+  - apikey
+  - write
+- name: fle-basic-write-creditcard-data
+  description: Write credit card data that must be field-level encrypted
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_Payment'', ''card_number'', { algorithm:
+    ''AES-256-GCM'', keyVersion: 1, visibility: [''pci_admin''] }); CREATE (n:FLETest_Payment
+    { payment_id: ''PAY001'', card_number: ''FLESECRET_CC_5555444433332222'', amount:
+    99.99 }) RETURN n.payment_id AS payment_id'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - basic
+  - creditcard
+  - write
+- name: fle-basic-write-privatekey-data
+  description: Write private key data that must be field-level encrypted
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_Credential'', ''private_key'', { algorithm:
+    ''ChaCha20-Poly1305'', keyVersion: 1, visibility: [''key_custodian''] }); CREATE
+    (n:FLETest_Credential { credential_id: ''CRED001'', private_key: ''FLESECRET_PRIVKEY_BEGIN_RSA_PRIVATE'',
+    algorithm: ''RSA-4096'' }) RETURN n.credential_id AS credential_id'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - basic
+  - privatekey
+  - write
+- name: fle-basic-verify-data-readable
+  description: Verify all FLE-protected data is readable through queries
+  args:
+  - query
+  - MATCH (n) WHERE n:FLETest_User OR n:FLETest_Service OR n:FLETest_Payment OR n:FLETest_Credential
+    RETURN count(*) AS total_records
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - basic
+  - verify
+  - readable
+- name: fle-basic-force-checkpoint
+  description: Force checkpoint to ensure all data is written to disk
+  args:
+  - query
+  - RETURN 'checkpoint_requested' AS status
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - basic
+  - checkpoint
+- name: fle-basic-scan-no-ssn-plaintext
+  description: 'CRITICAL: Verify SSN marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_SSN_999888777
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - basic
+  - scan
+  - ssn
+  - critical
+- name: fle-basic-scan-no-password-plaintext
+  description: 'CRITICAL: Verify password marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_PASSWORD_MyS3cur3P@ssw0rd!
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - basic
+  - scan
+  - password
+  - critical
+- name: fle-basic-scan-no-apikey-plaintext
+  description: 'CRITICAL: Verify API key marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_APIKEY_sk_live_xyzabc123456789
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - basic
+  - scan
+  - apikey
+  - critical
+- name: fle-basic-scan-no-creditcard-plaintext
+  description: 'CRITICAL: Verify credit card marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_CC_5555444433332222
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - basic
+  - scan
+  - creditcard
+  - critical
+- name: fle-basic-scan-no-privatekey-plaintext
+  description: 'CRITICAL: Verify private key marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_PRIVKEY_BEGIN_RSA_PRIVATE
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - basic
+  - scan
+  - privatekey
+  - critical
+- name: fle-basic-binary-scan-flesecret-prefix
+  description: 'CRITICAL: Verify NO FLESECRET_ prefix appears in ANY binary file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - basic
+  - binary-scan
+  - comprehensive
+  - critical
 invariants:
-  - type: "server_running"
-
+- type: server_running
 plaintext_verification:
   enabled: true
   patterns:
-    - "FLESECRET_SSN_999888777"
-    - "FLESECRET_PASSWORD_MyS3cur3P@ssw0rd!"
-    - "FLESECRET_APIKEY_sk_live_xyzabc123456789"
-    - "FLESECRET_CC_5555444433332222"
-    - "FLESECRET_PRIVKEY_BEGIN_RSA_PRIVATE"
-    - "FLESECRET_"
+  - FLESECRET_SSN_999888777
+  - FLESECRET_PASSWORD_MyS3cur3P@ssw0rd!
+  - FLESECRET_APIKEY_sk_live_xyzabc123456789
+  - FLESECRET_CC_5555444433332222
+  - FLESECRET_PRIVKEY_BEGIN_RSA_PRIVATE
+  - FLESECRET_
   fail_on_violation: true
   scan_binary_files: true
-
-tags: ["fle", "field-level-encryption", "security", "plaintext-verification", "critical", "compliance"]
+tags:
+- fle
+- field-level-encryption
+- security
+- plaintext-verification
+- critical
+- compliance

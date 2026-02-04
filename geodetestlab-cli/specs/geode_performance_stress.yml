@@ -1,327 +1,464 @@
-version: "1.0"
-name: "Geode Performance & Stress Tests"
-description: "Performance benchmarking and stress testing for Geode database operations"
-
+version: '1.0'
+name: Geode Performance & Stress Tests
+description: Performance benchmarking and stress testing for Geode database operations
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "warn", "--enable-metrics", "--max-memory", "2GB"]
+    args:
+    - --log-level
+    - warn
+    - --enable-metrics
+    - --max-memory
+    - 2GB
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
-    timeout_ms: 60000  # Longer timeout for performance tests
+    timeout_ms: 60000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # Performance baseline tests
-  - name: "performance-baseline-simple"
-    description: "Baseline performance test - simple RETURN"
-    args: ["query", "RETURN 1 AS result"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 1000  # Should complete in under 1 second
-    tags: ["performance", "baseline"]
-
-  - name: "performance-baseline-arithmetic"
-    description: "Baseline performance test - arithmetic operations"
-    args: ["query", "RETURN 1 + 2 * 3 / 4 - 5 AS result, sqrt(16) AS sqrt_result, abs(-10) AS abs_result"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 1000
-    tags: ["performance", "arithmetic"]
-
-  # Data creation performance
-  - name: "create-small-dataset"
-    description: "Create small dataset (5 nodes)"
-    args: ["query", "CREATE (n1:SmallTest {id: 1, name: 'node_1'}), (n2:SmallTest {id: 2, name: 'node_2'}), (n3:SmallTest {id: 3, name: 'node_3'}), (n4:SmallTest {id: 4, name: 'node_4'}), (n5:SmallTest {id: 5, name: 'node_5'}) RETURN count(*) AS created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["created"]
-        execution_time_ms: 5000
-    tags: ["performance", "create", "small"]
-
-  - name: "create-medium-dataset"
-    description: "Create medium dataset (10 nodes)"
-    args: ["query", "CREATE (n1:MediumTest {id: 1, name: 'node_1', value: 2}), (n2:MediumTest {id: 2, name: 'node_2', value: 4}), (n3:MediumTest {id: 3, name: 'node_3', value: 6}), (n4:MediumTest {id: 4, name: 'node_4', value: 8}), (n5:MediumTest {id: 5, name: 'node_5', value: 10}), (n6:MediumTest {id: 6, name: 'node_6', value: 12}), (n7:MediumTest {id: 7, name: 'node_7', value: 14}), (n8:MediumTest {id: 8, name: 'node_8', value: 16}), (n9:MediumTest {id: 9, name: 'node_9', value: 18}), (n10:MediumTest {id: 10, name: 'node_10', value: 20}) RETURN count(*) AS created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["created"]
-        execution_time_ms: 15000
-    tags: ["performance", "create", "medium"]
-
-  # Note: Removed "create-large-dataset" test due to invalid GQL syntax (UNWIND, range(), toString())
-
-  # Relationship creation performance
-  - name: "create-relationships-small"
-    description: "Create relationships for small dataset"
-    args: ["query", "MATCH (n1:SmallTest), (n2:SmallTest) WHERE n1.id < n2.id CREATE (n1)-[:RELATED_TO {weight: 0.5}]->(n2) RETURN count(*) AS relationships_created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 10000
-    tags: ["performance", "relationships", "small"]
-
-  - name: "create-relationships-medium"
-    description: "Create relationships for medium dataset"
-    args: ["query", "MATCH (n1:MediumTest), (n2:MediumTest) WHERE n1.id < n2.id AND n1.id % 50 = n2.id % 50 AND n1.id <= 500 AND n2.id <= 500 CREATE (n1)-[:CONNECTED_TO {strength: rand(), created: timestamp()}]->(n2) RETURN count(*) AS relationships_created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 20000
-    tags: ["performance", "relationships", "medium"]
-
-  # Query performance tests
-  - name: "simple-match-performance"
-    description: "Simple MATCH query performance"
-    args: ["query", "MATCH (n:MediumTest) RETURN count(n) AS node_count"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 5000
-    tags: ["performance", "query", "match"]
-
-  - name: "filtered-match-performance"
-    description: "Filtered MATCH query performance"
-    args: ["query", "MATCH (n:MediumTest) WHERE n.value > 500 AND n.value < 1500 RETURN count(n) AS filtered_count"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 8000
-    tags: ["performance", "query", "filter"]
-
-  - name: "complex-match-performance"
-    description: "Complex MATCH query with relationships"
-    args: ["query", "MATCH (n1:MediumTest)-[r:CONNECTED_TO]->(n2:MediumTest) WHERE r.strength > 0.5 RETURN count(r) AS strong_relationships"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 15000
-    tags: ["performance", "query", "complex"]
-
-  - name: "aggregation-performance"
-    description: "Aggregation query performance"
-    args: ["query", "MATCH (n:LargeTest) RETURN avg(n.value) AS avg_value, max(n.value) AS max_value, min(n.value) AS min_value, count(n) AS total_count"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 10000
-    tags: ["performance", "aggregation"]
-
-  - name: "grouping-performance"
-    description: "GROUP BY query performance"
-    args: ["query", "MATCH (n:LargeTest) RETURN n.metadata AS category, count(n) AS count, avg(n.value) AS avg_value GROUP BY n.metadata ORDER BY count DESC LIMIT 20"]
-    expect:
-      exit_code: 0
-      geode_query:
-        max_rows: 20
-        execution_time_ms: 12000
-    tags: ["performance", "grouping"]
-
-  # Index performance testing
-  - name: "create-performance-index"
-    description: "Create index for performance testing"
-    args: ["query", "CREATE INDEX IF NOT EXISTS large_test_value_idx FOR (n:LargeTest) ON (n.value)"]
-    expect:
-      exit_code: 0
+- name: performance-baseline-simple
+  description: Baseline performance test - simple RETURN
+  args:
+  - query
+  - RETURN 1 AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 1000
+  tags:
+  - performance
+  - baseline
+- name: performance-baseline-arithmetic
+  description: Baseline performance test - arithmetic operations
+  args:
+  - query
+  - RETURN 1 + 2 * 3 / 4 - 5 AS result, sqrt(16) AS sqrt_result, abs(-10) AS abs_result
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 1000
+  tags:
+  - performance
+  - arithmetic
+- name: create-small-dataset
+  description: Create small dataset (5 nodes)
+  args:
+  - query
+  - 'CREATE (n1:SmallTest {id: 1, name: ''node_1''}), (n2:SmallTest {id: 2, name:
+    ''node_2''}), (n3:SmallTest {id: 3, name: ''node_3''}), (n4:SmallTest {id: 4,
+    name: ''node_4''}), (n5:SmallTest {id: 5, name: ''node_5''}) RETURN count(*) AS
+    created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - created
       execution_time_ms: 5000
-    tags: ["performance", "index", "create"]
-
-  - name: "indexed-query-performance"
-    description: "Query performance with index"
-    args: ["query", "MATCH (n:LargeTest) WHERE n.value = 5000 RETURN n.name AS name, n.metadata AS metadata"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 1000  # Should be fast with index
-    tags: ["performance", "index", "query"]
-
-  - name: "range-query-performance"
-    description: "Range query performance with index"
-    args: ["query", "MATCH (n:LargeTest) WHERE n.value >= 1000 AND n.value <= 2000 RETURN count(n) AS count_in_range"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 3000
-    tags: ["performance", "index", "range"]
-
-  # Update performance tests
-  - name: "single-node-update"
-    description: "Single node update performance"
-    args: ["query", "MATCH (n:MediumTest {id: 500}) SET n.updated = timestamp(), n.version = 2 RETURN n.id AS id, n.version AS version"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 1000
-    tags: ["performance", "update", "single"]
-
-  - name: "bulk-update-performance"
-    description: "Bulk update performance"
-    args: ["query", "MATCH (n:MediumTest) WHERE n.id % 10 = 0 SET n.special = true, n.updated = timestamp() RETURN count(n) AS updated"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 10000
-    tags: ["performance", "update", "bulk"]
-
-  # Delete performance tests
-  - name: "selective-delete-performance"
-    description: "Selective delete performance"
-    args: ["query", "MATCH (n:SmallTest) WHERE n.id % 5 = 0 DELETE n RETURN count(n) AS deleted"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 5000
-    tags: ["performance", "delete", "selective"]
-
-  # Path finding performance
-  - name: "shortest-path-performance"
-    description: "Shortest path query performance"
-    args: ["query", "MATCH (start:MediumTest {id: 1}), (end:MediumTest {id: 100}) MATCH path = shortestPath((start)-[:CONNECTED_TO*]-(end)) RETURN length(path) AS path_length"]
-    expect:
-      exit_code: 0
-      geode_query:
-        max_rows: 1
-        execution_time_ms: 8000
-    tags: ["performance", "path", "shortest"]
-
-  - name: "all-paths-performance"
-    description: "All paths query performance (limited)"
-    args: ["query", "MATCH (start:MediumTest {id: 1}), (end:MediumTest {id: 50}) MATCH path = (start)-[:CONNECTED_TO*1..3]-(end) RETURN count(path) AS path_count"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 15000
-    tags: ["performance", "path", "all"]
-
-  # Concurrent operation simulation
-  - name: "concurrent-reads-simulation"
-    description: "Simulate concurrent read operations"
-    args: ["query", "MATCH (n:LargeTest) WHERE n.id IN [1, 100, 1000, 5000, 9999] RETURN n.id AS id, n.name AS name, n.value AS value ORDER BY n.id"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 5
-        execution_time_ms: 3000
-    tags: ["performance", "concurrent", "reads"]
-
-  # Memory usage tests
-  - name: "memory-intensive-query"
-    description: "Memory-intensive query to test resource usage"
-    args: ["query", "MATCH (n1:LargeTest), (n2:LargeTest) WHERE n1.id < 100 AND n2.id < 100 AND n1.id != n2.id RETURN n1.name AS name1, n2.name AS name2, n1.value + n2.value AS sum_value ORDER BY sum_value DESC LIMIT 50"]
-    expect:
-      exit_code: 0
-      geode_query:
-        max_rows: 50
-        execution_time_ms: 20000
-    tags: ["performance", "memory", "intensive"]
-
-  # Transaction performance
-  - name: "transaction-performance"
-    description: "Transaction performance test"
-    args: ["query", "--begin", "MATCH (n:MediumTest) WHERE n.id <= 10 SET n.tx_test = timestamp() RETURN count(n) AS updated"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 5000
-    tags: ["performance", "transaction"]
-
-  - name: "commit-transaction-performance"
-    description: "Transaction commit performance"
-    args: ["query", "--commit", "RETURN 'committed' AS status"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 2000
-    tags: ["performance", "transaction", "commit"]
-
-  # Stress tests
-  - name: "stress-test-rapid-queries"
-    description: "Stress test with rapid sequential queries"
-    args: ["query", "MATCH (n:MediumTest) WHERE n.id IN [1, 2, 3, 4, 5] RETURN n.name AS name ORDER BY n.id"]
-    expect:
-      exit_code: 0
-      geode_query:
-        max_rows: 5
-        execution_time_ms: 10000
-    tags: ["stress", "rapid", "queries"]
-
-  - name: "stress-test-large-result"
-    description: "Stress test with large result set"
-    args: ["query", "MATCH (n:LargeTest) RETURN n.id AS id, n.name AS name, n.value AS value ORDER BY n.id LIMIT 1000"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1000
-        execution_time_ms: 15000
-    tags: ["stress", "large", "result"]
-
-  # Performance regression detection
-  - name: "regression-test-basic-ops"
-    description: "Regression test for basic operations"
-    args: ["query", "CREATE (test:RegressionTest {created: timestamp()}) WITH test MATCH (n:MediumTest) WHERE n.id = 500 CREATE (test)-[:TESTS]->(n) RETURN test.created AS created, n.name AS target"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 3000
-    tags: ["performance", "regression"]
-
-  # Cleanup with performance tracking
-  - name: "performance-cleanup-medium"
-    description: "Performance test of medium dataset cleanup"
-    args: ["query", "MATCH (n:MediumTest) DETACH DELETE n RETURN count(n) AS deleted"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 15000
-    tags: ["performance", "cleanup", "medium"]
-
-  - name: "performance-cleanup-large"
-    description: "Performance test of large dataset cleanup"
-    args: ["query", "MATCH (n:LargeTest) DETACH DELETE n RETURN count(n) AS deleted"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        execution_time_ms: 30000
-    tags: ["performance", "cleanup", "large"]
-
-  - name: "final-cleanup"
-    description: "Final cleanup of all test data"
-    args: ["query", "MATCH (n) DETACH DELETE n"]
-    expect:
-      exit_code: 0
+  tags:
+  - performance
+  - create
+  - small
+- name: create-medium-dataset
+  description: Create medium dataset (10 nodes)
+  args:
+  - query
+  - 'CREATE (n1:MediumTest {id: 1, name: ''node_1'', value: 2}), (n2:MediumTest {id:
+    2, name: ''node_2'', value: 4}), (n3:MediumTest {id: 3, name: ''node_3'', value:
+    6}), (n4:MediumTest {id: 4, name: ''node_4'', value: 8}), (n5:MediumTest {id:
+    5, name: ''node_5'', value: 10}), (n6:MediumTest {id: 6, name: ''node_6'', value:
+    12}), (n7:MediumTest {id: 7, name: ''node_7'', value: 14}), (n8:MediumTest {id:
+    8, name: ''node_8'', value: 16}), (n9:MediumTest {id: 9, name: ''node_9'', value:
+    18}), (n10:MediumTest {id: 10, name: ''node_10'', value: 20}) RETURN count(*)
+    AS created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - created
+      execution_time_ms: 15000
+  tags:
+  - performance
+  - create
+  - medium
+- name: create-relationships-small
+  description: Create relationships for small dataset
+  args:
+  - query
+  - 'MATCH (n1:SmallTest), (n2:SmallTest) WHERE n1.id < n2.id CREATE (n1)-[:RELATED_TO
+    {weight: 0.5}]->(n2) RETURN count(*) AS relationships_created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
       execution_time_ms: 10000
-    tags: ["cleanup", "final"]
-
+  tags:
+  - performance
+  - relationships
+  - small
+- name: create-relationships-medium
+  description: Create relationships for medium dataset
+  args:
+  - query
+  - 'MATCH (n1:MediumTest), (n2:MediumTest) WHERE n1.id < n2.id AND n1.id % 50 = n2.id
+    % 50 AND n1.id <= 500 AND n2.id <= 500 CREATE (n1)-[:CONNECTED_TO {strength: rand(),
+    created: timestamp()}]->(n2) RETURN count(*) AS relationships_created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 20000
+  tags:
+  - performance
+  - relationships
+  - medium
+- name: simple-match-performance
+  description: Simple MATCH query performance
+  args:
+  - query
+  - MATCH (n:MediumTest) RETURN count(n) AS node_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 5000
+  tags:
+  - performance
+  - query
+  - match
+- name: filtered-match-performance
+  description: Filtered MATCH query performance
+  args:
+  - query
+  - MATCH (n:MediumTest) WHERE n.value > 500 AND n.value < 1500 RETURN count(n) AS
+    filtered_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 8000
+  tags:
+  - performance
+  - query
+  - filter
+- name: complex-match-performance
+  description: Complex MATCH query with relationships
+  args:
+  - query
+  - MATCH (n1:MediumTest)-[r:CONNECTED_TO]->(n2:MediumTest) WHERE r.strength > 0.5
+    RETURN count(r) AS strong_relationships
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 15000
+  tags:
+  - performance
+  - query
+  - complex
+- name: aggregation-performance
+  description: Aggregation query performance
+  args:
+  - query
+  - MATCH (n:LargeTest) RETURN avg(n.value) AS avg_value, max(n.value) AS max_value,
+    min(n.value) AS min_value, count(n) AS total_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - performance
+  - aggregation
+- name: grouping-performance
+  description: GROUP BY query performance
+  args:
+  - query
+  - MATCH (n:LargeTest) RETURN n.metadata AS category, count(n) AS count, avg(n.value)
+    AS avg_value GROUP BY n.metadata ORDER BY count DESC LIMIT 20
+  expect:
+    exit_code: 0
+    geode_query:
+      max_rows: 20
+      execution_time_ms: 12000
+  tags:
+  - performance
+  - grouping
+- name: create-performance-index
+  description: Create index for performance testing
+  args:
+  - query
+  - CREATE INDEX IF NOT EXISTS large_test_value_idx FOR (n:LargeTest) ON (n.value)
+  expect:
+    exit_code: 0
+    execution_time_ms: 5000
+  tags:
+  - performance
+  - index
+  - create
+- name: indexed-query-performance
+  description: Query performance with index
+  args:
+  - query
+  - MATCH (n:LargeTest) WHERE n.value = 5000 RETURN n.name AS name, n.metadata AS
+    metadata
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 1000
+  tags:
+  - performance
+  - index
+  - query
+- name: range-query-performance
+  description: Range query performance with index
+  args:
+  - query
+  - MATCH (n:LargeTest) WHERE n.value >= 1000 AND n.value <= 2000 RETURN count(n)
+    AS count_in_range
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 3000
+  tags:
+  - performance
+  - index
+  - range
+- name: single-node-update
+  description: Single node update performance
+  args:
+  - query
+  - 'MATCH (n:MediumTest {id: 500}) SET n.updated = timestamp(), n.version = 2 RETURN
+    n.id AS id, n.version AS version'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 1000
+  tags:
+  - performance
+  - update
+  - single
+- name: bulk-update-performance
+  description: Bulk update performance
+  args:
+  - query
+  - MATCH (n:MediumTest) WHERE n.id % 10 = 0 SET n.special = true, n.updated = timestamp()
+    RETURN count(n) AS updated
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - performance
+  - update
+  - bulk
+- name: selective-delete-performance
+  description: Selective delete performance
+  args:
+  - query
+  - MATCH (n:SmallTest) WHERE n.id % 5 = 0 DELETE n RETURN count(n) AS deleted
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 5000
+  tags:
+  - performance
+  - delete
+  - selective
+- name: shortest-path-performance
+  description: Shortest path query performance
+  args:
+  - query
+  - 'MATCH (start:MediumTest {id: 1}), (end:MediumTest {id: 100}) MATCH path = shortestPath((start)-[:CONNECTED_TO*]-(end))
+    RETURN length(path) AS path_length'
+  expect:
+    exit_code: 0
+    geode_query:
+      max_rows: 1
+      execution_time_ms: 8000
+  tags:
+  - performance
+  - path
+  - shortest
+- name: all-paths-performance
+  description: All paths query performance (limited)
+  args:
+  - query
+  - 'MATCH (start:MediumTest {id: 1}), (end:MediumTest {id: 50}) MATCH path = (start)-[:CONNECTED_TO*1..3]-(end)
+    RETURN count(path) AS path_count'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 15000
+  tags:
+  - performance
+  - path
+  - all
+- name: concurrent-reads-simulation
+  description: Simulate concurrent read operations
+  args:
+  - query
+  - MATCH (n:LargeTest) WHERE n.id IN [1, 100, 1000, 5000, 9999] RETURN n.id AS id,
+    n.name AS name, n.value AS value ORDER BY n.id
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 5
+      execution_time_ms: 3000
+  tags:
+  - performance
+  - concurrent
+  - reads
+- name: memory-intensive-query
+  description: Memory-intensive query to test resource usage
+  args:
+  - query
+  - MATCH (n1:LargeTest), (n2:LargeTest) WHERE n1.id < 100 AND n2.id < 100 AND n1.id
+    != n2.id RETURN n1.name AS name1, n2.name AS name2, n1.value + n2.value AS sum_value
+    ORDER BY sum_value DESC LIMIT 50
+  expect:
+    exit_code: 0
+    geode_query:
+      max_rows: 50
+      execution_time_ms: 20000
+  tags:
+  - performance
+  - memory
+  - intensive
+- name: transaction-performance
+  description: Transaction performance test
+  args:
+  - query
+  - --begin
+  - MATCH (n:MediumTest) WHERE n.id <= 10 SET n.tx_test = timestamp() RETURN count(n)
+    AS updated
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 5000
+  tags:
+  - performance
+  - transaction
+- name: commit-transaction-performance
+  description: Transaction commit performance
+  args:
+  - query
+  - --commit
+  - RETURN 'committed' AS status
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 2000
+  tags:
+  - performance
+  - transaction
+  - commit
+- name: stress-test-rapid-queries
+  description: Stress test with rapid sequential queries
+  args:
+  - query
+  - MATCH (n:MediumTest) WHERE n.id IN [1, 2, 3, 4, 5] RETURN n.name AS name ORDER
+    BY n.id
+  expect:
+    exit_code: 0
+    geode_query:
+      max_rows: 5
+      execution_time_ms: 10000
+  tags:
+  - stress
+  - rapid
+  - queries
+- name: stress-test-large-result
+  description: Stress test with large result set
+  args:
+  - query
+  - MATCH (n:LargeTest) RETURN n.id AS id, n.name AS name, n.value AS value ORDER
+    BY n.id LIMIT 1000
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1000
+      execution_time_ms: 15000
+  tags:
+  - stress
+  - large
+  - result
+- name: regression-test-basic-ops
+  description: Regression test for basic operations
+  args:
+  - query
+  - 'CREATE (test:RegressionTest {created: timestamp()}) WITH test MATCH (n:MediumTest)
+    WHERE n.id = 500 CREATE (test)-[:TESTS]->(n) RETURN test.created AS created, n.name
+    AS target'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 3000
+  tags:
+  - performance
+  - regression
+- name: performance-cleanup-medium
+  description: Performance test of medium dataset cleanup
+  args:
+  - query
+  - MATCH (n:MediumTest) DETACH DELETE n RETURN count(n) AS deleted
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 15000
+  tags:
+  - performance
+  - cleanup
+  - medium
+- name: performance-cleanup-large
+  description: Performance test of large dataset cleanup
+  args:
+  - query
+  - MATCH (n:LargeTest) DETACH DELETE n RETURN count(n) AS deleted
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 30000
+  tags:
+  - performance
+  - cleanup
+  - large
+- name: final-cleanup
+  description: Final cleanup of all test data
+  args:
+  - query
+  - MATCH (n) DETACH DELETE n
+  expect:
+    exit_code: 0
+    execution_time_ms: 10000
+  tags:
+  - cleanup
+  - final
 invariants:
-  - type: "server_running"
-
-tags: ["performance", "stress", "benchmark", "scalability", "regression"]
+- type: server_running
+tags:
+- performance
+- stress
+- benchmark
+- scalability
+- regression

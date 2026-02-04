@@ -1,444 +1,707 @@
-version: "1.0"
-name: "Geode TDE (Transparent Data Encryption) Security Test Suite"
-description: "Comprehensive testing of Geode's TDE encryption including key management, rotation, backup/restore, and performance validation"
-
+version: '1.0'
+name: Geode TDE (Transparent Data Encryption) Security Test Suite
+description: Comprehensive testing of Geode's TDE encryption including key management,
+  rotation, backup/restore, and performance validation
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "info", "--enable-tde", "--tde-provider", "MockKms"]
+    args:
+    - --log-level
+    - info
+    - --enable-tde
+    - --tde-provider
+    - MockKms
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # ===============================
-  # TDE SETUP AND INITIALIZATION
-  # ===============================
-
-  - name: "tde-setup-key-hierarchy"
-    description: "Initialize TDE key hierarchy with master key"
-    args: ["query", "CALL tde.initialize_key_hierarchy() YIELD status, master_key_id, data_key_id, wal_key_id RETURN status, master_key_id, data_key_id, wal_key_id"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["status", "master_key_id", "data_key_id", "wal_key_id"]
-    tags: ["tde", "setup", "keys"]
-
-  - name: "tde-setup-test-data"
-    description: "Create test data for TDE encryption validation"
-    args: ["query",
-           "CREATE (alice:Person {name: 'Alice', ssn: '123-45-6789', email: 'alice@company.com', salary: 95000}), (bob:Person {name: 'Bob', ssn: '987-65-4321', email: 'bob@company.com', salary: 85000}), (alice)-[:KNOWS {since: 2020, confidential_notes: 'Performance review notes'}]->(bob) RETURN count(*) AS created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["created"]
-    tags: ["tde", "setup", "data"]
-
-  # ===============================
-  # KEY MANAGEMENT TESTING
-  # ===============================
-
-  - name: "tde-key-providers-static-env"
-    description: "Test StaticEnv key provider configuration"
-    args: ["query", "CALL tde.configure_provider('StaticEnv') YIELD provider_type, status, key_source RETURN provider_type, status, key_source"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["provider_type", "status", "key_source"]
-    tags: ["tde", "key", "static"]
-
-  - name: "tde-key-providers-mock-kms"
-    description: "Test MockKms key provider for development/testing"
-    args: ["query", "CALL tde.configure_provider('MockKms') YIELD provider_type, status, mock_endpoint RETURN provider_type, status, mock_endpoint"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["provider_type", "status", "mock_endpoint"]
-    tags: ["tde", "key", "mock"]
-
-  - name: "tde-key-derivation-master-to-data"
-    description: "Test master key to data key derivation"
-    args: ["query", "CALL tde.derive_data_key() YIELD master_key_id, derived_data_key_id, derivation_algorithm RETURN master_key_id, derived_data_key_id, derivation_algorithm"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["master_key_id", "derived_data_key_id", "derivation_algorithm"]
-    tags: ["tde", "key", "derivation"]
-
-  - name: "tde-key-derivation-master-to-wal"
-    description: "Test master key to WAL key derivation"
-    args: ["query", "CALL tde.derive_wal_key() YIELD master_key_id, derived_wal_key_id, derivation_algorithm RETURN master_key_id, derived_wal_key_id, derivation_algorithm"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["master_key_id", "derived_wal_key_id", "derivation_algorithm"]
-    tags: ["tde", "key", "wal"]
-
-  # ===============================
-  # KEY ROTATION TESTING
-  # ===============================
-
-  - name: "tde-key-rotation-age-based"
-    description: "Test age-based key rotation trigger"
-    args: ["query", "CALL tde.configure_rotation(strategy => 'age_based', max_age_hours => 168) YIELD status, next_rotation_time RETURN status, next_rotation_time"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["status", "next_rotation_time"]
-    tags: ["tde", "rotation", "age"]
-
-  - name: "tde-key-rotation-manual-trigger"
-    description: "Test manual key rotation trigger"
-    args: ["query", "CALL tde.rotate_keys() YIELD old_master_key_id, new_master_key_id, rotation_timestamp RETURN old_master_key_id, new_master_key_id, rotation_timestamp"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["old_master_key_id", "new_master_key_id", "rotation_timestamp"]
-    tags: ["tde", "rotation", "manual"]
-
-  - name: "tde-key-rotation-state-persistence"
-    description: "Test key rotation state persistence across restarts"
-    args: ["query", "CALL tde.get_rotation_state() YIELD current_generation, last_rotation_time, rotation_in_progress, scheduled_rotation RETURN current_generation, last_rotation_time, rotation_in_progress, scheduled_rotation"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["current_generation", "last_rotation_time", "rotation_in_progress", "scheduled_rotation"]
-    tags: ["tde", "rotation", "persistence"]
-
-  # ===============================
-  # ENCRYPTION/DECRYPTION TESTING
-  # ===============================
-
-  - name: "tde-encryption-aes256-gcm-primitives"
-    description: "Test AES-256-GCM encryption primitives"
-    args: ["query", "CALL tde.test_encryption('AES-256-GCM', 'sensitive test data for encryption') YIELD algorithm, plaintext_length, ciphertext_length, authentication_tag RETURN algorithm, plaintext_length, ciphertext_length, authentication_tag"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["algorithm", "plaintext_length", "ciphertext_length", "authentication_tag"]
-    tags: ["tde", "encryption", "aes256"]
-
-  - name: "tde-encryption-page-level"
-    description: "Test page-level encryption for storage"
-    args: ["query", "CALL tde.encrypt_page_test() YIELD page_id, encryption_status, page_size_encrypted, integrity_check RETURN page_id, encryption_status, page_size_encrypted, integrity_check"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["page_id", "encryption_status", "page_size_encrypted", "integrity_check"]
-    tags: ["tde", "encryption", "page"]
-
-  - name: "tde-encryption-wal-segments"
-    description: "Test WAL segment encryption"
-    args: ["query", "CALL tde.encrypt_wal_test() YIELD segment_id, encryption_status, segment_size, integrity_verified RETURN segment_id, encryption_status, segment_size, integrity_verified"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["segment_id", "encryption_status", "segment_size", "integrity_verified"]
-    tags: ["tde", "encryption", "wal"]
-
-  - name: "tde-decryption-roundtrip-validation"
-    description: "Test encryption/decryption roundtrip validation"
-    args: ["query", "CALL tde.roundtrip_test('confidential data for roundtrip test') YIELD original_data, decrypted_data, roundtrip_success RETURN original_data, decrypted_data, roundtrip_success"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["original_data", "decrypted_data", "roundtrip_success"]
-    tags: ["tde", "decryption", "roundtrip"]
-
-  # ===============================
-  # BACKUP/RESTORE TESTING
-  # ===============================
-
-  - name: "tde-backup-encrypted-creation"
-    description: "Test encrypted backup creation with key information"
-    args: ["query", "CALL tde.create_encrypted_backup('/tmp/tde_test_backup.enc') YIELD backup_path, encryption_key_id, backup_size, integrity_hash RETURN backup_path, encryption_key_id, backup_size, integrity_hash"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["backup_path", "encryption_key_id", "backup_size", "integrity_hash"]
-    tags: ["tde", "backup", "encrypted"]
-
-  - name: "tde-backup-key-manifest"
-    description: "Test backup key manifest generation and validation"
-    args: ["query", "CALL tde.generate_key_manifest('/tmp/tde_test_backup.enc') YIELD manifest_path, key_count, master_key_included, historical_keys_count RETURN manifest_path, key_count, master_key_included, historical_keys_count"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["manifest_path", "key_count", "master_key_included", "historical_keys_count"]
-    tags: ["tde", "backup", "manifest"]
-
-  - name: "tde-restore-with-historical-keys"
-    description: "Test restore operation with historical key access"
-    args: ["query", "CALL tde.restore_with_keys('/tmp/tde_test_backup.enc', '/tmp/tde_test_backup.manifest') YIELD restore_status, records_restored, keys_verified RETURN restore_status, records_restored, keys_verified"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["restore_status", "records_restored", "keys_verified"]
-    tags: ["tde", "restore", "historical"]
-
-  # ===============================
-  # PERFORMANCE VALIDATION TESTING
-  # ===============================
-
-  - name: "tde-performance-overhead-validation"
-    description: "Test TDE overhead is under 5% threshold"
-    args: ["query", "CALL tde.measure_overhead() YIELD baseline_ops_per_sec, encrypted_ops_per_sec, overhead_percentage, passes_threshold RETURN baseline_ops_per_sec, encrypted_ops_per_sec, overhead_percentage, passes_threshold"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["baseline_ops_per_sec", "encrypted_ops_per_sec", "overhead_percentage", "passes_threshold"]
-    tags: ["tde", "performance", "overhead"]
-
-  - name: "tde-performance-aead-benchmark"
-    description: "Test AEAD encryption performance benchmarks"
-    args: ["query", "CALL tde.benchmark_aead(iterations => 1000, data_size_kb => 64) YIELD avg_encrypt_time_us, avg_decrypt_time_us, throughput_mbps RETURN avg_encrypt_time_us, avg_decrypt_time_us, throughput_mbps"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["avg_encrypt_time_us", "avg_decrypt_time_us", "throughput_mbps"]
-    tags: ["tde", "performance", "aead"]
-
-  - name: "tde-performance-oltp-simulation"
-    description: "Test TDE performance under OLTP workload simulation"
-    args: ["query", "CALL tde.simulate_oltp_workload(duration_seconds => 30, concurrent_transactions => 10) YIELD avg_transaction_time_ms, tps_with_encryption, tps_without_encryption, degradation_percentage RETURN avg_transaction_time_ms, tps_with_encryption, tps_without_encryption, degradation_percentage"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["avg_transaction_time_ms", "tps_with_encryption", "tps_without_encryption", "degradation_percentage"]
-    tags: ["tde", "performance", "oltp"]
-
-  # ===============================
-  # SECURITY VALIDATION TESTING
-  # ===============================
-
-  - name: "tde-security-key-zeroization"
-    description: "Test key zeroization and secure memory cleanup"
-    args: ["query", "CALL tde.test_key_zeroization() YIELD keys_zeroized, memory_cleared, secure_cleanup_verified RETURN keys_zeroized, memory_cleared, secure_cleanup_verified"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["keys_zeroized", "memory_cleared", "secure_cleanup_verified"]
-    tags: ["tde", "security", "zeroization"]
-
-  - name: "tde-security-no-plaintext-persistence"
-    description: "Test that no plaintext keys are persisted to disk"
-    args: ["query", "CALL tde.audit_plaintext_keys() YIELD plaintext_keys_found, encrypted_keys_count, security_violation RETURN plaintext_keys_found, encrypted_keys_count, security_violation"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["plaintext_keys_found", "encrypted_keys_count", "security_violation"]
-    tags: ["tde", "security", "plaintext"]
-
-  - name: "tde-security-access-control"
-    description: "Test TDE key access control and authorization"
-    args: ["query", "CALL tde.test_key_access_control() YIELD authorized_access, unauthorized_attempts, access_denied_count RETURN authorized_access, unauthorized_attempts, access_denied_count"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["authorized_access", "unauthorized_attempts", "access_denied_count"]
-    tags: ["tde", "security", "access"]
-
-  # ===============================
-  # EXTERNAL KMS TESTING
-  # ===============================
-
-  - name: "tde-external-kms-configuration"
-    description: "Test external KMS provider configuration"
-    args: ["query", "CALL tde.configure_external_kms(endpoint => 'https://kms.example.com', region => 'us-east-1') YIELD status, endpoint, connection_verified RETURN status, endpoint, connection_verified"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["status", "endpoint", "connection_verified"]
-    tags: ["tde", "external", "kms"]
-
-  - name: "tde-external-kms-wrap-unwrap"
-    description: "Test external KMS key wrap/unwrap operations"
-    args: ["query", "CALL tde.test_kms_wrap_unwrap() YIELD wrap_success, unwrap_success, roundtrip_verified, latency_ms RETURN wrap_success, unwrap_success, roundtrip_verified, latency_ms"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["wrap_success", "unwrap_success", "roundtrip_verified", "latency_ms"]
-    tags: ["tde", "external", "wrap"]
-
-  - name: "tde-external-kms-attestation"
-    description: "Test external KMS attestation and signature verification"
-    args: ["query", "CALL tde.test_kms_attestation() YIELD attestation_valid, signature_verified, ed25519_verification, tamper_detected RETURN attestation_valid, signature_verified, ed25519_verification, tamper_detected"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["attestation_valid", "signature_verified", "ed25519_verification", "tamper_detected"]
-    tags: ["tde", "external", "attestation"]
-
-  # ===============================
-  # PRIVILEGED OPERATIONS TESTING
-  # ===============================
-
-  - name: "tde-privileged-unwrap-path"
-    description: "Test privileged key unwrap path for sensitive operations"
-    args: ["query", "CALL tde.test_privileged_unwrap() YIELD privileged_access_granted, unwrap_successful, audit_logged RETURN privileged_access_granted, unwrap_successful, audit_logged"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["privileged_access_granted", "unwrap_successful", "audit_logged"]
-    tags: ["tde", "privileged", "unwrap"]
-
-  - name: "tde-privileged-key-recovery"
-    description: "Test privileged key recovery procedures"
-    args: ["query", "CALL tde.test_key_recovery() YIELD recovery_initiated, master_key_recovered, data_accessible RETURN recovery_initiated, master_key_recovered, data_accessible"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["recovery_initiated", "master_key_recovered", "data_accessible"]
-    tags: ["tde", "privileged", "recovery"]
-
-  # ===============================
-  # ROTATION SCHEDULING TESTING
-  # ===============================
-
-  - name: "tde-rotation-scheduling-predicate"
-    description: "Test rotation scheduling predicate evaluation"
-    args: ["query", "CALL tde.evaluate_rotation_schedule() YIELD should_rotate, next_check_time, rotation_reason, age_hours RETURN should_rotate, next_check_time, rotation_reason, age_hours"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["should_rotate", "next_check_time", "rotation_reason", "age_hours"]
-    tags: ["tde", "rotation", "scheduling"]
-
-  - name: "tde-rotation-adaptive-schedule"
-    description: "Test adaptive rotation schedule based on usage patterns"
-    args: ["query", "CALL tde.configure_adaptive_rotation(usage_threshold => 1000000, age_factor => 0.8) YIELD status, adaptive_enabled, next_evaluation RETURN status, adaptive_enabled, next_evaluation"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["status", "adaptive_enabled", "next_evaluation"]
-    tags: ["tde", "rotation", "adaptive"]
-
-  # ===============================
-  # ERROR HANDLING AND EDGE CASES
-  # ===============================
-
-  - name: "tde-error-invalid-key-provider"
-    description: "Test error handling for invalid key provider configuration"
-    skip: true  # CLI returns exit code 0 even when query errors occur (error in response body, not exit code)
-    args: ["query", "CALL tde.configure_provider('InvalidProvider') YIELD status RETURN status"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "error", "provider"]
-
-  - name: "tde-error-kms-unavailable"
-    description: "Test error handling when KMS is unavailable"
-    args: ["query", "CALL tde.test_kms_failure() YIELD error_handled, fallback_activated, service_degraded RETURN error_handled, fallback_activated, service_degraded"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["error_handled", "fallback_activated", "service_degraded"]
-    tags: ["tde", "error", "kms"]
-
-  - name: "tde-error-corrupted-key"
-    description: "Test error handling for corrupted encryption keys"
-    args: ["query", "CALL tde.test_corrupted_key_handling() YIELD corruption_detected, recovery_attempted, data_recoverable RETURN corruption_detected, recovery_attempted, data_recoverable"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["corruption_detected", "recovery_attempted", "data_recoverable"]
-    tags: ["tde", "error", "corruption"]
-
-  # ===============================
-  # TDE INTEGRATION TESTING
-  # ===============================
-
-  - name: "tde-integration-query-performance"
-    description: "Test TDE integration with query performance"
-    args: ["query", "MATCH (p:Person) WHERE p.salary > 90000 RETURN p.name, p.salary, p.ssn ORDER BY p.salary DESC"]
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["p.name", "p.salary", "p.ssn"]
-    tags: ["tde", "integration", "query"]
-
-  - name: "tde-integration-transaction-isolation"
-    description: "Test TDE with transaction isolation and MVCC"
-    args: ["query", "START TRANSACTION"]
-    expect:
-      exit_code: 0
-    tags: ["tde", "integration", "transaction"]
-
-  - name: "tde-integration-transaction-commit"
-    description: "Test TDE transaction commit with encrypted data"
-    args: ["query", "MATCH (p:Person {name: 'Alice'}) SET p.salary = 100000 RETURN p.name, p.salary"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["p.name", "p.salary"]
-    tags: ["tde", "integration", "commit"]
-
-  - name: "tde-integration-transaction-finalize"
-    description: "Finalize TDE transaction test"
-    args: ["query", "COMMIT"]
-    expect:
-      exit_code: 0
-    tags: ["tde", "integration", "finalize"]
-
-  # ===============================
-  # TDE CLEANUP
-  # ===============================
-
-  - name: "tde-cleanup-test-data"
-    description: "Clean up TDE test data and keys"
-    args: ["query", "MATCH (n) DETACH DELETE n"]
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "tde-cleanup-key-hierarchy"
-    description: "Clean up TDE key hierarchy and zeroize keys"
-    args: ["query", "CALL tde.cleanup_key_hierarchy() YIELD keys_zeroized, hierarchy_cleared RETURN keys_zeroized, hierarchy_cleared"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["keys_zeroized", "hierarchy_cleared"]
-    tags: ["tde", "cleanup"]
-
+- name: tde-setup-key-hierarchy
+  description: Initialize TDE key hierarchy with master key
+  args:
+  - query
+  - CALL tde.initialize_key_hierarchy() YIELD status, master_key_id, data_key_id,
+    wal_key_id RETURN status, master_key_id, data_key_id, wal_key_id
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - status
+      - master_key_id
+      - data_key_id
+      - wal_key_id
+  tags:
+  - tde
+  - setup
+  - keys
+- name: tde-setup-test-data
+  description: Create test data for TDE encryption validation
+  args:
+  - query
+  - 'CREATE (alice:Person {name: ''Alice'', ssn: ''123-45-6789'', email: ''alice@company.com'',
+    salary: 95000}), (bob:Person {name: ''Bob'', ssn: ''987-65-4321'', email: ''bob@company.com'',
+    salary: 85000}), (alice)-[:KNOWS {since: 2020, confidential_notes: ''Performance
+    review notes''}]->(bob) RETURN count(*) AS created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - created
+  tags:
+  - tde
+  - setup
+  - data
+- name: tde-key-providers-static-env
+  description: Test StaticEnv key provider configuration
+  args:
+  - query
+  - CALL tde.configure_provider('StaticEnv') YIELD provider_type, status, key_source
+    RETURN provider_type, status, key_source
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - provider_type
+      - status
+      - key_source
+  tags:
+  - tde
+  - key
+  - static
+- name: tde-key-providers-mock-kms
+  description: Test MockKms key provider for development/testing
+  args:
+  - query
+  - CALL tde.configure_provider('MockKms') YIELD provider_type, status, mock_endpoint
+    RETURN provider_type, status, mock_endpoint
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - provider_type
+      - status
+      - mock_endpoint
+  tags:
+  - tde
+  - key
+  - mock
+- name: tde-key-derivation-master-to-data
+  description: Test master key to data key derivation
+  args:
+  - query
+  - CALL tde.derive_data_key() YIELD master_key_id, derived_data_key_id, derivation_algorithm
+    RETURN master_key_id, derived_data_key_id, derivation_algorithm
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - master_key_id
+      - derived_data_key_id
+      - derivation_algorithm
+  tags:
+  - tde
+  - key
+  - derivation
+- name: tde-key-derivation-master-to-wal
+  description: Test master key to WAL key derivation
+  args:
+  - query
+  - CALL tde.derive_wal_key() YIELD master_key_id, derived_wal_key_id, derivation_algorithm
+    RETURN master_key_id, derived_wal_key_id, derivation_algorithm
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - master_key_id
+      - derived_wal_key_id
+      - derivation_algorithm
+  tags:
+  - tde
+  - key
+  - wal
+- name: tde-key-rotation-age-based
+  description: Test age-based key rotation trigger
+  args:
+  - query
+  - CALL tde.configure_rotation(strategy => 'age_based', max_age_hours => 168) YIELD
+    status, next_rotation_time RETURN status, next_rotation_time
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - status
+      - next_rotation_time
+  tags:
+  - tde
+  - rotation
+  - age
+- name: tde-key-rotation-manual-trigger
+  description: Test manual key rotation trigger
+  args:
+  - query
+  - CALL tde.rotate_keys() YIELD old_master_key_id, new_master_key_id, rotation_timestamp
+    RETURN old_master_key_id, new_master_key_id, rotation_timestamp
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - old_master_key_id
+      - new_master_key_id
+      - rotation_timestamp
+  tags:
+  - tde
+  - rotation
+  - manual
+- name: tde-key-rotation-state-persistence
+  description: Test key rotation state persistence across restarts
+  args:
+  - query
+  - CALL tde.get_rotation_state() YIELD current_generation, last_rotation_time, rotation_in_progress,
+    scheduled_rotation RETURN current_generation, last_rotation_time, rotation_in_progress,
+    scheduled_rotation
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - current_generation
+      - last_rotation_time
+      - rotation_in_progress
+      - scheduled_rotation
+  tags:
+  - tde
+  - rotation
+  - persistence
+- name: tde-encryption-aes256-gcm-primitives
+  description: Test AES-256-GCM encryption primitives
+  args:
+  - query
+  - CALL tde.test_encryption('AES-256-GCM', 'sensitive test data for encryption')
+    YIELD algorithm, plaintext_length, ciphertext_length, authentication_tag RETURN
+    algorithm, plaintext_length, ciphertext_length, authentication_tag
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - algorithm
+      - plaintext_length
+      - ciphertext_length
+      - authentication_tag
+  tags:
+  - tde
+  - encryption
+  - aes256
+- name: tde-encryption-page-level
+  description: Test page-level encryption for storage
+  args:
+  - query
+  - CALL tde.encrypt_page_test() YIELD page_id, encryption_status, page_size_encrypted,
+    integrity_check RETURN page_id, encryption_status, page_size_encrypted, integrity_check
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - page_id
+      - encryption_status
+      - page_size_encrypted
+      - integrity_check
+  tags:
+  - tde
+  - encryption
+  - page
+- name: tde-encryption-wal-segments
+  description: Test WAL segment encryption
+  args:
+  - query
+  - CALL tde.encrypt_wal_test() YIELD segment_id, encryption_status, segment_size,
+    integrity_verified RETURN segment_id, encryption_status, segment_size, integrity_verified
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - segment_id
+      - encryption_status
+      - segment_size
+      - integrity_verified
+  tags:
+  - tde
+  - encryption
+  - wal
+- name: tde-decryption-roundtrip-validation
+  description: Test encryption/decryption roundtrip validation
+  args:
+  - query
+  - CALL tde.roundtrip_test('confidential data for roundtrip test') YIELD original_data,
+    decrypted_data, roundtrip_success RETURN original_data, decrypted_data, roundtrip_success
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - original_data
+      - decrypted_data
+      - roundtrip_success
+  tags:
+  - tde
+  - decryption
+  - roundtrip
+- name: tde-backup-encrypted-creation
+  description: Test encrypted backup creation with key information
+  args:
+  - query
+  - CALL tde.create_encrypted_backup('/tmp/tde_test_backup.enc') YIELD backup_path,
+    encryption_key_id, backup_size, integrity_hash RETURN backup_path, encryption_key_id,
+    backup_size, integrity_hash
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - backup_path
+      - encryption_key_id
+      - backup_size
+      - integrity_hash
+  tags:
+  - tde
+  - backup
+  - encrypted
+- name: tde-backup-key-manifest
+  description: Test backup key manifest generation and validation
+  args:
+  - query
+  - CALL tde.generate_key_manifest('/tmp/tde_test_backup.enc') YIELD manifest_path,
+    key_count, master_key_included, historical_keys_count RETURN manifest_path, key_count,
+    master_key_included, historical_keys_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - manifest_path
+      - key_count
+      - master_key_included
+      - historical_keys_count
+  tags:
+  - tde
+  - backup
+  - manifest
+- name: tde-restore-with-historical-keys
+  description: Test restore operation with historical key access
+  args:
+  - query
+  - CALL tde.restore_with_keys('/tmp/tde_test_backup.enc', '/tmp/tde_test_backup.manifest')
+    YIELD restore_status, records_restored, keys_verified RETURN restore_status, records_restored,
+    keys_verified
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - restore_status
+      - records_restored
+      - keys_verified
+  tags:
+  - tde
+  - restore
+  - historical
+- name: tde-performance-overhead-validation
+  description: Test TDE overhead is under 5% threshold
+  args:
+  - query
+  - CALL tde.measure_overhead() YIELD baseline_ops_per_sec, encrypted_ops_per_sec,
+    overhead_percentage, passes_threshold RETURN baseline_ops_per_sec, encrypted_ops_per_sec,
+    overhead_percentage, passes_threshold
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - baseline_ops_per_sec
+      - encrypted_ops_per_sec
+      - overhead_percentage
+      - passes_threshold
+  tags:
+  - tde
+  - performance
+  - overhead
+- name: tde-performance-aead-benchmark
+  description: Test AEAD encryption performance benchmarks
+  args:
+  - query
+  - CALL tde.benchmark_aead(iterations => 1000, data_size_kb => 64) YIELD avg_encrypt_time_us,
+    avg_decrypt_time_us, throughput_mbps RETURN avg_encrypt_time_us, avg_decrypt_time_us,
+    throughput_mbps
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - avg_encrypt_time_us
+      - avg_decrypt_time_us
+      - throughput_mbps
+  tags:
+  - tde
+  - performance
+  - aead
+- name: tde-performance-oltp-simulation
+  description: Test TDE performance under OLTP workload simulation
+  args:
+  - query
+  - CALL tde.simulate_oltp_workload(duration_seconds => 30, concurrent_transactions
+    => 10) YIELD avg_transaction_time_ms, tps_with_encryption, tps_without_encryption,
+    degradation_percentage RETURN avg_transaction_time_ms, tps_with_encryption, tps_without_encryption,
+    degradation_percentage
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - avg_transaction_time_ms
+      - tps_with_encryption
+      - tps_without_encryption
+      - degradation_percentage
+  tags:
+  - tde
+  - performance
+  - oltp
+- name: tde-security-key-zeroization
+  description: Test key zeroization and secure memory cleanup
+  args:
+  - query
+  - CALL tde.test_key_zeroization() YIELD keys_zeroized, memory_cleared, secure_cleanup_verified
+    RETURN keys_zeroized, memory_cleared, secure_cleanup_verified
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - keys_zeroized
+      - memory_cleared
+      - secure_cleanup_verified
+  tags:
+  - tde
+  - security
+  - zeroization
+- name: tde-security-no-plaintext-persistence
+  description: Test that no plaintext keys are persisted to disk
+  args:
+  - query
+  - CALL tde.audit_plaintext_keys() YIELD plaintext_keys_found, encrypted_keys_count,
+    security_violation RETURN plaintext_keys_found, encrypted_keys_count, security_violation
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - plaintext_keys_found
+      - encrypted_keys_count
+      - security_violation
+  tags:
+  - tde
+  - security
+  - plaintext
+- name: tde-security-access-control
+  description: Test TDE key access control and authorization
+  args:
+  - query
+  - CALL tde.test_key_access_control() YIELD authorized_access, unauthorized_attempts,
+    access_denied_count RETURN authorized_access, unauthorized_attempts, access_denied_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - authorized_access
+      - unauthorized_attempts
+      - access_denied_count
+  tags:
+  - tde
+  - security
+  - access
+- name: tde-external-kms-configuration
+  description: Test external KMS provider configuration
+  args:
+  - query
+  - CALL tde.configure_external_kms(endpoint => 'https://kms.example.com', region
+    => 'us-east-1') YIELD status, endpoint, connection_verified RETURN status, endpoint,
+    connection_verified
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - status
+      - endpoint
+      - connection_verified
+  tags:
+  - tde
+  - external
+  - kms
+- name: tde-external-kms-wrap-unwrap
+  description: Test external KMS key wrap/unwrap operations
+  args:
+  - query
+  - CALL tde.test_kms_wrap_unwrap() YIELD wrap_success, unwrap_success, roundtrip_verified,
+    latency_ms RETURN wrap_success, unwrap_success, roundtrip_verified, latency_ms
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - wrap_success
+      - unwrap_success
+      - roundtrip_verified
+      - latency_ms
+  tags:
+  - tde
+  - external
+  - wrap
+- name: tde-external-kms-attestation
+  description: Test external KMS attestation and signature verification
+  args:
+  - query
+  - CALL tde.test_kms_attestation() YIELD attestation_valid, signature_verified, ed25519_verification,
+    tamper_detected RETURN attestation_valid, signature_verified, ed25519_verification,
+    tamper_detected
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - attestation_valid
+      - signature_verified
+      - ed25519_verification
+      - tamper_detected
+  tags:
+  - tde
+  - external
+  - attestation
+- name: tde-privileged-unwrap-path
+  description: Test privileged key unwrap path for sensitive operations
+  args:
+  - query
+  - CALL tde.test_privileged_unwrap() YIELD privileged_access_granted, unwrap_successful,
+    audit_logged RETURN privileged_access_granted, unwrap_successful, audit_logged
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - privileged_access_granted
+      - unwrap_successful
+      - audit_logged
+  tags:
+  - tde
+  - privileged
+  - unwrap
+- name: tde-privileged-key-recovery
+  description: Test privileged key recovery procedures
+  args:
+  - query
+  - CALL tde.test_key_recovery() YIELD recovery_initiated, master_key_recovered, data_accessible
+    RETURN recovery_initiated, master_key_recovered, data_accessible
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - recovery_initiated
+      - master_key_recovered
+      - data_accessible
+  tags:
+  - tde
+  - privileged
+  - recovery
+- name: tde-rotation-scheduling-predicate
+  description: Test rotation scheduling predicate evaluation
+  args:
+  - query
+  - CALL tde.evaluate_rotation_schedule() YIELD should_rotate, next_check_time, rotation_reason,
+    age_hours RETURN should_rotate, next_check_time, rotation_reason, age_hours
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - should_rotate
+      - next_check_time
+      - rotation_reason
+      - age_hours
+  tags:
+  - tde
+  - rotation
+  - scheduling
+- name: tde-rotation-adaptive-schedule
+  description: Test adaptive rotation schedule based on usage patterns
+  args:
+  - query
+  - CALL tde.configure_adaptive_rotation(usage_threshold => 1000000, age_factor =>
+    0.8) YIELD status, adaptive_enabled, next_evaluation RETURN status, adaptive_enabled,
+    next_evaluation
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - status
+      - adaptive_enabled
+      - next_evaluation
+  tags:
+  - tde
+  - rotation
+  - adaptive
+- name: tde-error-invalid-key-provider
+  description: Test error handling for invalid key provider configuration
+  skip: true
+  args:
+  - query
+  - CALL tde.configure_provider('InvalidProvider') YIELD status RETURN status
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - error
+  - provider
+- name: tde-error-kms-unavailable
+  description: Test error handling when KMS is unavailable
+  args:
+  - query
+  - CALL tde.test_kms_failure() YIELD error_handled, fallback_activated, service_degraded
+    RETURN error_handled, fallback_activated, service_degraded
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - error_handled
+      - fallback_activated
+      - service_degraded
+  tags:
+  - tde
+  - error
+  - kms
+- name: tde-error-corrupted-key
+  description: Test error handling for corrupted encryption keys
+  args:
+  - query
+  - CALL tde.test_corrupted_key_handling() YIELD corruption_detected, recovery_attempted,
+    data_recoverable RETURN corruption_detected, recovery_attempted, data_recoverable
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - corruption_detected
+      - recovery_attempted
+      - data_recoverable
+  tags:
+  - tde
+  - error
+  - corruption
+- name: tde-integration-query-performance
+  description: Test TDE integration with query performance
+  args:
+  - query
+  - MATCH (p:Person) WHERE p.salary > 90000 RETURN p.name, p.salary, p.ssn ORDER BY
+    p.salary DESC
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - p.name
+      - p.salary
+      - p.ssn
+  tags:
+  - tde
+  - integration
+  - query
+- name: tde-integration-transaction-isolation
+  description: Test TDE with transaction isolation and MVCC
+  args:
+  - query
+  - START TRANSACTION
+  expect:
+    exit_code: 0
+  tags:
+  - tde
+  - integration
+  - transaction
+- name: tde-integration-transaction-commit
+  description: Test TDE transaction commit with encrypted data
+  args:
+  - query
+  - 'MATCH (p:Person {name: ''Alice''}) SET p.salary = 100000 RETURN p.name, p.salary'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - p.name
+      - p.salary
+  tags:
+  - tde
+  - integration
+  - commit
+- name: tde-integration-transaction-finalize
+  description: Finalize TDE transaction test
+  args:
+  - query
+  - COMMIT
+  expect:
+    exit_code: 0
+  tags:
+  - tde
+  - integration
+  - finalize
+- name: tde-cleanup-test-data
+  description: Clean up TDE test data and keys
+  args:
+  - query
+  - MATCH (n) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: tde-cleanup-key-hierarchy
+  description: Clean up TDE key hierarchy and zeroize keys
+  args:
+  - query
+  - CALL tde.cleanup_key_hierarchy() YIELD keys_zeroized, hierarchy_cleared RETURN
+    keys_zeroized, hierarchy_cleared
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - keys_zeroized
+      - hierarchy_cleared
+  tags:
+  - tde
+  - cleanup
 invariants:
-  - type: "server_running"
-
-tags: ["tde", "encryption", "security", "key-management", "performance", "comprehensive"]
+- type: server_running
+tags:
+- tde
+- encryption
+- security
+- key-management
+- performance
+- comprehensive

@@ -1,112 +1,163 @@
-version: "1.0"
-name: "MERGE Performance Optimization January 2026"
-description: "Tests for MERGE performance optimization using label-based indexing (Issues #391, #392)"
-
-# CANARY: REQ=REQ-PERF-MERGE-TESTS-001; FEATURE="MergePerformanceTests"; ASPECT=TestSpec; STATUS=TESTED; OWNER=perf; UPDATED=2026-01-28
-
+version: '1.0'
+name: MERGE Performance Optimization January 2026
+description: 'Tests for MERGE performance optimization using label-based indexing
+  (Issues #391, #392)'
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   working_dir: null
   env:
-    GEODE_LOG_LEVEL: "error"
+    GEODE_LOG_LEVEL: error
   server:
     enabled: true
-    port: null  # Auto-allocate
-    data_dir: null  # Use temporary directory
+    port: null
+    data_dir: null
     startup_timeout_ms: 60000
     cleanup: true
-    args: ["--log-level", "error"]
-    env: {}
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
-    server_address: "127.0.0.1:3141"  # Will be overridden by managed server
+    server_address: 127.0.0.1:3141
     timeout_ms: 30000
     tls_verify: false
-    format: "json"
-
+    format: json
 secrets:
   admin_password:
-    source: "env"
-    key: "GEODE_ADMIN_PASSWORD"
+    source: env
+    key: GEODE_ADMIN_PASSWORD
     required: false
-
 invariants:
-  - type: "server_running"
-
+- type: server_running
 fuzz:
   enabled: false
-  provider: "mock"
+  provider: mock
   max_cases: 5
   seed: 42
-
 tests:
-  # Issue #391: Test MERGE creates nodes correctly
-  - name: "merge-creates-node"
-    description: "Test MERGE creates node when none exists"
-    args: ["query", "--insecure", "CREATE GRAPH test391; USE GRAPH test391; MERGE (p:Person {name: 'Alice'}); MATCH (n:Person) RETURN n.name"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["Alice"]
-    tags: ["merge", "performance", "issue-391"]
-
-  - name: "merge-finds-existing-node"
-    description: "Test MERGE finds existing node instead of creating duplicate"
-    args: ["query", "--insecure", "CREATE GRAPH test391b; USE GRAPH test391b; CREATE (:Person {name: 'Bob'}); MERGE (p:Person {name: 'Bob'}); MATCH (n:Person) RETURN count(n) AS cnt"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]
-    tags: ["merge", "performance", "issue-391"]
-
-  - name: "merge-label-index-basic"
-    description: "Test MERGE with label uses index for lookup"
-    args: ["query", "--insecure", "CREATE GRAPH test391c; USE GRAPH test391c; MERGE (p:Employee {emp_id: '123'}); MERGE (p:Employee {emp_id: '123'}); MATCH (n:Employee) RETURN count(n) AS cnt"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]
-    tags: ["merge", "performance", "label-index", "issue-391"]
-
-  - name: "merge-multiple-labels"
-    description: "Test MERGE with multiple labels"
-    args: ["query", "--insecure", "CREATE GRAPH test391d; USE GRAPH test391d; MERGE (p:Person:Manager {name: 'Carol'}); MATCH (n:Person:Manager) RETURN n.name"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["Carol"]
-    tags: ["merge", "performance", "issue-391"]
-
-  # Issue #392: Test edge adjacency (implicitly through DELETE DETACH)
-  - name: "delete-detach-with-adjacency"
-    description: "Test DELETE DETACH performance with adjacency index"
-    # Fixed: Use MATCH clause with property filter for proper DETACH DELETE syntax
-    args: ["query", "--insecure", "CREATE GRAPH test392; USE GRAPH test392; CREATE (a:Node {id: 'A'})-[:CONNECTS]->(b:Node {id: 'B'})-[:CONNECTS]->(c:Node {id: 'C'}); MATCH (a:Node {id: 'A'}) DETACH DELETE a; MATCH (n) RETURN count(n) AS cnt"]
-    expect:
-      exit_code: 0
-      # After deleting node A with DETACH, only B and C should remain
-      stdout_contains: ["2"]
-    tags: ["delete", "detach", "performance", "issue-392"]
-
-  - name: "create-edge-adjacency-basic"
-    description: "Test edges are indexed for adjacency lookup"
-    args: ["query", "--insecure", "CREATE GRAPH test392b; USE GRAPH test392b; CREATE (a:Start {id: 'S'})-[:TO]->(b:End {id: 'E'}); MATCH ()-[r]->() RETURN type(r)"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["TO"]
-    tags: ["edge", "adjacency", "issue-392"]
-
-  # Performance regression test - multiple MERGE operations
-  - name: "merge-repeated-operations"
-    description: "Test repeated MERGE operations don't degrade performance"
-    args: ["query", "--insecure", "CREATE GRAPH testperf; USE GRAPH testperf; MERGE (:Item {id: 1}); MERGE (:Item {id: 2}); MERGE (:Item {id: 3}); MERGE (:Item {id: 1}); MERGE (:Item {id: 2}); MERGE (:Item {id: 3}); MATCH (n:Item) RETURN count(n) AS cnt"]
-    expect:
-      exit_code: 0
-      # Should have exactly 3 items, not 6 (duplicates merged)
-      stdout_contains: ["3"]
-    tags: ["merge", "performance", "regression"]
-
-  # Graph isolation test
-  - name: "merge-graph-isolation"
-    description: "Test MERGE respects graph boundaries"
-    args: ["query", "--insecure", "CREATE GRAPH iso1; CREATE GRAPH iso2; USE GRAPH iso1; MERGE (:Widget {name: 'W1'}); USE GRAPH iso2; MERGE (:Widget {name: 'W1'}); MATCH (n:Widget) RETURN count(n) AS cnt"]
-    expect:
-      exit_code: 0
-      # Should see only 1 widget in iso2 graph
-      stdout_contains: ["1"]
-    tags: ["merge", "multi-graph", "isolation"]
+- name: merge-creates-node
+  description: Test MERGE creates node when none exists
+  args:
+  - query
+  - --insecure
+  - 'CREATE GRAPH test391; USE GRAPH test391; MERGE (p:Person {name: ''Alice''});
+    MATCH (n:Person) RETURN n.name'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Alice
+  tags:
+  - merge
+  - performance
+  - issue-391
+- name: merge-finds-existing-node
+  description: Test MERGE finds existing node instead of creating duplicate
+  args:
+  - query
+  - --insecure
+  - 'CREATE GRAPH test391b; USE GRAPH test391b; CREATE (:Person {name: ''Bob''});
+    MERGE (p:Person {name: ''Bob''}); MATCH (n:Person) RETURN count(n) AS cnt'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - merge
+  - performance
+  - issue-391
+- name: merge-label-index-basic
+  description: Test MERGE with label uses index for lookup
+  args:
+  - query
+  - --insecure
+  - 'CREATE GRAPH test391c; USE GRAPH test391c; MERGE (p:Employee {emp_id: ''123''});
+    MERGE (p:Employee {emp_id: ''123''}); MATCH (n:Employee) RETURN count(n) AS cnt'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - merge
+  - performance
+  - label-index
+  - issue-391
+- name: merge-multiple-labels
+  description: Test MERGE with multiple labels
+  args:
+  - query
+  - --insecure
+  - 'CREATE GRAPH test391d; USE GRAPH test391d; MERGE (p:Person:Manager {name: ''Carol''});
+    MATCH (n:Person:Manager) RETURN n.name'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Carol
+  tags:
+  - merge
+  - performance
+  - issue-391
+- name: delete-detach-with-adjacency
+  description: Test DELETE DETACH performance with adjacency index
+  args:
+  - query
+  - --insecure
+  - 'CREATE GRAPH test392; USE GRAPH test392; CREATE (a:Node {id: ''A''})-[:CONNECTS]->(b:Node
+    {id: ''B''})-[:CONNECTS]->(c:Node {id: ''C''}); MATCH (a:Node {id: ''A''}) DETACH
+    DELETE a; MATCH (n) RETURN count(n) AS cnt'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '2'
+  tags:
+  - delete
+  - detach
+  - performance
+  - issue-392
+- name: create-edge-adjacency-basic
+  description: Test edges are indexed for adjacency lookup
+  args:
+  - query
+  - --insecure
+  - 'CREATE GRAPH test392b; USE GRAPH test392b; CREATE (a:Start {id: ''S''})-[:TO]->(b:End
+    {id: ''E''}); MATCH ()-[r]->() RETURN type(r)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - TO
+  tags:
+  - edge
+  - adjacency
+  - issue-392
+- name: merge-repeated-operations
+  description: Test repeated MERGE operations don't degrade performance
+  args:
+  - query
+  - --insecure
+  - 'CREATE GRAPH testperf; USE GRAPH testperf; MERGE (:Item {id: 1}); MERGE (:Item
+    {id: 2}); MERGE (:Item {id: 3}); MERGE (:Item {id: 1}); MERGE (:Item {id: 2});
+    MERGE (:Item {id: 3}); MATCH (n:Item) RETURN count(n) AS cnt'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '3'
+  tags:
+  - merge
+  - performance
+  - regression
+- name: merge-graph-isolation
+  description: Test MERGE respects graph boundaries
+  args:
+  - query
+  - --insecure
+  - 'CREATE GRAPH iso1; CREATE GRAPH iso2; USE GRAPH iso1; MERGE (:Widget {name: ''W1''});
+    USE GRAPH iso2; MERGE (:Widget {name: ''W1''}); MATCH (n:Widget) RETURN count(n)
+    AS cnt'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - merge
+  - multi-graph
+  - isolation

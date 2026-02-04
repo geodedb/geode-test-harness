@@ -1,353 +1,404 @@
-version: "1.0"
-name: "GQL Transaction Management Comprehensive Tests"
-description: "Complete ISO/IEC 39075:2024 transaction management testing covering START TRANSACTION, COMMIT, ROLLBACK with all options"
-
+version: '1.0'
+name: GQL Transaction Management Comprehensive Tests
+description: Complete ISO/IEC 39075:2024 transaction management testing covering START
+  TRANSACTION, COMMIT, ROLLBACK with all options
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "info"]
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # ===============================
-  # BASIC TRANSACTION COMMANDS
-  # ===============================
-
-  - name: "basic-start-transaction"
-    description: "Test basic START TRANSACTION command"
-    args: ["query", "START TRANSACTION"]
+- name: basic-start-transaction
+  description: Test basic START TRANSACTION command
+  args:
+  - query
+  - START TRANSACTION
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - start
+  - basic
+- name: basic-commit
+  description: Test basic COMMIT command
+  setup:
+  - args:
+    - query
+    - START TRANSACTION
     expect:
       exit_code: 0
-    tags: ["transaction", "start", "basic"]
-
-  - name: "basic-commit"
-    description: "Test basic COMMIT command"
-    setup:
-      - args: ["query", "START TRANSACTION"]
-        expect:
-          exit_code: 0
-    args: ["query", "COMMIT"]
+  args:
+  - query
+  - COMMIT
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - commit
+  - basic
+- name: basic-rollback
+  description: Test basic ROLLBACK command
+  setup:
+  - args:
+    - query
+    - START TRANSACTION
     expect:
       exit_code: 0
-    tags: ["transaction", "commit", "basic"]
+  args:
+  - query
+  - ROLLBACK
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - rollback
+  - basic
+- name: transaction-read-only
+  description: Test START TRANSACTION READ ONLY
+  args:
+  - query
+  - START TRANSACTION READ ONLY
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - read-only
+  - characteristics
+- name: transaction-read-write
+  description: Test START TRANSACTION READ WRITE
+  args:
+  - query
+  - START TRANSACTION READ WRITE
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - read-write
+  - characteristics
+- name: transaction-commit-workflow
+  description: Complete transaction workflow with data modification and commit
+  args:
+  - query
+  - 'START TRANSACTION;
 
-  - name: "basic-rollback"
-    description: "Test basic ROLLBACK command"
-    setup:
-      - args: ["query", "START TRANSACTION"]
-        expect:
-          exit_code: 0
-    args: ["query", "ROLLBACK"]
+    CREATE (n:TestNode {id: 1, name: ''transaction_test''});
+
+    COMMIT
+
+    '
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - workflow
+  - commit
+- name: transaction-rollback-workflow
+  description: Complete transaction workflow with data modification and rollback
+  args:
+  - query
+  - 'START TRANSACTION;
+
+    CREATE (n:TestNode {id: 2, name: ''rollback_test''});
+
+    ROLLBACK
+
+    '
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - workflow
+  - rollback
+- name: transaction-read-only-workflow
+  description: Read-only transaction workflow
+  setup:
+  - args:
+    - query
+    - 'CREATE (n:ReadTestNode {id: 1, value: ''test''})'
     expect:
       exit_code: 0
-    tags: ["transaction", "rollback", "basic"]
+  args:
+  - query
+  - 'START TRANSACTION READ ONLY;
 
-  # ===============================
-  # TRANSACTION CHARACTERISTICS
-  # ===============================
+    MATCH (n:ReadTestNode) RETURN n.id AS id, n.value AS value;
 
-  - name: "transaction-read-only"
-    description: "Test START TRANSACTION READ ONLY"
-    args: ["query", "START TRANSACTION READ ONLY"]
+    COMMIT
+
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 1
+      columns:
+      - id
+      - value
+  tags:
+  - transaction
+  - read-only
+  - workflow
+- name: nested-transaction-procedure
+  description: Test transaction with nested procedure specification
+  args:
+  - query
+  - "START TRANSACTION {\n  CREATE (n:NestedNode {id: 1, type: 'nested'});\n  MATCH\
+    \ (n:NestedNode) RETURN count(n) AS node_count\n}\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - node_count
+  tags:
+  - transaction
+  - nested
+  - procedure
+- name: transaction-isolation-commit
+  description: Test transaction isolation - changes visible after commit
+  args:
+  - query
+  - 'START TRANSACTION;
+
+    CREATE (n:IsolationTest {id: 1, status: ''committed''});
+
+    COMMIT;
+
+    MATCH (n:IsolationTest {id: 1}) RETURN n.status AS status
+
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - status
+    stdout_json_assert:
+    - expression: results[0].status
+      equals: committed
+  tags:
+  - transaction
+  - isolation
+  - commit
+- name: transaction-isolation-rollback
+  description: Test transaction isolation - changes not visible after rollback
+  args:
+  - query
+  - 'START TRANSACTION;
+
+    CREATE (n:IsolationTest {id: 2, status: ''rolled_back''});
+
+    ROLLBACK;
+
+    MATCH (n:IsolationTest {id: 2}) RETURN count(n) AS count
+
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - count
+    stdout_json_assert:
+    - expression: results[0].count
+      equals: 0
+  tags:
+  - transaction
+  - isolation
+  - rollback
+- name: transaction-multiple-operations
+  description: Transaction with multiple CREATE, SET, and DELETE operations
+  args:
+  - query
+  - "START TRANSACTION;\nCREATE (a:MultiOp {id: 1, name: 'first'}),\n       (b:MultiOp\
+    \ {id: 2, name: 'second'});\nMATCH (n:MultiOp {id: 1}) SET n.modified = true;\n\
+    MATCH (n:MultiOp {id: 2}) SET n.value = 100;\nMATCH (n:MultiOp) RETURN count(n)\
+    \ AS total_count;\nCOMMIT\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - total_count
+  tags:
+  - transaction
+  - multiple-operations
+  - complex
+- name: transaction-with-relationships
+  description: Transaction with node and relationship creation
+  args:
+  - query
+  - "START TRANSACTION;\nCREATE (a:TxNode {id: 1, name: 'source'}),\n       (b:TxNode\
+    \ {id: 2, name: 'target'}),\n       (a)-[:CONNECTS {weight: 1.5}]->(b);\nMATCH\
+    \ (a:TxNode)-[r:CONNECTS]->(b:TxNode)\nRETURN a.name AS source, b.name AS target,\
+    \ r.weight AS weight;\nCOMMIT\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - source
+      - target
+      - weight
+  tags:
+  - transaction
+  - relationships
+  - complex
+- name: commit-without-transaction
+  description: Test COMMIT without active transaction
+  args:
+  - query
+  - COMMIT
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: 0A000
+  tags:
+  - transaction
+  - error
+  - commit
+- name: rollback-without-transaction
+  description: Test ROLLBACK without active transaction
+  args:
+  - query
+  - ROLLBACK
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: 0A000
+  tags:
+  - transaction
+  - error
+  - rollback
+- name: nested-start-transaction
+  description: Test starting transaction within transaction (should error)
+  skip: true
+  args:
+  - query
+  - 'START TRANSACTION;
+
+    START TRANSACTION
+
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '25000'
+  cleanup:
+  - args:
+    - query
+    - ROLLBACK
     expect:
       exit_code: 0
-    tags: ["transaction", "read-only", "characteristics"]
+  tags:
+  - transaction
+  - error
+  - nested
+- name: transaction-state-after-commit
+  description: Verify transaction state after successful commit
+  args:
+  - query
+  - 'START TRANSACTION;
 
-  - name: "transaction-read-write"
-    description: "Test START TRANSACTION READ WRITE"
-    args: ["query", "START TRANSACTION READ WRITE"]
-    expect:
-      exit_code: 0
-    tags: ["transaction", "read-write", "characteristics"]
+    CREATE (n:StateTest {id: 1, state: ''committed''});
 
-  # ===============================
-  # TRANSACTION WORKFLOWS
-  # ===============================
+    COMMIT;
 
-  - name: "transaction-commit-workflow"
-    description: "Complete transaction workflow with data modification and commit"
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (n:TestNode {id: 1, name: 'transaction_test'});
-        COMMIT
-    expect:
-      exit_code: 0
-    tags: ["transaction", "workflow", "commit"]
+    MATCH (n:StateTest {state: ''committed''}) RETURN count(n) AS committed_count
 
-  - name: "transaction-rollback-workflow"
-    description: "Complete transaction workflow with data modification and rollback"
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (n:TestNode {id: 2, name: 'rollback_test'});
-        ROLLBACK
-    expect:
-      exit_code: 0
-    tags: ["transaction", "workflow", "rollback"]
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - committed_count
+    stdout_json_assert:
+    - expression: results[0].committed_count
+      equals: 1
+  tags:
+  - transaction
+  - state
+  - verification
+- name: transaction-state-after-rollback
+  description: Verify transaction state after rollback
+  args:
+  - query
+  - 'START TRANSACTION;
 
-  - name: "transaction-read-only-workflow"
-    description: "Read-only transaction workflow"
-    setup:
-      - args: ["query", "CREATE (n:ReadTestNode {id: 1, value: 'test'})"]
-        expect:
-          exit_code: 0
-    args:
-      - "query"
-      - |
-        START TRANSACTION READ ONLY;
-        MATCH (n:ReadTestNode) RETURN n.id AS id, n.value AS value;
-        COMMIT
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 1
-        columns: ["id", "value"]
-    tags: ["transaction", "read-only", "workflow"]
+    CREATE (n:StateTest {id: 2, state: ''rolled_back''});
 
-  # ===============================
-  # NESTED TRANSACTIONS
-  # ===============================
+    ROLLBACK;
 
-  - name: "nested-transaction-procedure"
-    description: "Test transaction with nested procedure specification"
-    args:
-      - "query"
-      - |
-        START TRANSACTION {
-          CREATE (n:NestedNode {id: 1, type: 'nested'});
-          MATCH (n:NestedNode) RETURN count(n) AS node_count
-        }
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["node_count"]
-    tags: ["transaction", "nested", "procedure"]
+    MATCH (n:StateTest {state: ''rolled_back''}) RETURN count(n) AS rollback_count
 
-  # ===============================
-  # TRANSACTION ISOLATION TESTS
-  # ===============================
-
-  - name: "transaction-isolation-commit"
-    description: "Test transaction isolation - changes visible after commit"
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (n:IsolationTest {id: 1, status: 'committed'});
-        COMMIT;
-        MATCH (n:IsolationTest {id: 1}) RETURN n.status AS status
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["status"]
-      stdout_json_assert:
-        - expression: "results[0].status"
-          equals: "committed"
-    tags: ["transaction", "isolation", "commit"]
-
-  - name: "transaction-isolation-rollback"
-    description: "Test transaction isolation - changes not visible after rollback"
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (n:IsolationTest {id: 2, status: 'rolled_back'});
-        ROLLBACK;
-        MATCH (n:IsolationTest {id: 2}) RETURN count(n) AS count
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["count"]
-      stdout_json_assert:
-        - expression: "results[0].count"
-          equals: 0
-    tags: ["transaction", "isolation", "rollback"]
-
-  # ===============================
-  # COMPLEX TRANSACTION SCENARIOS
-  # ===============================
-
-  - name: "transaction-multiple-operations"
-    description: "Transaction with multiple CREATE, SET, and DELETE operations"
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (a:MultiOp {id: 1, name: 'first'}),
-               (b:MultiOp {id: 2, name: 'second'});
-        MATCH (n:MultiOp {id: 1}) SET n.modified = true;
-        MATCH (n:MultiOp {id: 2}) SET n.value = 100;
-        MATCH (n:MultiOp) RETURN count(n) AS total_count;
-        COMMIT
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["total_count"]
-    tags: ["transaction", "multiple-operations", "complex"]
-
-  - name: "transaction-with-relationships"
-    description: "Transaction with node and relationship creation"
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (a:TxNode {id: 1, name: 'source'}),
-               (b:TxNode {id: 2, name: 'target'}),
-               (a)-[:CONNECTS {weight: 1.5}]->(b);
-        MATCH (a:TxNode)-[r:CONNECTS]->(b:TxNode)
-        RETURN a.name AS source, b.name AS target, r.weight AS weight;
-        COMMIT
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["source", "target", "weight"]
-    tags: ["transaction", "relationships", "complex"]
-
-  # ===============================
-  # TRANSACTION ERROR SCENARIOS
-  # ===============================
-
-  - name: "commit-without-transaction"
-    description: "Test COMMIT without active transaction"
-    args: ["query", "COMMIT"]
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "0A000"
-    tags: ["transaction", "error", "commit"]
-
-  - name: "rollback-without-transaction"
-    description: "Test ROLLBACK without active transaction"
-    args: ["query", "ROLLBACK"]
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "0A000"
-    tags: ["transaction", "error", "rollback"]
-
-  - name: "nested-start-transaction"
-    description: "Test starting transaction within transaction (should error)"
-    skip: true  # Geode returns status codes via response, not exit codes - test runner limitation
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        START TRANSACTION
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "25000"  # Invalid transaction state
-    cleanup:
-      - args: ["query", "ROLLBACK"]
-        expect:
-          exit_code: 0
-    tags: ["transaction", "error", "nested"]
-
-  # ===============================
-  # TRANSACTION STATE VERIFICATION
-  # ===============================
-
-  - name: "transaction-state-after-commit"
-    description: "Verify transaction state after successful commit"
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (n:StateTest {id: 1, state: 'committed'});
-        COMMIT;
-        MATCH (n:StateTest {state: 'committed'}) RETURN count(n) AS committed_count
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["committed_count"]
-      stdout_json_assert:
-        - expression: "results[0].committed_count"
-          equals: 1
-    tags: ["transaction", "state", "verification"]
-
-  - name: "transaction-state-after-rollback"
-    description: "Verify transaction state after rollback"
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (n:StateTest {id: 2, state: 'rolled_back'});
-        ROLLBACK;
-        MATCH (n:StateTest {state: 'rolled_back'}) RETURN count(n) AS rollback_count
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["rollback_count"]
-      stdout_json_assert:
-        - expression: "results[0].rollback_count"
-          equals: 0
-    tags: ["transaction", "state", "verification"]
-
-  # ===============================
-  # PERFORMANCE TESTS
-  # ===============================
-
-  - name: "transaction-performance-large"
-    description: "Performance test with larger transaction"
-    timeout_ms: 30000
-    args:
-      - "query"
-      - |
-        START TRANSACTION;
-        CREATE (n1:PerfTest {id: 1, batch: 'large'}),
-               (n2:PerfTest {id: 2, batch: 'large'}),
-               (n3:PerfTest {id: 3, batch: 'large'}),
-               (n4:PerfTest {id: 4, batch: 'large'}),
-               (n5:PerfTest {id: 5, batch: 'large'}),
-               (n6:PerfTest {id: 6, batch: 'large'}),
-               (n7:PerfTest {id: 7, batch: 'large'}),
-               (n8:PerfTest {id: 8, batch: 'large'}),
-               (n9:PerfTest {id: 9, batch: 'large'}),
-               (n10:PerfTest {id: 10, batch: 'large'});
-        MATCH (n:PerfTest {batch: 'large'}) RETURN count(n) AS large_batch_count;
-        COMMIT
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["large_batch_count"]
-      stdout_json_assert:
-        - expression: "results[0].large_batch_count"
-          equals: 10
-    tags: ["transaction", "performance", "large"]
-
-  # ===============================
-  # CLEANUP
-  # ===============================
-
-  - name: "cleanup-test-data"
-    description: "Clean up all test data created during transaction tests"
-    args:
-      - "query"
-      - "MATCH (n) WHERE n:TestNode OR n:ReadTestNode OR n:NestedNode OR n:IsolationTest OR n:MultiOp OR n:TxNode OR n:StateTest OR n:PerfTest DETACH DELETE n"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - rollback_count
+    stdout_json_assert:
+    - expression: results[0].rollback_count
+      equals: 0
+  tags:
+  - transaction
+  - state
+  - verification
+- name: transaction-performance-large
+  description: Performance test with larger transaction
+  timeout_ms: 30000
+  args:
+  - query
+  - "START TRANSACTION;\nCREATE (n1:PerfTest {id: 1, batch: 'large'}),\n       (n2:PerfTest\
+    \ {id: 2, batch: 'large'}),\n       (n3:PerfTest {id: 3, batch: 'large'}),\n \
+    \      (n4:PerfTest {id: 4, batch: 'large'}),\n       (n5:PerfTest {id: 5, batch:\
+    \ 'large'}),\n       (n6:PerfTest {id: 6, batch: 'large'}),\n       (n7:PerfTest\
+    \ {id: 7, batch: 'large'}),\n       (n8:PerfTest {id: 8, batch: 'large'}),\n \
+    \      (n9:PerfTest {id: 9, batch: 'large'}),\n       (n10:PerfTest {id: 10, batch:\
+    \ 'large'});\nMATCH (n:PerfTest {batch: 'large'}) RETURN count(n) AS large_batch_count;\n\
+    COMMIT\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - large_batch_count
+    stdout_json_assert:
+    - expression: results[0].large_batch_count
+      equals: 10
+  tags:
+  - transaction
+  - performance
+  - large
+- name: cleanup-test-data
+  description: Clean up all test data created during transaction tests
+  args:
+  - query
+  - MATCH (n) WHERE n:TestNode OR n:ReadTestNode OR n:NestedNode OR n:IsolationTest
+    OR n:MultiOp OR n:TxNode OR n:StateTest OR n:PerfTest DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
 invariants:
-  - type: "server_running"
-
-tags: ["transaction", "management", "iso-gql", "comprehensive", "acid"]
+- type: server_running
+tags:
+- transaction
+- management
+- iso-gql
+- comprehensive
+- acid

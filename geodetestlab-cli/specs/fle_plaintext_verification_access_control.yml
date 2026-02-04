@@ -1,295 +1,368 @@
-version: "1.0"
-name: "FLE Plaintext Verification - Access Control Enforcement"
-description: |
-  SECURITY CRITICAL TEST SUITE
+version: '1.0'
+name: FLE Plaintext Verification - Access Control Enforcement
+description: 'SECURITY CRITICAL TEST SUITE
+
 
   Verifies that FLE access control is properly enforced:
+
   1. Unauthorized roles CANNOT read plaintext of encrypted fields
+
   2. Role checks are case-sensitive (prevents role name confusion attacks)
+
   3. Empty role lists block ALL access (fail secure)
+
   4. Role validation rejects invalid role formats
+
   5. Cross-tenant access is blocked
 
+
   CRITICAL: This test verifies that users without proper permissions
+
   receive redacted/encrypted data, NOT plaintext.
 
+
   Test Data Markers:
+
   - Admin-only: "FLESECRET_ADMIN_ONLY_TopSecretData123"
+
   - Multi-role: "FLESECRET_MULTI_ROLE_SharedSecretXYZ"
+
   - No-role (locked): "FLESECRET_NO_ROLE_CompletelyLocked"
 
-  CANARY: REQ=REQ-FLE-ENFORCE-007; FEATURE=FLEEnforcement; ASPECT=AccessControl; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
 
+  CANARY: REQ=REQ-FLE-ENFORCE-007; FEATURE=FLEEnforcement; ASPECT=AccessControl; STATUS=TESTED;
+  OWNER=security; UPDATED=2026-01-28
+
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
-    cleanup: false  # DO NOT CLEANUP - we need to verify access control
-    args: ["--log-level", "info", "--enable-fle"]
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 env:
-  GEODE_FLE_ENABLED: "true"
-  GEODE_MASTER_KEY: "fle-acl-test-master-key-32bytes!!"
-
-# Skip isolation suffix for FLE tests - the CALL geode.fle.configureField
-# must match the exact label names used in CREATE statements
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: fle-acl-test-master-key-32bytes!!
 skip_isolation: true
-
 tests:
-  # ===============================
-  # PHASE 1: CONFIGURE FLE WITH ROLES
-  # ===============================
-
-  - name: "fle-acl-configure-admin-only"
-    description: "Configure field visible only to admin role"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_ACL', 'admin_secret', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: ['admin']
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "acl", "configure", "admin-only"]
-
-  - name: "fle-acl-configure-multi-role"
-    description: "Configure field visible to multiple roles"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_ACL', 'shared_secret', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: ['admin', 'security_officer', 'auditor']
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "acl", "configure", "multi-role"]
-
-  - name: "fle-acl-configure-locked-field"
-    description: "Configure field with empty visibility (completely locked)"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_ACL', 'locked_secret', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: []
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "acl", "configure", "locked"]
-
-  # ===============================
-  # PHASE 2: WRITE TEST DATA
-  # ===============================
-
-  - name: "fle-acl-write-admin-only-data"
-    description: "Write admin-only secret data"
-    args: ["query",
-           "CREATE (n:FLETest_ACL {
-              record_type: 'admin_only',
-              admin_secret: 'FLESECRET_ADMIN_ONLY_TopSecretData123',
-              public_info: 'This is public information'
-            })
-            RETURN n.record_type AS record_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "acl", "write", "admin-only"]
-
-  - name: "fle-acl-write-multi-role-data"
-    description: "Write multi-role shared secret data"
-    args: ["query",
-           "CREATE (n:FLETest_ACL {
-              record_type: 'multi_role',
-              shared_secret: 'FLESECRET_MULTI_ROLE_SharedSecretXYZ',
-              public_info: 'Another public field'
-            })
-            RETURN n.record_type AS record_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "acl", "write", "multi-role"]
-
-  - name: "fle-acl-write-locked-data"
-    description: "Write completely locked secret data"
-    args: ["query",
-           "CREATE (n:FLETest_ACL {
-              record_type: 'locked',
-              locked_secret: 'FLESECRET_NO_ROLE_CompletelyLocked',
-              public_info: 'Public data here'
-            })
-            RETURN n.record_type AS record_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "acl", "write", "locked"]
-
-  # ===============================
-  # PHASE 3: ACCESS CONTROL TESTS
-  # ===============================
-
-  - name: "fle-acl-test-unauthorized-read-admin-field"
-    description: "Verify unauthorized role cannot read admin-only field plaintext"
-    args: ["query",
-           "--role", "regular_user",
-           "MATCH (n:FLETest_ACL {record_type: 'admin_only'})
-            RETURN n.admin_secret AS secret"]
-    expect:
-      exit_code: 0
-      stdout_not_contains: "FLESECRET_ADMIN_ONLY_TopSecretData123"
-    tags: ["fle", "acl", "access", "unauthorized"]
-
-  - name: "fle-acl-test-case-sensitivity"
-    description: "Verify role matching is case-sensitive (ADMIN != admin)"
-    args: ["query",
-           "--role", "ADMIN",
-           "MATCH (n:FLETest_ACL {record_type: 'admin_only'})
-            RETURN n.admin_secret AS secret"]
-    expect:
-      exit_code: 0
-      stdout_not_contains: "FLESECRET_ADMIN_ONLY_TopSecretData123"
-    tags: ["fle", "acl", "case-sensitive", "critical"]
-
-  - name: "fle-acl-test-locked-field-no-access"
-    description: "Verify locked field cannot be read by ANY role"
-    args: ["query",
-           "--role", "admin",
-           "MATCH (n:FLETest_ACL {record_type: 'locked'})
-            RETURN n.locked_secret AS secret"]
-    expect:
-      exit_code: 0
-      stdout_not_contains: "FLESECRET_NO_ROLE_CompletelyLocked"
-    tags: ["fle", "acl", "locked", "critical"]
-
-  - name: "fle-acl-test-multi-role-authorized"
-    description: "Verify authorized role CAN read multi-role field"
-    args: ["query",
-           "--role", "auditor",
-           "MATCH (n:FLETest_ACL {record_type: 'multi_role'})
-            RETURN n.shared_secret AS secret"]
-    expect:
-      exit_code: 0
-      # Authorized role should see the plaintext
-    tags: ["fle", "acl", "authorized"]
-
-  # ===============================
-  # PHASE 4: ROLE BYPASS ATTEMPTS
-  # ===============================
-
-  - name: "fle-acl-test-role-injection-comma"
-    description: "Verify comma-separated role injection is blocked"
-    args: ["query",
-           "--role", "user,admin",
-           "MATCH (n:FLETest_ACL {record_type: 'admin_only'})
-            RETURN n.admin_secret AS secret"]
-    expect:
-      exit_code: 0
-      stdout_not_contains: "FLESECRET_ADMIN_ONLY_TopSecretData123"
-    tags: ["fle", "acl", "bypass", "injection"]
-
-  - name: "fle-acl-test-role-injection-semicolon"
-    description: "Verify semicolon-separated role injection is blocked"
-    args: ["query",
-           "--role", "user;admin",
-           "MATCH (n:FLETest_ACL {record_type: 'admin_only'})
-            RETURN n.admin_secret AS secret"]
-    expect:
-      exit_code: 0
-      stdout_not_contains: "FLESECRET_ADMIN_ONLY_TopSecretData123"
-    tags: ["fle", "acl", "bypass", "injection"]
-
-  - name: "fle-acl-test-role-injection-wildcard"
-    description: "Verify wildcard role is blocked"
-    args: ["query",
-           "--role", "*",
-           "MATCH (n:FLETest_ACL {record_type: 'admin_only'})
-            RETURN n.admin_secret AS secret"]
-    expect:
-      exit_code: 0
-      stdout_not_contains: "FLESECRET_ADMIN_ONLY_TopSecretData123"
-    tags: ["fle", "acl", "bypass", "wildcard"]
-
-  - name: "fle-acl-test-role-empty-string"
-    description: "Verify empty role string cannot access any field"
-    args: ["query",
-           "--role", "",
-           "MATCH (n:FLETest_ACL {record_type: 'admin_only'})
-            RETURN n.admin_secret AS secret"]
-    expect:
-      exit_code: 0
-      stdout_not_contains: "FLESECRET_ADMIN_ONLY_TopSecretData123"
-    tags: ["fle", "acl", "bypass", "empty"]
-
-  # ===============================
-  # PHASE 5: FORCE FLUSH TO DISK
-  # ===============================
-
-  - name: "fle-acl-force-checkpoint"
-    description: "Force checkpoint to ensure all data is written to disk"
-    args: ["query",
-           "RETURN 'checkpoint_requested' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "acl", "checkpoint"]
-
-  # ===============================
-  # PHASE 6: SCAN DATA FILES
-  # ===============================
-
-  - name: "fle-acl-scan-no-admin-plaintext"
-    description: "CRITICAL: Verify admin-only marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_ADMIN_ONLY_TopSecretData123", "${data_dir}"]
-    expect:
-      exit_code: 1  # grep returns 1 when no match found (EXPECTED)
-    tags: ["fle", "acl", "scan", "admin-only", "critical"]
-
-  - name: "fle-acl-scan-no-multi-role-plaintext"
-    description: "CRITICAL: Verify multi-role marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_MULTI_ROLE_SharedSecretXYZ", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "acl", "scan", "multi-role", "critical"]
-
-  - name: "fle-acl-scan-no-locked-plaintext"
-    description: "CRITICAL: Verify locked marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_NO_ROLE_CompletelyLocked", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "acl", "scan", "locked", "critical"]
-
-  - name: "fle-acl-binary-scan-flesecret-prefix"
-    description: "CRITICAL: Verify NO FLESECRET_ prefix appears in ANY binary file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_", "${data_dir}"]
-    expect:
-      exit_code: 1  # No matches expected
-    tags: ["fle", "acl", "binary-scan", "comprehensive", "critical"]
-
+- name: fle-acl-configure-admin-only
+  description: Configure field visible only to admin role
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_ACL'', ''admin_secret'', { algorithm:
+    ''AES-256-GCM'', keyVersion: 1, visibility: [''admin''] }) RETURN ''configured''
+    AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - acl
+  - configure
+  - admin-only
+- name: fle-acl-configure-multi-role
+  description: Configure field visible to multiple roles
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_ACL'', ''shared_secret'', { algorithm:
+    ''AES-256-GCM'', keyVersion: 1, visibility: [''admin'', ''security_officer'',
+    ''auditor''] }) RETURN ''configured'' AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - acl
+  - configure
+  - multi-role
+- name: fle-acl-configure-locked-field
+  description: Configure field with empty visibility (completely locked)
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_ACL'', ''locked_secret'', { algorithm:
+    ''AES-256-GCM'', keyVersion: 1, visibility: [] }) RETURN ''configured'' AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - acl
+  - configure
+  - locked
+- name: fle-acl-write-admin-only-data
+  description: Write admin-only secret data
+  args:
+  - query
+  - 'CREATE (n:FLETest_ACL { record_type: ''admin_only'', admin_secret: ''FLESECRET_ADMIN_ONLY_TopSecretData123'',
+    public_info: ''This is public information'' }) RETURN n.record_type AS record_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - acl
+  - write
+  - admin-only
+- name: fle-acl-write-multi-role-data
+  description: Write multi-role shared secret data
+  args:
+  - query
+  - 'CREATE (n:FLETest_ACL { record_type: ''multi_role'', shared_secret: ''FLESECRET_MULTI_ROLE_SharedSecretXYZ'',
+    public_info: ''Another public field'' }) RETURN n.record_type AS record_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - acl
+  - write
+  - multi-role
+- name: fle-acl-write-locked-data
+  description: Write completely locked secret data
+  args:
+  - query
+  - 'CREATE (n:FLETest_ACL { record_type: ''locked'', locked_secret: ''FLESECRET_NO_ROLE_CompletelyLocked'',
+    public_info: ''Public data here'' }) RETURN n.record_type AS record_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - acl
+  - write
+  - locked
+- name: fle-acl-test-unauthorized-read-admin-field
+  description: Verify unauthorized role cannot read admin-only field plaintext
+  args:
+  - query
+  - --role
+  - regular_user
+  - 'MATCH (n:FLETest_ACL {record_type: ''admin_only''}) RETURN n.admin_secret AS
+    secret'
+  expect:
+    exit_code: 0
+    stdout_not_contains: FLESECRET_ADMIN_ONLY_TopSecretData123
+  tags:
+  - fle
+  - acl
+  - access
+  - unauthorized
+- name: fle-acl-test-case-sensitivity
+  description: Verify role matching is case-sensitive (ADMIN != admin)
+  args:
+  - query
+  - --role
+  - ADMIN
+  - 'MATCH (n:FLETest_ACL {record_type: ''admin_only''}) RETURN n.admin_secret AS
+    secret'
+  expect:
+    exit_code: 0
+    stdout_not_contains: FLESECRET_ADMIN_ONLY_TopSecretData123
+  tags:
+  - fle
+  - acl
+  - case-sensitive
+  - critical
+- name: fle-acl-test-locked-field-no-access
+  description: Verify locked field cannot be read by ANY role
+  args:
+  - query
+  - --role
+  - admin
+  - 'MATCH (n:FLETest_ACL {record_type: ''locked''}) RETURN n.locked_secret AS secret'
+  expect:
+    exit_code: 0
+    stdout_not_contains: FLESECRET_NO_ROLE_CompletelyLocked
+  tags:
+  - fle
+  - acl
+  - locked
+  - critical
+- name: fle-acl-test-multi-role-authorized
+  description: Verify authorized role CAN read multi-role field
+  args:
+  - query
+  - --role
+  - auditor
+  - 'MATCH (n:FLETest_ACL {record_type: ''multi_role''}) RETURN n.shared_secret AS
+    secret'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - acl
+  - authorized
+- name: fle-acl-test-role-injection-comma
+  description: Verify comma-separated role injection is blocked
+  args:
+  - query
+  - --role
+  - user,admin
+  - 'MATCH (n:FLETest_ACL {record_type: ''admin_only''}) RETURN n.admin_secret AS
+    secret'
+  expect:
+    exit_code: 0
+    stdout_not_contains: FLESECRET_ADMIN_ONLY_TopSecretData123
+  tags:
+  - fle
+  - acl
+  - bypass
+  - injection
+- name: fle-acl-test-role-injection-semicolon
+  description: Verify semicolon-separated role injection is blocked
+  args:
+  - query
+  - --role
+  - user;admin
+  - 'MATCH (n:FLETest_ACL {record_type: ''admin_only''}) RETURN n.admin_secret AS
+    secret'
+  expect:
+    exit_code: 0
+    stdout_not_contains: FLESECRET_ADMIN_ONLY_TopSecretData123
+  tags:
+  - fle
+  - acl
+  - bypass
+  - injection
+- name: fle-acl-test-role-injection-wildcard
+  description: Verify wildcard role is blocked
+  args:
+  - query
+  - --role
+  - '*'
+  - 'MATCH (n:FLETest_ACL {record_type: ''admin_only''}) RETURN n.admin_secret AS
+    secret'
+  expect:
+    exit_code: 0
+    stdout_not_contains: FLESECRET_ADMIN_ONLY_TopSecretData123
+  tags:
+  - fle
+  - acl
+  - bypass
+  - wildcard
+- name: fle-acl-test-role-empty-string
+  description: Verify empty role string cannot access any field
+  args:
+  - query
+  - --role
+  - ''
+  - 'MATCH (n:FLETest_ACL {record_type: ''admin_only''}) RETURN n.admin_secret AS
+    secret'
+  expect:
+    exit_code: 0
+    stdout_not_contains: FLESECRET_ADMIN_ONLY_TopSecretData123
+  tags:
+  - fle
+  - acl
+  - bypass
+  - empty
+- name: fle-acl-force-checkpoint
+  description: Force checkpoint to ensure all data is written to disk
+  args:
+  - query
+  - RETURN 'checkpoint_requested' AS status
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - acl
+  - checkpoint
+- name: fle-acl-scan-no-admin-plaintext
+  description: 'CRITICAL: Verify admin-only marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_ADMIN_ONLY_TopSecretData123
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - acl
+  - scan
+  - admin-only
+  - critical
+- name: fle-acl-scan-no-multi-role-plaintext
+  description: 'CRITICAL: Verify multi-role marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_MULTI_ROLE_SharedSecretXYZ
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - acl
+  - scan
+  - multi-role
+  - critical
+- name: fle-acl-scan-no-locked-plaintext
+  description: 'CRITICAL: Verify locked marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_NO_ROLE_CompletelyLocked
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - acl
+  - scan
+  - locked
+  - critical
+- name: fle-acl-binary-scan-flesecret-prefix
+  description: 'CRITICAL: Verify NO FLESECRET_ prefix appears in ANY binary file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - acl
+  - binary-scan
+  - comprehensive
+  - critical
 invariants:
-  - type: "server_running"
-
+- type: server_running
 plaintext_verification:
   enabled: true
   patterns:
-    - "FLESECRET_ADMIN_ONLY_TopSecretData123"
-    - "FLESECRET_MULTI_ROLE_SharedSecretXYZ"
-    - "FLESECRET_NO_ROLE_CompletelyLocked"
-    - "FLESECRET_"
+  - FLESECRET_ADMIN_ONLY_TopSecretData123
+  - FLESECRET_MULTI_ROLE_SharedSecretXYZ
+  - FLESECRET_NO_ROLE_CompletelyLocked
+  - FLESECRET_
   fail_on_violation: true
   scan_binary_files: true
-
-tags: ["fle", "field-level-encryption", "security", "access-control", "rbac", "plaintext-verification", "critical"]
+tags:
+- fle
+- field-level-encryption
+- security
+- access-control
+- rbac
+- plaintext-verification
+- critical

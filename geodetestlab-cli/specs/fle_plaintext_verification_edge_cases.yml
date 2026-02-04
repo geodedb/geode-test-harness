@@ -1,330 +1,422 @@
-version: "1.0"
-name: "FLE Plaintext Verification - Edge Cases"
-description: |
-  SECURITY CRITICAL TEST SUITE
+version: '1.0'
+name: FLE Plaintext Verification - Edge Cases
+description: 'SECURITY CRITICAL TEST SUITE
+
 
   Verifies that FLE properly encrypts edge case data including:
+
   - Unicode/UTF-8 characters (including homograph attacks)
+
   - Empty strings (boundary condition)
+
   - Very long strings (buffer handling)
+
   - Binary-like data (embedded nulls, control characters)
+
   - Special characters (SQL injection patterns, shell metacharacters)
+
   - Multi-byte UTF-8 sequences
 
+
   Test Data Markers (these MUST NOT appear in any data file):
+
   - Unicode: "FLESECRET_UNICODE_\xe4\xb8\xad\xe6\x96\x87\xe5\xaf\x86\xe7\xa0\x81"
+
   - Long String: "FLESECRET_LONG_AAAA...AAAA" (1000 chars)
-  - Special Chars: "FLESECRET_SPECIAL_'; DROP TABLE--"
+
+  - Special Chars: "FLESECRET_SPECIAL_''; DROP TABLE--"
+
   - Control Chars: "FLESECRET_CTRL_\x00\x01\x02\x7f"
+
   - Emoji: "FLESECRET_EMOJI_\xf0\x9f\x94\x90\xf0\x9f\x94\x91"
 
-  CANARY: REQ=REQ-FLE-ENFORCE-006; FEATURE=FLEEnforcement; ASPECT=EdgeCases; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
 
+  CANARY: REQ=REQ-FLE-ENFORCE-006; FEATURE=FLEEnforcement; ASPECT=EdgeCases; STATUS=TESTED;
+  OWNER=security; UPDATED=2026-01-28
+
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
-    cleanup: false  # DO NOT CLEANUP - we need to scan files after tests
-    args: ["--log-level", "info", "--enable-fle"]
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 env:
-  GEODE_FLE_ENABLED: "true"
-  GEODE_MASTER_KEY: "fle-edge-test-master-key-32bytes!"
-
-# Skip isolation suffix for FLE tests - the CALL geode.fle.configureField
-# must match the exact label names used in CREATE statements
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: fle-edge-test-master-key-32bytes!
 skip_isolation: true
-
 tests:
-  # ===============================
-  # PHASE 1: CONFIGURE FLE SCHEMA
-  # ===============================
-
-  - name: "fle-edge-configure-schema"
-    description: "Configure fields for FLE edge case testing"
-    args: ["query",
-           "CALL geode.fle.configureField('FLETest_EdgeCase', 'secret_data', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: ['admin']
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "edge", "configure"]
-
-  # ===============================
-  # PHASE 2: UNICODE DATA TESTS
-  # ===============================
-
-  - name: "fle-edge-write-unicode-chinese"
-    description: "Write Chinese Unicode data that must be encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'unicode_chinese',
-              secret_data: 'FLESECRET_UNICODE_CHINESE_\u4e2d\u6587\u5bc6\u7801\u6d4b\u8bd5'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "unicode", "chinese"]
-
-  - name: "fle-edge-write-unicode-cyrillic"
-    description: "Write Cyrillic Unicode data (potential homograph attack vector)"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'unicode_cyrillic',
-              secret_data: 'FLESECRET_UNICODE_CYRILLIC_\u0430\u0434\u043c\u0438\u043d\u043f\u0430\u0441\u0441'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "unicode", "cyrillic", "homograph"]
-
-  - name: "fle-edge-write-unicode-arabic"
-    description: "Write Arabic RTL Unicode data"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'unicode_arabic',
-              secret_data: 'FLESECRET_UNICODE_ARABIC_\u0643\u0644\u0645\u0629_\u0627\u0644\u0633\u0631'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "unicode", "arabic", "rtl"]
-
-  - name: "fle-edge-write-emoji"
-    description: "Write emoji data (4-byte UTF-8 sequences)"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'emoji',
-              secret_data: 'FLESECRET_EMOJI_\U0001F510\U0001F511\U0001F512\U0001F513'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "emoji", "utf8-4byte"]
-
-  # ===============================
-  # PHASE 3: SPECIAL CHARACTERS
-  # ===============================
-
-  - name: "fle-edge-write-sql-injection-pattern"
-    description: "Write SQL injection-like pattern that must be encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'sql_injection',
-              secret_data: 'FLESECRET_SQLI_\\'; DROP TABLE users; --'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "special", "sqli"]
-
-  - name: "fle-edge-write-shell-metacharacters"
-    description: "Write shell metacharacters that must be encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'shell_meta',
-              secret_data: 'FLESECRET_SHELL_$(cat /etc/passwd)\\`id\\`|nc'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "special", "shell"]
-
-  - name: "fle-edge-write-path-traversal"
-    description: "Write path traversal pattern that must be encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'path_traversal',
-              secret_data: 'FLESECRET_PATH_../../../etc/shadow'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "special", "path"]
-
-  # ===============================
-  # PHASE 4: BOUNDARY CONDITIONS
-  # ===============================
-
-  - name: "fle-edge-write-long-string"
-    description: "Write very long string (1000+ chars) that must be encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'long_string',
-              secret_data: 'FLESECRET_LONG_' +
-                          'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' +
-                          'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' +
-                          'CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC' +
-                          'DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD' +
-                          'EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE_END'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "boundary", "long"]
-
-  - name: "fle-edge-write-single-char"
-    description: "Write single character that must be encrypted"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'single_char',
-              secret_data: 'FLESECRET_SINGLE_X'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "boundary", "single"]
-
-  - name: "fle-edge-write-repeated-pattern"
-    description: "Write repeated pattern (compression detection)"
-    args: ["query",
-           "CREATE (n:FLETest_EdgeCase {
-              test_type: 'repeated',
-              secret_data: 'FLESECRET_REPEAT_ABCABCABCABCABCABCABCABCABCABC'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "edge", "boundary", "repeated"]
-
-  # ===============================
-  # PHASE 5: FORCE FLUSH TO DISK
-  # ===============================
-
-  - name: "fle-edge-force-checkpoint"
-    description: "Force checkpoint to ensure all data is written to disk"
-    args: ["query",
-           "RETURN 'checkpoint_requested' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "edge", "checkpoint"]
-
-  # ===============================
-  # PHASE 6: SCAN DATA FILES
-  # ===============================
-
-  - name: "fle-edge-scan-no-unicode-plaintext"
-    description: "CRITICAL: Verify Unicode markers do NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_UNICODE_", "${data_dir}"]
-    expect:
-      exit_code: 1  # grep returns 1 when no match found (EXPECTED)
-    tags: ["fle", "edge", "scan", "unicode", "critical"]
-
-  - name: "fle-edge-scan-no-emoji-plaintext"
-    description: "CRITICAL: Verify emoji marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_EMOJI_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "edge", "scan", "emoji", "critical"]
-
-  - name: "fle-edge-scan-no-sqli-plaintext"
-    description: "CRITICAL: Verify SQL injection marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_SQLI_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "edge", "scan", "sqli", "critical"]
-
-  - name: "fle-edge-scan-no-shell-plaintext"
-    description: "CRITICAL: Verify shell metachar marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_SHELL_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "edge", "scan", "shell", "critical"]
-
-  - name: "fle-edge-scan-no-path-plaintext"
-    description: "CRITICAL: Verify path traversal marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_PATH_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "edge", "scan", "path", "critical"]
-
-  - name: "fle-edge-scan-no-long-plaintext"
-    description: "CRITICAL: Verify long string marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_LONG_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "edge", "scan", "long", "critical"]
-
-  - name: "fle-edge-scan-no-single-plaintext"
-    description: "CRITICAL: Verify single char marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_SINGLE_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "edge", "scan", "single", "critical"]
-
-  - name: "fle-edge-scan-no-repeat-plaintext"
-    description: "CRITICAL: Verify repeated pattern marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_REPEAT_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "edge", "scan", "repeat", "critical"]
-
-  # ===============================
-  # PHASE 7: COMPREHENSIVE BINARY SCAN
-  # ===============================
-
-  - name: "fle-edge-binary-scan-flesecret-prefix"
-    description: "CRITICAL: Verify NO FLESECRET_ prefix appears in ANY binary file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_", "${data_dir}"]
-    expect:
-      exit_code: 1  # No matches expected
-    tags: ["fle", "edge", "binary-scan", "comprehensive", "critical"]
-
+- name: fle-edge-configure-schema
+  description: Configure fields for FLE edge case testing
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''FLETest_EdgeCase'', ''secret_data'', { algorithm:
+    ''AES-256-GCM'', keyVersion: 1, visibility: [''admin''] }) RETURN ''configured''
+    AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - edge
+  - configure
+- name: fle-edge-write-unicode-chinese
+  description: Write Chinese Unicode data that must be encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''unicode_chinese'', secret_data: ''FLESECRET_UNICODE_CHINESE_中文密码测试''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - unicode
+  - chinese
+- name: fle-edge-write-unicode-cyrillic
+  description: Write Cyrillic Unicode data (potential homograph attack vector)
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''unicode_cyrillic'', secret_data: ''FLESECRET_UNICODE_CYRILLIC_админпасс''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - unicode
+  - cyrillic
+  - homograph
+- name: fle-edge-write-unicode-arabic
+  description: Write Arabic RTL Unicode data
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''unicode_arabic'', secret_data: ''FLESECRET_UNICODE_ARABIC_كلمة_السر''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - unicode
+  - arabic
+  - rtl
+- name: fle-edge-write-emoji
+  description: Write emoji data (4-byte UTF-8 sequences)
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''emoji'', secret_data: ''FLESECRET_EMOJI_🔐🔑🔒🔓''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - emoji
+  - utf8-4byte
+- name: fle-edge-write-sql-injection-pattern
+  description: Write SQL injection-like pattern that must be encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''sql_injection'', secret_data: ''FLESECRET_SQLI_\'';
+    DROP TABLE users; --'' }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - special
+  - sqli
+- name: fle-edge-write-shell-metacharacters
+  description: Write shell metacharacters that must be encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''shell_meta'', secret_data: ''FLESECRET_SHELL_$(cat
+    /etc/passwd)\`id\`|nc'' }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - special
+  - shell
+- name: fle-edge-write-path-traversal
+  description: Write path traversal pattern that must be encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''path_traversal'', secret_data: ''FLESECRET_PATH_../../../etc/shadow''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - special
+  - path
+- name: fle-edge-write-long-string
+  description: Write very long string (1000+ chars) that must be encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''long_string'', secret_data: ''FLESECRET_LONG_''
+    + ''AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA''
+    + ''BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB''
+    + ''CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC''
+    + ''DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD''
+    + ''EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE_END''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - boundary
+  - long
+- name: fle-edge-write-single-char
+  description: Write single character that must be encrypted
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''single_char'', secret_data: ''FLESECRET_SINGLE_X''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - boundary
+  - single
+- name: fle-edge-write-repeated-pattern
+  description: Write repeated pattern (compression detection)
+  args:
+  - query
+  - 'CREATE (n:FLETest_EdgeCase { test_type: ''repeated'', secret_data: ''FLESECRET_REPEAT_ABCABCABCABCABCABCABCABCABCABC''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - edge
+  - boundary
+  - repeated
+- name: fle-edge-force-checkpoint
+  description: Force checkpoint to ensure all data is written to disk
+  args:
+  - query
+  - RETURN 'checkpoint_requested' AS status
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - edge
+  - checkpoint
+- name: fle-edge-scan-no-unicode-plaintext
+  description: 'CRITICAL: Verify Unicode markers do NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_UNICODE_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - scan
+  - unicode
+  - critical
+- name: fle-edge-scan-no-emoji-plaintext
+  description: 'CRITICAL: Verify emoji marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_EMOJI_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - scan
+  - emoji
+  - critical
+- name: fle-edge-scan-no-sqli-plaintext
+  description: 'CRITICAL: Verify SQL injection marker does NOT appear in ANY data
+    file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_SQLI_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - scan
+  - sqli
+  - critical
+- name: fle-edge-scan-no-shell-plaintext
+  description: 'CRITICAL: Verify shell metachar marker does NOT appear in ANY data
+    file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_SHELL_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - scan
+  - shell
+  - critical
+- name: fle-edge-scan-no-path-plaintext
+  description: 'CRITICAL: Verify path traversal marker does NOT appear in ANY data
+    file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_PATH_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - scan
+  - path
+  - critical
+- name: fle-edge-scan-no-long-plaintext
+  description: 'CRITICAL: Verify long string marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_LONG_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - scan
+  - long
+  - critical
+- name: fle-edge-scan-no-single-plaintext
+  description: 'CRITICAL: Verify single char marker does NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_SINGLE_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - scan
+  - single
+  - critical
+- name: fle-edge-scan-no-repeat-plaintext
+  description: 'CRITICAL: Verify repeated pattern marker does NOT appear in ANY data
+    file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_REPEAT_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - scan
+  - repeat
+  - critical
+- name: fle-edge-binary-scan-flesecret-prefix
+  description: 'CRITICAL: Verify NO FLESECRET_ prefix appears in ANY binary file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - edge
+  - binary-scan
+  - comprehensive
+  - critical
 invariants:
-  - type: "server_running"
-
+- type: server_running
 plaintext_verification:
   enabled: true
   patterns:
-    - "FLESECRET_UNICODE_"
-    - "FLESECRET_EMOJI_"
-    - "FLESECRET_SQLI_"
-    - "FLESECRET_SHELL_"
-    - "FLESECRET_PATH_"
-    - "FLESECRET_LONG_"
-    - "FLESECRET_SINGLE_"
-    - "FLESECRET_REPEAT_"
-    - "FLESECRET_"
+  - FLESECRET_UNICODE_
+  - FLESECRET_EMOJI_
+  - FLESECRET_SQLI_
+  - FLESECRET_SHELL_
+  - FLESECRET_PATH_
+  - FLESECRET_LONG_
+  - FLESECRET_SINGLE_
+  - FLESECRET_REPEAT_
+  - FLESECRET_
   fail_on_violation: true
   scan_binary_files: true
-
-tags: ["fle", "field-level-encryption", "security", "edge-cases", "unicode", "plaintext-verification", "critical"]
+tags:
+- fle
+- field-level-encryption
+- security
+- edge-cases
+- unicode
+- plaintext-verification
+- critical

@@ -1,329 +1,517 @@
-version: "1.0"
-name: "Gap Analysis Security and CBO Fixes - January 2026"
-description: "Tests for security, path finding, and CBO gap fixes: GAP-0070 (TDE Shamir SSS), GAP-0072 (DP Join Enumeration), GAP-0073 (CDC TxIDs), GAP-0080 (Cost Evaluation), GAP-0084 (Path Edges), GAP-0085 (HKDF Key ID)"
-
+version: '1.0'
+name: Gap Analysis Security and CBO Fixes - January 2026
+description: 'Tests for security, path finding, and CBO gap fixes: GAP-0070 (TDE Shamir
+  SSS), GAP-0072 (DP Join Enumeration), GAP-0073 (CDC TxIDs), GAP-0080 (Cost Evaluation),
+  GAP-0084 (Path Edges), GAP-0085 (HKDF Key ID)'
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "error"]
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 30000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # =============================================================================
-  # GAP-0084: Path Finding Edge Collection
-  # =============================================================================
+- name: gap-0084-path-edges-basic
+  description: RELATIONSHIPS(path) returns edge IDs from path finding
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:PathNode {name: ''A''});
 
-  - name: "gap-0084-path-edges-basic"
-    description: "RELATIONSHIPS(path) returns edge IDs from path finding"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (a:PathNode {name: 'A'});
-      CREATE (b:PathNode {name: 'B'});
-      CREATE (c:PathNode {name: 'C'});
-      CREATE (a)-[:CONNECTS]->(b);
-      CREATE (b)-[:CONNECTS]->(c);
-      MATCH path = (start:PathNode {name: 'A'})-[:CONNECTS*1..2]->(end:PathNode {name: 'C'})
-      RETURN length(path) AS path_length, size(RELATIONSHIPS(path)) AS edge_count
-    expect:
-      exit_code: 0
-      stdout_contains: ["path_length", "edge_count"]
-    tags: ["gap-0084", "path", "edges"]
+    CREATE (b:PathNode {name: ''B''});
 
-  - name: "gap-0084-path-nodes-and-edges"
-    description: "Path returns both NODES and RELATIONSHIPS"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (x:Waypoint {id: 1});
-      CREATE (y:Waypoint {id: 2});
-      CREATE (x)-[:ROUTE {distance: 10}]->(y);
-      MATCH path = (a:Waypoint {id: 1})-[:ROUTE]->(b:Waypoint {id: 2})
-      RETURN NODES(path) AS nodes, RELATIONSHIPS(path) AS edges
-    expect:
-      exit_code: 0
-      stdout_contains: ["nodes", "edges"]
-    tags: ["gap-0084", "path", "nodes", "relationships"]
+    CREATE (c:PathNode {name: ''C''});
 
-  - name: "gap-0084-shortest-path-edges"
-    description: "Shortest path returns edge information"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (p1:Place {name: 'Start'});
-      CREATE (p2:Place {name: 'Mid'});
-      CREATE (p3:Place {name: 'End'});
-      CREATE (p1)-[:PATH {cost: 5}]->(p2);
-      CREATE (p2)-[:PATH {cost: 3}]->(p3);
-      CREATE (p1)-[:PATH {cost: 10}]->(p3);
-      MATCH path = shortestPath((s:Place {name: 'Start'})-[:PATH*]->(e:Place {name: 'End'}))
-      RETURN length(path) AS hops
-    expect:
-      exit_code: 0
-      stdout_contains: ["hops"]
-    tags: ["gap-0084", "path", "shortest"]
+    CREATE (a)-[:CONNECTS]->(b);
 
-  # =============================================================================
-  # GAP-0080: Cost Evaluation Phase in Query Planning
-  # =============================================================================
+    CREATE (b)-[:CONNECTS]->(c);
 
-  - name: "gap-0080-explain-shows-cost"
-    description: "EXPLAIN output includes cost estimates"
-    args: ["query", "-"]
-    stdin: "EXPLAIN MATCH (n:CostTest) WHERE n.value > 100 RETURN n"
-    expect:
-      exit_code: 0
-      stdout_contains: ["cost"]
-    tags: ["gap-0080", "explain", "cost"]
+    MATCH path = (start:PathNode {name: ''A''})-[:CONNECTS*1..2]->(end:PathNode {name:
+    ''C''})
 
-  - name: "gap-0080-profile-shows-cost"
-    description: "PROFILE output includes cost information"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (a:CostNode {value: 50});
-      CREATE (b:CostNode {value: 150});
-      PROFILE MATCH (n:CostNode) WHERE n.value > 100 RETURN n.value AS val
-    expect:
-      exit_code: 0
-      stdout_contains: ["val"]
-    tags: ["gap-0080", "profile", "cost"]
+    RETURN length(path) AS path_length, size(RELATIONSHIPS(path)) AS edge_count
 
-  - name: "gap-0080-cost-based-plan-selection"
-    description: "CBO selects optimal plan based on cost"
-    args: ["query", "-"]
-    stdin: |
-      CREATE INDEX ON :CostSelect(indexed_prop);
-      CREATE (a:CostSelect {indexed_prop: 'find_me', other: 'data'});
-      EXPLAIN MATCH (n:CostSelect {indexed_prop: 'find_me'}) RETURN n
-    expect:
-      exit_code: 0
-    tags: ["gap-0080", "cbo", "index-selection"]
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - path_length
+    - edge_count
+  tags:
+  - gap-0084
+  - path
+  - edges
+- name: gap-0084-path-nodes-and-edges
+  description: Path returns both NODES and RELATIONSHIPS
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (x:Waypoint {id: 1});
 
-  # =============================================================================
-  # GAP-0072: DP Join Enumeration
-  # =============================================================================
+    CREATE (y:Waypoint {id: 2});
 
-  - name: "gap-0072-multi-join-basic"
-    description: "Multi-way join uses DP enumeration for optimal ordering"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (a:TableA {id: 1, name: 'A'});
-      CREATE (b:TableB {id: 1, ref_a: 1});
-      CREATE (c:TableC {id: 1, ref_b: 1});
-      MATCH (a:TableA), (b:TableB), (c:TableC)
-      WHERE b.ref_a = a.id AND c.ref_b = b.id
-      RETURN a.name AS name
-    expect:
-      exit_code: 0
-      stdout_contains: ["A"]
-    tags: ["gap-0072", "join", "multi-way"]
+    CREATE (x)-[:ROUTE {distance: 10}]->(y);
 
-  - name: "gap-0072-explain-multi-join"
-    description: "EXPLAIN shows query plan for multi-way match"
-    args: ["query", "-"]
-    stdin: "EXPLAIN MATCH (a:JoinA), (b:JoinB), (c:JoinC) WHERE a.id = b.a_id AND b.id = c.b_id RETURN count(*)"
-    expect:
-      exit_code: 0
-      stdout_contains: ["NodeScan", "cost"]
-    tags: ["gap-0072", "join", "explain"]
+    MATCH path = (a:Waypoint {id: 1})-[:ROUTE]->(b:Waypoint {id: 2})
 
-  - name: "gap-0072-four-way-join"
-    description: "Four-way join optimization"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (w:T1 {id: 1});
-      CREATE (x:T2 {id: 1, t1_id: 1});
-      CREATE (y:T3 {id: 1, t2_id: 1});
-      CREATE (z:T4 {id: 1, t3_id: 1});
-      MATCH (w:T1), (x:T2), (y:T3), (z:T4)
-      WHERE x.t1_id = w.id AND y.t2_id = x.id AND z.t3_id = y.id
-      RETURN count(*) AS cnt
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]
-    tags: ["gap-0072", "join", "four-way"]
+    RETURN NODES(path) AS nodes, RELATIONSHIPS(path) AS edges
 
-  # =============================================================================
-  # GAP-0073: CDC Transaction IDs
-  # =============================================================================
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - nodes
+    - edges
+  tags:
+  - gap-0084
+  - path
+  - nodes
+  - relationships
+- name: gap-0084-shortest-path-edges
+  description: Shortest path returns edge information
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (p1:Place {name: ''Start''});
 
-  - name: "gap-0073-transaction-id-tracking"
-    description: "Transactions have unique IDs for CDC tracking"
-    args: ["query", "-"]
-    stdin: |
-      BEGIN;
-      CREATE (n:CDCTest {event: 'test'});
-      COMMIT;
-      RETURN 'transaction_completed' AS status
-    expect:
-      exit_code: 0
-      stdout_contains: ["transaction_completed"]
-    tags: ["gap-0073", "cdc", "transaction"]
+    CREATE (p2:Place {name: ''Mid''});
 
-  - name: "gap-0073-multi-statement-transaction"
-    description: "Multi-statement transactions have consistent TX ID"
-    args: ["query", "-"]
-    stdin: |
-      BEGIN;
-      CREATE (a:TxnNode {seq: 1});
-      CREATE (b:TxnNode {seq: 2});
-      CREATE (a)-[:FOLLOWS]->(b);
-      COMMIT;
-      MATCH (n:TxnNode) RETURN count(n) AS cnt
-    expect:
-      exit_code: 0
-      stdout_contains: ["2"]
-    tags: ["gap-0073", "cdc", "multi-statement"]
+    CREATE (p3:Place {name: ''End''});
 
-  - name: "gap-0073-rollback-cdc-behavior"
-    description: "Rolled back transactions should not appear in CDC stream"
-    args: ["query", "-"]
-    stdin: |
-      BEGIN;
-      CREATE (n:RollbackCDC {should_not_exist: true});
-      ROLLBACK;
-      MATCH (n:RollbackCDC) RETURN count(n) AS cnt
-    expect:
-      exit_code: 0
-      stdout_contains: ["0"]
-    tags: ["gap-0073", "cdc", "rollback"]
+    CREATE (p1)-[:PATH {cost: 5}]->(p2);
 
-  # =============================================================================
-  # GAP-0070 & GAP-0085: TDE Key Management (Indirect Tests)
-  # These test TDE functionality which relies on proper secret sharing and HKDF
-  # =============================================================================
+    CREATE (p2)-[:PATH {cost: 3}]->(p3);
 
-  - name: "gap-0070-0085-tde-encryption-roundtrip"
-    description: "TDE encryption/decryption works (validates key management)"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (n:EncryptedNode {sensitive: 'secret_data', public: 'visible'});
-      MATCH (n:EncryptedNode) RETURN n.sensitive AS data, n.public AS visible
-    expect:
-      exit_code: 0
-      stdout_contains: ["secret_data", "visible"]
-    tags: ["gap-0070", "gap-0085", "tde", "encryption"]
+    CREATE (p1)-[:PATH {cost: 10}]->(p3);
 
-  - name: "gap-0070-0085-tde-status-query"
-    description: "TDE status can be queried (validates key system)"
-    skip: true
-    skip_reason: "tde.status() procedure not yet implemented"
-    args: ["query", "-"]
-    stdin: "CALL tde.status() YIELD enabled, algorithm, key_id RETURN enabled, algorithm, key_id"
-    expect:
-      exit_code: 0
-      stdout_contains: ["enabled", "algorithm"]
-    tags: ["gap-0070", "gap-0085", "tde", "status"]
+    MATCH path = shortestPath((s:Place {name: ''Start''})-[:PATH*]->(e:Place {name:
+    ''End''}))
 
-  - name: "gap-0070-0085-tde-configure"
-    description: "TDE configuration works (validates secret sharing)"
-    args: ["query", "-"]
-    stdin: "CALL tde.configure_kms() YIELD success, kms_provider RETURN success, kms_provider"
-    expect:
-      exit_code: 0
-      stdout_contains: ["success", "kms_provider"]
-    tags: ["gap-0070", "gap-0085", "tde", "configure"]
+    RETURN length(path) AS hops
 
-  # =============================================================================
-  # Integration Tests - Combined Security and CBO Features
-  # =============================================================================
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hops
+  tags:
+  - gap-0084
+  - path
+  - shortest
+- name: gap-0080-explain-shows-cost
+  description: EXPLAIN output includes cost estimates
+  args:
+  - query
+  - '-'
+  stdin: EXPLAIN MATCH (n:CostTest) WHERE n.value > 100 RETURN n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cost
+  tags:
+  - gap-0080
+  - explain
+  - cost
+- name: gap-0080-profile-shows-cost
+  description: PROFILE output includes cost information
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:CostNode {value: 50});
 
-  - name: "integration-path-with-cost"
-    description: "Path finding with cost-based optimization"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (s:Start {id: 1});
-      CREATE (m1:Middle {id: 2});
-      CREATE (m2:Middle {id: 3});
-      CREATE (e:End {id: 4});
-      CREATE (s)-[:STEP {weight: 1}]->(m1);
-      CREATE (m1)-[:STEP {weight: 1}]->(e);
-      CREATE (s)-[:STEP {weight: 2}]->(m2);
-      CREATE (m2)-[:STEP {weight: 2}]->(e);
-      MATCH path = (start:Start)-[:STEP*]->(end:End)
-      RETURN length(path) AS hops, NODES(path) AS nodes
-    expect:
-      exit_code: 0
-      stdout_contains: ["hops", "nodes"]
-    tags: ["integration", "gap-0084", "gap-0080"]
+    CREATE (b:CostNode {value: 150});
 
-  - name: "integration-join-with-transaction"
-    description: "Multi-join query within transaction"
-    args: ["query", "-"]
-    stdin: |
-      BEGIN;
-      CREATE (u:User {id: 1, name: 'Alice'});
-      CREATE (o:Order {id: 1, user_id: 1, total: 100});
-      CREATE (i:Item {id: 1, order_id: 1, name: 'Widget'});
-      COMMIT;
-      MATCH (u:User), (o:Order), (i:Item)
-      WHERE o.user_id = u.id AND i.order_id = o.id
-      RETURN u.name AS user, o.total AS total, i.name AS item
-    expect:
-      exit_code: 0
-      stdout_contains: ["Alice", "100", "Widget"]
-    tags: ["integration", "gap-0072", "gap-0073"]
+    PROFILE MATCH (n:CostNode) WHERE n.value > 100 RETURN n.value AS val
 
-  - name: "integration-encrypted-path-query"
-    description: "Path query on potentially encrypted data"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (a:SecureNode {data: 'encrypted_a'})-[:SECURE_LINK]->(b:SecureNode {data: 'encrypted_b'});
-      MATCH path = (start:SecureNode)-[:SECURE_LINK]->(end:SecureNode)
-      RETURN start.data AS from_data, end.data AS to_data, length(path) AS len
-    expect:
-      exit_code: 0
-      stdout_contains: ["encrypted_a", "encrypted_b", "len"]
-    tags: ["integration", "gap-0070", "gap-0084"]
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - val
+  tags:
+  - gap-0080
+  - profile
+  - cost
+- name: gap-0080-cost-based-plan-selection
+  description: CBO selects optimal plan based on cost
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE INDEX ON :CostSelect(indexed_prop);
 
-  # =============================================================================
-  # Edge Cases and Error Handling
-  # =============================================================================
+    CREATE (a:CostSelect {indexed_prop: ''find_me'', other: ''data''});
 
-  - name: "edge-empty-path-edges"
-    description: "RELATIONSHIPS on single-node path returns empty"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (n:SingleNode {id: 1});
-      MATCH path = (n:SingleNode {id: 1})
-      RETURN length(path) AS len, size(RELATIONSHIPS(path)) AS edge_count
-    expect:
-      exit_code: 0
-      stdout_contains: ["0"]
-    tags: ["edge-case", "gap-0084", "path"]
+    EXPLAIN MATCH (n:CostSelect {indexed_prop: ''find_me''}) RETURN n
 
-  - name: "edge-join-single-table"
-    description: "Single table query (no join enumeration needed)"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (n:Solo {value: 42});
-      MATCH (n:Solo) RETURN n.value AS val
-    expect:
-      exit_code: 0
-      stdout_contains: ["42"]
-    tags: ["edge-case", "gap-0072", "single"]
+    '
+  expect:
+    exit_code: 0
+  tags:
+  - gap-0080
+  - cbo
+  - index-selection
+- name: gap-0072-multi-join-basic
+  description: Multi-way join uses DP enumeration for optimal ordering
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:TableA {id: 1, name: ''A''});
 
-  - name: "edge-cost-estimation-no-stats"
-    description: "Cost estimation works without statistics"
-    args: ["query", "-"]
-    stdin: "EXPLAIN MATCH (n:NoStats) RETURN n"
-    expect:
-      exit_code: 0
-    tags: ["edge-case", "gap-0080", "no-stats"]
+    CREATE (b:TableB {id: 1, ref_a: 1});
 
-  - name: "edge-transaction-empty-commit"
-    description: "Empty transaction commit (CDC should handle)"
-    args: ["query", "-"]
-    stdin: |
-      BEGIN;
-      COMMIT;
-      RETURN 'empty_txn_ok' AS status
-    expect:
-      exit_code: 0
-      stdout_contains: ["empty_txn_ok"]
-    tags: ["edge-case", "gap-0073", "empty-txn"]
+    CREATE (c:TableC {id: 1, ref_b: 1});
+
+    MATCH (a:TableA), (b:TableB), (c:TableC)
+
+    WHERE b.ref_a = a.id AND c.ref_b = b.id
+
+    RETURN a.name AS name
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - A
+  tags:
+  - gap-0072
+  - join
+  - multi-way
+- name: gap-0072-explain-multi-join
+  description: EXPLAIN shows query plan for multi-way match
+  args:
+  - query
+  - '-'
+  stdin: EXPLAIN MATCH (a:JoinA), (b:JoinB), (c:JoinC) WHERE a.id = b.a_id AND b.id
+    = c.b_id RETURN count(*)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - NodeScan
+    - cost
+  tags:
+  - gap-0072
+  - join
+  - explain
+- name: gap-0072-four-way-join
+  description: Four-way join optimization
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (w:T1 {id: 1});
+
+    CREATE (x:T2 {id: 1, t1_id: 1});
+
+    CREATE (y:T3 {id: 1, t2_id: 1});
+
+    CREATE (z:T4 {id: 1, t3_id: 1});
+
+    MATCH (w:T1), (x:T2), (y:T3), (z:T4)
+
+    WHERE x.t1_id = w.id AND y.t2_id = x.id AND z.t3_id = y.id
+
+    RETURN count(*) AS cnt
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - gap-0072
+  - join
+  - four-way
+- name: gap-0073-transaction-id-tracking
+  description: Transactions have unique IDs for CDC tracking
+  args:
+  - query
+  - '-'
+  stdin: 'BEGIN;
+
+    CREATE (n:CDCTest {event: ''test''});
+
+    COMMIT;
+
+    RETURN ''transaction_completed'' AS status
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - transaction_completed
+  tags:
+  - gap-0073
+  - cdc
+  - transaction
+- name: gap-0073-multi-statement-transaction
+  description: Multi-statement transactions have consistent TX ID
+  args:
+  - query
+  - '-'
+  stdin: 'BEGIN;
+
+    CREATE (a:TxnNode {seq: 1});
+
+    CREATE (b:TxnNode {seq: 2});
+
+    CREATE (a)-[:FOLLOWS]->(b);
+
+    COMMIT;
+
+    MATCH (n:TxnNode) RETURN count(n) AS cnt
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '2'
+  tags:
+  - gap-0073
+  - cdc
+  - multi-statement
+- name: gap-0073-rollback-cdc-behavior
+  description: Rolled back transactions should not appear in CDC stream
+  args:
+  - query
+  - '-'
+  stdin: 'BEGIN;
+
+    CREATE (n:RollbackCDC {should_not_exist: true});
+
+    ROLLBACK;
+
+    MATCH (n:RollbackCDC) RETURN count(n) AS cnt
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0'
+  tags:
+  - gap-0073
+  - cdc
+  - rollback
+- name: gap-0070-0085-tde-encryption-roundtrip
+  description: TDE encryption/decryption works (validates key management)
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:EncryptedNode {sensitive: ''secret_data'', public: ''visible''});
+
+    MATCH (n:EncryptedNode) RETURN n.sensitive AS data, n.public AS visible
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - secret_data
+    - visible
+  tags:
+  - gap-0070
+  - gap-0085
+  - tde
+  - encryption
+- name: gap-0070-0085-tde-status-query
+  description: TDE status can be queried (validates key system)
+  skip: true
+  skip_reason: tde.status() procedure not yet implemented
+  args:
+  - query
+  - '-'
+  stdin: CALL tde.status() YIELD enabled, algorithm, key_id RETURN enabled, algorithm,
+    key_id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - enabled
+    - algorithm
+  tags:
+  - gap-0070
+  - gap-0085
+  - tde
+  - status
+- name: gap-0070-0085-tde-configure
+  description: TDE configuration works (validates secret sharing)
+  args:
+  - query
+  - '-'
+  stdin: CALL tde.configure_kms() YIELD success, kms_provider RETURN success, kms_provider
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - success
+    - kms_provider
+  tags:
+  - gap-0070
+  - gap-0085
+  - tde
+  - configure
+- name: integration-path-with-cost
+  description: Path finding with cost-based optimization
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (s:Start {id: 1});
+
+    CREATE (m1:Middle {id: 2});
+
+    CREATE (m2:Middle {id: 3});
+
+    CREATE (e:End {id: 4});
+
+    CREATE (s)-[:STEP {weight: 1}]->(m1);
+
+    CREATE (m1)-[:STEP {weight: 1}]->(e);
+
+    CREATE (s)-[:STEP {weight: 2}]->(m2);
+
+    CREATE (m2)-[:STEP {weight: 2}]->(e);
+
+    MATCH path = (start:Start)-[:STEP*]->(end:End)
+
+    RETURN length(path) AS hops, NODES(path) AS nodes
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hops
+    - nodes
+  tags:
+  - integration
+  - gap-0084
+  - gap-0080
+- name: integration-join-with-transaction
+  description: Multi-join query within transaction
+  args:
+  - query
+  - '-'
+  stdin: 'BEGIN;
+
+    CREATE (u:User {id: 1, name: ''Alice''});
+
+    CREATE (o:Order {id: 1, user_id: 1, total: 100});
+
+    CREATE (i:Item {id: 1, order_id: 1, name: ''Widget''});
+
+    COMMIT;
+
+    MATCH (u:User), (o:Order), (i:Item)
+
+    WHERE o.user_id = u.id AND i.order_id = o.id
+
+    RETURN u.name AS user, o.total AS total, i.name AS item
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Alice
+    - '100'
+    - Widget
+  tags:
+  - integration
+  - gap-0072
+  - gap-0073
+- name: integration-encrypted-path-query
+  description: Path query on potentially encrypted data
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:SecureNode {data: ''encrypted_a''})-[:SECURE_LINK]->(b:SecureNode
+    {data: ''encrypted_b''});
+
+    MATCH path = (start:SecureNode)-[:SECURE_LINK]->(end:SecureNode)
+
+    RETURN start.data AS from_data, end.data AS to_data, length(path) AS len
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - encrypted_a
+    - encrypted_b
+    - len
+  tags:
+  - integration
+  - gap-0070
+  - gap-0084
+- name: edge-empty-path-edges
+  description: RELATIONSHIPS on single-node path returns empty
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:SingleNode {id: 1});
+
+    MATCH path = (n:SingleNode {id: 1})
+
+    RETURN length(path) AS len, size(RELATIONSHIPS(path)) AS edge_count
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0'
+  tags:
+  - edge-case
+  - gap-0084
+  - path
+- name: edge-join-single-table
+  description: Single table query (no join enumeration needed)
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:Solo {value: 42});
+
+    MATCH (n:Solo) RETURN n.value AS val
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '42'
+  tags:
+  - edge-case
+  - gap-0072
+  - single
+- name: edge-cost-estimation-no-stats
+  description: Cost estimation works without statistics
+  args:
+  - query
+  - '-'
+  stdin: EXPLAIN MATCH (n:NoStats) RETURN n
+  expect:
+    exit_code: 0
+  tags:
+  - edge-case
+  - gap-0080
+  - no-stats
+- name: edge-transaction-empty-commit
+  description: Empty transaction commit (CDC should handle)
+  args:
+  - query
+  - '-'
+  stdin: 'BEGIN;
+
+    COMMIT;
+
+    RETURN ''empty_txn_ok'' AS status
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - empty_txn_ok
+  tags:
+  - edge-case
+  - gap-0073
+  - empty-txn

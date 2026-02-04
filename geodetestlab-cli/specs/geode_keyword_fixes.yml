@@ -1,294 +1,414 @@
-version: "1.0"
-name: "Geode GQL Keyword Handling Tests"
-description: "Test suite validating keyword handling in GQL queries"
-
+version: '1.0'
+name: Geode GQL Keyword Handling Tests
+description: Test suite validating keyword handling in GQL queries
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "error"]
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # ===============================
-  # SETUP - Create test data
-  # ===============================
-
-  - name: "setup-keyword-test-data"
-    description: "Create test data for keyword handling validation"
-    args: ["query", "-"]
-    stdin: |
-      CREATE
-        (alice:Person {name: 'Alice', age: 30, property: 'senior', type: 'engineer', count: 5, path: '/home/alice', value: 100}),
-        (bob:Person {name: 'Bob', age: 25, property: 'junior', type: 'developer', count: 3, path: '/home/bob', value: 80}),
-        (charlie:Person {name: 'Charlie', age: 35, property: 'manager', type: 'lead', count: 8, path: '/home/charlie', value: 120}),
-        (alice)-[:KNOWS {since: 2020, type: 'friendship', property: 'strong'}]->(bob),
-        (alice)-[:KNOWS {since: 2018, type: 'work', property: 'professional'}]->(charlie),
-        (bob)-[:KNOWS {since: 2021, type: 'work', property: 'collaboration'}]->(charlie)
-      RETURN count(*) AS created
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["created"]
-    tags: ["setup", "keywords"]
-
-  # ===============================
-  # PATH VARIABLE ASSIGNMENT TESTS
-  # ===============================
-
-  - name: "path-variable-basic-assignment"
-    description: "Test basic path variable assignment with PATH keyword"
-    args: ["query", "-"]
-    stdin: "MATCH path = (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS from_name, b.name AS to_name"
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["from_name", "to_name"]
-    tags: ["path", "variable", "assignment"]
-
-  - name: "path-variable-with-quantifiers"
-    description: "Test path variable assignment with variable-length patterns"
-    args: ["query", "-"]
-    stdin: "MATCH path = (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN a.name AS from_name, b.name AS to_name"
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["from_name", "to_name"]
-    tags: ["path", "variable", "quantifiers"]
-
-  - name: "path-variable-complex-pattern"
-    description: "Test the originally failing complex path variable pattern"
-    args: ["query", "-"]
-    stdin: "MATCH path = (a:Person)-[:KNOWS*2..3]->(b:Person) RETURN a.name AS from_name, b.name AS to_name"
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["from_name", "to_name"]
-    tags: ["path", "variable", "complex"]
-
-  # ===============================
-  # AGGREGATION WITH KEYWORD ALIASES
-  # ===============================
-
-  - name: "aggregation-count-with-keyword-alias"
-    description: "Test COUNT aggregation with keyword aliases"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person) RETURN COUNT(n) AS count, COUNT(n.name) AS property, COUNT(DISTINCT n.type) AS type"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["count", "property", "type"]
-    tags: ["aggregation", "count", "alias"]
-
-  - name: "aggregation-math-functions-with-keyword-aliases"
-    description: "Test mathematical aggregations with keyword aliases"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person) RETURN SUM(n.value) AS sum, AVG(n.age) AS avg, MIN(n.count) AS min, MAX(n.value) AS max"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["sum", "avg", "min", "max"]
-    tags: ["aggregation", "math", "alias"]
-
-  - name: "aggregation-with-path-keyword-alias"
-    description: "Test aggregation functions with PATH keyword as alias"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person) RETURN COUNT(n) AS path, SUM(n.value) AS value, AVG(n.count) AS property"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["path", "value", "property"]
-    tags: ["aggregation", "path", "alias"]
-
-  # ===============================
-  # SET CLAUSE WITH KEYWORD PROPERTIES
-  # ===============================
-
-  - name: "set-property-keyword-basic"
-    description: "Test SET clause with PROPERTY keyword as property name"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person {name: 'Alice'}) SET n.property = 'updated_senior' RETURN n.name AS name, n.property AS property"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["name", "property"]
-    tags: ["set", "property", "keyword"]
-
-  - name: "set-type-keyword-property"
-    description: "Test SET clause with TYPE keyword as property name"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person {name: 'Bob'}) SET n.type = 'senior_developer' RETURN n.name AS name, n.type AS type"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["name", "type"]
-    tags: ["set", "type", "keyword"]
-
-  - name: "set-path-keyword-property"
-    description: "Test SET clause with PATH keyword as property name"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person {name: 'Charlie'}) SET n.path = '/updated/home/charlie' RETURN n.name AS name, n.path AS path"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["name", "path"]
-    tags: ["set", "path", "keyword"]
-
-  - name: "set-count-keyword-property"
-    description: "Test SET clause with COUNT keyword as property name"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person {name: 'Alice'}) SET n.count = n.count + 1 RETURN n.name AS name, n.count AS count"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["name", "count"]
-    tags: ["set", "count", "keyword"]
-
-  - name: "set-multiple-keyword-properties"
-    description: "Test SET clause with multiple keyword properties"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person {name: 'Bob'}) SET n.property = 'multi_update', n.count = 99, n.path = '/new/path' RETURN n.name AS name, n.property AS property"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["name", "property"]
-    tags: ["set", "multiple", "keywords"]
-
-  # ===============================
-  # KEYWORDS AS IDENTIFIERS IN VARIOUS CONTEXTS
-  # ===============================
-
-  - name: "keywords-as-node-variables"
-    description: "Test keywords used as node variable names"
-    args: ["query", "-"]
-    stdin: "MATCH (path:Person), (count:Person) WHERE path.name = 'Alice' AND count.name = 'Bob' RETURN path.name AS person1, count.name AS person2"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["person1", "person2"]
-    tags: ["keywords", "node", "variables"]
-
-  - name: "keywords-as-relationship-variables"
-    description: "Test keywords used as relationship variable names"
-    args: ["query", "-"]
-    stdin: "MATCH (a:Person)-[property:KNOWS]->(b:Person) RETURN a.name AS from_name, b.name AS to_name, property.since AS since"
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["from_name", "to_name", "since"]
-    tags: ["keywords", "relationship", "variables"]
-
-  - name: "keywords-in-where-clauses"
-    description: "Test keywords used in WHERE clause property access"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person) WHERE n.type IN ['engineer', 'developer'] AND n.property IS NOT NULL RETURN n.name AS name, n.type AS type, n.property AS property ORDER BY n.name"
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["name", "type", "property"]
-    tags: ["keywords", "where", "properties"]
-
-  - name: "keywords-in-order-by-clauses"
-    description: "Test keywords used in ORDER BY clauses"
-    args: ["query", "-"]
-    stdin: "MATCH (n:Person) RETURN n.name AS name, n.count AS count, n.property AS property ORDER BY n.count DESC, n.property ASC"
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["name", "count", "property"]
-    tags: ["keywords", "order", "clauses"]
-
-  # ===============================
-  # REGRESSION VALIDATION TESTS
-  # ===============================
-
-  - name: "regression-built-in-functions"
-    description: "Test built-in functions still work after keyword fixes"
-    args: ["query", "-"]
-    stdin: "RETURN upper('hello') AS upper_case, lower('WORLD') AS lower_case, length('test') AS string_length, abs(-5) AS absolute"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["upper_case", "lower_case", "string_length", "absolute"]
-    tags: ["regression", "builtin", "functions"]
-
-  - name: "regression-variable-length-paths"
-    description: "Test variable-length paths still work after keyword fixes"
-    args: ["query", "-"]
-    stdin: "MATCH (a:Person)-[*1..2]->(b:Person) RETURN count(*) AS path_count"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["path_count"]
-    tags: ["regression", "variable", "paths"]
-
-  # ===============================
-  # ERROR CASES SHOULD STILL FAIL
-  # ===============================
-
-  - name: "error-missing-label-name"
-    description: "Test that syntax errors still fail correctly (missing label)"
-    args: ["query", "-"]
-    stdin: "MATCH (n:) RETURN n"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"
-    tags: ["error", "syntax", "validation"]
-
-  - name: "error-unclosed-parenthesis"
-    description: "Test that syntax errors still fail correctly (unclosed paren)"
-    args: ["query", "-"]
-    stdin: "RETURN (1 + 2"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"
-    tags: ["error", "syntax", "validation"]
-
-  # ===============================
-  # CLEANUP
-  # ===============================
-
-  - name: "cleanup-keyword-test-data"
-    description: "Clean up all keyword test data"
-    args: ["query", "-"]
-    stdin: "MATCH (n) DELETE n"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "verify-keyword-cleanup"
-    description: "Verify all keyword test data is cleaned up"
-    args: ["query", "-"]
-    stdin: "MATCH (n) RETURN count(n) AS remaining_nodes"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["remaining_nodes"]
-    tags: ["cleanup", "verify"]
-
+- name: setup-keyword-test-data
+  description: Create test data for keyword handling validation
+  args:
+  - query
+  - '-'
+  stdin: "CREATE\n  (alice:Person {name: 'Alice', age: 30, property: 'senior', type:\
+    \ 'engineer', count: 5, path: '/home/alice', value: 100}),\n  (bob:Person {name:\
+    \ 'Bob', age: 25, property: 'junior', type: 'developer', count: 3, path: '/home/bob',\
+    \ value: 80}),\n  (charlie:Person {name: 'Charlie', age: 35, property: 'manager',\
+    \ type: 'lead', count: 8, path: '/home/charlie', value: 120}),\n  (alice)-[:KNOWS\
+    \ {since: 2020, type: 'friendship', property: 'strong'}]->(bob),\n  (alice)-[:KNOWS\
+    \ {since: 2018, type: 'work', property: 'professional'}]->(charlie),\n  (bob)-[:KNOWS\
+    \ {since: 2021, type: 'work', property: 'collaboration'}]->(charlie)\nRETURN count(*)\
+    \ AS created\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - created
+  tags:
+  - setup
+  - keywords
+- name: path-variable-basic-assignment
+  description: Test basic path variable assignment with PATH keyword
+  args:
+  - query
+  - '-'
+  stdin: MATCH path = (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS from_name,
+    b.name AS to_name
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - from_name
+      - to_name
+  tags:
+  - path
+  - variable
+  - assignment
+- name: path-variable-with-quantifiers
+  description: Test path variable assignment with variable-length patterns
+  args:
+  - query
+  - '-'
+  stdin: MATCH path = (a:Person)-[:KNOWS*1..2]->(b:Person) RETURN a.name AS from_name,
+    b.name AS to_name
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - from_name
+      - to_name
+  tags:
+  - path
+  - variable
+  - quantifiers
+- name: path-variable-complex-pattern
+  description: Test the originally failing complex path variable pattern
+  args:
+  - query
+  - '-'
+  stdin: MATCH path = (a:Person)-[:KNOWS*2..3]->(b:Person) RETURN a.name AS from_name,
+    b.name AS to_name
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - from_name
+      - to_name
+  tags:
+  - path
+  - variable
+  - complex
+- name: aggregation-count-with-keyword-alias
+  description: Test COUNT aggregation with keyword aliases
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Person) RETURN COUNT(n) AS count, COUNT(n.name) AS property, COUNT(DISTINCT
+    n.type) AS type
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - count
+      - property
+      - type
+  tags:
+  - aggregation
+  - count
+  - alias
+- name: aggregation-math-functions-with-keyword-aliases
+  description: Test mathematical aggregations with keyword aliases
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Person) RETURN SUM(n.value) AS sum, AVG(n.age) AS avg, MIN(n.count)
+    AS min, MAX(n.value) AS max
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - sum
+      - avg
+      - min
+      - max
+  tags:
+  - aggregation
+  - math
+  - alias
+- name: aggregation-with-path-keyword-alias
+  description: Test aggregation functions with PATH keyword as alias
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Person) RETURN COUNT(n) AS path, SUM(n.value) AS value, AVG(n.count)
+    AS property
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - path
+      - value
+      - property
+  tags:
+  - aggregation
+  - path
+  - alias
+- name: set-property-keyword-basic
+  description: Test SET clause with PROPERTY keyword as property name
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:Person {name: ''Alice''}) SET n.property = ''updated_senior'' RETURN
+    n.name AS name, n.property AS property'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - name
+      - property
+  tags:
+  - set
+  - property
+  - keyword
+- name: set-type-keyword-property
+  description: Test SET clause with TYPE keyword as property name
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:Person {name: ''Bob''}) SET n.type = ''senior_developer'' RETURN
+    n.name AS name, n.type AS type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - name
+      - type
+  tags:
+  - set
+  - type
+  - keyword
+- name: set-path-keyword-property
+  description: Test SET clause with PATH keyword as property name
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:Person {name: ''Charlie''}) SET n.path = ''/updated/home/charlie''
+    RETURN n.name AS name, n.path AS path'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - name
+      - path
+  tags:
+  - set
+  - path
+  - keyword
+- name: set-count-keyword-property
+  description: Test SET clause with COUNT keyword as property name
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:Person {name: ''Alice''}) SET n.count = n.count + 1 RETURN n.name
+    AS name, n.count AS count'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - name
+      - count
+  tags:
+  - set
+  - count
+  - keyword
+- name: set-multiple-keyword-properties
+  description: Test SET clause with multiple keyword properties
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:Person {name: ''Bob''}) SET n.property = ''multi_update'', n.count
+    = 99, n.path = ''/new/path'' RETURN n.name AS name, n.property AS property'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - name
+      - property
+  tags:
+  - set
+  - multiple
+  - keywords
+- name: keywords-as-node-variables
+  description: Test keywords used as node variable names
+  args:
+  - query
+  - '-'
+  stdin: MATCH (path:Person), (count:Person) WHERE path.name = 'Alice' AND count.name
+    = 'Bob' RETURN path.name AS person1, count.name AS person2
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - person1
+      - person2
+  tags:
+  - keywords
+  - node
+  - variables
+- name: keywords-as-relationship-variables
+  description: Test keywords used as relationship variable names
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:Person)-[property:KNOWS]->(b:Person) RETURN a.name AS from_name,
+    b.name AS to_name, property.since AS since
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - from_name
+      - to_name
+      - since
+  tags:
+  - keywords
+  - relationship
+  - variables
+- name: keywords-in-where-clauses
+  description: Test keywords used in WHERE clause property access
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Person) WHERE n.type IN ['engineer', 'developer'] AND n.property
+    IS NOT NULL RETURN n.name AS name, n.type AS type, n.property AS property ORDER
+    BY n.name
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - name
+      - type
+      - property
+  tags:
+  - keywords
+  - where
+  - properties
+- name: keywords-in-order-by-clauses
+  description: Test keywords used in ORDER BY clauses
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Person) RETURN n.name AS name, n.count AS count, n.property AS property
+    ORDER BY n.count DESC, n.property ASC
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - name
+      - count
+      - property
+  tags:
+  - keywords
+  - order
+  - clauses
+- name: regression-built-in-functions
+  description: Test built-in functions still work after keyword fixes
+  args:
+  - query
+  - '-'
+  stdin: RETURN upper('hello') AS upper_case, lower('WORLD') AS lower_case, length('test')
+    AS string_length, abs(-5) AS absolute
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - upper_case
+      - lower_case
+      - string_length
+      - absolute
+  tags:
+  - regression
+  - builtin
+  - functions
+- name: regression-variable-length-paths
+  description: Test variable-length paths still work after keyword fixes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:Person)-[*1..2]->(b:Person) RETURN count(*) AS path_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - path_count
+  tags:
+  - regression
+  - variable
+  - paths
+- name: error-missing-label-name
+  description: Test that syntax errors still fail correctly (missing label)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:) RETURN n
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - error
+  - syntax
+  - validation
+- name: error-unclosed-parenthesis
+  description: Test that syntax errors still fail correctly (unclosed paren)
+  args:
+  - query
+  - '-'
+  stdin: RETURN (1 + 2
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - error
+  - syntax
+  - validation
+- name: cleanup-keyword-test-data
+  description: Clean up all keyword test data
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: verify-keyword-cleanup
+  description: Verify all keyword test data is cleaned up
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) RETURN count(n) AS remaining_nodes
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - remaining_nodes
+  tags:
+  - cleanup
+  - verify
 invariants:
-  - type: "server_running"
-
-tags: ["keywords", "gql", "compliance", "path", "aggregation", "set"]
+- type: server_running
+tags:
+- keywords
+- gql
+- compliance
+- path
+- aggregation
+- set

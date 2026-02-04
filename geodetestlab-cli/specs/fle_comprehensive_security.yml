@@ -1,842 +1,1325 @@
-version: "1.0"
-name: "Geode FLE (Field-Level Encryption) Comprehensive Security Test Suite"
-description: "End-to-end testing of Field-Level Encryption including key hierarchy, multi-tenant isolation, and encrypted field operations"
-
-# FLE Comprehensive Security Test Suite (75 tests)
-#
-# NOTE: Authentication is disabled for this test suite since we're testing FLE encryption
-# functionality, not authentication. Auth testing is covered in geode_auth_security.yml
-#
-# Test Phases:
-#
-# 1. User and Role Setup (8 tests) - Creates users/roles for local data directory
-# 2. Key Hierarchy Setup (14 tests) - Initializes TRK, SK, and FEK keys for multiple tenants and schemas
-# 3. Test Data Creation (4 tests) - Creates Employee, Customer, and Financial records with PII fields
-# 4. Data Access Tests (9 tests) - Tests reading PII, salary, aggregations, and customer data
-# 5. Key Rotation Operations (5 tests) - Tests FEK, SK, and TRK rotation with data verification
-# 6. Multi-Tenant Isolation (4 tests) - Sets up separate key hierarchies for tenant_a and tenant_b
-# 7. Migration Operations (2 tests) - Tests plaintext-to-encrypted field migration
-# 8. GQL Query Operations (5 tests) - Complex queries including joins, filters, aggregations, path traversals
-# 9. Write Operations (3 tests) - Tests updates and creates with PII fields
-# 10. Stress Testing (3 tests) - Multiple rotations and bulk queries
-# 11. Audit and Compliance (2 tests) - Audited access to PII and financial data
-# 12. Error Handling (3 tests) - Invalid scope, missing arguments
-# 13. Cleanup (11 tests) - Removes all test data, users, and roles
-#
-# Key Features Tested:
-#
-# - Key Hierarchy: TRK (Tenant Root Key) → SK (Schema Key) → FEK (Field Encryption Key)
-# - Multi-tenant isolation: Separate key trees per tenant
-# - Encrypted fields: SSN, salary, DOB, account numbers, routing numbers, email, phone
-# - Key rotation: All three levels (FEK, SK, TRK)
-# - Data operations: CRUD with PII fields, joins, aggregations
-# - Audit logging: PII and financial data access auditing
-# - Error handling: Invalid arguments and scopes
-
+version: '1.0'
+name: Geode FLE (Field-Level Encryption) Comprehensive Security Test Suite
+description: End-to-end testing of Field-Level Encryption including key hierarchy,
+  multi-tenant isolation, and encrypted field operations
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    # Note: Authentication disabled for FLE tests since we're testing encryption, not auth
-    # Auth testing is covered in geode_auth_security.yml
-    args: ["--log-level", "info", "--enable-fle", "--enable-tde", "--tde-provider", "MockKms"]
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    - --enable-tde
+    - --tde-provider
+    - MockKms
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 secrets:
   admin_password:
-    source: "env"
-    key: "GEODE_ADMIN_PASSWORD"
+    source: env
+    key: GEODE_ADMIN_PASSWORD
     required: false
-    default: "admin_secure_pass_123"
+    default: admin_secure_pass_123
   analyst_password:
-    source: "env"
-    key: "GEODE_ANALYST_PASSWORD"
+    source: env
+    key: GEODE_ANALYST_PASSWORD
     required: false
-    default: "analyst_pass_456"
+    default: analyst_pass_456
   hr_manager_password:
-    source: "env"
-    key: "GEODE_HR_PASSWORD"
+    source: env
+    key: GEODE_HR_PASSWORD
     required: false
-    default: "hr_manager_pass_789"
+    default: hr_manager_pass_789
   auditor_password:
-    source: "env"
-    key: "GEODE_AUDITOR_PASSWORD"
+    source: env
+    key: GEODE_AUDITOR_PASSWORD
     required: false
-    default: "auditor_pass_012"
+    default: auditor_pass_012
   regular_user_password:
-    source: "env"
-    key: "GEODE_USER_PASSWORD"
+    source: env
+    key: GEODE_USER_PASSWORD
     required: false
-    default: "regular_user_pass_345"
-
-# Skip isolation suffix for FLE tests - the CALL geode.fle.configureField
-# must match the exact label names used in CREATE statements
+    default: regular_user_pass_345
 skip_isolation: true
-
 tests:
-  # ===============================
-  # PHASE 1: USER AND ROLE SETUP
-  # ===============================
-
-  - name: "fle-setup-admin-user"
-    description: "Create admin user with full FLE access"
-    args: ["user", "create", "fle_admin", "fle_admin@geode.dev", "--password", "${secret:admin_password}", "--role", "admin"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["admin", "created"]
-    tags: ["fle", "setup", "user", "admin"]
-
-  - name: "fle-setup-hr-manager-role"
-    description: "Create HR manager role with PII read permissions"
-    args: ["role", "create", "hr_manager", "--permissions", "read,write,pii_read"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["hr_manager", "created"]
-    tags: ["fle", "setup", "role", "hr"]
-
-  - name: "fle-setup-analyst-role"
-    description: "Create analyst role with limited read permissions (no PII)"
-    args: ["role", "create", "analyst", "--permissions", "read,query"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["analyst", "created"]
-    tags: ["fle", "setup", "role", "analyst"]
-
-  - name: "fle-setup-auditor-role"
-    description: "Create auditor role with audit log access"
-    args: ["role", "create", "auditor", "--permissions", "read,audit_read"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["auditor", "created"]
-    tags: ["fle", "setup", "role", "auditor"]
-
-  - name: "fle-setup-hr-manager-user"
-    description: "Create HR manager user"
-    args: ["user", "create", "hr_manager", "hr@geode.dev", "--password", "HrM4nager789!", "--role", "hr_manager"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["hr_manager", "created"]
-    tags: ["fle", "setup", "user", "hr"]
-
-  - name: "fle-setup-analyst-user"
-    description: "Create analyst user"
-    args: ["user", "create", "analyst_user", "analyst@geode.dev", "--password", "An4lyst456!", "--role", "analyst"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["analyst_user", "created"]
-    tags: ["fle", "setup", "user", "analyst"]
-
-  - name: "fle-setup-auditor-user"
-    description: "Create auditor user"
-    args: ["user", "create", "auditor_user", "auditor@geode.dev", "--password", "Aud1tor012!", "--role", "auditor"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["auditor_user", "created"]
-    tags: ["fle", "setup", "user", "auditor"]
-
-  - name: "fle-setup-regular-user"
-    description: "Create regular user with no PII access"
-    args: ["user", "create", "regular_user", "user@geode.dev", "--password", "RegUl4r345!", "--role", "user"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["regular_user", "created"]
-    tags: ["fle", "setup", "user", "regular"]
-
-  # ===============================
-  # PHASE 2: KEY HIERARCHY SETUP
-  # ===============================
-
-  - name: "fle-key-rotate-trk-default"
-    description: "Initialize/rotate Tenant Root Key for default tenant"
-    args: ["fle", "rotate-key", "default", "trk"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped TRK for default"
-    tags: ["fle", "key", "trk", "rotation"]
-
-  - name: "fle-key-rotate-trk-tenant-a"
-    description: "Initialize TRK for tenant_a (multi-tenant test)"
-    args: ["fle", "rotate-key", "tenant_a", "trk"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped TRK for tenant_a"
-    tags: ["fle", "key", "trk", "multi-tenant"]
-
-  - name: "fle-key-rotate-trk-tenant-b"
-    description: "Initialize TRK for tenant_b (multi-tenant test)"
-    args: ["fle", "rotate-key", "tenant_b", "trk"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped TRK for tenant_b"
-    tags: ["fle", "key", "trk", "multi-tenant"]
-
-  - name: "fle-key-rotate-sk-employee"
-    description: "Initialize Schema Key for Employee schema"
-    args: ["fle", "rotate-key", "default", "sk", "Employee"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped SK for default.Employee"
-    tags: ["fle", "key", "sk", "rotation"]
-
-  - name: "fle-key-rotate-sk-customer"
-    description: "Initialize Schema Key for Customer schema"
-    args: ["fle", "rotate-key", "default", "sk", "Customer"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped SK for default.Customer"
-    tags: ["fle", "key", "sk", "rotation"]
-
-  - name: "fle-key-rotate-sk-financial"
-    description: "Initialize Schema Key for Financial schema"
-    args: ["fle", "rotate-key", "default", "sk", "Financial"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped SK for default.Financial"
-    tags: ["fle", "key", "sk", "rotation"]
-
-  - name: "fle-key-rotate-fek-ssn"
-    description: "Initialize Field Encryption Key for Employee.ssn"
-    args: ["fle", "rotate-key", "default", "fek", "Employee", "ssn"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Employee.ssn"
-    tags: ["fle", "key", "fek", "rotation"]
-
-  - name: "fle-key-rotate-fek-salary"
-    description: "Initialize Field Encryption Key for Employee.salary"
-    args: ["fle", "rotate-key", "default", "fek", "Employee", "salary"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Employee.salary"
-    tags: ["fle", "key", "fek", "rotation"]
-
-  - name: "fle-key-rotate-fek-dob"
-    description: "Initialize Field Encryption Key for Employee.date_of_birth"
-    args: ["fle", "rotate-key", "default", "fek", "Employee", "date_of_birth"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Employee.date_of_birth"
-    tags: ["fle", "key", "fek", "rotation"]
-
-  - name: "fle-key-rotate-fek-customer-email"
-    description: "Initialize FEK for Customer.email"
-    args: ["fle", "rotate-key", "default", "fek", "Customer", "email"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Customer.email"
-    tags: ["fle", "key", "fek", "rotation"]
-
-  - name: "fle-key-rotate-fek-customer-phone"
-    description: "Initialize FEK for Customer.phone"
-    args: ["fle", "rotate-key", "default", "fek", "Customer", "phone"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Customer.phone"
-    tags: ["fle", "key", "fek", "rotation"]
-
-  - name: "fle-key-rotate-fek-account-number"
-    description: "Initialize FEK for Financial.account_number"
-    args: ["fle", "rotate-key", "default", "fek", "Financial", "account_number"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Financial.account_number"
-    tags: ["fle", "key", "fek", "rotation"]
-
-  - name: "fle-key-rotate-fek-routing-number"
-    description: "Initialize FEK for Financial.routing_number"
-    args: ["fle", "rotate-key", "default", "fek", "Financial", "routing_number"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Financial.routing_number"
-    tags: ["fle", "key", "fek", "rotation"]
-
-  # ===============================
-  # PHASE 3: TEST DATA CREATION
-  # ===============================
-
-  - name: "fle-create-encrypted-employee-data"
-    description: "Create employee records with PII fields (encrypted at rest)"
-    args: ["query",
-           "CREATE (e1:Employee {employee_id: 'EMP001', name: 'Alice Johnson', ssn: '123-45-6789', salary: 95000, date_of_birth: '1985-03-15', department: 'Engineering'}),
-                   (e2:Employee {employee_id: 'EMP002', name: 'Bob Smith', ssn: '987-65-4321', salary: 85000, date_of_birth: '1990-07-22', department: 'Marketing'}),
-                   (e3:Employee {employee_id: 'EMP003', name: 'Carol Williams', ssn: '456-78-9012', salary: 120000, date_of_birth: '1978-11-08', department: 'Engineering'}),
-                   (e4:Employee {employee_id: 'EMP004', name: 'David Brown', ssn: '234-56-7890', salary: 75000, date_of_birth: '1995-01-30', department: 'Support'}),
-                   (e5:Employee {employee_id: 'EMP005', name: 'Eve Davis', ssn: '567-89-0123', salary: 110000, date_of_birth: '1982-06-14', department: 'Engineering'})
-            RETURN count(*) AS employees_created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["employees_created"]
-    tags: ["fle", "data", "employee", "create"]
-
-  - name: "fle-create-encrypted-customer-data"
-    description: "Create customer records with encrypted contact info"
-    args: ["query",
-           "CREATE (c1:Customer {customer_id: 'CUST001', name: 'John Doe', email: 'john.doe@example.com', phone: '+1-555-0101', tier: 'Gold'}),
-                   (c2:Customer {customer_id: 'CUST002', name: 'Jane Smith', email: 'jane.smith@example.com', phone: '+1-555-0102', tier: 'Silver'}),
-                   (c3:Customer {customer_id: 'CUST003', name: 'Mike Wilson', email: 'mike.wilson@example.com', phone: '+1-555-0103', tier: 'Platinum'}),
-                   (c4:Customer {customer_id: 'CUST004', name: 'Sarah Connor', email: 'sarah.connor@example.com', phone: '+1-555-0104', tier: 'Gold'}),
-                   (c5:Customer {customer_id: 'CUST005', name: 'Tom Anderson', email: 'tom.anderson@example.com', phone: '+1-555-0105', tier: 'Silver'})
-            RETURN count(*) AS customers_created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["customers_created"]
-    tags: ["fle", "data", "customer", "create"]
-
-  - name: "fle-create-encrypted-financial-data"
-    description: "Create financial records with highly sensitive encrypted fields"
-    args: ["query",
-           "CREATE (f1:Financial {record_id: 'FIN001', employee_id: 'EMP001', account_number: '4111111111111111', routing_number: '021000021', balance: 15000}),
-                   (f2:Financial {record_id: 'FIN002', employee_id: 'EMP002', account_number: '4222222222222222', routing_number: '021000022', balance: 12000}),
-                   (f3:Financial {record_id: 'FIN003', employee_id: 'EMP003', account_number: '4333333333333333', routing_number: '021000023', balance: 25000}),
-                   (f4:Financial {record_id: 'FIN004', employee_id: 'EMP004', account_number: '4444444444444444', routing_number: '021000024', balance: 8000}),
-                   (f5:Financial {record_id: 'FIN005', employee_id: 'EMP005', account_number: '4555555555555555', routing_number: '021000025', balance: 20000})
-            RETURN count(*) AS financial_records_created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["financial_records_created"]
-    tags: ["fle", "data", "financial", "create"]
-
-  - name: "fle-create-employee-relationships"
-    description: "Create reporting relationships between employees"
-    args: ["query",
-           "MATCH (mgr:Employee {employee_id: 'EMP003'}), (e1:Employee {employee_id: 'EMP001'}), (e2:Employee {employee_id: 'EMP005'})
-            CREATE (e1)-[:REPORTS_TO]->(mgr), (e2)-[:REPORTS_TO]->(mgr)
-            RETURN count(*) AS relationships_created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["relationships_created"]
-    tags: ["fle", "data", "relationship", "create"]
-
-  # ===============================
-  # PHASE 4: ACCESS CONTROL - ADMIN ACCESS
-  # ===============================
-
-  - name: "fle-admin-read-all-pii"
-    description: "Admin can read all PII fields including SSN and salary"
-    args: ["query",
-           "MATCH (e:Employee) WHERE e.department = 'Engineering' RETURN e.name, e.ssn, e.salary ORDER BY e.salary DESC"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 3
-        columns: ["e.name", "e.ssn", "e.salary"]
-    tags: ["fle", "access", "admin", "pii"]
-
-  - name: "fle-admin-read-financial"
-    description: "Admin can read highly sensitive financial data"
-    args: ["query",
-           "MATCH (f:Financial) RETURN f.record_id, f.account_number, f.routing_number, f.balance ORDER BY f.balance DESC LIMIT 3"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 3
-        columns: ["f.record_id", "f.account_number", "f.routing_number", "f.balance"]
-    tags: ["fle", "access", "admin", "financial"]
-
-  - name: "fle-admin-read-customer-contact"
-    description: "Admin can read customer contact information"
-    args: ["query",
-           "MATCH (c:Customer) WHERE c.tier = 'Gold' RETURN c.name, c.email, c.phone ORDER BY c.name"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 2
-        columns: ["c.name", "c.email", "c.phone"]
-    tags: ["fle", "access", "admin", "customer"]
-
-  # ===============================
-  # PHASE 5: ACCESS CONTROL - HR MANAGER
-  # ===============================
-
-  - name: "fle-hr-read-employee-pii"
-    description: "HR manager can read employee PII (SSN for HR purposes)"
-    args: ["query",
-           "MATCH (e:Employee) RETURN e.name, e.employee_id, e.ssn, e.date_of_birth ORDER BY e.name"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 5
-        columns: ["e.name", "e.employee_id", "e.ssn", "e.date_of_birth"]
-    tags: ["fle", "access", "hr", "pii"]
-
-  - name: "fle-hr-read-salary-info"
-    description: "HR manager can read salary information"
-    args: ["query",
-           "MATCH (e:Employee) WHERE e.department = 'Engineering' RETURN e.name, e.salary, e.department ORDER BY e.salary DESC"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 3
-        columns: ["e.name", "e.salary", "e.department"]
-    tags: ["fle", "access", "hr", "salary"]
-
-  - name: "fle-hr-aggregate-salary"
-    description: "HR manager can perform salary aggregations"
-    args: ["query",
-           "MATCH (e:Employee) RETURN e.department, count(*) AS headcount, avg(e.salary) AS avg_salary, min(e.salary) AS min_salary, max(e.salary) AS max_salary GROUP BY e.department ORDER BY avg_salary DESC"]
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["e.department", "headcount", "avg_salary", "min_salary", "max_salary"]
-    tags: ["fle", "access", "hr", "aggregation"]
-
-  # ===============================
-  # PHASE 6: ACCESS CONTROL - ANALYST (NO PII)
-  # ===============================
-
-  - name: "fle-analyst-read-public-fields"
-    description: "Analyst can read non-encrypted fields"
-    args: ["query",
-           "MATCH (e:Employee) RETURN e.name, e.employee_id, e.department ORDER BY e.department"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 5
-        columns: ["e.name", "e.employee_id", "e.department"]
-    tags: ["fle", "access", "analyst", "public"]
-
-  - name: "fle-analyst-count-by-department"
-    description: "Analyst can perform aggregations on non-PII data"
-    args: ["query",
-           "MATCH (e:Employee) RETURN e.department, count(*) AS employee_count GROUP BY e.department ORDER BY employee_count DESC"]
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["e.department", "employee_count"]
-    tags: ["fle", "access", "analyst", "aggregation"]
-
-  - name: "fle-analyst-customer-tier-analysis"
-    description: "Analyst can analyze customer tiers without PII"
-    args: ["query",
-           "MATCH (c:Customer) RETURN c.tier, count(*) AS customer_count GROUP BY c.tier ORDER BY customer_count DESC"]
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["c.tier", "customer_count"]
-    tags: ["fle", "access", "analyst", "customer"]
-
-  # ===============================
-  # PHASE 7: REGULAR USER ACCESS (MINIMAL)
-  # ===============================
-
-  - name: "fle-user-basic-query"
-    description: "Regular user can perform basic authenticated queries"
-    args: ["query",
-           "RETURN 'authenticated' AS status, current_user() AS user"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["status", "user"]
-    tags: ["fle", "access", "user", "basic"]
-
-  - name: "fle-user-count-public-data"
-    description: "Regular user can count public records"
-    args: ["query",
-           "MATCH (e:Employee) RETURN count(*) AS total_employees"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["total_employees"]
-    tags: ["fle", "access", "user", "count"]
-
-  # ===============================
-  # PHASE 8: KEY ROTATION OPERATIONS
-  # ===============================
-
-  - name: "fle-rotate-employee-ssn-v2"
-    description: "Rotate SSN field encryption key to version 2"
-    args: ["fle", "rotate-key", "default", "fek", "Employee", "ssn"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Employee.ssn"
-    tags: ["fle", "rotation", "fek", "ssn"]
-
-  - name: "fle-rotate-employee-salary-v2"
-    description: "Rotate salary field encryption key to version 2"
-    args: ["fle", "rotate-key", "default", "fek", "Employee", "salary"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for default.Employee.salary"
-    tags: ["fle", "rotation", "fek", "salary"]
-
-  - name: "fle-rotate-sk-employee-v2"
-    description: "Rewrap Employee schema key"
-    args: ["fle", "rotate-key", "default", "sk", "Employee"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped SK for default.Employee"
-    tags: ["fle", "rotation", "sk"]
-
-  - name: "fle-rotate-trk-default-v2"
-    description: "Rewrap default tenant root key"
-    args: ["fle", "rotate-key", "default", "trk"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped TRK for default"
-    tags: ["fle", "rotation", "trk"]
-
-  - name: "fle-verify-data-after-rotation"
-    description: "Verify data is still accessible after key rotation"
-    args: ["query",
-           "MATCH (e:Employee {employee_id: 'EMP001'}) RETURN e.name, e.ssn, e.salary"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["e.name", "e.ssn", "e.salary"]
-    tags: ["fle", "rotation", "verify"]
-
-  # ===============================
-  # PHASE 9: MULTI-TENANT ISOLATION
-  # ===============================
-
-  - name: "fle-tenant-a-sk-setup"
-    description: "Initialize schema key for tenant_a"
-    args: ["fle", "rotate-key", "tenant_a", "sk", "TenantData"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped SK for tenant_a.TenantData"
-    tags: ["fle", "multi-tenant", "setup"]
-
-  - name: "fle-tenant-a-fek-setup"
-    description: "Initialize FEK for tenant_a sensitive field"
-    args: ["fle", "rotate-key", "tenant_a", "fek", "TenantData", "secret_value"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for tenant_a.TenantData.secret_value"
-    tags: ["fle", "multi-tenant", "setup"]
-
-  - name: "fle-tenant-b-sk-setup"
-    description: "Initialize schema key for tenant_b"
-    args: ["fle", "rotate-key", "tenant_b", "sk", "TenantData"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rewrapped SK for tenant_b.TenantData"
-    tags: ["fle", "multi-tenant", "setup"]
-
-  - name: "fle-tenant-b-fek-setup"
-    description: "Initialize FEK for tenant_b sensitive field"
-    args: ["fle", "rotate-key", "tenant_b", "fek", "TenantData", "secret_value"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK for tenant_b.TenantData.secret_value"
-    tags: ["fle", "multi-tenant", "setup"]
-
-  # ===============================
-  # PHASE 10: MIGRATION OPERATIONS
-  # ===============================
-  # Note: These tests verify proper error handling when schema isn't registered in FLE catalog
-  # A full migration test would require complex schema registration setup
-
-  - name: "fle-migrate-encrypt-notes"
-    description: "Test encryption migration error handling for unregistered schema"
-    args: ["fle", "migrate-encrypt", "default", "Employee", "notes", "500"]
-    expect:
-      exit_code: 1
-      stderr_contains: "not found in FLE catalog"
-    tags: ["fle", "migration", "encrypt", "error-handling"]
-
-  - name: "fle-migrate-encrypt-customer-address"
-    description: "Test encryption migration error handling for unregistered schema"
-    args: ["fle", "migrate-encrypt", "default", "Customer", "address", "1000"]
-    expect:
-      exit_code: 1
-      stderr_contains: "not found in FLE catalog"
-    tags: ["fle", "migration", "encrypt", "error-handling"]
-
-  # ===============================
-  # PHASE 11: GQL QUERY OPERATIONS WITH FLE
-  # ===============================
-
-  - name: "fle-query-join-employee-financial"
-    description: "Query joining employee and financial data (admin only)"
-    args: ["query",
-           "MATCH (e:Employee), (f:Financial) WHERE e.employee_id = f.employee_id RETURN e.name, e.ssn, f.account_number, f.balance ORDER BY f.balance DESC LIMIT 3"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 3
-        columns: ["e.name", "e.ssn", "f.account_number", "f.balance"]
-    tags: ["fle", "query", "join", "admin"]
-
-  - name: "fle-query-filter-encrypted-field"
-    description: "Query filtering on encrypted salary field"
-    args: ["query",
-           "MATCH (e:Employee) WHERE e.salary >= 100000 RETURN e.name, e.department, e.salary ORDER BY e.salary DESC"]
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["e.name", "e.department", "e.salary"]
-    tags: ["fle", "query", "filter", "encrypted"]
-
-  - name: "fle-query-aggregation-encrypted"
-    description: "Aggregation query on encrypted field"
-    args: ["query",
-           "MATCH (e:Employee) RETURN sum(e.salary) AS total_salary, avg(e.salary) AS avg_salary, count(*) AS employee_count"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["total_salary", "avg_salary", "employee_count"]
-    tags: ["fle", "query", "aggregation", "encrypted"]
-
-  - name: "fle-query-path-traversal"
-    description: "Path traversal query with encrypted fields"
-    args: ["query",
-           "MATCH (e:Employee)-[:REPORTS_TO]->(mgr:Employee) RETURN e.name, e.salary, mgr.name AS manager, mgr.salary AS manager_salary ORDER BY e.name"]
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["e.name", "e.salary", "manager", "manager_salary"]
-    tags: ["fle", "query", "traversal", "encrypted"]
-
-  - name: "fle-query-optional-match"
-    description: "OPTIONAL MATCH with encrypted fields"
-    args: ["query",
-           "MATCH (e:Employee) OPTIONAL MATCH (e)-[:REPORTS_TO]->(mgr:Employee) RETURN e.name, e.salary, mgr.name AS manager ORDER BY e.name"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 5
-        columns: ["e.name", "e.salary", "manager"]
-    tags: ["fle", "query", "optional", "encrypted"]
-
-  # ===============================
-  # PHASE 12: WRITE OPERATIONS WITH FLE
-  # ===============================
-
-  - name: "fle-update-encrypted-salary"
-    description: "Update encrypted salary field"
-    args: ["query",
-           "MATCH (e:Employee {employee_id: 'EMP001'}) SET e.salary = 98000 RETURN e.name, e.salary"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["e.name", "e.salary"]
-    tags: ["fle", "update", "encrypted"]
-
-  - name: "fle-create-new-employee-with-pii"
-    description: "Create new employee with encrypted PII fields"
-    args: ["query",
-           "CREATE (e:Employee {employee_id: 'EMP006', name: 'Frank Miller', ssn: '678-90-1234', salary: 88000, date_of_birth: '1992-04-20', department: 'Marketing'}) RETURN e.employee_id, e.name"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["e.employee_id", "e.name"]
-    tags: ["fle", "create", "encrypted"]
-
-  - name: "fle-verify-new-employee"
-    description: "Verify newly created employee with encrypted fields"
-    args: ["query",
-           "MATCH (e:Employee {employee_id: 'EMP006'}) RETURN e.name, e.ssn, e.salary, e.department"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["e.name", "e.ssn", "e.salary", "e.department"]
-    tags: ["fle", "verify", "encrypted"]
-
-  # ===============================
-  # PHASE 13: STRESS TESTING
-  # ===============================
-
-  - name: "fle-stress-multiple-key-rotations"
-    description: "Multiple sequential key rotations"
-    args: ["fle", "rotate-key", "default", "fek", "Employee", "ssn"]
-    expect:
-      exit_code: 0
-      stdout_contains: "Rotated FEK"
-    tags: ["fle", "stress", "rotation"]
-
-  - name: "fle-stress-rotation-then-query"
-    description: "Query immediately after rotation"
-    args: ["query",
-           "MATCH (e:Employee) RETURN count(*) AS count, collect(e.ssn) AS ssns"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["count", "ssns"]
-    tags: ["fle", "stress", "post-rotation"]
-
-  - name: "fle-stress-bulk-query-encrypted"
-    description: "Bulk query accessing multiple encrypted fields"
-    args: ["query",
-           "MATCH (e:Employee), (f:Financial) WHERE e.employee_id = f.employee_id RETURN e.name, e.ssn, e.salary, e.date_of_birth, f.account_number, f.routing_number, f.balance ORDER BY e.name"]
-    expect:
-      exit_code: 0
-      geode_query:
-        columns: ["e.name", "e.ssn", "e.salary", "e.date_of_birth", "f.account_number", "f.routing_number", "f.balance"]
-    tags: ["fle", "stress", "bulk"]
-
-  # ===============================
-  # PHASE 14: AUDIT AND COMPLIANCE
-  # ===============================
-
-  - name: "fle-audit-pii-access"
-    description: "Audit PII field access (admin query with audit flag)"
-    args: ["query", "--audit",
-           "MATCH (e:Employee) RETURN e.name, e.ssn LIMIT 1"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["e.name", "e.ssn"]
-    tags: ["fle", "audit", "pii"]
-
-  - name: "fle-audit-financial-access"
-    description: "Audit financial data access"
-    args: ["query", "--audit",
-           "MATCH (f:Financial) RETURN f.record_id, f.account_number LIMIT 1"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["f.record_id", "f.account_number"]
-    tags: ["fle", "audit", "financial"]
-
-  # ===============================
-  # PHASE 15: ERROR HANDLING
-  # ===============================
-
-  - name: "fle-error-invalid-scope"
-    description: "Test error handling for invalid key rotation scope"
-    args: ["fle", "rotate-key", "default", "invalid_scope", "Employee"]
-    expect:
-      exit_code: 1
-      stderr_contains: "unknown scope"
-    tags: ["fle", "error", "scope"]
-
-  - name: "fle-error-missing-tenant"
-    description: "Test error handling for missing tenant argument"
-    args: ["fle", "rotate-key"]
-    expect:
-      exit_code: 1
-      stderr_contains: "requires"
-    tags: ["fle", "error", "args"]
-
-  - name: "fle-error-missing-fek-field"
-    description: "Test error handling for missing field in FEK rotation"
-    args: ["fle", "rotate-key", "default", "fek", "Employee"]
-    expect:
-      exit_code: 1
-      stderr_contains: "requires"
-    tags: ["fle", "error", "fek"]
-
-  # ===============================
-  # PHASE 16: CLEANUP
-  # ===============================
-
-  - name: "fle-cleanup-financial-data"
-    description: "Clean up financial test data"
-    args: ["query",
-           "MATCH (f:Financial) DETACH DELETE f RETURN count(*) AS deleted"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup"]
-
-  - name: "fle-cleanup-customer-data"
-    description: "Clean up customer test data"
-    args: ["query",
-           "MATCH (c:Customer) DETACH DELETE c RETURN count(*) AS deleted"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup"]
-
-  - name: "fle-cleanup-employee-data"
-    description: "Clean up employee test data"
-    args: ["query",
-           "MATCH (e:Employee) DETACH DELETE e RETURN count(*) AS deleted"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup"]
-
-  - name: "fle-cleanup-verify-empty"
-    description: "Verify all test data cleaned up"
-    args: ["query",
-           "MATCH (n) WHERE n:Employee OR n:Customer OR n:Financial RETURN count(*) AS remaining"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "cleanup", "verify"]
-
-  - name: "fle-cleanup-users"
-    description: "Clean up test users"
-    args: ["user", "delete", "analyst_user"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup", "user"]
-
-  - name: "fle-cleanup-hr-user"
-    description: "Clean up HR manager user"
-    args: ["user", "delete", "hr_manager"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup", "user"]
-
-  - name: "fle-cleanup-auditor-user"
-    description: "Clean up auditor user"
-    args: ["user", "delete", "auditor_user"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup", "user"]
-
-  - name: "fle-cleanup-regular-user"
-    description: "Clean up regular user"
-    args: ["user", "delete", "regular_user"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup", "user"]
-
-  - name: "fle-cleanup-admin-user"
-    description: "Clean up admin user (last)"
-    args: ["user", "delete", "fle_admin"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup", "user"]
-
-  - name: "fle-cleanup-roles"
-    description: "Clean up test roles"
-    args: ["role", "delete", "hr_manager"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup", "role"]
-
-  - name: "fle-cleanup-analyst-role"
-    description: "Clean up analyst role"
-    args: ["role", "delete", "analyst"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup", "role"]
-
-  - name: "fle-cleanup-auditor-role"
-    description: "Clean up auditor role"
-    args: ["role", "delete", "auditor"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "cleanup", "role"]
-
+- name: fle-setup-admin-user
+  description: Create admin user with full FLE access
+  args:
+  - user
+  - create
+  - fle_admin
+  - fle_admin@geode.dev
+  - --password
+  - ${secret:admin_password}
+  - --role
+  - admin
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - admin
+    - created
+  tags:
+  - fle
+  - setup
+  - user
+  - admin
+- name: fle-setup-hr-manager-role
+  description: Create HR manager role with PII read permissions
+  args:
+  - role
+  - create
+  - hr_manager
+  - --permissions
+  - read,write,pii_read
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hr_manager
+    - created
+  tags:
+  - fle
+  - setup
+  - role
+  - hr
+- name: fle-setup-analyst-role
+  description: Create analyst role with limited read permissions (no PII)
+  args:
+  - role
+  - create
+  - analyst
+  - --permissions
+  - read,query
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - analyst
+    - created
+  tags:
+  - fle
+  - setup
+  - role
+  - analyst
+- name: fle-setup-auditor-role
+  description: Create auditor role with audit log access
+  args:
+  - role
+  - create
+  - auditor
+  - --permissions
+  - read,audit_read
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - auditor
+    - created
+  tags:
+  - fle
+  - setup
+  - role
+  - auditor
+- name: fle-setup-hr-manager-user
+  description: Create HR manager user
+  args:
+  - user
+  - create
+  - hr_manager
+  - hr@geode.dev
+  - --password
+  - HrM4nager789!
+  - --role
+  - hr_manager
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hr_manager
+    - created
+  tags:
+  - fle
+  - setup
+  - user
+  - hr
+- name: fle-setup-analyst-user
+  description: Create analyst user
+  args:
+  - user
+  - create
+  - analyst_user
+  - analyst@geode.dev
+  - --password
+  - An4lyst456!
+  - --role
+  - analyst
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - analyst_user
+    - created
+  tags:
+  - fle
+  - setup
+  - user
+  - analyst
+- name: fle-setup-auditor-user
+  description: Create auditor user
+  args:
+  - user
+  - create
+  - auditor_user
+  - auditor@geode.dev
+  - --password
+  - Aud1tor012!
+  - --role
+  - auditor
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - auditor_user
+    - created
+  tags:
+  - fle
+  - setup
+  - user
+  - auditor
+- name: fle-setup-regular-user
+  description: Create regular user with no PII access
+  args:
+  - user
+  - create
+  - regular_user
+  - user@geode.dev
+  - --password
+  - RegUl4r345!
+  - --role
+  - user
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - regular_user
+    - created
+  tags:
+  - fle
+  - setup
+  - user
+  - regular
+- name: fle-key-rotate-trk-default
+  description: Initialize/rotate Tenant Root Key for default tenant
+  args:
+  - fle
+  - rotate-key
+  - default
+  - trk
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped TRK for default
+  tags:
+  - fle
+  - key
+  - trk
+  - rotation
+- name: fle-key-rotate-trk-tenant-a
+  description: Initialize TRK for tenant_a (multi-tenant test)
+  args:
+  - fle
+  - rotate-key
+  - tenant_a
+  - trk
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped TRK for tenant_a
+  tags:
+  - fle
+  - key
+  - trk
+  - multi-tenant
+- name: fle-key-rotate-trk-tenant-b
+  description: Initialize TRK for tenant_b (multi-tenant test)
+  args:
+  - fle
+  - rotate-key
+  - tenant_b
+  - trk
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped TRK for tenant_b
+  tags:
+  - fle
+  - key
+  - trk
+  - multi-tenant
+- name: fle-key-rotate-sk-employee
+  description: Initialize Schema Key for Employee schema
+  args:
+  - fle
+  - rotate-key
+  - default
+  - sk
+  - Employee
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped SK for default.Employee
+  tags:
+  - fle
+  - key
+  - sk
+  - rotation
+- name: fle-key-rotate-sk-customer
+  description: Initialize Schema Key for Customer schema
+  args:
+  - fle
+  - rotate-key
+  - default
+  - sk
+  - Customer
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped SK for default.Customer
+  tags:
+  - fle
+  - key
+  - sk
+  - rotation
+- name: fle-key-rotate-sk-financial
+  description: Initialize Schema Key for Financial schema
+  args:
+  - fle
+  - rotate-key
+  - default
+  - sk
+  - Financial
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped SK for default.Financial
+  tags:
+  - fle
+  - key
+  - sk
+  - rotation
+- name: fle-key-rotate-fek-ssn
+  description: Initialize Field Encryption Key for Employee.ssn
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Employee
+  - ssn
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Employee.ssn
+  tags:
+  - fle
+  - key
+  - fek
+  - rotation
+- name: fle-key-rotate-fek-salary
+  description: Initialize Field Encryption Key for Employee.salary
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Employee
+  - salary
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Employee.salary
+  tags:
+  - fle
+  - key
+  - fek
+  - rotation
+- name: fle-key-rotate-fek-dob
+  description: Initialize Field Encryption Key for Employee.date_of_birth
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Employee
+  - date_of_birth
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Employee.date_of_birth
+  tags:
+  - fle
+  - key
+  - fek
+  - rotation
+- name: fle-key-rotate-fek-customer-email
+  description: Initialize FEK for Customer.email
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Customer
+  - email
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Customer.email
+  tags:
+  - fle
+  - key
+  - fek
+  - rotation
+- name: fle-key-rotate-fek-customer-phone
+  description: Initialize FEK for Customer.phone
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Customer
+  - phone
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Customer.phone
+  tags:
+  - fle
+  - key
+  - fek
+  - rotation
+- name: fle-key-rotate-fek-account-number
+  description: Initialize FEK for Financial.account_number
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Financial
+  - account_number
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Financial.account_number
+  tags:
+  - fle
+  - key
+  - fek
+  - rotation
+- name: fle-key-rotate-fek-routing-number
+  description: Initialize FEK for Financial.routing_number
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Financial
+  - routing_number
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Financial.routing_number
+  tags:
+  - fle
+  - key
+  - fek
+  - rotation
+- name: fle-create-encrypted-employee-data
+  description: Create employee records with PII fields (encrypted at rest)
+  args:
+  - query
+  - 'CREATE (e1:Employee {employee_id: ''EMP001'', name: ''Alice Johnson'', ssn: ''123-45-6789'',
+    salary: 95000, date_of_birth: ''1985-03-15'', department: ''Engineering''}), (e2:Employee
+    {employee_id: ''EMP002'', name: ''Bob Smith'', ssn: ''987-65-4321'', salary: 85000,
+    date_of_birth: ''1990-07-22'', department: ''Marketing''}), (e3:Employee {employee_id:
+    ''EMP003'', name: ''Carol Williams'', ssn: ''456-78-9012'', salary: 120000, date_of_birth:
+    ''1978-11-08'', department: ''Engineering''}), (e4:Employee {employee_id: ''EMP004'',
+    name: ''David Brown'', ssn: ''234-56-7890'', salary: 75000, date_of_birth: ''1995-01-30'',
+    department: ''Support''}), (e5:Employee {employee_id: ''EMP005'', name: ''Eve
+    Davis'', ssn: ''567-89-0123'', salary: 110000, date_of_birth: ''1982-06-14'',
+    department: ''Engineering''}) RETURN count(*) AS employees_created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - employees_created
+  tags:
+  - fle
+  - data
+  - employee
+  - create
+- name: fle-create-encrypted-customer-data
+  description: Create customer records with encrypted contact info
+  args:
+  - query
+  - 'CREATE (c1:Customer {customer_id: ''CUST001'', name: ''John Doe'', email: ''john.doe@example.com'',
+    phone: ''+1-555-0101'', tier: ''Gold''}), (c2:Customer {customer_id: ''CUST002'',
+    name: ''Jane Smith'', email: ''jane.smith@example.com'', phone: ''+1-555-0102'',
+    tier: ''Silver''}), (c3:Customer {customer_id: ''CUST003'', name: ''Mike Wilson'',
+    email: ''mike.wilson@example.com'', phone: ''+1-555-0103'', tier: ''Platinum''}),
+    (c4:Customer {customer_id: ''CUST004'', name: ''Sarah Connor'', email: ''sarah.connor@example.com'',
+    phone: ''+1-555-0104'', tier: ''Gold''}), (c5:Customer {customer_id: ''CUST005'',
+    name: ''Tom Anderson'', email: ''tom.anderson@example.com'', phone: ''+1-555-0105'',
+    tier: ''Silver''}) RETURN count(*) AS customers_created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - customers_created
+  tags:
+  - fle
+  - data
+  - customer
+  - create
+- name: fle-create-encrypted-financial-data
+  description: Create financial records with highly sensitive encrypted fields
+  args:
+  - query
+  - 'CREATE (f1:Financial {record_id: ''FIN001'', employee_id: ''EMP001'', account_number:
+    ''4111111111111111'', routing_number: ''021000021'', balance: 15000}), (f2:Financial
+    {record_id: ''FIN002'', employee_id: ''EMP002'', account_number: ''4222222222222222'',
+    routing_number: ''021000022'', balance: 12000}), (f3:Financial {record_id: ''FIN003'',
+    employee_id: ''EMP003'', account_number: ''4333333333333333'', routing_number:
+    ''021000023'', balance: 25000}), (f4:Financial {record_id: ''FIN004'', employee_id:
+    ''EMP004'', account_number: ''4444444444444444'', routing_number: ''021000024'',
+    balance: 8000}), (f5:Financial {record_id: ''FIN005'', employee_id: ''EMP005'',
+    account_number: ''4555555555555555'', routing_number: ''021000025'', balance:
+    20000}) RETURN count(*) AS financial_records_created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - financial_records_created
+  tags:
+  - fle
+  - data
+  - financial
+  - create
+- name: fle-create-employee-relationships
+  description: Create reporting relationships between employees
+  args:
+  - query
+  - 'MATCH (mgr:Employee {employee_id: ''EMP003''}), (e1:Employee {employee_id: ''EMP001''}),
+    (e2:Employee {employee_id: ''EMP005''}) CREATE (e1)-[:REPORTS_TO]->(mgr), (e2)-[:REPORTS_TO]->(mgr)
+    RETURN count(*) AS relationships_created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - relationships_created
+  tags:
+  - fle
+  - data
+  - relationship
+  - create
+- name: fle-admin-read-all-pii
+  description: Admin can read all PII fields including SSN and salary
+  args:
+  - query
+  - MATCH (e:Employee) WHERE e.department = 'Engineering' RETURN e.name, e.ssn, e.salary
+    ORDER BY e.salary DESC
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 3
+      columns:
+      - e.name
+      - e.ssn
+      - e.salary
+  tags:
+  - fle
+  - access
+  - admin
+  - pii
+- name: fle-admin-read-financial
+  description: Admin can read highly sensitive financial data
+  args:
+  - query
+  - MATCH (f:Financial) RETURN f.record_id, f.account_number, f.routing_number, f.balance
+    ORDER BY f.balance DESC LIMIT 3
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 3
+      columns:
+      - f.record_id
+      - f.account_number
+      - f.routing_number
+      - f.balance
+  tags:
+  - fle
+  - access
+  - admin
+  - financial
+- name: fle-admin-read-customer-contact
+  description: Admin can read customer contact information
+  args:
+  - query
+  - MATCH (c:Customer) WHERE c.tier = 'Gold' RETURN c.name, c.email, c.phone ORDER
+    BY c.name
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 2
+      columns:
+      - c.name
+      - c.email
+      - c.phone
+  tags:
+  - fle
+  - access
+  - admin
+  - customer
+- name: fle-hr-read-employee-pii
+  description: HR manager can read employee PII (SSN for HR purposes)
+  args:
+  - query
+  - MATCH (e:Employee) RETURN e.name, e.employee_id, e.ssn, e.date_of_birth ORDER
+    BY e.name
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 5
+      columns:
+      - e.name
+      - e.employee_id
+      - e.ssn
+      - e.date_of_birth
+  tags:
+  - fle
+  - access
+  - hr
+  - pii
+- name: fle-hr-read-salary-info
+  description: HR manager can read salary information
+  args:
+  - query
+  - MATCH (e:Employee) WHERE e.department = 'Engineering' RETURN e.name, e.salary,
+    e.department ORDER BY e.salary DESC
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 3
+      columns:
+      - e.name
+      - e.salary
+      - e.department
+  tags:
+  - fle
+  - access
+  - hr
+  - salary
+- name: fle-hr-aggregate-salary
+  description: HR manager can perform salary aggregations
+  args:
+  - query
+  - MATCH (e:Employee) RETURN e.department, count(*) AS headcount, avg(e.salary) AS
+    avg_salary, min(e.salary) AS min_salary, max(e.salary) AS max_salary GROUP BY
+    e.department ORDER BY avg_salary DESC
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - e.department
+      - headcount
+      - avg_salary
+      - min_salary
+      - max_salary
+  tags:
+  - fle
+  - access
+  - hr
+  - aggregation
+- name: fle-analyst-read-public-fields
+  description: Analyst can read non-encrypted fields
+  args:
+  - query
+  - MATCH (e:Employee) RETURN e.name, e.employee_id, e.department ORDER BY e.department
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 5
+      columns:
+      - e.name
+      - e.employee_id
+      - e.department
+  tags:
+  - fle
+  - access
+  - analyst
+  - public
+- name: fle-analyst-count-by-department
+  description: Analyst can perform aggregations on non-PII data
+  args:
+  - query
+  - MATCH (e:Employee) RETURN e.department, count(*) AS employee_count GROUP BY e.department
+    ORDER BY employee_count DESC
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - e.department
+      - employee_count
+  tags:
+  - fle
+  - access
+  - analyst
+  - aggregation
+- name: fle-analyst-customer-tier-analysis
+  description: Analyst can analyze customer tiers without PII
+  args:
+  - query
+  - MATCH (c:Customer) RETURN c.tier, count(*) AS customer_count GROUP BY c.tier ORDER
+    BY customer_count DESC
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - c.tier
+      - customer_count
+  tags:
+  - fle
+  - access
+  - analyst
+  - customer
+- name: fle-user-basic-query
+  description: Regular user can perform basic authenticated queries
+  args:
+  - query
+  - RETURN 'authenticated' AS status, current_user() AS user
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - status
+      - user
+  tags:
+  - fle
+  - access
+  - user
+  - basic
+- name: fle-user-count-public-data
+  description: Regular user can count public records
+  args:
+  - query
+  - MATCH (e:Employee) RETURN count(*) AS total_employees
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - total_employees
+  tags:
+  - fle
+  - access
+  - user
+  - count
+- name: fle-rotate-employee-ssn-v2
+  description: Rotate SSN field encryption key to version 2
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Employee
+  - ssn
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Employee.ssn
+  tags:
+  - fle
+  - rotation
+  - fek
+  - ssn
+- name: fle-rotate-employee-salary-v2
+  description: Rotate salary field encryption key to version 2
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Employee
+  - salary
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for default.Employee.salary
+  tags:
+  - fle
+  - rotation
+  - fek
+  - salary
+- name: fle-rotate-sk-employee-v2
+  description: Rewrap Employee schema key
+  args:
+  - fle
+  - rotate-key
+  - default
+  - sk
+  - Employee
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped SK for default.Employee
+  tags:
+  - fle
+  - rotation
+  - sk
+- name: fle-rotate-trk-default-v2
+  description: Rewrap default tenant root key
+  args:
+  - fle
+  - rotate-key
+  - default
+  - trk
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped TRK for default
+  tags:
+  - fle
+  - rotation
+  - trk
+- name: fle-verify-data-after-rotation
+  description: Verify data is still accessible after key rotation
+  args:
+  - query
+  - 'MATCH (e:Employee {employee_id: ''EMP001''}) RETURN e.name, e.ssn, e.salary'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - e.name
+      - e.ssn
+      - e.salary
+  tags:
+  - fle
+  - rotation
+  - verify
+- name: fle-tenant-a-sk-setup
+  description: Initialize schema key for tenant_a
+  args:
+  - fle
+  - rotate-key
+  - tenant_a
+  - sk
+  - TenantData
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped SK for tenant_a.TenantData
+  tags:
+  - fle
+  - multi-tenant
+  - setup
+- name: fle-tenant-a-fek-setup
+  description: Initialize FEK for tenant_a sensitive field
+  args:
+  - fle
+  - rotate-key
+  - tenant_a
+  - fek
+  - TenantData
+  - secret_value
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for tenant_a.TenantData.secret_value
+  tags:
+  - fle
+  - multi-tenant
+  - setup
+- name: fle-tenant-b-sk-setup
+  description: Initialize schema key for tenant_b
+  args:
+  - fle
+  - rotate-key
+  - tenant_b
+  - sk
+  - TenantData
+  expect:
+    exit_code: 0
+    stdout_contains: Rewrapped SK for tenant_b.TenantData
+  tags:
+  - fle
+  - multi-tenant
+  - setup
+- name: fle-tenant-b-fek-setup
+  description: Initialize FEK for tenant_b sensitive field
+  args:
+  - fle
+  - rotate-key
+  - tenant_b
+  - fek
+  - TenantData
+  - secret_value
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK for tenant_b.TenantData.secret_value
+  tags:
+  - fle
+  - multi-tenant
+  - setup
+- name: fle-migrate-encrypt-notes
+  description: Test encryption migration error handling for unregistered schema
+  args:
+  - fle
+  - migrate-encrypt
+  - default
+  - Employee
+  - notes
+  - '500'
+  expect:
+    exit_code: 1
+    stderr_contains: not found in FLE catalog
+  tags:
+  - fle
+  - migration
+  - encrypt
+  - error-handling
+- name: fle-migrate-encrypt-customer-address
+  description: Test encryption migration error handling for unregistered schema
+  args:
+  - fle
+  - migrate-encrypt
+  - default
+  - Customer
+  - address
+  - '1000'
+  expect:
+    exit_code: 1
+    stderr_contains: not found in FLE catalog
+  tags:
+  - fle
+  - migration
+  - encrypt
+  - error-handling
+- name: fle-query-join-employee-financial
+  description: Query joining employee and financial data (admin only)
+  args:
+  - query
+  - MATCH (e:Employee), (f:Financial) WHERE e.employee_id = f.employee_id RETURN e.name,
+    e.ssn, f.account_number, f.balance ORDER BY f.balance DESC LIMIT 3
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 3
+      columns:
+      - e.name
+      - e.ssn
+      - f.account_number
+      - f.balance
+  tags:
+  - fle
+  - query
+  - join
+  - admin
+- name: fle-query-filter-encrypted-field
+  description: Query filtering on encrypted salary field
+  args:
+  - query
+  - MATCH (e:Employee) WHERE e.salary >= 100000 RETURN e.name, e.department, e.salary
+    ORDER BY e.salary DESC
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - e.name
+      - e.department
+      - e.salary
+  tags:
+  - fle
+  - query
+  - filter
+  - encrypted
+- name: fle-query-aggregation-encrypted
+  description: Aggregation query on encrypted field
+  args:
+  - query
+  - MATCH (e:Employee) RETURN sum(e.salary) AS total_salary, avg(e.salary) AS avg_salary,
+    count(*) AS employee_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - total_salary
+      - avg_salary
+      - employee_count
+  tags:
+  - fle
+  - query
+  - aggregation
+  - encrypted
+- name: fle-query-path-traversal
+  description: Path traversal query with encrypted fields
+  args:
+  - query
+  - MATCH (e:Employee)-[:REPORTS_TO]->(mgr:Employee) RETURN e.name, e.salary, mgr.name
+    AS manager, mgr.salary AS manager_salary ORDER BY e.name
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - e.name
+      - e.salary
+      - manager
+      - manager_salary
+  tags:
+  - fle
+  - query
+  - traversal
+  - encrypted
+- name: fle-query-optional-match
+  description: OPTIONAL MATCH with encrypted fields
+  args:
+  - query
+  - MATCH (e:Employee) OPTIONAL MATCH (e)-[:REPORTS_TO]->(mgr:Employee) RETURN e.name,
+    e.salary, mgr.name AS manager ORDER BY e.name
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 5
+      columns:
+      - e.name
+      - e.salary
+      - manager
+  tags:
+  - fle
+  - query
+  - optional
+  - encrypted
+- name: fle-update-encrypted-salary
+  description: Update encrypted salary field
+  args:
+  - query
+  - 'MATCH (e:Employee {employee_id: ''EMP001''}) SET e.salary = 98000 RETURN e.name,
+    e.salary'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - e.name
+      - e.salary
+  tags:
+  - fle
+  - update
+  - encrypted
+- name: fle-create-new-employee-with-pii
+  description: Create new employee with encrypted PII fields
+  args:
+  - query
+  - 'CREATE (e:Employee {employee_id: ''EMP006'', name: ''Frank Miller'', ssn: ''678-90-1234'',
+    salary: 88000, date_of_birth: ''1992-04-20'', department: ''Marketing''}) RETURN
+    e.employee_id, e.name'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - e.employee_id
+      - e.name
+  tags:
+  - fle
+  - create
+  - encrypted
+- name: fle-verify-new-employee
+  description: Verify newly created employee with encrypted fields
+  args:
+  - query
+  - 'MATCH (e:Employee {employee_id: ''EMP006''}) RETURN e.name, e.ssn, e.salary,
+    e.department'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - e.name
+      - e.ssn
+      - e.salary
+      - e.department
+  tags:
+  - fle
+  - verify
+  - encrypted
+- name: fle-stress-multiple-key-rotations
+  description: Multiple sequential key rotations
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Employee
+  - ssn
+  expect:
+    exit_code: 0
+    stdout_contains: Rotated FEK
+  tags:
+  - fle
+  - stress
+  - rotation
+- name: fle-stress-rotation-then-query
+  description: Query immediately after rotation
+  args:
+  - query
+  - MATCH (e:Employee) RETURN count(*) AS count, collect(e.ssn) AS ssns
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - count
+      - ssns
+  tags:
+  - fle
+  - stress
+  - post-rotation
+- name: fle-stress-bulk-query-encrypted
+  description: Bulk query accessing multiple encrypted fields
+  args:
+  - query
+  - MATCH (e:Employee), (f:Financial) WHERE e.employee_id = f.employee_id RETURN e.name,
+    e.ssn, e.salary, e.date_of_birth, f.account_number, f.routing_number, f.balance
+    ORDER BY e.name
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - e.name
+      - e.ssn
+      - e.salary
+      - e.date_of_birth
+      - f.account_number
+      - f.routing_number
+      - f.balance
+  tags:
+  - fle
+  - stress
+  - bulk
+- name: fle-audit-pii-access
+  description: Audit PII field access (admin query with audit flag)
+  args:
+  - query
+  - --audit
+  - MATCH (e:Employee) RETURN e.name, e.ssn LIMIT 1
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - e.name
+      - e.ssn
+  tags:
+  - fle
+  - audit
+  - pii
+- name: fle-audit-financial-access
+  description: Audit financial data access
+  args:
+  - query
+  - --audit
+  - MATCH (f:Financial) RETURN f.record_id, f.account_number LIMIT 1
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - f.record_id
+      - f.account_number
+  tags:
+  - fle
+  - audit
+  - financial
+- name: fle-error-invalid-scope
+  description: Test error handling for invalid key rotation scope
+  args:
+  - fle
+  - rotate-key
+  - default
+  - invalid_scope
+  - Employee
+  expect:
+    exit_code: 1
+    stderr_contains: unknown scope
+  tags:
+  - fle
+  - error
+  - scope
+- name: fle-error-missing-tenant
+  description: Test error handling for missing tenant argument
+  args:
+  - fle
+  - rotate-key
+  expect:
+    exit_code: 1
+    stderr_contains: requires
+  tags:
+  - fle
+  - error
+  - args
+- name: fle-error-missing-fek-field
+  description: Test error handling for missing field in FEK rotation
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - Employee
+  expect:
+    exit_code: 1
+    stderr_contains: requires
+  tags:
+  - fle
+  - error
+  - fek
+- name: fle-cleanup-financial-data
+  description: Clean up financial test data
+  args:
+  - query
+  - MATCH (f:Financial) DETACH DELETE f RETURN count(*) AS deleted
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+- name: fle-cleanup-customer-data
+  description: Clean up customer test data
+  args:
+  - query
+  - MATCH (c:Customer) DETACH DELETE c RETURN count(*) AS deleted
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+- name: fle-cleanup-employee-data
+  description: Clean up employee test data
+  args:
+  - query
+  - MATCH (e:Employee) DETACH DELETE e RETURN count(*) AS deleted
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+- name: fle-cleanup-verify-empty
+  description: Verify all test data cleaned up
+  args:
+  - query
+  - MATCH (n) WHERE n:Employee OR n:Customer OR n:Financial RETURN count(*) AS remaining
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - cleanup
+  - verify
+- name: fle-cleanup-users
+  description: Clean up test users
+  args:
+  - user
+  - delete
+  - analyst_user
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+  - user
+- name: fle-cleanup-hr-user
+  description: Clean up HR manager user
+  args:
+  - user
+  - delete
+  - hr_manager
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+  - user
+- name: fle-cleanup-auditor-user
+  description: Clean up auditor user
+  args:
+  - user
+  - delete
+  - auditor_user
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+  - user
+- name: fle-cleanup-regular-user
+  description: Clean up regular user
+  args:
+  - user
+  - delete
+  - regular_user
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+  - user
+- name: fle-cleanup-admin-user
+  description: Clean up admin user (last)
+  args:
+  - user
+  - delete
+  - fle_admin
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+  - user
+- name: fle-cleanup-roles
+  description: Clean up test roles
+  args:
+  - role
+  - delete
+  - hr_manager
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+  - role
+- name: fle-cleanup-analyst-role
+  description: Clean up analyst role
+  args:
+  - role
+  - delete
+  - analyst
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+  - role
+- name: fle-cleanup-auditor-role
+  description: Clean up auditor role
+  args:
+  - role
+  - delete
+  - auditor
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - cleanup
+  - role
 invariants:
-  - type: "server_running"
-
-tags: ["fle", "field-level-encryption", "security", "pii", "compliance", "access-control", "key-management", "multi-tenant", "comprehensive"]
+- type: server_running
+tags:
+- fle
+- field-level-encryption
+- security
+- pii
+- compliance
+- access-control
+- key-management
+- multi-tenant
+- comprehensive

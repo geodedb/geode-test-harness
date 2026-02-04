@@ -1,251 +1,284 @@
-version: "1.0"
-name: "Geode Advanced Features Tests"
-description: "Advanced Geode functionality including complex queries, authentication, and performance testing"
-
+version: '1.0'
+name: Geode Advanced Features Tests
+description: Advanced Geode functionality including complex queries, authentication,
+  and performance testing
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 90000
     cleanup: true
-    args: ["--log-level", "debug"]
+    args:
+    - --log-level
+    - debug
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 60000
-    format: "json"
-
+    format: json
 secrets:
   admin_token:
-    source: "env"
-    key: "GEODE_ADMIN_TOKEN"
+    source: env
+    key: GEODE_ADMIN_TOKEN
     required: false
   user_password:
-    source: "env"
-    key: "GEODE_USER_PASSWORD"
+    source: env
+    key: GEODE_USER_PASSWORD
     required: false
-
 fuzz:
   enabled: true
-  provider: "mock"
+  provider: mock
   max_cases: 10
   seed: 123
   geode_specific: true
   include_gql: true
   include_auth: true
-  prompt_template: |
-    Generate sophisticated test cases for Geode graph database.
+  prompt_template: 'Generate sophisticated test cases for Geode graph database.
+
     Focus on complex GQL queries, schema operations, and edge cases.
+
     Include both valid and invalid scenarios for comprehensive testing.
 
+    '
 tests:
-  - name: "complex-graph-creation"
-    description: "Create a complex graph structure"
-    args:
-      - "query"
-      - |
-        CREATE
-          (alice:Person {name: 'Alice', age: 30, city: 'New York'}),
-          (bob:Person {name: 'Bob', age: 25, city: 'San Francisco'}),
-          (carol:Person {name: 'Carol', age: 35, city: 'London'}),
-          (company:Company {name: 'TechCorp', founded: 2010}),
-          (product:Product {name: 'Database', version: '1.0'}),
-          (alice)-[:WORKS_FOR {since: 2020}]->(company),
-          (bob)-[:WORKS_FOR {since: 2021}]->(company),
-          (carol)-[:MANAGES]->(alice),
-          (alice)-[:DEVELOPED]->(product),
-          (company)-[:OWNS]->(product)
-        RETURN alice, bob, carol, company, product
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        contains_node:
-          name: "Alice"
-        contains_edge:
-          since: 2020
-    tags: ["complex", "graph", "create"]
+- name: complex-graph-creation
+  description: Create a complex graph structure
+  args:
+  - query
+  - "CREATE\n  (alice:Person {name: 'Alice', age: 30, city: 'New York'}),\n  (bob:Person\
+    \ {name: 'Bob', age: 25, city: 'San Francisco'}),\n  (carol:Person {name: 'Carol',\
+    \ age: 35, city: 'London'}),\n  (company:Company {name: 'TechCorp', founded: 2010}),\n\
+    \  (product:Product {name: 'Database', version: '1.0'}),\n  (alice)-[:WORKS_FOR\
+    \ {since: 2020}]->(company),\n  (bob)-[:WORKS_FOR {since: 2021}]->(company),\n\
+    \  (carol)-[:MANAGES]->(alice),\n  (alice)-[:DEVELOPED]->(product),\n  (company)-[:OWNS]->(product)\n\
+    RETURN alice, bob, carol, company, product\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      contains_node:
+        name: Alice
+      contains_edge:
+        since: 2020
+  tags:
+  - complex
+  - graph
+  - create
+- name: path-traversal-query
+  description: Complex path traversal and analysis
+  args:
+  - query
+  - "MATCH path = (person:Person)-[:WORKS_FOR*1..2]->(org)-[:OWNS]->(product:Product)\n\
+    WHERE person.age > 25\nRETURN\n  person.name AS employee,\n  length(path) AS path_length,\n\
+    \  product.name AS product_name,\n  path\nORDER BY person.age DESC\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 0
+      columns:
+      - employee
+      - path_length
+      - product_name
+      - path
+  tags:
+  - complex
+  - query
+  - path
+- name: aggregation-analysis
+  description: Advanced aggregation and analytics
+  args:
+  - query
+  - "MATCH (p:Person)-[r:WORKS_FOR]->(c:Company)\nWITH c.name AS company,\n     count(p)\
+    \ AS employee_count,\n     avg(p.age) AS avg_age\nWHERE employee_count > 0\nRETURN\
+    \ company, employee_count, avg_age\nORDER BY employee_count DESC\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 0
+      max_rows: 10
+      columns:
+      - company
+      - employee_count
+      - avg_age
+  tags:
+  - complex
+  - aggregation
+  - analytics
+- name: temporal-query
+  description: Time-based query with temporal functions
+  args:
+  - query
+  - "MATCH (p:Person)-[r:WORKS_FOR]->(c:Company)\nWHERE r.since <= 2021\nWITH p, r,\
+    \ c, (2024 - r.since) AS years_employed\nRETURN\n  p.name AS employee,\n  c.name\
+    \ AS company,\n  r.since AS start_year,\n  years_employed\nORDER BY years_employed\
+    \ DESC\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 0
+  tags:
+  - temporal
+  - query
+  - analytics
+- name: subquery-with-union
+  description: Complex subquery with UNION operations
+  args:
+  - query
+  - 'MATCH (p:Person) RETURN p.name AS name, ''Person'' AS type
 
-  - name: "path-traversal-query"
-    description: "Complex path traversal and analysis"
-    args:
-      - "query"
-      - |
-        MATCH path = (person:Person)-[:WORKS_FOR*1..2]->(org)-[:OWNS]->(product:Product)
-        WHERE person.age > 25
-        RETURN
-          person.name AS employee,
-          length(path) AS path_length,
-          product.name AS product_name,
-          path
-        ORDER BY person.age DESC
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 0
-        columns: ["employee", "path_length", "product_name", "path"]
-    tags: ["complex", "query", "path"]
+    UNION
 
-  - name: "aggregation-analysis"
-    description: "Advanced aggregation and analytics"
-    args:
-      - "query"
-      - |
-        MATCH (p:Person)-[r:WORKS_FOR]->(c:Company)
-        WITH c.name AS company,
-             count(p) AS employee_count,
-             avg(p.age) AS avg_age
-        WHERE employee_count > 0
-        RETURN company, employee_count, avg_age
-        ORDER BY employee_count DESC
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 0
-        max_rows: 10
-        columns: ["company", "employee_count", "avg_age"]
-    tags: ["complex", "aggregation", "analytics"]
+    MATCH (c:Company) RETURN c.name AS name, ''Company'' AS type
 
-  - name: "temporal-query"
-    description: "Time-based query with temporal functions"
-    args:
-      - "query"
-      - |
-        MATCH (p:Person)-[r:WORKS_FOR]->(c:Company)
-        WHERE r.since <= 2021
-        WITH p, r, c, (2024 - r.since) AS years_employed
-        RETURN
-          p.name AS employee,
-          c.name AS company,
-          r.since AS start_year,
-          years_employed
-        ORDER BY years_employed DESC
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 0
-    tags: ["temporal", "query", "analytics"]
+    UNION
 
-  - name: "subquery-with-union"
-    description: "Complex subquery with UNION operations"
-    args:
-      - "query"
-      - |
-        MATCH (p:Person) RETURN p.name AS name, 'Person' AS type
-        UNION
-        MATCH (c:Company) RETURN c.name AS name, 'Company' AS type
-        UNION
-        MATCH (pr:Product) RETURN pr.name AS name, 'Product' AS type
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 1
-        max_rows: 10
-        columns: ["name", "type"]
-    tags: ["complex", "subquery", "union"]
+    MATCH (pr:Product) RETURN pr.name AS name, ''Product'' AS type
 
-  - name: "schema-introspection"
-    description: "Explore database schema and structure"
-    args:
-      - "query"
-      - |
-        MATCH (n)
-        RETURN count(DISTINCT n) AS total_nodes,
-               count(n) AS node_count
-        LIMIT 1
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["total_nodes", "node_count"]
-    tags: ["schema", "introspection", "metadata"]
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 1
+      max_rows: 10
+      columns:
+      - name
+      - type
+  tags:
+  - complex
+  - subquery
+  - union
+- name: schema-introspection
+  description: Explore database schema and structure
+  args:
+  - query
+  - "MATCH (n)\nRETURN count(DISTINCT n) AS total_nodes,\n       count(n) AS node_count\n\
+    LIMIT 1\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - total_nodes
+      - node_count
+  tags:
+  - schema
+  - introspection
+  - metadata
+- name: performance-bulk-create
+  description: Performance test with bulk data creation
+  timeout_ms: 120000
+  args:
+  - query
+  - "CREATE (n1:TestNode {id: 1, name: 'node_1', category: 'B'}),\n       (n2:TestNode\
+    \ {id: 2, name: 'node_2', category: 'C'}),\n       (n3:TestNode {id: 3, name:\
+    \ 'node_3', category: 'A'}),\n       (n4:TestNode {id: 4, name: 'node_4', category:\
+    \ 'B'}),\n       (n5:TestNode {id: 5, name: 'node_5', category: 'C'})\nRETURN\
+    \ count(*) AS nodes_created\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - nodes_created
+    stdout_json_assert:
+    - expression: results[0].nodes_created
+      equals: 5
+  tags:
+  - performance
+  - bulk
+  - create
+- name: performance-complex-matching
+  description: Performance test with complex pattern matching
+  timeout_ms: 60000
+  args:
+  - query
+  - 'MATCH (n:TestNode)
 
-  - name: "performance-bulk-create"
-    description: "Performance test with bulk data creation"
-    timeout_ms: 120000
-    args:
-      - "query"
-      - |
-        CREATE (n1:TestNode {id: 1, name: 'node_1', category: 'B'}),
-               (n2:TestNode {id: 2, name: 'node_2', category: 'C'}),
-               (n3:TestNode {id: 3, name: 'node_3', category: 'A'}),
-               (n4:TestNode {id: 4, name: 'node_4', category: 'B'}),
-               (n5:TestNode {id: 5, name: 'node_5', category: 'C'})
-        RETURN count(*) AS nodes_created
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["nodes_created"]
-      stdout_json_assert:
-        - expression: "results[0].nodes_created"
-          equals: 5
-    tags: ["performance", "bulk", "create"]
+    WHERE n.category IN [''A'', ''B'']
 
-  - name: "performance-complex-matching"
-    description: "Performance test with complex pattern matching"
-    timeout_ms: 60000
-    args:
-      - "query"
-      - |
-        MATCH (n:TestNode)
-        WHERE n.category IN ['A', 'B']
-        WITH n.category AS cat, count(n) AS node_count
-        RETURN cat, node_count
-        ORDER BY node_count DESC
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 0
-        max_rows: 2
-        execution_time_ms: 30000
-    tags: ["performance", "matching", "analytics"]
+    WITH n.category AS cat, count(n) AS node_count
 
-  - name: "transaction-rollback-test"
-    description: "Test transaction handling and rollback"
-    args:
-      - "query"
-      - "--begin"
-      - |
-        CREATE (temp:TempNode {test: true})
-        RETURN temp
-    expect:
-      exit_code: 0
-    cleanup:
-      - "query --rollback"
-    tags: ["transaction", "rollback"]
+    RETURN cat, node_count
 
-  - name: "index-performance"
-    description: "Test query execution and performance"
-    args:
-      - "query"
-      - |
-        EXPLAIN MATCH (p:Person)
-        WHERE p.name = 'Alice'
-        RETURN p
-    expect:
-      exit_code: 0
-      stdout_contains: ["Scan", "EXPLAIN"]
-    tags: ["query", "performance", "explain"]
+    ORDER BY node_count DESC
 
-  - name: "error-handling-division-by-zero"
-    description: "Test error handling in mathematical operations (Geode returns empty result for division by zero)"
-    args: ["query", "RETURN 10 / 0 AS result"]
-    expect:
-      exit_code: 0
-      # Division by zero currently returns empty result with success status
-      # This is the actual behavior - the error is caught during evaluation
-      geode_query:
-        row_count: 0
-    tags: ["error", "math"]
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 0
+      max_rows: 2
+      execution_time_ms: 30000
+  tags:
+  - performance
+  - matching
+  - analytics
+- name: transaction-rollback-test
+  description: Test transaction handling and rollback
+  args:
+  - query
+  - --begin
+  - 'CREATE (temp:TempNode {test: true})
 
-  - name: "memory-cleanup-test"
-    description: "Test memory cleanup with large result sets"
-    args: ["query", "MATCH (n:TestNode) RETURN n LIMIT 1000"]
-    expect:
-      exit_code: 0
-      geode_query:
-        max_rows: 1000
-    tags: ["memory", "performance", "cleanup"]
+    RETURN temp
 
-tags: ["advanced", "performance", "complex"]
+    '
+  expect:
+    exit_code: 0
+  cleanup:
+  - query --rollback
+  tags:
+  - transaction
+  - rollback
+- name: index-performance
+  description: Test query execution and performance
+  args:
+  - query
+  - 'EXPLAIN MATCH (p:Person)
+
+    WHERE p.name = ''Alice''
+
+    RETURN p
+
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Scan
+    - EXPLAIN
+  tags:
+  - query
+  - performance
+  - explain
+- name: error-handling-division-by-zero
+  description: Test error handling in mathematical operations (Geode returns empty
+    result for division by zero)
+  args:
+  - query
+  - RETURN 10 / 0 AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 0
+  tags:
+  - error
+  - math
+- name: memory-cleanup-test
+  description: Test memory cleanup with large result sets
+  args:
+  - query
+  - MATCH (n:TestNode) RETURN n LIMIT 1000
+  expect:
+    exit_code: 0
+    geode_query:
+      max_rows: 1000
+  tags:
+  - memory
+  - performance
+  - cleanup
+tags:
+- advanced
+- performance
+- complex

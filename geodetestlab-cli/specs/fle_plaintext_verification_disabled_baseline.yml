@@ -1,165 +1,197 @@
-version: "1.0"
-name: "FLE Plaintext Verification - DISABLED Baseline"
-description: |
-  BASELINE TEST - FLE INTENTIONALLY DISABLED
+version: '1.0'
+name: FLE Plaintext Verification - DISABLED Baseline
+description: 'BASELINE TEST - FLE INTENTIONALLY DISABLED
+
 
   This test proves that when FLE is DISABLED, plaintext DOES appear in data files.
+
   This is critical because it validates that our grep-based scanning methodology
+
   actually works and can detect plaintext.
 
+
   If this test PASSES (finds plaintext), it proves the scanning methodology is valid.
+
   If this test FAILS (no plaintext found), something is wrong with the test setup.
 
+
   Test Data Markers (these SHOULD appear in data files when FLE is disabled):
+
   - "FLEBASELINE_PLAINTEXT_EXPECTED_SSN123"
+
   - "FLEBASELINE_PLAINTEXT_EXPECTED_PWD456"
 
-  CANARY: REQ=REQ-FLE-BASELINE-001; FEATURE=FLEEnforcement; ASPECT=BaselineValidation; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
 
+  CANARY: REQ=REQ-FLE-BASELINE-001; FEATURE=FLEEnforcement; ASPECT=BaselineValidation;
+  STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
-    cleanup: false  # DO NOT CLEANUP - we need to scan files after tests
-    args: ["--log-level", "info"]  # NOTE: --enable-fle is NOT specified
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 env:
-  # TDE is NOT set here - we want plaintext data files for this baseline test
-  # GEODE_TDE_KEY: "..." # Intentionally not set - TDE would encrypt all data
-  GEODE_FLE_ENABLED: "false"  # Explicitly disabled
-
-# Skip isolation suffix for FLE tests - the CALL geode.fle.configureField
-# must match the exact label names used in CREATE statements
+  GEODE_FLE_ENABLED: 'false'
 skip_isolation: true
-
 tests:
-  # ===============================
-  # PHASE 1: WRITE PLAINTEXT DATA (FLE DISABLED)
-  # ===============================
-
-  - name: "fle-baseline-write-ssn"
-    description: "Write SSN data WITHOUT FLE (should be plaintext)"
-    args: ["query",
-           "CREATE (n:FLETest_Baseline {
-              test_type: 'baseline_ssn',
-              data: 'FLEBASELINE_PLAINTEXT_EXPECTED_SSN123'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "baseline", "write"]
-
-  - name: "fle-baseline-write-password"
-    description: "Write password data WITHOUT FLE (should be plaintext)"
-    args: ["query",
-           "CREATE (n:FLETest_Baseline {
-              test_type: 'baseline_password',
-              data: 'FLEBASELINE_PLAINTEXT_EXPECTED_PWD456'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "baseline", "write"]
-
-  - name: "fle-baseline-write-combined"
-    description: "Write combined marker data WITHOUT FLE (should be plaintext)"
-    args: ["query",
-           "CREATE (n:FLETest_Baseline {
-              test_type: 'baseline_combined',
-              data: 'FLEBASELINE_PLAINTEXT_EXPECTED_COMBO789'
-            })
-            RETURN n.test_type AS test_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "baseline", "write"]
-
-  # ===============================
-  # PHASE 2: VERIFY DATA READABLE
-  # ===============================
-
-  - name: "fle-baseline-verify-data-readable"
-    description: "Verify all baseline data is readable"
-    args: ["query",
-           "MATCH (n:FLETest_Baseline)
-            RETURN count(*) AS total_records"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "baseline", "verify"]
-
-  # ===============================
-  # PHASE 3: FORCE FLUSH TO DISK
-  # ===============================
-
-  - name: "fle-baseline-force-checkpoint"
-    description: "Force checkpoint to ensure all data is written to disk"
-    args: ["query",
-           "RETURN 'checkpoint_requested' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "baseline", "checkpoint"]
-
-  # ===============================
-  # PHASE 4: VALIDATE PLAINTEXT IS PRESENT (FLE DISABLED)
-  # ===============================
-
-  - name: "fle-baseline-scan-ssn-plaintext-present"
-    description: "BASELINE: Verify SSN marker IS PRESENT in data files (FLE disabled)"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLEBASELINE_PLAINTEXT_EXPECTED_SSN123", "${data_dir}"]
-    expect:
-      exit_code: 0  # grep returns 0 when match IS found (expected for baseline)
-    tags: ["fle", "baseline", "scan", "validation"]
-
-  - name: "fle-baseline-scan-password-plaintext-present"
-    description: "BASELINE: Verify password marker IS PRESENT in data files (FLE disabled)"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLEBASELINE_PLAINTEXT_EXPECTED_PWD456", "${data_dir}"]
-    expect:
-      exit_code: 0  # grep returns 0 when match IS found (expected for baseline)
-    tags: ["fle", "baseline", "scan", "validation"]
-
-  - name: "fle-baseline-scan-combined-plaintext-present"
-    description: "BASELINE: Verify combined marker IS PRESENT in data files (FLE disabled)"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLEBASELINE_PLAINTEXT_EXPECTED_COMBO789", "${data_dir}"]
-    expect:
-      exit_code: 0  # grep returns 0 when match IS found (expected for baseline)
-    tags: ["fle", "baseline", "scan", "validation"]
-
-  - name: "fle-baseline-binary-scan-prefix-present"
-    description: "BASELINE: Verify FLEBASELINE_ prefix IS PRESENT in data files"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLEBASELINE_PLAINTEXT_EXPECTED_", "${data_dir}"]
-    expect:
-      exit_code: 0  # grep returns 0 when match IS found (expected for baseline)
-    tags: ["fle", "baseline", "binary-scan", "validation"]
-
+- name: fle-baseline-write-ssn
+  description: Write SSN data WITHOUT FLE (should be plaintext)
+  args:
+  - query
+  - 'CREATE (n:FLETest_Baseline { test_type: ''baseline_ssn'', data: ''FLEBASELINE_PLAINTEXT_EXPECTED_SSN123''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - baseline
+  - write
+- name: fle-baseline-write-password
+  description: Write password data WITHOUT FLE (should be plaintext)
+  args:
+  - query
+  - 'CREATE (n:FLETest_Baseline { test_type: ''baseline_password'', data: ''FLEBASELINE_PLAINTEXT_EXPECTED_PWD456''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - baseline
+  - write
+- name: fle-baseline-write-combined
+  description: Write combined marker data WITHOUT FLE (should be plaintext)
+  args:
+  - query
+  - 'CREATE (n:FLETest_Baseline { test_type: ''baseline_combined'', data: ''FLEBASELINE_PLAINTEXT_EXPECTED_COMBO789''
+    }) RETURN n.test_type AS test_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - baseline
+  - write
+- name: fle-baseline-verify-data-readable
+  description: Verify all baseline data is readable
+  args:
+  - query
+  - MATCH (n:FLETest_Baseline) RETURN count(*) AS total_records
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - baseline
+  - verify
+- name: fle-baseline-force-checkpoint
+  description: Force checkpoint to ensure all data is written to disk
+  args:
+  - query
+  - RETURN 'checkpoint_requested' AS status
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - baseline
+  - checkpoint
+- name: fle-baseline-scan-ssn-plaintext-present
+  description: 'BASELINE: Verify SSN marker IS PRESENT in data files (FLE disabled)'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLEBASELINE_PLAINTEXT_EXPECTED_SSN123
+  - ${data_dir}
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - baseline
+  - scan
+  - validation
+- name: fle-baseline-scan-password-plaintext-present
+  description: 'BASELINE: Verify password marker IS PRESENT in data files (FLE disabled)'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLEBASELINE_PLAINTEXT_EXPECTED_PWD456
+  - ${data_dir}
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - baseline
+  - scan
+  - validation
+- name: fle-baseline-scan-combined-plaintext-present
+  description: 'BASELINE: Verify combined marker IS PRESENT in data files (FLE disabled)'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLEBASELINE_PLAINTEXT_EXPECTED_COMBO789
+  - ${data_dir}
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - baseline
+  - scan
+  - validation
+- name: fle-baseline-binary-scan-prefix-present
+  description: 'BASELINE: Verify FLEBASELINE_ prefix IS PRESENT in data files'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLEBASELINE_PLAINTEXT_EXPECTED_
+  - ${data_dir}
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - baseline
+  - binary-scan
+  - validation
 invariants:
-  - type: "server_running"
-
+- type: server_running
 plaintext_verification:
   enabled: true
   patterns:
-    - "FLEBASELINE_PLAINTEXT_EXPECTED_SSN123"
-    - "FLEBASELINE_PLAINTEXT_EXPECTED_PWD456"
-    - "FLEBASELINE_PLAINTEXT_EXPECTED_COMBO789"
-  fail_on_violation: false  # This is a baseline test - we EXPECT plaintext
+  - FLEBASELINE_PLAINTEXT_EXPECTED_SSN123
+  - FLEBASELINE_PLAINTEXT_EXPECTED_PWD456
+  - FLEBASELINE_PLAINTEXT_EXPECTED_COMBO789
+  fail_on_violation: false
   scan_binary_files: true
   baseline_test: true
-
-tags: ["fle", "field-level-encryption", "security", "baseline", "validation", "methodology"]
+tags:
+- fle
+- field-level-encryption
+- security
+- baseline
+- validation
+- methodology

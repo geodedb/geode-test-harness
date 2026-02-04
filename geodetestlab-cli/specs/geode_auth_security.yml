@@ -1,307 +1,554 @@
-version: "1.0"
-name: "Geode Authentication & Security Tests"
-description: "Comprehensive testing of Geode authentication, authorization, and security features"
-
+version: '1.0'
+name: Geode Authentication & Security Tests
+description: Comprehensive testing of Geode authentication, authorization, and security
+  features
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "info", "--enable-auth"]
+    args:
+    - --log-level
+    - info
+    - --enable-auth
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-    server_address: "127.0.0.1:3141"
-    default_flags: ["--server", "${server_address}", "--insecure"]
-
+    format: json
+    server_address: 127.0.0.1:3141
+    default_flags:
+    - --server
+    - ${server_address}
+    - --insecure
 secrets:
   admin_password:
-    source: "env"
-    key: "GEODE_ADMIN_PASSWORD"
+    source: env
+    key: GEODE_ADMIN_PASSWORD
     required: false
   user_password:
-    source: "env"
-    key: "GEODE_USER_PASSWORD"
+    source: env
+    key: GEODE_USER_PASSWORD
     required: false
-
 tests:
-  # User management
-  - name: "create-admin-user"
-    description: "Create initial admin user"
-    args: ["user", "create", "admin", "admin@geode.dev", "--password", "${secret:admin_password}", "--role", "admin"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["admin", "created"]
-    tags: ["auth", "user", "admin"]
-
-  - name: "list-users"
-    description: "List all users"
-    args: ["user", "list"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["admin"]
-    tags: ["auth", "user", "list"]
-
-  - name: "create-regular-user"
-    description: "Create regular user"
-    args: ["user", "create", "testuser", "test@geode.dev", "--password", "${secret:user_password}", "--role", "user"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["testuser", "created"]
-    tags: ["auth", "user", "create"]
-
-  - name: "user-info"
-    description: "Get user information"
-    args: ["user", "info", "testuser"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["testuser", "test@geode.dev"]
-    tags: ["auth", "user", "info"]
-
-  # Role management
-  - name: "create-custom-role"
-    description: "Create custom role"
-    args: ["role", "create", "analyst", "--permissions", "read,query"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["analyst", "created"]
-    tags: ["auth", "role", "create"]
-
-  - name: "list-roles"
-    description: "List all roles"
-    args: ["role", "list"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["admin", "user", "analyst"]
-    tags: ["auth", "role", "list"]
-
-  - name: "assign-role"
-    description: "Assign role to user"
-    args: ["user", "assign-role", "testuser", "analyst"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["testuser", "analyst"]
-    tags: ["auth", "role", "assign"]
-
-  # Permission management
-  - name: "grant-permission"
-    description: "Grant specific permission"
-    args: ["grant", "read", "testuser", "--resource", "database:test"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["granted", "read"]
-    tags: ["auth", "permission", "grant"]
-
-  - name: "list-permissions"
-    description: "List user permissions"
-    args: ["user", "permissions", "testuser"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["read"]
-    tags: ["auth", "permission", "list"]
-
-  - name: "revoke-permission"
-    description: "Revoke specific permission"
-    args: ["revoke", "read", "testuser", "--resource", "database:test"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["revoked", "read"]
-    tags: ["auth", "permission", "revoke"]
-
-  # Authentication testing
-  - name: "authenticated-query-admin"
-    description: "Execute query as admin user"
-    args: ["query", "--user", "admin", "--password", "${secret:admin_password}", "RETURN 'authenticated' AS status"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["status"]
-    tags: ["auth", "query", "admin"]
-
-  - name: "authenticated-query-user"
-    description: "Execute query as regular user (SKIP: CLI user mgmt is local-only, not connected to server auth)"
-    skip: true
-    skip_reason: "CLI user management creates local users, not server-side users. Server authentication uses separate store."
-    args: ["query", "--user", "testuser", "--password", "${secret:user_password}", "RETURN 'user_query' AS status"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["status"]
-    tags: ["auth", "query", "user"]
-
-  - name: "unauthenticated-query-failure"
-    description: "Attempt query without authentication (should fail with auth error exit code 3)"
-    args: ["query", "RETURN 'should_fail' AS status"]
-    expect:
-      exit_code: 3
-    tags: ["auth", "query", "failure"]
-
-  - name: "wrong-password-failure"
-    description: "Attempt query with wrong password (should fail with auth error exit code 3)"
-    args: ["query", "--user", "testuser", "--password", "wrongpassword", "RETURN 'should_fail' AS status"]
-    expect:
-      exit_code: 3
-    tags: ["auth", "password", "failure"]
-
-  # Row-Level Security (RLS) testing
-  - name: "create-rls-policy"
-    description: "Create row-level security policy"
-    args: ["policy", "create", "user_data_access", "--table", "user_data", "--condition", "owner = current_user()"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["policy", "created"]
-    tags: ["security", "rls", "policy"]
-
-  - name: "list-policies"
-    description: "List all RLS policies"
-    args: ["policy", "list"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["user_data_access"]
-    tags: ["security", "rls", "list"]
-
-  # Audit logging testing
-  - name: "enable-audit-logging"
-    description: "Test audit logging functionality"
-    args: ["query", "--user", "admin", "--password", "${secret:admin_password}", "--audit", "CREATE (n:AuditTest {created_by: 'admin'}) RETURN n"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["security", "audit", "logging"]
-
-  # TLS/SSL testing
-  - name: "tls-connection-test"
-    description: "Test TLS connection (should work with --insecure)"
-    args: ["query", "--user", "admin", "--password", "${secret:admin_password}", "--insecure", "RETURN 'tls_test' AS result"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        columns: ["result"]
-    tags: ["security", "tls", "connection"]
-
-  # Session management
-  - name: "create-session"
-    description: "Create user session"
-    args: ["auth", "login", "--user", "testuser", "--password", "${secret:user_password}"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["session", "token"]
-    tags: ["auth", "session", "login"]
-
-  - name: "validate-session"
-    description: "Validate user session"
-    args: ["auth", "validate", "--token", "session_token_placeholder"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["valid"]
-    tags: ["auth", "session", "validate"]
-
-  - name: "logout-session"
-    description: "Logout user session"
-    args: ["auth", "logout", "--token", "session_token_placeholder"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["logged out"]
-    tags: ["auth", "session", "logout"]
-
-  # Multi-factor authentication (if supported)
-  - name: "setup-mfa"
-    description: "Setup multi-factor authentication"
-    args: ["user", "mfa-setup", "testuser"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["MFA", "secret"]
-    tags: ["auth", "mfa", "setup"]
-
-  - name: "verify-mfa"
-    description: "Verify MFA token"
-    args: ["user", "mfa-verify", "testuser", "--token", "123456"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["verified"]
-    tags: ["auth", "mfa", "verify"]
-
-  # Password management
-  - name: "change-password"
-    description: "Change user password"
-    args: ["user", "change-password", "testuser", "--old-password", "${secret:user_password}", "--new-password", "newpassword123"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["password", "changed"]
-    tags: ["auth", "password", "change"]
-
-  - name: "reset-password"
-    description: "Reset user password (admin action)"
-    args: ["user", "reset-password", "testuser", "--new-password", "${secret:user_password}"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["password", "reset"]
-    tags: ["auth", "password", "reset"]
-
-  # Access control testing
-  # Note: Role-based write restrictions require additional RBAC enforcement in the engine
-  # Currently all authenticated users with valid credentials can execute write operations
-  - name: "test-read-only-access"
-    description: "Test authenticated user can execute queries (SKIP: CLI user mgmt is local-only)"
-    skip: true
-    skip_reason: "CLI user management creates local users, not server-side users. Server authentication uses separate store."
-    args: ["query", "--user", "testuser", "--password", "${secret:user_password}", "CREATE (n:Forbidden) RETURN n"]
-    expect:
-      exit_code: 0  # Currently succeeds - RBAC write restrictions not enforced at query level
-      geode_query:
-        row_count: 1
-    tags: ["auth", "access", "readonly"]
-
-  - name: "test-admin-full-access"
-    description: "Test admin full access"
-    args: ["query", "--user", "admin", "--password", "${secret:admin_password}", "CREATE (n:AdminTest {created: timestamp()}) RETURN n"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["auth", "access", "admin"]
-
-  # Cleanup
-  - name: "cleanup-test-data"
-    description: "Clean up security test data"
-    args: ["query", "--user", "admin", "--password", "${secret:admin_password}", "MATCH (n) WHERE n:AuditTest OR n:AdminTest DETACH DELETE n"]
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-users"
-    description: "Clean up test users"
-    args: ["user", "delete", "testuser"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["deleted"]
-    tags: ["cleanup", "user"]
-
-  - name: "cleanup-roles"
-    description: "Clean up test roles"
-    args: ["role", "delete", "analyst"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["deleted"]
-    tags: ["cleanup", "role"]
-
-  - name: "cleanup-policies"
-    description: "Clean up test policies"
-    args: ["policy", "delete", "user_data_access"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["deleted"]
-    tags: ["cleanup", "policy"]
-
+- name: create-admin-user
+  description: Create initial admin user
+  args:
+  - user
+  - create
+  - admin
+  - admin@geode.dev
+  - --password
+  - ${secret:admin_password}
+  - --role
+  - admin
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - admin
+    - created
+  tags:
+  - auth
+  - user
+  - admin
+- name: list-users
+  description: List all users
+  args:
+  - user
+  - list
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - admin
+  tags:
+  - auth
+  - user
+  - list
+- name: create-regular-user
+  description: Create regular user
+  args:
+  - user
+  - create
+  - testuser
+  - test@geode.dev
+  - --password
+  - ${secret:user_password}
+  - --role
+  - user
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - testuser
+    - created
+  tags:
+  - auth
+  - user
+  - create
+- name: user-info
+  description: Get user information
+  args:
+  - user
+  - info
+  - testuser
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - testuser
+    - test@geode.dev
+  tags:
+  - auth
+  - user
+  - info
+- name: create-custom-role
+  description: Create custom role
+  args:
+  - role
+  - create
+  - analyst
+  - --permissions
+  - read,query
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - analyst
+    - created
+  tags:
+  - auth
+  - role
+  - create
+- name: list-roles
+  description: List all roles
+  args:
+  - role
+  - list
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - admin
+    - user
+    - analyst
+  tags:
+  - auth
+  - role
+  - list
+- name: assign-role
+  description: Assign role to user
+  args:
+  - user
+  - assign-role
+  - testuser
+  - analyst
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - testuser
+    - analyst
+  tags:
+  - auth
+  - role
+  - assign
+- name: grant-permission
+  description: Grant specific permission
+  args:
+  - grant
+  - read
+  - testuser
+  - --resource
+  - database:test
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - granted
+    - read
+  tags:
+  - auth
+  - permission
+  - grant
+- name: list-permissions
+  description: List user permissions
+  args:
+  - user
+  - permissions
+  - testuser
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - read
+  tags:
+  - auth
+  - permission
+  - list
+- name: revoke-permission
+  description: Revoke specific permission
+  args:
+  - revoke
+  - read
+  - testuser
+  - --resource
+  - database:test
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - revoked
+    - read
+  tags:
+  - auth
+  - permission
+  - revoke
+- name: authenticated-query-admin
+  description: Execute query as admin user
+  args:
+  - query
+  - --user
+  - admin
+  - --password
+  - ${secret:admin_password}
+  - RETURN 'authenticated' AS status
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - status
+  tags:
+  - auth
+  - query
+  - admin
+- name: authenticated-query-user
+  description: 'Execute query as regular user (SKIP: CLI user mgmt is local-only,
+    not connected to server auth)'
+  skip: true
+  skip_reason: CLI user management creates local users, not server-side users. Server
+    authentication uses separate store.
+  args:
+  - query
+  - --user
+  - testuser
+  - --password
+  - ${secret:user_password}
+  - RETURN 'user_query' AS status
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - status
+  tags:
+  - auth
+  - query
+  - user
+- name: unauthenticated-query-failure
+  description: Attempt query without authentication (should fail with auth error exit
+    code 3)
+  args:
+  - query
+  - RETURN 'should_fail' AS status
+  expect:
+    exit_code: 3
+  tags:
+  - auth
+  - query
+  - failure
+- name: wrong-password-failure
+  description: Attempt query with wrong password (should fail with auth error exit
+    code 3)
+  args:
+  - query
+  - --user
+  - testuser
+  - --password
+  - wrongpassword
+  - RETURN 'should_fail' AS status
+  expect:
+    exit_code: 3
+  tags:
+  - auth
+  - password
+  - failure
+- name: create-rls-policy
+  description: Create row-level security policy
+  args:
+  - policy
+  - create
+  - user_data_access
+  - --table
+  - user_data
+  - --condition
+  - owner = current_user()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - policy
+    - created
+  tags:
+  - security
+  - rls
+  - policy
+- name: list-policies
+  description: List all RLS policies
+  args:
+  - policy
+  - list
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - user_data_access
+  tags:
+  - security
+  - rls
+  - list
+- name: enable-audit-logging
+  description: Test audit logging functionality
+  args:
+  - query
+  - --user
+  - admin
+  - --password
+  - ${secret:admin_password}
+  - --audit
+  - 'CREATE (n:AuditTest {created_by: ''admin''}) RETURN n'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - security
+  - audit
+  - logging
+- name: tls-connection-test
+  description: Test TLS connection (should work with --insecure)
+  args:
+  - query
+  - --user
+  - admin
+  - --password
+  - ${secret:admin_password}
+  - --insecure
+  - RETURN 'tls_test' AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - result
+  tags:
+  - security
+  - tls
+  - connection
+- name: create-session
+  description: Create user session
+  args:
+  - auth
+  - login
+  - --user
+  - testuser
+  - --password
+  - ${secret:user_password}
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - session
+    - token
+  tags:
+  - auth
+  - session
+  - login
+- name: validate-session
+  description: Validate user session
+  args:
+  - auth
+  - validate
+  - --token
+  - session_token_placeholder
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - valid
+  tags:
+  - auth
+  - session
+  - validate
+- name: logout-session
+  description: Logout user session
+  args:
+  - auth
+  - logout
+  - --token
+  - session_token_placeholder
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - logged out
+  tags:
+  - auth
+  - session
+  - logout
+- name: setup-mfa
+  description: Setup multi-factor authentication
+  args:
+  - user
+  - mfa-setup
+  - testuser
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - MFA
+    - secret
+  tags:
+  - auth
+  - mfa
+  - setup
+- name: verify-mfa
+  description: Verify MFA token
+  args:
+  - user
+  - mfa-verify
+  - testuser
+  - --token
+  - '123456'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - verified
+  tags:
+  - auth
+  - mfa
+  - verify
+- name: change-password
+  description: Change user password
+  args:
+  - user
+  - change-password
+  - testuser
+  - --old-password
+  - ${secret:user_password}
+  - --new-password
+  - newpassword123
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - password
+    - changed
+  tags:
+  - auth
+  - password
+  - change
+- name: reset-password
+  description: Reset user password (admin action)
+  args:
+  - user
+  - reset-password
+  - testuser
+  - --new-password
+  - ${secret:user_password}
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - password
+    - reset
+  tags:
+  - auth
+  - password
+  - reset
+- name: test-read-only-access
+  description: 'Test authenticated user can execute queries (SKIP: CLI user mgmt is
+    local-only)'
+  skip: true
+  skip_reason: CLI user management creates local users, not server-side users. Server
+    authentication uses separate store.
+  args:
+  - query
+  - --user
+  - testuser
+  - --password
+  - ${secret:user_password}
+  - CREATE (n:Forbidden) RETURN n
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - auth
+  - access
+  - readonly
+- name: test-admin-full-access
+  description: Test admin full access
+  args:
+  - query
+  - --user
+  - admin
+  - --password
+  - ${secret:admin_password}
+  - 'CREATE (n:AdminTest {created: timestamp()}) RETURN n'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - auth
+  - access
+  - admin
+- name: cleanup-test-data
+  description: Clean up security test data
+  args:
+  - query
+  - --user
+  - admin
+  - --password
+  - ${secret:admin_password}
+  - MATCH (n) WHERE n:AuditTest OR n:AdminTest DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-users
+  description: Clean up test users
+  args:
+  - user
+  - delete
+  - testuser
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - deleted
+  tags:
+  - cleanup
+  - user
+- name: cleanup-roles
+  description: Clean up test roles
+  args:
+  - role
+  - delete
+  - analyst
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - deleted
+  tags:
+  - cleanup
+  - role
+- name: cleanup-policies
+  description: Clean up test policies
+  args:
+  - policy
+  - delete
+  - user_data_access
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - deleted
+  tags:
+  - cleanup
+  - policy
 invariants:
-  - type: "server_running"
-
-tags: ["authentication", "authorization", "security", "rbac", "audit"]
+- type: server_running
+tags:
+- authentication
+- authorization
+- security
+- rbac
+- audit

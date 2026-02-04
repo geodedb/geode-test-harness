@@ -1,7 +1,6 @@
-description: "Test edge cases, boundary conditions, and error handling for functions"
+description: Test edge cases, boundary conditions, and error handling for functions
 binary: geode
 timeout: 30
-
 cli:
   server:
     enabled: true
@@ -9,438 +8,606 @@ cli:
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "error"]
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 30000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # Numeric Overflow/Underflow
-  - name: "integer-overflow"
-    description: "Integer overflow test"
-    args: ["query", "-"]
-    stdin: "RETURN 9223372036854775807 + 1 AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "overflow"]
+- name: integer-overflow
+  description: Integer overflow test
+  args:
+  - query
+  - '-'
+  stdin: RETURN 9223372036854775807 + 1 AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - overflow
+- name: decimal-precision-limit
+  description: Decimal precision limit
+  skip: true
+  args:
+  - query
+  - '-'
+  stdin: RETURN CAST(1.123456789012345678901234567890 AS DECIMAL(30,29)) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1.123456'
+  tags:
+  - numeric
+  - decimal
+- name: very-small-decimal
+  description: Very small decimal
+  skip: true
+  args:
+  - query
+  - '-'
+  stdin: RETURN CAST(0.00000000000000000001 AS DECIMAL(20,20)) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0.00000000000000000001'
+  tags:
+  - numeric
+  - decimal
+- name: empty-string-length
+  description: Empty string length
+  args:
+  - query
+  - '-'
+  stdin: RETURN length('') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0'
+  tags:
+  - string
+  - length
+- name: empty-string-upper
+  description: Empty string upper
+  args:
+  - query
+  - '-'
+  stdin: RETURN upper('') AS result
+  expect:
+    exit_code: 0
+  tags:
+  - string
+  - upper
+- name: very-long-string
+  description: Very long string
+  skip: true
+  args:
+  - query
+  - '-'
+  stdin: WITH repeat('a', 10000) AS long_str RETURN length(long_str) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '10000'
+  tags:
+  - string
+  - length
+- name: unicode-string-length
+  description: Unicode string length
+  args:
+  - query
+  - '-'
+  stdin: RETURN length('hello') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '5'
+  tags:
+  - string
+  - unicode
+- name: substring-with-negative-index
+  description: Substring with negative index
+  args:
+  - query
+  - '-'
+  stdin: RETURN substring('hello', -1, 2) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - string
+  - error
+- name: substring-with-zero-index
+  description: Substring with zero index
+  args:
+  - query
+  - '-'
+  stdin: RETURN substring('hello', 0, 2) AS result
+  expect:
+    exit_code: 0
+  tags:
+  - string
+  - substring
+- name: null-in-math-functions
+  description: NULL in math functions
+  args:
+  - query
+  - '-'
+  stdin: WITH null AS x RETURN abs(x) AS abs_null, sqrt(x) AS sqrt_null, pow(x, 2)
+    AS pow_null
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'null'
+  tags:
+  - 'null'
+  - math
+- name: null-in-string-functions
+  description: NULL in string functions
+  args:
+  - query
+  - '-'
+  stdin: RETURN length(NULL) AS len_null, upper(NULL) AS upper_null, trim(NULL) AS
+    trim_null
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'null'
+  tags:
+  - 'null'
+  - string
+- name: null-in-aggregations
+  description: NULL in aggregations
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n1:TestNode {int_val: 10})
 
-  - name: "decimal-precision-limit"
-    description: "Decimal precision limit"
-    skip: true  # CAST to DECIMAL(p,s) syntax not yet implemented
-    args: ["query", "-"]
-    stdin: "RETURN CAST(1.123456789012345678901234567890 AS DECIMAL(30,29)) AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["1.123456"]
-    tags: ["numeric", "decimal"]
+    CREATE (n2:TestNode {int_val: NULL})
 
-  - name: "very-small-decimal"
-    description: "Very small decimal"
-    skip: true  # CAST to DECIMAL(p,s) syntax not yet implemented
-    args: ["query", "-"]
-    stdin: "RETURN CAST(0.00000000000000000001 AS DECIMAL(20,20)) AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["0.00000000000000000001"]
-    tags: ["numeric", "decimal"]
+    CREATE (n3:TestNode {int_val: 20})
 
-  # String Boundary Cases
-  - name: "empty-string-length"
-    description: "Empty string length"
-    args: ["query", "-"]
-    stdin: "RETURN length('') AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["0"]
-    tags: ["string", "length"]
+    MATCH (n:TestNode) RETURN avg(n.int_val) AS avg_with_null, count(n.int_val) AS
+    count_non_null
 
-  - name: "empty-string-upper"
-    description: "Empty string upper"
-    args: ["query", "-"]
-    stdin: "RETURN upper('') AS result"
-    expect:
-      exit_code: 0
-    tags: ["string", "upper"]
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '15'
+    - '2'
+  tags:
+  - 'null'
+  - aggregation
+- name: division-by-zero-integer
+  description: Division by zero integer
+  args:
+  - query
+  - '-'
+  stdin: RETURN 10 / 0 AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - error
+- name: division-by-zero-decimal
+  description: Division by zero decimal
+  args:
+  - query
+  - '-'
+  stdin: RETURN CAST(10.0 AS DECIMAL(10,2)) / CAST(0.0 AS DECIMAL(10,2)) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - error
+- name: mod-by-zero
+  description: MOD by zero
+  args:
+  - query
+  - '-'
+  stdin: RETURN 10 % 0 AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - error
+- name: sqrt-of-negative
+  description: SQRT of negative
+  args:
+  - query
+  - '-'
+  stdin: RETURN sqrt(-1) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - error
+- name: log-of-zero
+  description: LOG of zero
+  args:
+  - query
+  - '-'
+  stdin: RETURN log(0) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - error
+- name: log-of-negative
+  description: LOG of negative
+  args:
+  - query
+  - '-'
+  stdin: RETURN log(-1) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - error
+- name: asin-out-of-range
+  description: ASIN out of range
+  args:
+  - query
+  - '-'
+  stdin: RETURN asin(1.5) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - error
+- name: acos-out-of-range
+  description: ACOS out of range
+  args:
+  - query
+  - '-'
+  stdin: RETURN acos(-1.5) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - numeric
+  - error
+- name: invalid-integer-cast
+  description: Invalid integer cast
+  args:
+  - query
+  - '-'
+  stdin: RETURN CAST('not_a_number' AS INTEGER) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - type
+  - error
+- name: invalid-decimal-cast
+  description: Invalid decimal cast
+  args:
+  - query
+  - '-'
+  stdin: RETURN CAST('12.34.56' AS DECIMAL(10,2)) AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - type
+  - error
+- name: boolean-to-integer
+  description: Boolean to integer
+  skip: true
+  args:
+  - query
+  - '-'
+  stdin: RETURN CAST(true AS INTEGER) AS true_int, CAST(false AS INTEGER) AS false_int
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+    - '0'
+  tags:
+  - type
+  - cast
+- name: invalid-date
+  description: Invalid date
+  args:
+  - query
+  - '-'
+  stdin: RETURN DATE '2024-02-30' AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - date
+  - error
+- name: invalid-time
+  description: Invalid time
+  args:
+  - query
+  - '-'
+  stdin: RETURN TIME '25:00:00' AS result
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - time
+  - error
+- name: leap-year-date
+  description: Leap year date
+  args:
+  - query
+  - '-'
+  stdin: RETURN date('2024-02-29') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '2024-02-29'
+  tags:
+  - date
+- name: empty-pattern-match
+  description: Empty pattern match
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NonExistentLabel) RETURN count(n) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0'
+  tags:
+  - graph
+  - empty
+- name: self-loop
+  description: Self loop
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:SelfLoopTest {int_val: 42})
 
-  - name: "very-long-string"
-    description: "Very long string"
-    skip: true  # repeat() function not yet implemented
-    args: ["query", "-"]
-    stdin: "WITH repeat('a', 10000) AS long_str RETURN length(long_str) AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["10000"]
-    tags: ["string", "length"]
+    MATCH (n:SelfLoopTest {int_val: 42})
 
-  - name: "unicode-string-length"
-    description: "Unicode string length"
-    args: ["query", "-"]
-    stdin: "RETURN length('hello') AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["5"]
-    tags: ["string", "unicode"]
+    CREATE (n)-[:SELF_LOOP]->(n)
 
-  - name: "substring-with-negative-index"
-    description: "Substring with negative index"
-    args: ["query", "-"]
-    stdin: "RETURN substring('hello', -1, 2) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["string", "error"]
+    MATCH (n:SelfLoopTest)-[r:SELF_LOOP]->(n) RETURN count(r) AS self_loops
 
-  - name: "substring-with-zero-index"
-    description: "Substring with zero index"
-    args: ["query", "-"]
-    stdin: "RETURN substring('hello', 0, 2) AS result"
-    expect:
-      exit_code: 0
-    tags: ["string", "substring"]
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - graph
+  - loop
+- name: zero-length-path
+  description: Zero length path
+  args:
+  - query
+  - '-'
+  stdin: MATCH p = (n:TestNode) RETURN length(p) AS path_length LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0'
+  tags:
+  - graph
+  - path
+- name: empty-aggregation
+  description: Empty aggregation
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NonExistentLabel) RETURN sum(n.value) AS sum_empty, avg(n.value)
+    AS avg_empty, count(n) AS count_empty
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'null'
+    - '0'
+  tags:
+  - aggregation
+  - empty
+- name: single-value-aggregation
+  description: Single value aggregation
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:SingleAggTest {int_val: 42})
 
-  # NULL Handling
-  - name: "null-in-math-functions"
-    description: "NULL in math functions"
-    args: ["query", "-"]
-    stdin: "WITH null AS x RETURN abs(x) AS abs_null, sqrt(x) AS sqrt_null, pow(x, 2) AS pow_null"
-    expect:
-      exit_code: 0
-      stdout_contains: ["null"]
-    tags: ["null", "math"]
+    MATCH (n:SingleAggTest) WHERE n.int_val = 42
 
-  - name: "null-in-string-functions"
-    description: "NULL in string functions"
-    args: ["query", "-"]
-    stdin: "RETURN length(NULL) AS len_null, upper(NULL) AS upper_null, trim(NULL) AS trim_null"
-    expect:
-      exit_code: 0
-      stdout_contains: ["null"]
-    tags: ["null", "string"]
+    RETURN min(n.int_val) AS min_val, max(n.int_val) AS max_val, avg(n.int_val) AS
+    avg_val
 
-  - name: "null-in-aggregations"
-    description: "NULL in aggregations"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (n1:TestNode {int_val: 10})
-      CREATE (n2:TestNode {int_val: NULL})
-      CREATE (n3:TestNode {int_val: 20})
-      MATCH (n:TestNode) RETURN avg(n.int_val) AS avg_with_null, count(n.int_val) AS count_non_null
-    expect:
-      exit_code: 0
-      stdout_contains: ["15", "2"]
-    tags: ["null", "aggregation"]
-
-  # Special Numeric Values
-  - name: "division-by-zero-integer"
-    description: "Division by zero integer"
-    args: ["query", "-"]
-    stdin: "RETURN 10 / 0 AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "error"]
-
-  - name: "division-by-zero-decimal"
-    description: "Division by zero decimal"
-    args: ["query", "-"]
-    stdin: "RETURN CAST(10.0 AS DECIMAL(10,2)) / CAST(0.0 AS DECIMAL(10,2)) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "error"]
-
-  - name: "mod-by-zero"
-    description: "MOD by zero"
-    args: ["query", "-"]
-    stdin: "RETURN 10 % 0 AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "error"]
-
-  - name: "sqrt-of-negative"
-    description: "SQRT of negative"
-    args: ["query", "-"]
-    stdin: "RETURN sqrt(-1) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "error"]
-
-  - name: "log-of-zero"
-    description: "LOG of zero"
-    args: ["query", "-"]
-    stdin: "RETURN log(0) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "error"]
-
-  - name: "log-of-negative"
-    description: "LOG of negative"
-    args: ["query", "-"]
-    stdin: "RETURN log(-1) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "error"]
-
-  - name: "asin-out-of-range"
-    description: "ASIN out of range"
-    args: ["query", "-"]
-    stdin: "RETURN asin(1.5) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "error"]
-
-  - name: "acos-out-of-range"
-    description: "ACOS out of range"
-    args: ["query", "-"]
-    stdin: "RETURN acos(-1.5) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["numeric", "error"]
-
-  # Type Conversion Edge Cases
-  - name: "invalid-integer-cast"
-    description: "Invalid integer cast"
-    args: ["query", "-"]
-    stdin: "RETURN CAST('not_a_number' AS INTEGER) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["type", "error"]
-
-  - name: "invalid-decimal-cast"
-    description: "Invalid decimal cast"
-    args: ["query", "-"]
-    stdin: "RETURN CAST('12.34.56' AS DECIMAL(10,2)) AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["type", "error"]
-
-  - name: "boolean-to-integer"
-    description: "Boolean to integer"
-    skip: true  # CAST boolean to INTEGER not yet implemented
-    args: ["query", "-"]
-    stdin: "RETURN CAST(true AS INTEGER) AS true_int, CAST(false AS INTEGER) AS false_int"
-    expect:
-      exit_code: 0
-      stdout_contains: ["1", "0"]
-    tags: ["type", "cast"]
-
-  # Date/Time Edge Cases
-  - name: "invalid-date"
-    description: "Invalid date"
-    args: ["query", "-"]
-    stdin: "RETURN DATE '2024-02-30' AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["date", "error"]
-
-  - name: "invalid-time"
-    description: "Invalid time"
-    args: ["query", "-"]
-    stdin: "RETURN TIME '25:00:00' AS result"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"
-    tags: ["time", "error"]
-
-  - name: "leap-year-date"
-    description: "Leap year date"
-    args: ["query", "-"]
-    stdin: "RETURN date('2024-02-29') AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["2024-02-29"]
-    tags: ["date"]
-
-  # Graph Edge Cases
-  - name: "empty-pattern-match"
-    description: "Empty pattern match"
-    args: ["query", "-"]
-    stdin: "MATCH (n:NonExistentLabel) RETURN count(n) AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["0"]
-    tags: ["graph", "empty"]
-
-  - name: "self-loop"
-    description: "Self loop"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (n:SelfLoopTest {int_val: 42})
-      MATCH (n:SelfLoopTest {int_val: 42})
-      CREATE (n)-[:SELF_LOOP]->(n)
-      MATCH (n:SelfLoopTest)-[r:SELF_LOOP]->(n) RETURN count(r) AS self_loops
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]
-    tags: ["graph", "loop"]
-
-  - name: "zero-length-path"
-    description: "Zero length path"
-    args: ["query", "-"]
-    stdin: "MATCH p = (n:TestNode) RETURN length(p) AS path_length LIMIT 1"
-    expect:
-      exit_code: 0
-      stdout_contains: ["0"]
-    tags: ["graph", "path"]
-
-  # Aggregation Edge Cases
-  - name: "empty-aggregation"
-    description: "Empty aggregation"
-    args: ["query", "-"]
-    stdin: "MATCH (n:NonExistentLabel) RETURN sum(n.value) AS sum_empty, avg(n.value) AS avg_empty, count(n) AS count_empty"
-    expect:
-      exit_code: 0
-      stdout_contains: ["null", "0"]
-    tags: ["aggregation", "empty"]
-
-  - name: "single-value-aggregation"
-    description: "Single value aggregation"
-    args: ["query", "-"]
-    stdin: |
-      CREATE (n:SingleAggTest {int_val: 42})
-      MATCH (n:SingleAggTest) WHERE n.int_val = 42
-      RETURN min(n.int_val) AS min_val, max(n.int_val) AS max_val, avg(n.int_val) AS avg_val
-    expect:
-      exit_code: 0
-      stdout_contains: ["42"]
-    tags: ["aggregation", "single"]
-
-  # String Function Edge Cases
-  - name: "trim-with-special-characters"
-    description: "TRIM with special characters"
-    args: ["query", "-"]
-    stdin: "RETURN trim('  hello  ') AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["hello"]
-    tags: ["string", "trim"]
-
-  - name: "replace-with-empty-string"
-    description: "REPLACE with empty string"
-    args: ["query", "-"]
-    stdin: "RETURN replace('hello world', 'world', '') AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["hello"]
-    tags: ["string", "replace"]
-
-  - name: "replace-non-existent-pattern"
-    description: "REPLACE non-existent pattern"
-    args: ["query", "-"]
-    stdin: "RETURN replace('hello world', 'xyz', 'abc') AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["hello world"]
-    tags: ["string", "replace"]
-
-  - name: "substring-entire-string"
-    description: "SUBSTRING entire string"
-    args: ["query", "-"]
-    stdin: "RETURN substring('hello', 1, 1000) AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["hello"]
-    tags: ["string", "substring"]
-
-  # Complex Expression Edge Cases
-  - name: "nested-null-propagation"
-    description: "Nested NULL propagation"
-    args: ["query", "-"]
-    stdin: "RETURN abs(sqrt(pow(NULL, 2))) AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["null"]
-    tags: ["null", "nested"]
-
-  - name: "deep-function-nesting"
-    description: "Deep function nesting"
-    args: ["query", "-"]
-    stdin: "RETURN abs(floor(ceil(round(sqrt(pow(2, 3)), 2)))) AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["3"]
-    tags: ["function", "nesting"]
-
-  - name: "mixed-type-operations"
-    description: "Mixed type operations"
-    skip: true  # CAST AS INTEGER syntax not supported in Geode GQL
-    args: ["query", "-"]
-    stdin: "RETURN 10 + CAST('20' AS INTEGER) + 30.5 AS result"
-    expect:
-      exit_code: 0
-      stdout_contains: ["60.5"]
-    tags: ["type", "mixed"]
-
-  # Comparison Edge Cases
-  - name: "null-comparisons"
-    description: "NULL comparisons"
-    args: ["query", "-"]
-    stdin: "RETURN NULL = NULL AS null_eq, NULL <> NULL AS null_neq, NULL IS NULL AS null_is"
-    expect:
-      exit_code: 0
-      stdout_contains: ["null", "true"]
-    tags: ["null", "comparison"]
-
-  - name: "string-comparison-case-sensitivity"
-    description: "String comparison case sensitivity"
-    args: ["query", "-"]
-    stdin: "RETURN 'Hello' = 'hello' AS case_sensitive, upper('Hello') = upper('hello') AS case_insensitive"
-    expect:
-      exit_code: 0
-      stdout_contains: ["false", "true"]
-    tags: ["string", "comparison"]
-
-  # Floating Point Precision
-  - name: "float-precision-issues"
-    description: "Float precision issues"
-    args: ["query", "-"]
-    stdin: "RETURN 0.1 + 0.2 AS result"
-    expect:
-      exit_code: 0
-      stdout_regex: ["0\\.3\\d*"]
-    tags: ["float", "precision"]
-
-  - name: "very-large-exponent"
-    description: "Very large exponent (returns null on overflow)"
-    args: ["query", "-"]
-    stdin: "RETURN pow(10, 308) AS result"
-    expect:
-      exit_code: 0
-      # pow(10, 308) overflows to null in Geode
-      stdout_contains: ["null"]
-    tags: ["float", "exponent"]
-
-  - name: "very-small-exponent"
-    description: "Very small exponent (underflows to 0)"
-    args: ["query", "-"]
-    stdin: "RETURN pow(10, -308) AS result"
-    expect:
-      exit_code: 0
-      # pow(10, -308) underflows to 0 in Geode
-      stdout_contains: ["0"]
-    tags: ["float", "exponent"]
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '42'
+  tags:
+  - aggregation
+  - single
+- name: trim-with-special-characters
+  description: TRIM with special characters
+  args:
+  - query
+  - '-'
+  stdin: RETURN trim('  hello  ') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hello
+  tags:
+  - string
+  - trim
+- name: replace-with-empty-string
+  description: REPLACE with empty string
+  args:
+  - query
+  - '-'
+  stdin: RETURN replace('hello world', 'world', '') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hello
+  tags:
+  - string
+  - replace
+- name: replace-non-existent-pattern
+  description: REPLACE non-existent pattern
+  args:
+  - query
+  - '-'
+  stdin: RETURN replace('hello world', 'xyz', 'abc') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hello world
+  tags:
+  - string
+  - replace
+- name: substring-entire-string
+  description: SUBSTRING entire string
+  args:
+  - query
+  - '-'
+  stdin: RETURN substring('hello', 1, 1000) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hello
+  tags:
+  - string
+  - substring
+- name: nested-null-propagation
+  description: Nested NULL propagation
+  args:
+  - query
+  - '-'
+  stdin: RETURN abs(sqrt(pow(NULL, 2))) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'null'
+  tags:
+  - 'null'
+  - nested
+- name: deep-function-nesting
+  description: Deep function nesting
+  args:
+  - query
+  - '-'
+  stdin: RETURN abs(floor(ceil(round(sqrt(pow(2, 3)), 2)))) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '3'
+  tags:
+  - function
+  - nesting
+- name: mixed-type-operations
+  description: Mixed type operations
+  skip: true
+  args:
+  - query
+  - '-'
+  stdin: RETURN 10 + CAST('20' AS INTEGER) + 30.5 AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '60.5'
+  tags:
+  - type
+  - mixed
+- name: null-comparisons
+  description: NULL comparisons
+  args:
+  - query
+  - '-'
+  stdin: RETURN NULL = NULL AS null_eq, NULL <> NULL AS null_neq, NULL IS NULL AS
+    null_is
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'null'
+    - 'true'
+  tags:
+  - 'null'
+  - comparison
+- name: string-comparison-case-sensitivity
+  description: String comparison case sensitivity
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'Hello' = 'hello' AS case_sensitive, upper('Hello') = upper('hello')
+    AS case_insensitive
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'false'
+    - 'true'
+  tags:
+  - string
+  - comparison
+- name: float-precision-issues
+  description: Float precision issues
+  args:
+  - query
+  - '-'
+  stdin: RETURN 0.1 + 0.2 AS result
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - 0\.3\d*
+  tags:
+  - float
+  - precision
+- name: very-large-exponent
+  description: Very large exponent (returns null on overflow)
+  args:
+  - query
+  - '-'
+  stdin: RETURN pow(10, 308) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'null'
+  tags:
+  - float
+  - exponent
+- name: very-small-exponent
+  description: Very small exponent (underflows to 0)
+  args:
+  - query
+  - '-'
+  stdin: RETURN pow(10, -308) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0'
+  tags:
+  - float
+  - exponent

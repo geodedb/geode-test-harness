@@ -1,490 +1,620 @@
-version: "1.0"
-name: "TDE Plaintext Verification - Edge Cases"
-description: |
-  SECURITY CRITICAL TEST SUITE - EDGE CASES
+version: '1.0'
+name: TDE Plaintext Verification - Edge Cases
+description: 'SECURITY CRITICAL TEST SUITE - EDGE CASES
+
 
   Verifies TDE handles edge cases properly, ensuring NO plaintext escapes
+
   encryption even in unusual or boundary conditions. Tests include:
 
+
   1. Large data (potential buffer overflow in encryption)
+
   2. Unicode and special characters (encoding issues)
+
   3. Binary data patterns (might confuse encryption)
+
   4. Empty strings and null-like values
+
   5. Extremely long field names
+
   6. Special characters that might escape encryption
+
   7. Data at page boundaries
+
   8. Repeated patterns (compression might leak)
 
-  CANARY: REQ=REQ-TDE-ENFORCE-004; FEATURE=TDEEnforcement; ASPECT=EdgeCases; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
 
+  CANARY: REQ=REQ-TDE-ENFORCE-004; FEATURE=TDEEnforcement; ASPECT=EdgeCases; STATUS=TESTED;
+  OWNER=security; UPDATED=2026-01-28
+
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: false
-    args: ["--log-level", "info", "--enable-tde", "--enable-wal-encryption", "--tde-provider", "MockKms"]
+    args:
+    - --log-level
+    - info
+    - --enable-tde
+    - --enable-wal-encryption
+    - --tde-provider
+    - MockKms
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
-    timeout_ms: 30000  # Longer timeout for large data tests
+    timeout_ms: 30000
     tls_verify: false
-    format: "json"
-
+    format: json
 env:
-  # All keys must be exactly 64 hex characters (32 bytes for AES-256)
-  GEODE_TDE_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-  GEODE_WAL_KEY: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-  GEODE_TDE_ENABLED: "true"
-  GEODE_WAL_ENCRYPTION_ENABLED: "true"
-
+  GEODE_TDE_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  GEODE_WAL_KEY: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+  GEODE_TDE_ENABLED: 'true'
+  GEODE_WAL_ENCRYPTION_ENABLED: 'true'
 tests:
-  # ===============================
-  # PHASE 1: UNICODE AND SPECIAL CHARACTERS
-  # ===============================
-
-  - name: "tde-edge-unicode-chinese"
-    description: "Test encryption of Chinese characters"
-    args: ["query",
-           "CREATE (n:EdgeTest_Unicode {
-              type: 'Chinese',
-              content: 'EDGETEST_CHINESE_\u4e2d\u6587\u79d8\u5bc6_SECRET',
-              description: '\u8fd9\u662f\u4e00\u4e2a\u79d8\u5bc6\u6d4b\u8bd5'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "unicode", "chinese"]
-
-  - name: "tde-edge-unicode-arabic"
-    description: "Test encryption of Arabic characters (RTL)"
-    args: ["query",
-           "CREATE (n:EdgeTest_Arabic {
-              type: 'Arabic',
-              content: 'EDGETEST_ARABIC_\u0633\u0631\u064a_SECRET',
-              description: '\u0647\u0630\u0627 \u0627\u062e\u062a\u0628\u0627\u0631 \u0633\u0631\u064a'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "unicode", "arabic"]
-
-  - name: "tde-edge-unicode-emoji"
-    description: "Test encryption of emoji characters"
-    args: ["query",
-           "CREATE (n:EdgeTest_Emoji {
-              type: 'Emoji',
-              content: 'EDGETEST_EMOJI_\ud83d\udd10\ud83d\udcbb\ud83d\udd12_SECRET',
-              pin: '\ud83d\udcb0\ud83d\udcb3\ud83d\udcb4'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "unicode", "emoji"]
-
-  - name: "tde-edge-unicode-mixed"
-    description: "Test encryption of mixed unicode scripts"
-    args: ["query",
-           "CREATE (n:EdgeTest_Mixed {
-              type: 'MixedScript',
-              content: 'EDGETEST_MIXED_Hello\u4e16\u754c\u041c\u0438\u0440\u3053\u3093\u306b\u3061\u306f_SECRET',
-              marker: 'MixedUnicode'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "unicode", "mixed"]
-
-  # ===============================
-  # PHASE 2: SPECIAL CHARACTERS
-  # ===============================
-
-  - name: "tde-edge-special-null-bytes"
-    description: "Test encryption with null byte patterns"
-    args: ["query",
-           "CREATE (n:EdgeTest_NullPattern {
-              type: 'NullBytes',
-              content: 'EDGETEST_NULLBYTE_before\\x00after_SECRET',
-              pattern: 'NullBytePattern'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "special", "nullbyte"]
-
-  - name: "tde-edge-special-newlines"
-    description: "Test encryption with various newline types"
-    args: ["query",
-           "CREATE (n:EdgeTest_Newlines {
-              type: 'Newlines',
-              content: 'EDGETEST_NEWLINE_line1\\nline2\\r\\nline3\\rline4_SECRET',
-              marker: 'NewlineTypes'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "special", "newlines"]
-
-  - name: "tde-edge-special-tabs"
-    description: "Test encryption with tab characters"
-    args: ["query",
-           "CREATE (n:EdgeTest_Tabs {
-              type: 'Tabs',
-              content: 'EDGETEST_TAB_col1\\tcol2\\tcol3_SECRET',
-              marker: 'TabSeparated'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "special", "tabs"]
-
-  - name: "tde-edge-special-quotes"
-    description: "Test encryption with quote characters"
-    args: ["query",
-           "CREATE (n:EdgeTest_Quotes {
-              type: 'Quotes',
-              single_quoted: 'EDGETEST_QUOTE_it\\'s_SECRET',
-              double_content: 'EDGETEST_DQUOTE_he_said_hello_SECRET',
-              marker: 'QuoteChars'
-            })
-            RETURN n.single_quoted AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "special", "quotes"]
-
-  - name: "tde-edge-special-backslashes"
-    description: "Test encryption with backslash characters"
-    args: ["query",
-           "CREATE (n:EdgeTest_Backslash {
-              type: 'Backslash',
-              path: 'EDGETEST_BACKSLASH_C:\\\\Users\\\\Secret\\\\Data_SECRET',
-              marker: 'BackslashPath'
-            })
-            RETURN n.path AS path"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "special", "backslash"]
-
-  # ===============================
-  # PHASE 3: LARGE DATA
-  # ===============================
-
-  - name: "tde-edge-large-string-4k"
-    description: "Test encryption of larger string"
-    args: ["query",
-           "CREATE (n:EdgeTest_Large4K {
-              content: 'EDGETEST_LARGE4K_XXXXXXXXXXXXXXXXXX_SECRETPASSWORD123456789_CONFIDENTIAL_END',
-              size: 76
-            })
-            RETURN n.size AS size"]
-    expect:
-      exit_code: 0
-    tags: ["tde", "edge", "large", "4k"]
-
-  - name: "tde-edge-large-string-8k"
-    description: "Test encryption of larger string (crosses page boundary)"
-    args: ["query",
-           "CREATE (n:EdgeTest_Large8K {
-              content: 'EDGETEST_LARGE8K_YYYYYYYYYYYYYYYYYY_APIKEY_sk_live_1234567890_TOKEN_SECRET_END',
-              size: 78
-            })
-            RETURN n.size AS size"]
-    expect:
-      exit_code: 0
-    tags: ["tde", "edge", "large", "8k"]
-
-  - name: "tde-edge-large-string-16k"
-    description: "Test encryption of larger string (multiple pages)"
-    args: ["query",
-           "CREATE (n:EdgeTest_Large16K {
-              content: 'EDGETEST_LARGE16K_ZZZZZZZZZZZZZZZZZZ_DATABASE_PASSWORD_admin_PRIVATE_KEY_BEGIN_END',
-              size: 82
-            })
-            RETURN n.size AS size"]
-    expect:
-      exit_code: 0
-    tags: ["tde", "edge", "large", "16k"]
-
-  # ===============================
-  # PHASE 4: REPEATED PATTERNS
-  # ===============================
-
-  - name: "tde-edge-repeated-pattern-same"
-    description: "Test encryption of repeated identical strings"
-    args: ["query",
-           "CREATE (n:EdgeTest_Repeated {
-              field1: 'EDGETEST_REPEAT_IDENTICAL_SECRET',
-              field2: 'EDGETEST_REPEAT_IDENTICAL_SECRET',
-              field3: 'EDGETEST_REPEAT_IDENTICAL_SECRET'
-            })
-            RETURN n.field1 AS f1, n.field2 AS f2, n.field3 AS f3"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "repeated", "identical"]
-
-  - name: "tde-edge-repeated-many-nodes"
-    description: "Test encryption consistency across many nodes"
-    args: ["query",
-           "UNWIND range(1, 20) AS i
-            CREATE (n:EdgeTest_ManyNodes {
-              index: i,
-              secret: 'EDGETEST_MANY_NODE_SECRET_' + toString(i)
-            })
-            RETURN count(*) AS created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "repeated", "manynodes"]
-
-  # ===============================
-  # PHASE 5: BOUNDARY VALUES
-  # ===============================
-
-  - name: "tde-edge-boundary-empty-adjacent"
-    description: "Test encryption with empty string adjacent to secret"
-    args: ["query",
-           "CREATE (n:EdgeTest_Empty {
-              empty_field: '',
-              secret_field: 'EDGETEST_EMPTY_ADJACENT_SECRET',
-              another_empty: ''
-            })
-            RETURN n.secret_field AS secret"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "boundary", "empty"]
-
-  - name: "tde-edge-boundary-single-char"
-    description: "Test encryption of single character values"
-    args: ["query",
-           "CREATE (n:EdgeTest_SingleChar {
-              char_a: 'A',
-              secret: 'EDGETEST_SINGLECHAR_SECRET',
-              char_z: 'Z'
-            })
-            RETURN n.secret AS secret"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "boundary", "singlechar"]
-
-  - name: "tde-edge-boundary-numeric-strings"
-    description: "Test encryption of numeric strings"
-    args: ["query",
-           "CREATE (n:EdgeTest_Numeric {
-              pin: 'EDGETEST_NUMERIC_123456789012345678901234567890_SECRET',
-              ssn_like: 'EDGETEST_NUMSSN_111222333444555666_SECRET'
-            })
-            RETURN n.pin AS pin"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "boundary", "numeric"]
-
-  # ===============================
-  # PHASE 6: BINARY-LIKE PATTERNS
-  # ===============================
-
-  - name: "tde-edge-binary-hex-pattern"
-    description: "Test encryption of hex-like patterns"
-    args: ["query",
-           "CREATE (n:EdgeTest_Hex {
-              type: 'HexPattern',
-              content: 'EDGETEST_HEX_deadbeef0123456789abcdef_SECRET',
-              key_material: 'EDGETEST_HEXKEY_0x4141414141414141_SECRET'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "binary", "hex"]
-
-  - name: "tde-edge-binary-base64-pattern"
-    description: "Test encryption of base64-like patterns"
-    args: ["query",
-           "CREATE (n:EdgeTest_Base64 {
-              type: 'Base64Pattern',
-              content: 'EDGETEST_B64_U2VjcmV0TWVzc2FnZQ==_SECRET',
-              encoded_key: 'EDGETEST_B64KEY_YWJjZGVmZ2hpamtsbW5vcA==_SECRET'
-            })
-            RETURN n.content AS content"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "edge", "binary", "base64"]
-
-  # ===============================
-  # PHASE 7: COMPREHENSIVE SCANS
-  # ===============================
-
-  - name: "tde-edge-scan-no-chinese-marker"
-    description: "CRITICAL: Verify Chinese content NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_CHINESE_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "unicode", "critical"]
-
-  - name: "tde-edge-scan-no-arabic-marker"
-    description: "CRITICAL: Verify Arabic content NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_ARABIC_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "unicode", "critical"]
-
-  - name: "tde-edge-scan-no-emoji-marker"
-    description: "CRITICAL: Verify Emoji content NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_EMOJI_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "unicode", "critical"]
-
-  - name: "tde-edge-scan-no-mixed-marker"
-    description: "CRITICAL: Verify mixed unicode NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_MIXED_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "unicode", "critical"]
-
-  - name: "tde-edge-scan-no-nullbyte-marker"
-    description: "CRITICAL: Verify null byte pattern NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_NULLBYTE_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "special", "critical"]
-
-  - name: "tde-edge-scan-no-newline-marker"
-    description: "CRITICAL: Verify newline pattern NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_NEWLINE_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "special", "critical"]
-
-  - name: "tde-edge-scan-no-large4k-marker"
-    description: "CRITICAL: Verify large 4K data NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_LARGE4K_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "large", "critical"]
-
-  - name: "tde-edge-scan-no-large8k-marker"
-    description: "CRITICAL: Verify large 8K data NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_LARGE8K_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "large", "critical"]
-
-  - name: "tde-edge-scan-no-large16k-marker"
-    description: "CRITICAL: Verify large 16K data NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_LARGE16K_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "large", "critical"]
-
-  - name: "tde-edge-scan-no-repeated-marker"
-    description: "CRITICAL: Verify repeated data NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_REPEAT_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "repeated", "critical"]
-
-  - name: "tde-edge-scan-no-many-nodes-marker"
-    description: "CRITICAL: Verify many nodes data NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_MANY_NODE_SECRET_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "manynodes", "critical"]
-
-  - name: "tde-edge-scan-no-hex-marker"
-    description: "CRITICAL: Verify hex pattern NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_HEX_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "binary", "critical"]
-
-  - name: "tde-edge-scan-no-base64-marker"
-    description: "CRITICAL: Verify base64 pattern NOT in plaintext"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_B64_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "binary", "critical"]
-
-  - name: "tde-edge-scan-comprehensive-prefix"
-    description: "CRITICAL: Verify NO EDGETEST_ prefix in ANY file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "EDGETEST_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "edge", "scan", "comprehensive", "critical"]
-
+- name: tde-edge-unicode-chinese
+  description: Test encryption of Chinese characters
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Unicode { type: ''Chinese'', content: ''EDGETEST_CHINESE_中文秘密_SECRET'',
+    description: ''这是一个秘密测试'' }) RETURN n.content AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - unicode
+  - chinese
+- name: tde-edge-unicode-arabic
+  description: Test encryption of Arabic characters (RTL)
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Arabic { type: ''Arabic'', content: ''EDGETEST_ARABIC_سري_SECRET'',
+    description: ''هذا اختبار سري'' }) RETURN n.content AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - unicode
+  - arabic
+- name: tde-edge-unicode-emoji
+  description: Test encryption of emoji characters
+  args:
+  - query
+  - "CREATE (n:EdgeTest_Emoji { type: 'Emoji', content: 'EDGETEST_EMOJI_\uD83D\uDD10\
+    \uD83D\uDCBB\uD83D\uDD12_SECRET', pin: '\uD83D\uDCB0\uD83D\uDCB3\uD83D\uDCB4'\
+    \ }) RETURN n.content AS content"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - unicode
+  - emoji
+- name: tde-edge-unicode-mixed
+  description: Test encryption of mixed unicode scripts
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Mixed { type: ''MixedScript'', content: ''EDGETEST_MIXED_Hello世界Мирこんにちは_SECRET'',
+    marker: ''MixedUnicode'' }) RETURN n.content AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - unicode
+  - mixed
+- name: tde-edge-special-null-bytes
+  description: Test encryption with null byte patterns
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_NullPattern { type: ''NullBytes'', content: ''EDGETEST_NULLBYTE_before\x00after_SECRET'',
+    pattern: ''NullBytePattern'' }) RETURN n.content AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - special
+  - nullbyte
+- name: tde-edge-special-newlines
+  description: Test encryption with various newline types
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Newlines { type: ''Newlines'', content: ''EDGETEST_NEWLINE_line1\nline2\r\nline3\rline4_SECRET'',
+    marker: ''NewlineTypes'' }) RETURN n.content AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - special
+  - newlines
+- name: tde-edge-special-tabs
+  description: Test encryption with tab characters
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Tabs { type: ''Tabs'', content: ''EDGETEST_TAB_col1\tcol2\tcol3_SECRET'',
+    marker: ''TabSeparated'' }) RETURN n.content AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - special
+  - tabs
+- name: tde-edge-special-quotes
+  description: Test encryption with quote characters
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Quotes { type: ''Quotes'', single_quoted: ''EDGETEST_QUOTE_it\''s_SECRET'',
+    double_content: ''EDGETEST_DQUOTE_he_said_hello_SECRET'', marker: ''QuoteChars''
+    }) RETURN n.single_quoted AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - special
+  - quotes
+- name: tde-edge-special-backslashes
+  description: Test encryption with backslash characters
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Backslash { type: ''Backslash'', path: ''EDGETEST_BACKSLASH_C:\\Users\\Secret\\Data_SECRET'',
+    marker: ''BackslashPath'' }) RETURN n.path AS path'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - special
+  - backslash
+- name: tde-edge-large-string-4k
+  description: Test encryption of larger string
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Large4K { content: ''EDGETEST_LARGE4K_XXXXXXXXXXXXXXXXXX_SECRETPASSWORD123456789_CONFIDENTIAL_END'',
+    size: 76 }) RETURN n.size AS size'
+  expect:
+    exit_code: 0
+  tags:
+  - tde
+  - edge
+  - large
+  - 4k
+- name: tde-edge-large-string-8k
+  description: Test encryption of larger string (crosses page boundary)
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Large8K { content: ''EDGETEST_LARGE8K_YYYYYYYYYYYYYYYYYY_APIKEY_sk_live_1234567890_TOKEN_SECRET_END'',
+    size: 78 }) RETURN n.size AS size'
+  expect:
+    exit_code: 0
+  tags:
+  - tde
+  - edge
+  - large
+  - 8k
+- name: tde-edge-large-string-16k
+  description: Test encryption of larger string (multiple pages)
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Large16K { content: ''EDGETEST_LARGE16K_ZZZZZZZZZZZZZZZZZZ_DATABASE_PASSWORD_admin_PRIVATE_KEY_BEGIN_END'',
+    size: 82 }) RETURN n.size AS size'
+  expect:
+    exit_code: 0
+  tags:
+  - tde
+  - edge
+  - large
+  - 16k
+- name: tde-edge-repeated-pattern-same
+  description: Test encryption of repeated identical strings
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Repeated { field1: ''EDGETEST_REPEAT_IDENTICAL_SECRET'', field2:
+    ''EDGETEST_REPEAT_IDENTICAL_SECRET'', field3: ''EDGETEST_REPEAT_IDENTICAL_SECRET''
+    }) RETURN n.field1 AS f1, n.field2 AS f2, n.field3 AS f3'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - repeated
+  - identical
+- name: tde-edge-repeated-many-nodes
+  description: Test encryption consistency across many nodes
+  args:
+  - query
+  - 'UNWIND range(1, 20) AS i CREATE (n:EdgeTest_ManyNodes { index: i, secret: ''EDGETEST_MANY_NODE_SECRET_''
+    + toString(i) }) RETURN count(*) AS created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - repeated
+  - manynodes
+- name: tde-edge-boundary-empty-adjacent
+  description: Test encryption with empty string adjacent to secret
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Empty { empty_field: '''', secret_field: ''EDGETEST_EMPTY_ADJACENT_SECRET'',
+    another_empty: '''' }) RETURN n.secret_field AS secret'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - boundary
+  - empty
+- name: tde-edge-boundary-single-char
+  description: Test encryption of single character values
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_SingleChar { char_a: ''A'', secret: ''EDGETEST_SINGLECHAR_SECRET'',
+    char_z: ''Z'' }) RETURN n.secret AS secret'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - boundary
+  - singlechar
+- name: tde-edge-boundary-numeric-strings
+  description: Test encryption of numeric strings
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Numeric { pin: ''EDGETEST_NUMERIC_123456789012345678901234567890_SECRET'',
+    ssn_like: ''EDGETEST_NUMSSN_111222333444555666_SECRET'' }) RETURN n.pin AS pin'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - boundary
+  - numeric
+- name: tde-edge-binary-hex-pattern
+  description: Test encryption of hex-like patterns
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Hex { type: ''HexPattern'', content: ''EDGETEST_HEX_deadbeef0123456789abcdef_SECRET'',
+    key_material: ''EDGETEST_HEXKEY_0x4141414141414141_SECRET'' }) RETURN n.content
+    AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - binary
+  - hex
+- name: tde-edge-binary-base64-pattern
+  description: Test encryption of base64-like patterns
+  args:
+  - query
+  - 'CREATE (n:EdgeTest_Base64 { type: ''Base64Pattern'', content: ''EDGETEST_B64_U2VjcmV0TWVzc2FnZQ==_SECRET'',
+    encoded_key: ''EDGETEST_B64KEY_YWJjZGVmZ2hpamtsbW5vcA==_SECRET'' }) RETURN n.content
+    AS content'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - edge
+  - binary
+  - base64
+- name: tde-edge-scan-no-chinese-marker
+  description: 'CRITICAL: Verify Chinese content NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_CHINESE_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - unicode
+  - critical
+- name: tde-edge-scan-no-arabic-marker
+  description: 'CRITICAL: Verify Arabic content NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_ARABIC_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - unicode
+  - critical
+- name: tde-edge-scan-no-emoji-marker
+  description: 'CRITICAL: Verify Emoji content NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_EMOJI_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - unicode
+  - critical
+- name: tde-edge-scan-no-mixed-marker
+  description: 'CRITICAL: Verify mixed unicode NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_MIXED_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - unicode
+  - critical
+- name: tde-edge-scan-no-nullbyte-marker
+  description: 'CRITICAL: Verify null byte pattern NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_NULLBYTE_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - special
+  - critical
+- name: tde-edge-scan-no-newline-marker
+  description: 'CRITICAL: Verify newline pattern NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_NEWLINE_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - special
+  - critical
+- name: tde-edge-scan-no-large4k-marker
+  description: 'CRITICAL: Verify large 4K data NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_LARGE4K_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - large
+  - critical
+- name: tde-edge-scan-no-large8k-marker
+  description: 'CRITICAL: Verify large 8K data NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_LARGE8K_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - large
+  - critical
+- name: tde-edge-scan-no-large16k-marker
+  description: 'CRITICAL: Verify large 16K data NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_LARGE16K_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - large
+  - critical
+- name: tde-edge-scan-no-repeated-marker
+  description: 'CRITICAL: Verify repeated data NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_REPEAT_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - repeated
+  - critical
+- name: tde-edge-scan-no-many-nodes-marker
+  description: 'CRITICAL: Verify many nodes data NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_MANY_NODE_SECRET_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - manynodes
+  - critical
+- name: tde-edge-scan-no-hex-marker
+  description: 'CRITICAL: Verify hex pattern NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_HEX_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - binary
+  - critical
+- name: tde-edge-scan-no-base64-marker
+  description: 'CRITICAL: Verify base64 pattern NOT in plaintext'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_B64_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - binary
+  - critical
+- name: tde-edge-scan-comprehensive-prefix
+  description: 'CRITICAL: Verify NO EDGETEST_ prefix in ANY file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - EDGETEST_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - edge
+  - scan
+  - comprehensive
+  - critical
 invariants:
-  - type: "server_running"
-
+- type: server_running
 plaintext_verification:
   enabled: true
   patterns:
-    - "EDGETEST_CHINESE_"
-    - "EDGETEST_ARABIC_"
-    - "EDGETEST_EMOJI_"
-    - "EDGETEST_MIXED_"
-    - "EDGETEST_NULLBYTE_"
-    - "EDGETEST_NEWLINE_"
-    - "EDGETEST_TAB_"
-    - "EDGETEST_QUOTE_"
-    - "EDGETEST_DQUOTE_"
-    - "EDGETEST_BACKSLASH_"
-    - "EDGETEST_LARGE4K_"
-    - "EDGETEST_LARGE8K_"
-    - "EDGETEST_LARGE16K_"
-    - "EDGETEST_REPEAT_"
-    - "EDGETEST_MANY_NODE_"
-    - "EDGETEST_EMPTY_"
-    - "EDGETEST_SINGLECHAR_"
-    - "EDGETEST_NUMERIC_"
-    - "EDGETEST_HEX_"
-    - "EDGETEST_HEXKEY_"
-    - "EDGETEST_B64_"
-    - "EDGETEST_B64KEY_"
-    - "EDGETEST_"
+  - EDGETEST_CHINESE_
+  - EDGETEST_ARABIC_
+  - EDGETEST_EMOJI_
+  - EDGETEST_MIXED_
+  - EDGETEST_NULLBYTE_
+  - EDGETEST_NEWLINE_
+  - EDGETEST_TAB_
+  - EDGETEST_QUOTE_
+  - EDGETEST_DQUOTE_
+  - EDGETEST_BACKSLASH_
+  - EDGETEST_LARGE4K_
+  - EDGETEST_LARGE8K_
+  - EDGETEST_LARGE16K_
+  - EDGETEST_REPEAT_
+  - EDGETEST_MANY_NODE_
+  - EDGETEST_EMPTY_
+  - EDGETEST_SINGLECHAR_
+  - EDGETEST_NUMERIC_
+  - EDGETEST_HEX_
+  - EDGETEST_HEXKEY_
+  - EDGETEST_B64_
+  - EDGETEST_B64KEY_
+  - EDGETEST_
   fail_on_violation: true
   scan_binary_files: true
-
-tags: ["tde", "edge-cases", "unicode", "binary", "large-data", "special-chars", "security", "plaintext-verification", "critical"]
+tags:
+- tde
+- edge-cases
+- unicode
+- binary
+- large-data
+- special-chars
+- security
+- plaintext-verification
+- critical

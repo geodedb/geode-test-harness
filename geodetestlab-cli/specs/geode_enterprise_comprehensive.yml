@@ -1,368 +1,438 @@
----
-# Geode Enterprise Comprehensive Test Specification
-# Tests core enterprise features that are stable
-version: "1.0"
-name: "Geode Enterprise Comprehensive Tests"
-description: |
-  Comprehensive test suite for Geode's enterprise-grade features including:
+version: '1.0'
+name: Geode Enterprise Comprehensive Tests
+description: 'Comprehensive test suite for Geode''s enterprise-grade features including:
+
   - Multi-graph security and isolation
+
   - Transaction operations
+
   - Basic aggregations
+
   - Query chaining with WITH clause
 
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "warn", "--insecure"]
+    args:
+    - --log-level
+    - warn
+    - --insecure
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 10000
     tls_verify: false
-    format: "json"
-
+    format: json
 invariants:
-  - type: "server_running"
-
+- type: server_running
 tests:
-  # ============================================================================
-  # SECTION 1: MULTI-GRAPH MANAGEMENT
-  # ============================================================================
+- name: mg-01-create-production-graph
+  description: Create production graph
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS production
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - setup
+- name: mg-02-create-analytics-graph
+  description: Create analytics graph
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS analytics
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - setup
+- name: mg-03-production-data
+  description: Add data to production graph
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH production;\nCREATE (u1:User {name: 'Alice', role: 'admin'}),\n\
+    \       (u2:User {name: 'Bob', role: 'developer'}),\n       (u3:User {name: 'Carol',\
+    \ role: 'analyst'})\nRETURN count(*) AS created\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - multi-graph
+  - data
+- name: mg-04-analytics-data
+  description: Add data to analytics graph
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH analytics;\nCREATE (m1:Metric {name: 'users', value: 1000}),\n\
+    \       (m2:Metric {name: 'requests', value: 50000})\nRETURN count(*) AS created\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - multi-graph
+  - data
+- name: mg-05-verify-production
+  description: Query production graph
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  - name: "mg-01-create-production-graph"
-    description: "Create production graph"
-    args: ["query", "-"]
-    stdin: "CREATE GRAPH IF NOT EXISTS production"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "setup"]
+    MATCH (u:User) RETURN count(u) AS user_count
 
-  - name: "mg-02-create-analytics-graph"
-    description: "Create analytics graph"
-    args: ["query", "-"]
-    stdin: "CREATE GRAPH IF NOT EXISTS analytics"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "setup"]
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - multi-graph
+  - verify
+- name: mg-06-verify-analytics
+  description: Query analytics graph
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH analytics;
 
-  - name: "mg-03-production-data"
-    description: "Add data to production graph"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      CREATE (u1:User {name: 'Alice', role: 'admin'}),
-             (u2:User {name: 'Bob', role: 'developer'}),
-             (u3:User {name: 'Carol', role: 'analyst'})
-      RETURN count(*) AS created
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["multi-graph", "data"]
+    MATCH (m:Metric) RETURN count(m) AS metric_count
 
-  - name: "mg-04-analytics-data"
-    description: "Add data to analytics graph"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH analytics;
-      CREATE (m1:Metric {name: 'users', value: 1000}),
-             (m2:Metric {name: 'requests', value: 50000})
-      RETURN count(*) AS created
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["multi-graph", "data"]
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - multi-graph
+  - verify
+- name: mg-07-graph-isolation
+  description: Verify users not in analytics
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH analytics;
 
-  - name: "mg-05-verify-production"
-    description: "Query production graph"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User) RETURN count(u) AS user_count
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["multi-graph", "verify"]
+    MATCH (u:User) RETURN count(u) AS user_count
 
-  - name: "mg-06-verify-analytics"
-    description: "Query analytics graph"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH analytics;
-      MATCH (m:Metric) RETURN count(m) AS metric_count
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["multi-graph", "verify"]
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      rows:
+      - user_count: 0
+  tags:
+  - multi-graph
+  - isolation
+- name: agg-01-basic-count
+  description: Count nodes
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  - name: "mg-07-graph-isolation"
-    description: "Verify users not in analytics"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH analytics;
-      MATCH (u:User) RETURN count(u) AS user_count
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        rows:
-          - user_count: 0
-    tags: ["multi-graph", "isolation"]
+    MATCH (n) RETURN count(n) AS total
 
-  # ============================================================================
-  # SECTION 2: AGGREGATIONS
-  # ============================================================================
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - aggregation
+- name: agg-02-count-by-label
+  description: Count users
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  - name: "agg-01-basic-count"
-    description: "Count nodes"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (n) RETURN count(n) AS total
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["aggregation"]
+    MATCH (u:User) RETURN count(*) AS users
 
-  - name: "agg-02-count-by-label"
-    description: "Count users"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User) RETURN count(*) AS users
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["aggregation"]
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - aggregation
+- name: agg-03-group-by
+  description: Group by role
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  - name: "agg-03-group-by"
-    description: "Group by role"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User) RETURN u.role AS role, count(*) AS cnt GROUP BY u.role ORDER BY role
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 1
-    tags: ["aggregation", "group-by"]
+    MATCH (u:User) RETURN u.role AS role, count(*) AS cnt GROUP BY u.role ORDER BY
+    role
 
-  # ============================================================================
-  # SECTION 3: WITH CLAUSE
-  # ============================================================================
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 1
+  tags:
+  - aggregation
+  - group-by
+- name: with-01-projection
+  description: WITH for projection
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  - name: "with-01-projection"
-    description: "WITH for projection"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User)
-      WITH u.name AS name
-      RETURN name ORDER BY name
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 1
-    tags: ["with-clause"]
+    MATCH (u:User)
 
-  - name: "with-02-filter"
-    description: "WITH with filter"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User)
-      WITH u WHERE u.role = 'admin'
-      RETURN u.name AS admin
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["with-clause"]
+    WITH u.name AS name
 
-  - name: "with-03-order-limit"
-    description: "WITH ORDER BY LIMIT"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User)
-      WITH u ORDER BY u.name LIMIT 2
-      RETURN u.name AS name
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 2
-    tags: ["with-clause"]
+    RETURN name ORDER BY name
 
-  # ============================================================================
-  # SECTION 4: OPTIONAL MATCH
-  # ============================================================================
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 1
+  tags:
+  - with-clause
+- name: with-02-filter
+  description: WITH with filter
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  - name: "opt-01-setup-relationships"
-    description: "Create relationships for optional match"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (a:User {name: 'Alice'}), (b:User {name: 'Bob'})
-      CREATE (a)-[:MANAGES]->(b)
-      RETURN count(*) AS created
-    expect:
-      exit_code: 0
-    tags: ["optional-match", "setup"]
+    MATCH (u:User)
 
-  - name: "opt-02-basic-optional"
-    description: "Basic optional match"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User)
-      OPTIONAL MATCH (u)-[:MANAGES]->(sub:User)
-      RETURN u.name AS manager, sub.name AS subordinate ORDER BY manager
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 1
-    tags: ["optional-match"]
+    WITH u WHERE u.role = ''admin''
 
-  - name: "opt-03-count-optional"
-    description: "Count with optional"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User)
-      OPTIONAL MATCH (u)-[r:MANAGES]->()
-      RETURN u.name AS user, count(r) AS manages ORDER BY user
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 1
-    tags: ["optional-match"]
+    RETURN u.name AS admin
 
-  # ============================================================================
-  # SECTION 5: BASIC EXPRESSIONS
-  # ============================================================================
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - with-clause
+- name: with-03-order-limit
+  description: WITH ORDER BY LIMIT
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  - name: "expr-01-arithmetic"
-    description: "Arithmetic expressions"
-    args: ["query", "-"]
-    stdin: "RETURN 1 + 2 AS sum, 10 - 3 AS diff, 4 * 5 AS prod"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        rows:
-          - sum: 3
-            diff: 7
-            prod: 20
-    tags: ["expression"]
+    MATCH (u:User)
 
-  - name: "expr-02-comparison"
-    description: "Comparison expressions"
-    args: ["query", "-"]
-    stdin: "RETURN 5 > 3 AS gt, 2 < 1 AS lt, 4 = 4 AS eq"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        rows:
-          - gt: true
-            lt: false
-            eq: true
-    tags: ["expression"]
+    WITH u ORDER BY u.name LIMIT 2
 
-  - name: "expr-03-string-ops"
-    description: "String operations"
-    args: ["query", "-"]
-    stdin: "RETURN 'hello' + ' ' + 'world' AS greeting"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-        rows:
-          - greeting: "hello world"
-    tags: ["expression"]
+    RETURN u.name AS name
 
-  - name: "expr-04-case"
-    description: "CASE expression"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (u:User)
-      RETURN u.name,
-             CASE WHEN u.role = 'admin' THEN 'Administrator'
-                  ELSE 'Staff' END AS title
-      ORDER BY u.name
-    expect:
-      exit_code: 0
-      geode_query:
-        min_rows: 1
-    tags: ["expression", "case"]
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 2
+  tags:
+  - with-clause
+- name: opt-01-setup-relationships
+  description: Create relationships for optional match
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  # ============================================================================
-  # SECTION 6: TRANSACTIONS
-  # ============================================================================
+    MATCH (a:User {name: ''Alice''}), (b:User {name: ''Bob''})
 
-  - name: "txn-01-setup"
-    description: "Setup transaction test data"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      CREATE (a:Account {id: 'A1', balance: 1000}),
-             (b:Account {id: 'A2', balance: 500})
-      RETURN count(*) AS created
-    expect:
-      exit_code: 0
-    tags: ["transaction", "setup"]
+    CREATE (a)-[:MANAGES]->(b)
 
-  - name: "txn-02-read-accounts"
-    description: "Read account balances"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (a:Account) RETURN a.id AS id, a.balance AS balance ORDER BY a.id
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 2
-    tags: ["transaction"]
+    RETURN count(*) AS created
 
-  # ============================================================================
-  # SECTION 7: CLEANUP
-  # ============================================================================
+    '
+  expect:
+    exit_code: 0
+  tags:
+  - optional-match
+  - setup
+- name: opt-02-basic-optional
+  description: Basic optional match
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
 
-  - name: "cleanup-01-production"
-    description: "Clean production graph"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH production;
-      MATCH (n) DETACH DELETE n
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
+    MATCH (u:User)
 
-  - name: "cleanup-02-analytics"
-    description: "Clean analytics graph"
-    args: ["query", "-"]
-    stdin: |
-      USE GRAPH analytics;
-      MATCH (n) DETACH DELETE n
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
+    OPTIONAL MATCH (u)-[:MANAGES]->(sub:User)
 
-  - name: "cleanup-03-drop-graphs"
-    description: "Drop test graphs"
-    args: ["query", "-"]
-    stdin: |
-      DROP GRAPH IF EXISTS production;
-      DROP GRAPH IF EXISTS analytics
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
+    RETURN u.name AS manager, sub.name AS subordinate ORDER BY manager
+
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 1
+  tags:
+  - optional-match
+- name: opt-03-count-optional
+  description: Count with optional
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
+
+    MATCH (u:User)
+
+    OPTIONAL MATCH (u)-[r:MANAGES]->()
+
+    RETURN u.name AS user, count(r) AS manages ORDER BY user
+
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 1
+  tags:
+  - optional-match
+- name: expr-01-arithmetic
+  description: Arithmetic expressions
+  args:
+  - query
+  - '-'
+  stdin: RETURN 1 + 2 AS sum, 10 - 3 AS diff, 4 * 5 AS prod
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      rows:
+      - sum: 3
+        diff: 7
+        prod: 20
+  tags:
+  - expression
+- name: expr-02-comparison
+  description: Comparison expressions
+  args:
+  - query
+  - '-'
+  stdin: RETURN 5 > 3 AS gt, 2 < 1 AS lt, 4 = 4 AS eq
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      rows:
+      - gt: true
+        lt: false
+        eq: true
+  tags:
+  - expression
+- name: expr-03-string-ops
+  description: String operations
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'hello' + ' ' + 'world' AS greeting
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      rows:
+      - greeting: hello world
+  tags:
+  - expression
+- name: expr-04-case
+  description: CASE expression
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH production;\nMATCH (u:User)\nRETURN u.name,\n       CASE WHEN\
+    \ u.role = 'admin' THEN 'Administrator'\n            ELSE 'Staff' END AS title\n\
+    ORDER BY u.name\n"
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 1
+  tags:
+  - expression
+  - case
+- name: txn-01-setup
+  description: Setup transaction test data
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH production;\nCREATE (a:Account {id: 'A1', balance: 1000}),\n \
+    \      (b:Account {id: 'A2', balance: 500})\nRETURN count(*) AS created\n"
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - setup
+- name: txn-02-read-accounts
+  description: Read account balances
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
+
+    MATCH (a:Account) RETURN a.id AS id, a.balance AS balance ORDER BY a.id
+
+    '
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 2
+  tags:
+  - transaction
+- name: cleanup-01-production
+  description: Clean production graph
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH production;
+
+    MATCH (n) DETACH DELETE n
+
+    '
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-02-analytics
+  description: Clean analytics graph
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH analytics;
+
+    MATCH (n) DETACH DELETE n
+
+    '
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-03-drop-graphs
+  description: Drop test graphs
+  args:
+  - query
+  - '-'
+  stdin: 'DROP GRAPH IF EXISTS production;
+
+    DROP GRAPH IF EXISTS analytics
+
+    '
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup

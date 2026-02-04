@@ -1,131 +1,216 @@
-version: "1.0"
-name: "Geode Graph Algorithms Tests"
-description: "Comprehensive test suite for graph algorithms and traversals"
-
+version: '1.0'
+name: Geode Graph Algorithms Tests
+description: Comprehensive test suite for graph algorithms and traversals
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "error"]
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # Path Finding Algorithms
-  - name: shortest-path-simple
-    skip: true
-    skip_reason: "shortestPath edge population needs investigation - GAP-0380"
-    args: ["query", "CREATE (a:Node {name: 'A'})-[:EDGE {weight: 1}]->(b:Node {name: 'B'})-[:EDGE {weight: 2}]->(c:Node {name: 'C'}), (a)-[:EDGE {weight: 5}]->(c) WITH a, c MATCH p = shortestPath((a)-[*]-(c)) RETURN length(p)", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]  # shortestPath finds A->C (1 hop) not A->B->C (2 hops)
-
-  - name: all-shortest-paths
-    args: ["query", "MATCH (a:Node {name: 'A'}), (c:Node {name: 'C'}), p = allShortestPaths((a)-[*]-(c)) RETURN count(p)", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["count"]
-
-  - name: variable-length-basic
-    args: ["query", "MATCH p = (:Node {name: 'A'})-[*1..3]->(:Node) RETURN length(p)", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["length"]
-
-  - name: variable-length-with-filter
-    args: ["query", "MATCH p = (:Node {name: 'A'})-[r:EDGE*1..5]->(:Node) WHERE all(x IN r WHERE x.weight < 3) RETURN length(p)", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["length"]
-
-  - name: variable-length-unlimited
-    args: ["query", "MATCH p = (:Node {name: 'A'})-[*]->(:Node {name: 'C'}) RETURN length(p) ORDER BY length(p) LIMIT 1", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["length"]
-
-  # Graph Centrality Algorithms
-  - name: degree-centrality
-    args: ["query", "MATCH (n:Node) RETURN n.name, size((n)--()) AS degree ORDER BY degree DESC LIMIT 5", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["degree"]
-
-  - name: detect-cycles
-    args: ["query", "MATCH p = (n)-[*]-(n) WHERE length(p) > 0 RETURN p LIMIT 5", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["p"]
-
-  - name: find-triangles
-    args: ["query", "MATCH (a)-[:EDGE]-(b)-[:EDGE]-(c)-[:EDGE]-(a) WHERE id(a) < id(b) < id(c) RETURN count(*) AS triangles", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["triangles"]
-
-  # Similarity Algorithms
-  - name: jaccard-similarity
-    args: ["query", "MATCH (a:Node), (b:Node) WHERE id(a) <> id(b) WITH a, b, algo.similarity.jaccard([(a)--()], [(b)--()])  AS similarity WHERE similarity > 0.5 RETURN a.name, b.name, similarity ORDER BY similarity DESC LIMIT 5", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["similarity"]
-
-  - name: cosine-similarity
-    args: ["query", "MATCH (a:Node), (b:Node) WHERE id(a) <> id(b) AND a.vector IS NOT NULL AND b.vector IS NOT NULL RETURN a.name, b.name, algo.similarity.cosine(a.vector, b.vector) AS similarity ORDER BY similarity DESC LIMIT 5", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["similarity"]
-
-  # Graph Statistics
-  - name: graph-density
-    args: ["query", "MATCH (n) WITH count(n) AS nodes MATCH ()-[r]->() WITH nodes, count(r) AS edges RETURN toFloat(edges) / (nodes * (nodes - 1)) AS density", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["density"]
-
-  - name: average-path-length
-    args: ["query", "MATCH p = shortestPath((a)-[*]-(b)) WHERE a <> b WITH length(p) AS len RETURN avg(len) AS avgPathLength", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["avgPathLength"]
-
-  - name: clustering-coefficient
-    args: ["query", "MATCH (n) WITH n, size((n)--()) AS degree MATCH (n)--(neighbor1)--(neighbor2)--(n) WHERE neighbor1 <> neighbor2 WITH n, degree, count(DISTINCT [neighbor1, neighbor2]) AS triangles RETURN avg(CASE WHEN degree > 1 THEN 2.0 * triangles / (degree * (degree - 1)) ELSE 0 END) AS clusteringCoeff", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["clusteringCoeff"]
-
-  # Minimum Spanning Tree
-  - name: subgraph-isomorphism
-    args: ["query", "MATCH pattern = (:Node)-[:EDGE]->(:Node)-[:EDGE]->(:Node) WITH pattern MATCH graph = (:Node)-[*2]->(:Node) WHERE nodes(pattern) = nodes(graph) RETURN count(graph) AS count", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["count"]
-
-  # Temporal Graph Queries
-  - name: temporal-path-within-timeframe
-    skip: true
-    skip_reason: "Flaky under parallel load - passes when run individually but times out in parallel test runner"
-    args: ["query", "MATCH p = (a)-[r*]->(b) WHERE all(rel IN r WHERE rel.timestamp >= datetime('2024-01-01') AND rel.timestamp <= datetime('2024-12-31')) RETURN length(p)", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["length"]
-
-  - name: evolving-graph-snapshot
-    skip: true
-    skip_reason: "Flaky under parallel load - passes when run individually but times out in parallel test runner"
-    args: ["query", "MATCH (n)-[r]-(m) WHERE r.validFrom <= datetime('2024-06-01') AND (r.validTo IS NULL OR r.validTo > datetime('2024-06-01')) RETURN count(DISTINCT n) AS activeNodes", "--format", "json"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["activeNodes"]
-
+- name: shortest-path-simple
+  skip: true
+  skip_reason: shortestPath edge population needs investigation - GAP-0380
+  args:
+  - query
+  - 'CREATE (a:Node {name: ''A''})-[:EDGE {weight: 1}]->(b:Node {name: ''B''})-[:EDGE
+    {weight: 2}]->(c:Node {name: ''C''}), (a)-[:EDGE {weight: 5}]->(c) WITH a, c MATCH
+    p = shortestPath((a)-[*]-(c)) RETURN length(p)'
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+- name: all-shortest-paths
+  args:
+  - query
+  - 'MATCH (a:Node {name: ''A''}), (c:Node {name: ''C''}), p = allShortestPaths((a)-[*]-(c))
+    RETURN count(p)'
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - count
+- name: variable-length-basic
+  args:
+  - query
+  - 'MATCH p = (:Node {name: ''A''})-[*1..3]->(:Node) RETURN length(p)'
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - length
+- name: variable-length-with-filter
+  args:
+  - query
+  - 'MATCH p = (:Node {name: ''A''})-[r:EDGE*1..5]->(:Node) WHERE all(x IN r WHERE
+    x.weight < 3) RETURN length(p)'
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - length
+- name: variable-length-unlimited
+  args:
+  - query
+  - 'MATCH p = (:Node {name: ''A''})-[*]->(:Node {name: ''C''}) RETURN length(p) ORDER
+    BY length(p) LIMIT 1'
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - length
+- name: degree-centrality
+  args:
+  - query
+  - MATCH (n:Node) RETURN n.name, size((n)--()) AS degree ORDER BY degree DESC LIMIT
+    5
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - degree
+- name: detect-cycles
+  args:
+  - query
+  - MATCH p = (n)-[*]-(n) WHERE length(p) > 0 RETURN p LIMIT 5
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - p
+- name: find-triangles
+  args:
+  - query
+  - MATCH (a)-[:EDGE]-(b)-[:EDGE]-(c)-[:EDGE]-(a) WHERE id(a) < id(b) < id(c) RETURN
+    count(*) AS triangles
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - triangles
+- name: jaccard-similarity
+  args:
+  - query
+  - MATCH (a:Node), (b:Node) WHERE id(a) <> id(b) WITH a, b, algo.similarity.jaccard([(a)--()],
+    [(b)--()])  AS similarity WHERE similarity > 0.5 RETURN a.name, b.name, similarity
+    ORDER BY similarity DESC LIMIT 5
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - similarity
+- name: cosine-similarity
+  args:
+  - query
+  - MATCH (a:Node), (b:Node) WHERE id(a) <> id(b) AND a.vector IS NOT NULL AND b.vector
+    IS NOT NULL RETURN a.name, b.name, algo.similarity.cosine(a.vector, b.vector)
+    AS similarity ORDER BY similarity DESC LIMIT 5
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - similarity
+- name: graph-density
+  args:
+  - query
+  - MATCH (n) WITH count(n) AS nodes MATCH ()-[r]->() WITH nodes, count(r) AS edges
+    RETURN toFloat(edges) / (nodes * (nodes - 1)) AS density
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - density
+- name: average-path-length
+  args:
+  - query
+  - MATCH p = shortestPath((a)-[*]-(b)) WHERE a <> b WITH length(p) AS len RETURN
+    avg(len) AS avgPathLength
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - avgPathLength
+- name: clustering-coefficient
+  args:
+  - query
+  - MATCH (n) WITH n, size((n)--()) AS degree MATCH (n)--(neighbor1)--(neighbor2)--(n)
+    WHERE neighbor1 <> neighbor2 WITH n, degree, count(DISTINCT [neighbor1, neighbor2])
+    AS triangles RETURN avg(CASE WHEN degree > 1 THEN 2.0 * triangles / (degree *
+    (degree - 1)) ELSE 0 END) AS clusteringCoeff
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - clusteringCoeff
+- name: subgraph-isomorphism
+  args:
+  - query
+  - MATCH pattern = (:Node)-[:EDGE]->(:Node)-[:EDGE]->(:Node) WITH pattern MATCH graph
+    = (:Node)-[*2]->(:Node) WHERE nodes(pattern) = nodes(graph) RETURN count(graph)
+    AS count
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - count
+- name: temporal-path-within-timeframe
+  skip: true
+  skip_reason: Flaky under parallel load - passes when run individually but times
+    out in parallel test runner
+  args:
+  - query
+  - MATCH p = (a)-[r*]->(b) WHERE all(rel IN r WHERE rel.timestamp >= datetime('2024-01-01')
+    AND rel.timestamp <= datetime('2024-12-31')) RETURN length(p)
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - length
+- name: evolving-graph-snapshot
+  skip: true
+  skip_reason: Flaky under parallel load - passes when run individually but times
+    out in parallel test runner
+  args:
+  - query
+  - MATCH (n)-[r]-(m) WHERE r.validFrom <= datetime('2024-06-01') AND (r.validTo IS
+    NULL OR r.validTo > datetime('2024-06-01')) RETURN count(DISTINCT n) AS activeNodes
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - activeNodes
 invariants:
-  - type: "server_running"
-
-tags: ["algorithms", "graph", "traversal", "paths"]
+- type: server_running
+tags:
+- algorithms
+- graph
+- traversal
+- paths

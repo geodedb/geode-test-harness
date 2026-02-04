@@ -1,159 +1,230 @@
-version: "1.0"
-name: "GAP-0242 Bug Regression Tests"
-description: "Regression tests for Bug #365 (syntax validation) and Bug #366 (migrate QUIC segfault)"
-
-# CANARY: REQ=REQ-GAP-0242-REGRESSION-001; FEATURE="BugRegressionTests"; ASPECT=ServerSideSyntax; STATUS=TESTED; TEST=geodetestlab/specs/gap_0242_regression_tests.yml; OWNER=quality; UPDATED=2026-01-25
-
+version: '1.0'
+name: GAP-0242 Bug Regression Tests
+description: 'Regression tests for Bug #365 (syntax validation) and Bug #366 (migrate
+  QUIC segfault)'
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "info"]
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 30000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # ===============================
-  # BUG #365: Server accepts invalid GQL syntax
-  # https://gitlab.com/devnw/codepros/geode/geode/-/issues/365
-  # ===============================
-  # The parser unit tests exist but the server may accept what parser rejects.
-  # These tests verify the SERVER returns proper syntax errors.
-
-  - name: "bug-365-missing-paren-server"
-    description: "Bug #365: Server should reject MATCH (n RETURN n (missing closing paren)"
-    args: ["query", "-"]
-    stdin: "MATCH (n RETURN n"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"  # Syntax error class
-    tags: ["bug-365", "syntax", "regression", "gap-0242"]
-
-  - name: "bug-365-missing-paren-variation"
-    description: "Bug #365: Server should reject MATCH (n) WHERE x = 1 RETURN n (missing WHERE condition close)"
-    args: ["query", "-"]
-    stdin: "MATCH (n WHERE n.x = 1 RETURN n"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"
-    tags: ["bug-365", "syntax", "regression", "gap-0242"]
-
-  - name: "bug-365-unclosed-string"
-    description: "Bug #365: Server should reject unclosed string literal"
-    args: ["query", "-"]
-    stdin: "RETURN 'unclosed string"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"
-    tags: ["bug-365", "syntax", "regression", "gap-0242"]
-
-  - name: "bug-365-incomplete-where"
-    description: "Bug #365: Server should reject incomplete WHERE clause"
-    args: ["query", "-"]
-    stdin: "MATCH (n) WHERE RETURN n"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"
-    tags: ["bug-365", "syntax", "regression", "gap-0242"]
-
-  - name: "bug-365-unmatched-bracket"
-    description: "Bug #365: Server should reject unmatched brackets in list"
-    args: ["query", "-"]
-    stdin: "RETURN [1, 2, 3"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"
-    tags: ["bug-365", "syntax", "regression", "gap-0242"]
-
-  - name: "bug-365-unmatched-brace"
-    description: "Bug #365: Server should reject unmatched braces in map"
-    args: ["query", "-"]
-    stdin: "RETURN {a: 1, b: 2"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"
-    tags: ["bug-365", "syntax", "regression", "gap-0242"]
-
-  # Verify valid syntax still works (positive controls)
-  - name: "bug-365-control-valid-match"
-    description: "Control: Valid MATCH should succeed"
-    args: ["query", "-"]
-    stdin: "MATCH (n) RETURN n LIMIT 1"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "00000"  # Success
-    tags: ["bug-365", "control", "gap-0242"]
-
-  # ===============================
-  # BUG #366: Segmentation fault in migrate run
-  # https://gitlab.com/devnw/codepros/geode/geode/-/issues/366
-  # ===============================
-  # The segfault occurs in QUIC stream opening during migration execution.
-  # These tests verify migrate run doesn't crash with QUIC connections.
-
-  - name: "bug-366-migrate-run-no-segfault"
-    description: "Bug #366: migrate run should not segfault when connecting to server"
-    args: ["migrate", "run", "--dir", "tests/fixtures/migrations", "--server", "${SERVER_ADDR}", "--insecure", "--dry-run"]
-    expect:
-      exit_code: 0
-      stdout_not_contains:
-        - "Segmentation fault"
-        - "SIGSEGV"
-    tags: ["bug-366", "migration", "quic", "regression", "gap-0242"]
-
-  - name: "bug-366-migrate-status-server"
-    description: "Bug #366: migrate status should work with server connection"
-    args: ["migrate", "status", "--dir", "tests/fixtures/migrations", "--server", "${SERVER_ADDR}", "--insecure"]
-    expect:
-      exit_code: 0
-    tags: ["bug-366", "migration", "quic", "regression", "gap-0242"]
-
-  - name: "bug-366-migrate-run-empty-dir"
-    description: "Bug #366: migrate run with empty dir should not crash"
-    args: ["migrate", "run", "--dir", "/tmp/geode_empty_migrations", "--server", "${SERVER_ADDR}", "--insecure"]
-    expect:
-      exit_code: 0
-      stdout_contains:
-        - "No migration files found"
-    tags: ["bug-366", "migration", "quic", "regression", "gap-0242"]
-
-  - name: "bug-366-migrate-run-invalid-server"
-    description: "Bug #366: migrate run with invalid server should fail gracefully (not crash)"
-    args: ["migrate", "run", "--dir", "tests/fixtures/migrations", "--server", "invalid:99999", "--insecure"]
-    expect:
-      exit_code: 1
-      # Output goes to stdout, not stderr
-      stdout_contains:
-        - "Error"
-        - "Failed to connect"
-    tags: ["bug-366", "migration", "error-handling", "gap-0242"]
-
-  # ===============================
-  # COMBINED STRESS TESTS
-  # ===============================
-
-  - name: "regression-repeated-invalid-syntax"
-    description: "Repeated invalid syntax queries should all return syntax errors"
-    repeat: 5
-    args: ["query", "-"]
-    stdin: "MATCH (n RETURN n"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42000"
-    tags: ["bug-365", "stress", "gap-0242"]
-
-tags: ["gap-0242", "regression", "bug-365", "bug-366", "critical"]
+- name: bug-365-missing-paren-server
+  description: 'Bug #365: Server should reject MATCH (n RETURN n (missing closing
+    paren)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n RETURN n
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - bug-365
+  - syntax
+  - regression
+  - gap-0242
+- name: bug-365-missing-paren-variation
+  description: 'Bug #365: Server should reject MATCH (n) WHERE x = 1 RETURN n (missing
+    WHERE condition close)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n WHERE n.x = 1 RETURN n
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - bug-365
+  - syntax
+  - regression
+  - gap-0242
+- name: bug-365-unclosed-string
+  description: 'Bug #365: Server should reject unclosed string literal'
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'unclosed string
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - bug-365
+  - syntax
+  - regression
+  - gap-0242
+- name: bug-365-incomplete-where
+  description: 'Bug #365: Server should reject incomplete WHERE clause'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) WHERE RETURN n
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - bug-365
+  - syntax
+  - regression
+  - gap-0242
+- name: bug-365-unmatched-bracket
+  description: 'Bug #365: Server should reject unmatched brackets in list'
+  args:
+  - query
+  - '-'
+  stdin: RETURN [1, 2, 3
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - bug-365
+  - syntax
+  - regression
+  - gap-0242
+- name: bug-365-unmatched-brace
+  description: 'Bug #365: Server should reject unmatched braces in map'
+  args:
+  - query
+  - '-'
+  stdin: 'RETURN {a: 1, b: 2'
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - bug-365
+  - syntax
+  - regression
+  - gap-0242
+- name: bug-365-control-valid-match
+  description: 'Control: Valid MATCH should succeed'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) RETURN n LIMIT 1
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '00000'
+  tags:
+  - bug-365
+  - control
+  - gap-0242
+- name: bug-366-migrate-run-no-segfault
+  description: 'Bug #366: migrate run should not segfault when connecting to server'
+  args:
+  - migrate
+  - run
+  - --dir
+  - tests/fixtures/migrations
+  - --server
+  - ${SERVER_ADDR}
+  - --insecure
+  - --dry-run
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - Segmentation fault
+    - SIGSEGV
+  tags:
+  - bug-366
+  - migration
+  - quic
+  - regression
+  - gap-0242
+- name: bug-366-migrate-status-server
+  description: 'Bug #366: migrate status should work with server connection'
+  args:
+  - migrate
+  - status
+  - --dir
+  - tests/fixtures/migrations
+  - --server
+  - ${SERVER_ADDR}
+  - --insecure
+  expect:
+    exit_code: 0
+  tags:
+  - bug-366
+  - migration
+  - quic
+  - regression
+  - gap-0242
+- name: bug-366-migrate-run-empty-dir
+  description: 'Bug #366: migrate run with empty dir should not crash'
+  args:
+  - migrate
+  - run
+  - --dir
+  - /tmp/geode_empty_migrations
+  - --server
+  - ${SERVER_ADDR}
+  - --insecure
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - No migration files found
+  tags:
+  - bug-366
+  - migration
+  - quic
+  - regression
+  - gap-0242
+- name: bug-366-migrate-run-invalid-server
+  description: 'Bug #366: migrate run with invalid server should fail gracefully (not
+    crash)'
+  args:
+  - migrate
+  - run
+  - --dir
+  - tests/fixtures/migrations
+  - --server
+  - invalid:99999
+  - --insecure
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - Error
+    - Failed to connect
+  tags:
+  - bug-366
+  - migration
+  - error-handling
+  - gap-0242
+- name: regression-repeated-invalid-syntax
+  description: Repeated invalid syntax queries should all return syntax errors
+  repeat: 5
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n RETURN n
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42000'
+  tags:
+  - bug-365
+  - stress
+  - gap-0242
+tags:
+- gap-0242
+- regression
+- bug-365
+- bug-366
+- critical

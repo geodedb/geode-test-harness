@@ -1,457 +1,489 @@
-version: "1.0"
-name: "Transaction Connection State in Chunked Execution"
-description: "Black-box tests verifying transaction state persistence across QUIC RUN_GQL requests during chunked execution"
-
-# CANARY: REQ=REQ-TXN-CHUNKED-CONN-001; FEATURE="TransactionConnectionState"; ASPECT=IntegrationTests; STATUS=TESTED; OWNER=txn; UPDATED=2026-02-02
-# Tests that verify transaction state is maintained across multiple RUN_GQL requests on the same QUIC connection
-
+version: '1.0'
+name: Transaction Connection State in Chunked Execution
+description: Black-box tests verifying transaction state persistence across QUIC RUN_GQL
+  requests during chunked execution
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     startup_timeout_ms: 30000
-    args: ["--disable-auth", "--insecure", "--log-level", "error"]
-
+    args:
+    - --disable-auth
+    - --insecure
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
 secrets: {}
-
 invariants:
-  - type: "server_running"
-
+- type: server_running
 fuzz:
   enabled: false
-
 tests:
-  # ============================================================================
-  # Setup
-  # ============================================================================
-
-  - name: "setup-connection-state-graph"
-    description: "Create graph for connection state tests"
-    args: ["query", "--insecure", "CREATE GRAPH IF NOT EXISTS txn_conn_state"]
+- name: setup-connection-state-graph
+  description: Create graph for connection state tests
+  args:
+  - query
+  - --insecure
+  - CREATE GRAPH IF NOT EXISTS txn_conn_state
+  expect:
+    exit_code: 0
+  tags:
+  - setup
+- name: txn-connection-reuse-verification
+  description: Verify same connection is used for all chunks in a transaction
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_conn_reuse.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSTART TRANSACTION;\nEOF\n# Generate enough data to span multiple\
+      \ chunks\nfor i in {1..1200}; do\n  echo \"CREATE (n:ConnReuse {id: $i, chunk_marker:\
+      \ 'connection-test', description: 'Testing connection reuse across chunks with\
+      \ extended property data to ensure chunking occurs.'});\" >> /tmp/geode_txn_conn_reuse.gql\n\
+      done\necho \"COMMIT;\" >> /tmp/geode_txn_conn_reuse.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_conn_reuse.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:ConnReuse) RETURN count(n) AS cnt
     expect:
-      exit_code: 0
-    tags: ["setup"]
-
-  # ============================================================================
-  # Test 1: Connection persistence across chunks
-  # ============================================================================
-
-  - name: "txn-connection-reuse-verification"
-    description: "Verify same connection is used for all chunks in a transaction"
-    skip: true  # Stress test: 1200+ statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_conn_reuse.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        # Generate enough data to span multiple chunks
-        for i in {1..1200}; do
-          echo "CREATE (n:ConnReuse {id: $i, chunk_marker: 'connection-test', description: 'Testing connection reuse across chunks with extended property data to ensure chunking occurs.'});" >> /tmp/geode_txn_conn_reuse.gql
-        done
-        echo "COMMIT;" >> /tmp/geode_txn_conn_reuse.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_conn_reuse.gql"]
+      stdout_contains:
+      - '1200'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:ConnReuse) DELETE n
+  tags:
+  - connection
+  - state
+  - chunked
+- name: txn-id-consistency-across-chunks
+  description: Verify transaction ID remains consistent across all chunks (if exposed)
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_id_consistency.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSTART TRANSACTION;\nEOF\nfor i in {1..1500}; do\n  echo \"\
+      CREATE (n:TxnIdTest {id: $i, description: 'Transaction ID consistency test with\
+      \ extended data.'});\" >> /tmp/geode_txn_id_consistency.gql\ndone\n# Add some\
+      \ updates to ensure transaction context is used\nfor i in {1..500}; do\n  echo\
+      \ \"MATCH (n:TxnIdTest {id: $i}) SET n.updated = true;\" >> /tmp/geode_txn_id_consistency.gql\n\
+      done\necho \"COMMIT;\" >> /tmp/geode_txn_id_consistency.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_id_consistency.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:TxnIdTest) RETURN count(n) AS cnt
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      # If connection state is maintained, all nodes should be created
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:ConnReuse) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1200"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:ConnReuse) DELETE n"]
-    tags: ["connection", "state", "chunked"]
-
-  # ============================================================================
-  # Test 2: Transaction ID persistence
-  # ============================================================================
-
-  - name: "txn-id-consistency-across-chunks"
-    description: "Verify transaction ID remains consistent across all chunks (if exposed)"
-    skip: true  # Stress test: 2000+ statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_id_consistency.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        for i in {1..1500}; do
-          echo "CREATE (n:TxnIdTest {id: $i, description: 'Transaction ID consistency test with extended data.'});" >> /tmp/geode_txn_id_consistency.gql
-        done
-        # Add some updates to ensure transaction context is used
-        for i in {1..500}; do
-          echo "MATCH (n:TxnIdTest {id: $i}) SET n.updated = true;" >> /tmp/geode_txn_id_consistency.gql
-        done
-        echo "COMMIT;" >> /tmp/geode_txn_id_consistency.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_id_consistency.gql"]
+      stdout_contains:
+      - '1500'
+  - args:
+    - query
+    - --insecure
+    - 'USE GRAPH txn_conn_state; MATCH (n:TxnIdTest {updated: true}) RETURN count(n)
+      AS cnt'
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:TxnIdTest) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1500"]
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:TxnIdTest {updated: true}) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["500"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:TxnIdTest) DELETE n"]
-    tags: ["connection", "transaction-id", "chunked"]
-
-  # ============================================================================
-  # Test 3: Interleaved operations across chunks
-  # ============================================================================
-
-  - name: "txn-interleaved-create-update-delete"
-    description: "Test CREATE, UPDATE, DELETE interleaved across chunks maintain state"
-    skip: true  # Stress test: 1400+ statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_interleaved.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        # Pattern: Create 100, Update 50, Delete 25, repeated multiple times
-        for round in {1..8}; do
-          start=$((($round - 1) * 100 + 1))
-          end=$(($round * 100))
-          for i in $(seq $start $end); do
-            echo "CREATE (n:InterleavedOps {id: $i, round: $round, value: 0, description: 'Interleaved operations test data.'});" >> /tmp/geode_txn_interleaved.gql
-          done
-          # Update half
-          update_end=$(($start + 49))
-          for i in $(seq $start $update_end); do
-            echo "MATCH (n:InterleavedOps {id: $i}) SET n.value = $i * 10;" >> /tmp/geode_txn_interleaved.gql
-          done
-          # Delete quarter
-          delete_end=$(($start + 24))
-          for i in $(seq $start $delete_end); do
-            echo "MATCH (n:InterleavedOps {id: $i}) DELETE n;" >> /tmp/geode_txn_interleaved.gql
-          done
-        done
-        echo "COMMIT;" >> /tmp/geode_txn_interleaved.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_interleaved.gql"]
+      stdout_contains:
+      - '500'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:TxnIdTest) DELETE n
+  tags:
+  - connection
+  - transaction-id
+  - chunked
+- name: txn-interleaved-create-update-delete
+  description: Test CREATE, UPDATE, DELETE interleaved across chunks maintain state
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_interleaved.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSTART TRANSACTION;\nEOF\n# Pattern: Create 100, Update 50,\
+      \ Delete 25, repeated multiple times\nfor round in {1..8}; do\n  start=$((($round\
+      \ - 1) * 100 + 1))\n  end=$(($round * 100))\n  for i in $(seq $start $end);\
+      \ do\n    echo \"CREATE (n:InterleavedOps {id: $i, round: $round, value: 0,\
+      \ description: 'Interleaved operations test data.'});\" >> /tmp/geode_txn_interleaved.gql\n\
+      \  done\n  # Update half\n  update_end=$(($start + 49))\n  for i in $(seq $start\
+      \ $update_end); do\n    echo \"MATCH (n:InterleavedOps {id: $i}) SET n.value\
+      \ = $i * 10;\" >> /tmp/geode_txn_interleaved.gql\n  done\n  # Delete quarter\n\
+      \  delete_end=$(($start + 24))\n  for i in $(seq $start $delete_end); do\n \
+      \   echo \"MATCH (n:InterleavedOps {id: $i}) DELETE n;\" >> /tmp/geode_txn_interleaved.gql\n\
+      \  done\ndone\necho \"COMMIT;\" >> /tmp/geode_txn_interleaved.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_interleaved.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:InterleavedOps) RETURN count(n) AS cnt
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      # Should have 800 created - 200 deleted = 600 nodes
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:InterleavedOps) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["600"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:InterleavedOps) DELETE n"]
-    tags: ["connection", "interleaved", "chunked"]
-
-  # ============================================================================
-  # Test 4: Read-your-writes consistency
-  # ============================================================================
-
-  - name: "txn-read-your-writes-across-chunks"
-    description: "Verify writes in earlier chunks are visible in later chunks within same transaction"
-    skip: true  # Stress test: 1200+ statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_read_writes.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        # Chunk 1: Create nodes
-        for i in {1..400}; do
-          echo "CREATE (n:ReadYourWrites {id: $i, phase: 'created', description: 'Read-your-writes test data with extended properties.'});" >> /tmp/geode_txn_read_writes.gql
-        done
-
-        # Chunk 2: Read and update those nodes (tests visibility)
-        for i in {1..400}; do
-          echo "MATCH (n:ReadYourWrites {id: $i, phase: 'created'}) SET n.phase = 'updated';" >> /tmp/geode_txn_read_writes.gql
-        done
-
-        # Chunk 3: Read updated nodes and add property (tests update visibility)
-        for i in {1..400}; do
-          echo "MATCH (n:ReadYourWrites {id: $i, phase: 'updated'}) SET n.verified = true;" >> /tmp/geode_txn_read_writes.gql
-        done
-
-        echo "COMMIT;" >> /tmp/geode_txn_read_writes.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_read_writes.gql"]
+      stdout_contains:
+      - '600'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:InterleavedOps) DELETE n
+  tags:
+  - connection
+  - interleaved
+  - chunked
+- name: txn-read-your-writes-across-chunks
+  description: Verify writes in earlier chunks are visible in later chunks within
+    same transaction
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_read_writes.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSTART TRANSACTION;\nEOF\n# Chunk 1: Create nodes\nfor i in\
+      \ {1..400}; do\n  echo \"CREATE (n:ReadYourWrites {id: $i, phase: 'created',\
+      \ description: 'Read-your-writes test data with extended properties.'});\" >>\
+      \ /tmp/geode_txn_read_writes.gql\ndone\n\n# Chunk 2: Read and update those nodes\
+      \ (tests visibility)\nfor i in {1..400}; do\n  echo \"MATCH (n:ReadYourWrites\
+      \ {id: $i, phase: 'created'}) SET n.phase = 'updated';\" >> /tmp/geode_txn_read_writes.gql\n\
+      done\n\n# Chunk 3: Read updated nodes and add property (tests update visibility)\n\
+      for i in {1..400}; do\n  echo \"MATCH (n:ReadYourWrites {id: $i, phase: 'updated'})\
+      \ SET n.verified = true;\" >> /tmp/geode_txn_read_writes.gql\ndone\n\necho \"\
+      COMMIT;\" >> /tmp/geode_txn_read_writes.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_read_writes.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:ReadYourWrites) RETURN count(n) AS cnt
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:ReadYourWrites) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["400"]
-      # All nodes should have phase='updated' and verified=true
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:ReadYourWrites {phase: 'updated', verified: true}) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["400"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:ReadYourWrites) DELETE n"]
-    tags: ["connection", "read-your-writes", "consistency", "chunked"]
-
-  # ============================================================================
-  # Test 5: Relationship creation across chunks
-  # ============================================================================
-
-  - name: "txn-relationship-visibility-across-chunks"
-    description: "Test that relationships created in earlier chunks are visible in later chunks"
-    skip: true  # Stress test: 1000+ statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_rel_visibility.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        # Chunk 1: Create nodes
-        for i in {1..600}; do
-          echo "CREATE (n:RelVis {id: $i, description: 'Relationship visibility test node with extended data.'});" >> /tmp/geode_txn_rel_visibility.gql
-        done
-
-        # Chunk 2: Create relationships between nodes created in chunk 1
-        for i in {1..299}; do
-          j=$(($i + 1))
-          echo "MATCH (a:RelVis {id: $i}), (b:RelVis {id: $j}) CREATE (a)-[:LINKS {weight: $i}]->(b);" >> /tmp/geode_txn_rel_visibility.gql
-        done
-
-        # Chunk 3: Query relationships and add properties (tests relationship visibility)
-        for i in {1..149}; do
-          j=$(($i + 1))
-          echo "MATCH (a:RelVis {id: $i})-[r:LINKS]->(b:RelVis {id: $j}) SET r.verified = true;" >> /tmp/geode_txn_rel_visibility.gql
-        done
-
-        echo "COMMIT;" >> /tmp/geode_txn_rel_visibility.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_rel_visibility.gql"]
+      stdout_contains:
+      - '400'
+  - args:
+    - query
+    - --insecure
+    - 'USE GRAPH txn_conn_state; MATCH (n:ReadYourWrites {phase: ''updated'', verified:
+      true}) RETURN count(n) AS cnt'
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:RelVis) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["600"]
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH ()-[r:LINKS]->() RETURN count(r) AS cnt"]
-        expect:
-          stdout_contains: ["299"]
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH ()-[r:LINKS {verified: true}]->() RETURN count(r) AS cnt"]
-        expect:
-          stdout_contains: ["149"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:RelVis) DETACH DELETE n"]
-    tags: ["connection", "relationships", "visibility", "chunked"]
-
-  # ============================================================================
-  # Test 6: Path queries across chunks
-  # ============================================================================
-
-  - name: "txn-path-queries-spanning-chunks"
-    description: "Test that path queries work correctly with data spanning chunks"
-    skip: true  # Stress test: 1000 statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_paths.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        # Create a chain of nodes
-        for i in {1..500}; do
-          echo "CREATE (n:PathTest {id: $i, description: 'Path query test node with extended property data.'});" >> /tmp/geode_txn_paths.gql
-        done
-
-        # Create relationships forming a path
-        for i in {1..499}; do
-          j=$(($i + 1))
-          echo "MATCH (a:PathTest {id: $i}), (b:PathTest {id: $j}) CREATE (a)-[:NEXT]->(b);" >> /tmp/geode_txn_paths.gql
-        done
-
-        echo "COMMIT;" >> /tmp/geode_txn_paths.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_paths.gql"]
+      stdout_contains:
+      - '400'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:ReadYourWrites) DELETE n
+  tags:
+  - connection
+  - read-your-writes
+  - consistency
+  - chunked
+- name: txn-relationship-visibility-across-chunks
+  description: Test that relationships created in earlier chunks are visible in later
+    chunks
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_rel_visibility.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSTART TRANSACTION;\nEOF\n# Chunk 1: Create nodes\nfor i in\
+      \ {1..600}; do\n  echo \"CREATE (n:RelVis {id: $i, description: 'Relationship\
+      \ visibility test node with extended data.'});\" >> /tmp/geode_txn_rel_visibility.gql\n\
+      done\n\n# Chunk 2: Create relationships between nodes created in chunk 1\nfor\
+      \ i in {1..299}; do\n  j=$(($i + 1))\n  echo \"MATCH (a:RelVis {id: $i}), (b:RelVis\
+      \ {id: $j}) CREATE (a)-[:LINKS {weight: $i}]->(b);\" >> /tmp/geode_txn_rel_visibility.gql\n\
+      done\n\n# Chunk 3: Query relationships and add properties (tests relationship\
+      \ visibility)\nfor i in {1..149}; do\n  j=$(($i + 1))\n  echo \"MATCH (a:RelVis\
+      \ {id: $i})-[r:LINKS]->(b:RelVis {id: $j}) SET r.verified = true;\" >> /tmp/geode_txn_rel_visibility.gql\n\
+      done\n\necho \"COMMIT;\" >> /tmp/geode_txn_rel_visibility.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_rel_visibility.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:RelVis) RETURN count(n) AS cnt
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:PathTest) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["500"]
-      # Verify path exists from node 1 to node 10
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH path = (a:PathTest {id: 1})-[:NEXT*9]->(b:PathTest {id: 10}) RETURN length(path) AS len"]
-        expect:
-          stdout_contains: ["9"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:PathTest) DETACH DELETE n"]
-    tags: ["connection", "paths", "chunked"]
-
-  # ============================================================================
-  # Test 7: Session state interaction
-  # ============================================================================
-
-  - name: "txn-session-parameters-across-chunks"
-    description: "Test session parameter visibility within chunked transaction (if supported)"
-    skip: true  # Skip if session parameters not fully supported in transactions
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_session_params.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        SESSION SET VALUE $batch_id = 42;
-        START TRANSACTION;
-        EOF
-        for i in {1..800}; do
-          echo "CREATE (n:SessionParam {id: $i, batch_id: \$batch_id, description: 'Session parameter test.'});" >> /tmp/geode_txn_session_params.gql
-        done
-        echo "COMMIT;" >> /tmp/geode_txn_session_params.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_session_params.gql"]
+      stdout_contains:
+      - '600'
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH ()-[r:LINKS]->() RETURN count(r) AS cnt
     expect:
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:SessionParam {batch_id: 42}) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["800"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:SessionParam) DELETE n"]
-    tags: ["connection", "session", "parameters", "chunked"]
-
-  # ============================================================================
-  # Test 8: Transaction abort and cleanup
-  # ============================================================================
-
-  - name: "txn-abort-cleanup-across-chunks"
-    description: "Test that transaction abort properly cleans up state across all chunks"
-    skip: true  # Stress test: 1800+ statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_abort_cleanup.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        # Create data across multiple chunks
-        for i in {1..1500}; do
-          echo "CREATE (n:AbortCleanup {id: $i, temp_data: 'should-be-cleaned', description: 'Transaction abort cleanup test with extended data.'});" >> /tmp/geode_txn_abort_cleanup.gql
-        done
-        echo "ROLLBACK;" >> /tmp/geode_txn_abort_cleanup.gql
-
-        # Verify clean state by creating new transaction
-        echo "START TRANSACTION;" >> /tmp/geode_txn_abort_cleanup.gql
-        for i in {1..300}; do
-          echo "CREATE (n:AfterAbort {id: $i, description: 'Data after abort.'});" >> /tmp/geode_txn_abort_cleanup.gql
-        done
-        echo "COMMIT;" >> /tmp/geode_txn_abort_cleanup.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_abort_cleanup.gql"]
+      stdout_contains:
+      - '299'
+  - args:
+    - query
+    - --insecure
+    - 'USE GRAPH txn_conn_state; MATCH ()-[r:LINKS {verified: true}]->() RETURN count(r)
+      AS cnt'
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      # Aborted transaction data should not exist
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:AbortCleanup) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["0"]
-      # New transaction after abort should succeed
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:AfterAbort) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["300"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:AfterAbort) DELETE n"]
-    tags: ["connection", "abort", "cleanup", "chunked"]
-
-  # ============================================================================
-  # Test 9: Aggregation queries in chunked transactions
-  # ============================================================================
-
-  - name: "txn-aggregations-across-chunks"
-    description: "Test aggregation queries see consistent data across chunks"
-    skip: true  # Stress test: 1000 statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_aggregations.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        # Create nodes with numeric values
-        for i in {1..1000}; do
-          echo "CREATE (n:AggTest {id: $i, value: $i, category: 'test', description: 'Aggregation test data.'});" >> /tmp/geode_txn_aggregations.gql
-        done
-        echo "COMMIT;" >> /tmp/geode_txn_aggregations.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_aggregations.gql"]
+      stdout_contains:
+      - '149'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:RelVis) DETACH DELETE n
+  tags:
+  - connection
+  - relationships
+  - visibility
+  - chunked
+- name: txn-path-queries-spanning-chunks
+  description: Test that path queries work correctly with data spanning chunks
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_paths.gql << 'EOF'\nUSE GRAPH txn_conn_state;\n\
+      START TRANSACTION;\nEOF\n# Create a chain of nodes\nfor i in {1..500}; do\n\
+      \  echo \"CREATE (n:PathTest {id: $i, description: 'Path query test node with\
+      \ extended property data.'});\" >> /tmp/geode_txn_paths.gql\ndone\n\n# Create\
+      \ relationships forming a path\nfor i in {1..499}; do\n  j=$(($i + 1))\n  echo\
+      \ \"MATCH (a:PathTest {id: $i}), (b:PathTest {id: $j}) CREATE (a)-[:NEXT]->(b);\"\
+      \ >> /tmp/geode_txn_paths.gql\ndone\n\necho \"COMMIT;\" >> /tmp/geode_txn_paths.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_paths.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:PathTest) RETURN count(n) AS cnt
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      # Count
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:AggTest) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1000"]
-      # Sum (1 + 2 + ... + 1000 = 500500)
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:AggTest) RETURN sum(n.value) AS total"]
-        expect:
-          stdout_contains: ["500500"]
-      # Min/Max
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:AggTest) RETURN min(n.value) AS minimum, max(n.value) AS maximum"]
-        expect:
-          stdout_contains: ["1", "1000"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:AggTest) DELETE n"]
-    tags: ["connection", "aggregations", "chunked"]
-
-  # ============================================================================
-  # Test 10: Ordering and determinism
-  # ============================================================================
-
-  - name: "txn-deterministic-execution-chunked"
-    description: "Test that chunked execution produces deterministic results"
-    skip: true  # Stress test: 1000 statements takes > 10 seconds
-    setup:
-      script: |
-        #!/bin/bash
-        cat > /tmp/geode_txn_deterministic.gql << 'EOF'
-        USE GRAPH txn_conn_state;
-        START TRANSACTION;
-        EOF
-        # Create nodes with sequential IDs
-        for i in {1..1000}; do
-          echo "CREATE (n:DeterministicTest {id: $i, seq: $i, description: 'Determinism test data with extended properties.'});" >> /tmp/geode_txn_deterministic.gql
-        done
-        echo "COMMIT;" >> /tmp/geode_txn_deterministic.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_txn_deterministic.gql"]
+      stdout_contains:
+      - '500'
+  - args:
+    - query
+    - --insecure
+    - 'USE GRAPH txn_conn_state; MATCH path = (a:PathTest {id: 1})-[:NEXT*9]->(b:PathTest
+      {id: 10}) RETURN length(path) AS len'
     expect:
-      exit_code: 0
-      # Note: Geode doesn't output "Large file detected" message, just executes the file
-    verify:
-      # Verify all IDs exist in order
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) WHERE n.id = 1 RETURN n.id AS id"]
-        expect:
-          stdout_contains: ["1"]
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) WHERE n.id = 500 RETURN n.id AS id"]
-        expect:
-          stdout_contains: ["500"]
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) WHERE n.id = 1000 RETURN n.id AS id"]
-        expect:
-          stdout_contains: ["1000"]
-      # Verify count
-      - args: ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1000"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) DELETE n"]
-    tags: ["connection", "determinism", "chunked"]
-
-  # ============================================================================
-  # Cleanup
-  # ============================================================================
-
-  - name: "cleanup-connection-state-graph"
-    description: "Drop connection state test graph"
-    args: ["query", "--insecure", "DROP GRAPH IF EXISTS txn_conn_state"]
+      stdout_contains:
+      - '9'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:PathTest) DETACH DELETE n
+  tags:
+  - connection
+  - paths
+  - chunked
+- name: txn-session-parameters-across-chunks
+  description: Test session parameter visibility within chunked transaction (if supported)
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_session_params.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSESSION SET VALUE $batch_id = 42;\nSTART TRANSACTION;\nEOF\n\
+      for i in {1..800}; do\n  echo \"CREATE (n:SessionParam {id: $i, batch_id: \\\
+      $batch_id, description: 'Session parameter test.'});\" >> /tmp/geode_txn_session_params.gql\n\
+      done\necho \"COMMIT;\" >> /tmp/geode_txn_session_params.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_session_params.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - 'USE GRAPH txn_conn_state; MATCH (n:SessionParam {batch_id: 42}) RETURN count(n)
+      AS cnt'
     expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-connection-temp-files"
-    description: "Note: Temporary files will be cleaned up by OS"
-    skip: true
-    tags: ["cleanup"]
+      stdout_contains:
+      - '800'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:SessionParam) DELETE n
+  tags:
+  - connection
+  - session
+  - parameters
+  - chunked
+- name: txn-abort-cleanup-across-chunks
+  description: Test that transaction abort properly cleans up state across all chunks
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_abort_cleanup.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSTART TRANSACTION;\nEOF\n# Create data across multiple chunks\n\
+      for i in {1..1500}; do\n  echo \"CREATE (n:AbortCleanup {id: $i, temp_data:\
+      \ 'should-be-cleaned', description: 'Transaction abort cleanup test with extended\
+      \ data.'});\" >> /tmp/geode_txn_abort_cleanup.gql\ndone\necho \"ROLLBACK;\"\
+      \ >> /tmp/geode_txn_abort_cleanup.gql\n\n# Verify clean state by creating new\
+      \ transaction\necho \"START TRANSACTION;\" >> /tmp/geode_txn_abort_cleanup.gql\n\
+      for i in {1..300}; do\n  echo \"CREATE (n:AfterAbort {id: $i, description: 'Data\
+      \ after abort.'});\" >> /tmp/geode_txn_abort_cleanup.gql\ndone\necho \"COMMIT;\"\
+      \ >> /tmp/geode_txn_abort_cleanup.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_abort_cleanup.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:AbortCleanup) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '0'
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:AfterAbort) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '300'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:AfterAbort) DELETE n
+  tags:
+  - connection
+  - abort
+  - cleanup
+  - chunked
+- name: txn-aggregations-across-chunks
+  description: Test aggregation queries see consistent data across chunks
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_aggregations.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSTART TRANSACTION;\nEOF\n# Create nodes with numeric values\n\
+      for i in {1..1000}; do\n  echo \"CREATE (n:AggTest {id: $i, value: $i, category:\
+      \ 'test', description: 'Aggregation test data.'});\" >> /tmp/geode_txn_aggregations.gql\n\
+      done\necho \"COMMIT;\" >> /tmp/geode_txn_aggregations.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_aggregations.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:AggTest) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '1000'
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:AggTest) RETURN sum(n.value) AS total
+    expect:
+      stdout_contains:
+      - '500500'
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:AggTest) RETURN min(n.value) AS minimum,
+      max(n.value) AS maximum
+    expect:
+      stdout_contains:
+      - '1'
+      - '1000'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:AggTest) DELETE n
+  tags:
+  - connection
+  - aggregations
+  - chunked
+- name: txn-deterministic-execution-chunked
+  description: Test that chunked execution produces deterministic results
+  skip: true
+  setup:
+    script: "#!/bin/bash\ncat > /tmp/geode_txn_deterministic.gql << 'EOF'\nUSE GRAPH\
+      \ txn_conn_state;\nSTART TRANSACTION;\nEOF\n# Create nodes with sequential IDs\n\
+      for i in {1..1000}; do\n  echo \"CREATE (n:DeterministicTest {id: $i, seq: $i,\
+      \ description: 'Determinism test data with extended properties.'});\" >> /tmp/geode_txn_deterministic.gql\n\
+      done\necho \"COMMIT;\" >> /tmp/geode_txn_deterministic.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_txn_deterministic.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) WHERE n.id = 1 RETURN
+      n.id AS id
+    expect:
+      stdout_contains:
+      - '1'
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) WHERE n.id = 500 RETURN
+      n.id AS id
+    expect:
+      stdout_contains:
+      - '500'
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) WHERE n.id = 1000 RETURN
+      n.id AS id
+    expect:
+      stdout_contains:
+      - '1000'
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '1000'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH txn_conn_state; MATCH (n:DeterministicTest) DELETE n
+  tags:
+  - connection
+  - determinism
+  - chunked
+- name: cleanup-connection-state-graph
+  description: Drop connection state test graph
+  args:
+  - query
+  - --insecure
+  - DROP GRAPH IF EXISTS txn_conn_state
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-connection-temp-files
+  description: 'Note: Temporary files will be cleaned up by OS'
+  skip: true
+  tags:
+  - cleanup

@@ -1,494 +1,746 @@
-version: "1.0"
-name: "Shell Source Batch Execution Tests"
-description: "Tests for /source command batch execution performance and correctness (Issue #400)"
-
-# CANARY: REQ=REQ-SOURCE-PERF-007; FEATURE="SourceBatchIntegration"; ASPECT=E2ETests; STATUS=TESTED; OWNER=cli; UPDATED=2026-01-29
-
+version: '1.0'
+name: Shell Source Batch Execution Tests
+description: 'Tests for /source command batch execution performance and correctness
+  (Issue #400)'
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   working_dir: null
   env:
-    GEODE_LOG_LEVEL: "info"
+    GEODE_LOG_LEVEL: info
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 60000
     cleanup: true
-    args: ["--log-level", "info"]
-    env: {}
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
-    server_address: "127.0.0.1:3141"
+    server_address: 127.0.0.1:3141
     timeout_ms: 30000
     tls_verify: false
-    format: "json"
-
+    format: json
 invariants:
-  - type: "server_running"
-
+- type: server_running
 fuzz:
   enabled: false
-
 tests:
-  # Setup tests
-  - name: "setup-source-test-graph"
-    description: "Create graph for source batch tests"
-    args: ["query", "--insecure", "-"]
-    stdin: "DROP GRAPH IF EXISTS source_batch_test; CREATE GRAPH source_batch_test;"
-    expect:
-      exit_code: 0
-    tags: ["setup"]
+- name: setup-source-test-graph
+  description: Create graph for source batch tests
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: DROP GRAPH IF EXISTS source_batch_test; CREATE GRAPH source_batch_test;
+  expect:
+    exit_code: 0
+  tags:
+  - setup
+- name: batch-multiple-creates
+  description: Execute multiple CREATE statements in single batch
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (a:BatchNode {id: 1}); CREATE (b:BatchNode
+    {id: 2}); CREATE (c:BatchNode {id: 3}); CREATE (d:BatchNode {id: 4}); CREATE (e:BatchNode
+    {id: 5});'
+  expect:
+    exit_code: 0
+  tags:
+  - batch
+  - create
+- name: verify-batch-creates
+  description: Verify all nodes from batch were created
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:BatchNode) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '5'
+  tags:
+  - batch
+  - verify
+- name: batch-mixed-statements
+  description: Execute mixed statement types in single batch
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (x:MixedTest {name: ''X''}); CREATE
+    (y:MixedTest {name: ''Y''}); MATCH (a:MixedTest {name: ''X''}), (b:MixedTest {name:
+    ''Y''}) CREATE (a)-[:LINKED_TO]->(b); MATCH (n:MixedTest) RETURN count(n) AS node_count;'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '2'
+  tags:
+  - batch
+  - mixed
+- name: batch-with-relationships
+  description: Verify relationships created in batch
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH ()-[r:LINKED_TO]->() RETURN count(r) AS
+    rel_count;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - batch
+  - relationships
+- name: batch-multiline-property
+  description: Execute statement with multi-line properties in batch
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (m:MultiProp {name: ''MultiLine'', description:
+    ''A node with properties'', value: 42, active: true});'
+  expect:
+    exit_code: 0
+  tags:
+  - batch
+  - multiline
+- name: verify-multiline-properties
+  description: Verify multi-property node was created correctly
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MultiProp) RETURN n.name AS name, n.value
+    AS val;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - MultiLine
+    - '42'
+  tags:
+  - batch
+  - verify
+- name: batch-ten-statements
+  description: Execute 10 statements in a single batch
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (n1:TenTest {id: 1}); CREATE (n2:TenTest
+    {id: 2}); CREATE (n3:TenTest {id: 3}); CREATE (n4:TenTest {id: 4}); CREATE (n5:TenTest
+    {id: 5}); CREATE (n6:TenTest {id: 6}); CREATE (n7:TenTest {id: 7}); CREATE (n8:TenTest
+    {id: 8}); CREATE (n9:TenTest {id: 9}); CREATE (n10:TenTest {id: 10});'
+  expect:
+    exit_code: 0
+  tags:
+  - batch
+  - performance
+- name: verify-ten-statements
+  description: Verify all 10 nodes were created
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:TenTest) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '10'
+  tags:
+  - batch
+  - verify
+- name: batch-use-graph-conversion
+  description: Test USE GRAPH statement in batch (simulates \use conversion)
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (u:UseConvert {name: ''UseTest''});'
+  expect:
+    exit_code: 0
+  tags:
+  - batch
+  - use
+- name: verify-use-conversion
+  description: Verify USE GRAPH worked in batch
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:UseConvert) RETURN n.name AS name;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - UseTest
+  tags:
+  - batch
+  - verify
+- name: batch-transaction-atomicity
+  description: Verify batch executes atomically within transaction
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (t1:TxnAtomicTest {seq: 1}); CREATE
+    (t2:TxnAtomicTest {seq: 2}); CREATE (t3:TxnAtomicTest {seq: 3});'
+  expect:
+    exit_code: 0
+  tags:
+  - batch
+  - transaction
+- name: verify-transaction-atomicity
+  description: Verify all statements committed
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:TxnAtomicTest) RETURN count(n) AS cnt
+    ORDER BY n.seq;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '3'
+  tags:
+  - batch
+  - verify
+- name: batch-merge-idempotent
+  description: MERGE statements for idempotent batch execution
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; MERGE (m1:MergeTest {id: 1}) ON CREATE SET
+    m1.created = true; MERGE (m2:MergeTest {id: 2}) ON CREATE SET m2.created = true;'
+  expect:
+    exit_code: 0
+  tags:
+  - batch
+  - merge
+- name: batch-merge-rerun
+  description: Re-run MERGE batch (should be idempotent)
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; MERGE (m1:MergeTest {id: 1}) ON CREATE SET
+    m1.created = true; MERGE (m2:MergeTest {id: 2}) ON CREATE SET m2.created = true;'
+  expect:
+    exit_code: 0
+  tags:
+  - batch
+  - merge
+  - idempotent
+- name: verify-merge-idempotent
+  description: Verify MERGE created exactly 2 nodes despite double execution
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MergeTest) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '2'
+  tags:
+  - batch
+  - verify
+- name: shell-source-file-not-found
+  description: Test /source with non-existent file returns error
+  skip: true
+  args:
+  - shell
+  - --insecure
+  - --non-interactive
+  stdin: '\source /tmp/nonexistent_geode_test_file_xyz123.gql
 
-  # Batch execution tests using query command to verify multi-statement batching
-  - name: "batch-multiple-creates"
-    description: "Execute multiple CREATE statements in single batch"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (a:BatchNode {id: 1}); CREATE (b:BatchNode {id: 2}); CREATE (c:BatchNode {id: 3}); CREATE (d:BatchNode {id: 4}); CREATE (e:BatchNode {id: 5});"
-    expect:
-      exit_code: 0
-    tags: ["batch", "create"]
+    \quit
 
-  - name: "verify-batch-creates"
-    description: "Verify all nodes from batch were created"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:BatchNode) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["5"]
-    tags: ["batch", "verify"]
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Error
+    - Cannot open file
+  tags:
+  - shell
+  - source
+  - error
+- name: shell-source-home-expansion
+  description: Test ~ expansion in file path
+  skip: true
+  args:
+  - shell
+  - --insecure
+  - --non-interactive
+  stdin: '\source ~/nonexistent_geode_test.gql
 
-  - name: "batch-mixed-statements"
-    description: "Execute mixed statement types in single batch"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (x:MixedTest {name: 'X'}); CREATE (y:MixedTest {name: 'Y'}); MATCH (a:MixedTest {name: 'X'}), (b:MixedTest {name: 'Y'}) CREATE (a)-[:LINKED_TO]->(b); MATCH (n:MixedTest) RETURN count(n) AS node_count;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["2"]
-    tags: ["batch", "mixed"]
+    \quit
 
-  - name: "batch-with-relationships"
-    description: "Verify relationships created in batch"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH ()-[r:LINKED_TO]->() RETURN count(r) AS rel_count;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]
-    tags: ["batch", "relationships"]
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Error
+    - Cannot open file
+  tags:
+  - shell
+  - source
+  - path
+- name: shell-source-slash-variant
+  description: Test /source (slash) variant of source command
+  skip: true
+  args:
+  - shell
+  - --insecure
+  - --non-interactive
+  stdin: '/source /tmp/nonexistent_geode_test.gql
 
-  - name: "batch-multiline-property"
-    description: "Execute statement with multi-line properties in batch"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (m:MultiProp {name: 'MultiLine', description: 'A node with properties', value: 42, active: true});"
-    expect:
-      exit_code: 0
-    tags: ["batch", "multiline"]
+    \quit
 
-  - name: "verify-multiline-properties"
-    description: "Verify multi-property node was created correctly"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MultiProp) RETURN n.name AS name, n.value AS val;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["MultiLine", "42"]
-    tags: ["batch", "verify"]
-
-  - name: "batch-ten-statements"
-    description: "Execute 10 statements in a single batch"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (n1:TenTest {id: 1}); CREATE (n2:TenTest {id: 2}); CREATE (n3:TenTest {id: 3}); CREATE (n4:TenTest {id: 4}); CREATE (n5:TenTest {id: 5}); CREATE (n6:TenTest {id: 6}); CREATE (n7:TenTest {id: 7}); CREATE (n8:TenTest {id: 8}); CREATE (n9:TenTest {id: 9}); CREATE (n10:TenTest {id: 10});"
-    expect:
-      exit_code: 0
-    tags: ["batch", "performance"]
-
-  - name: "verify-ten-statements"
-    description: "Verify all 10 nodes were created"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:TenTest) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["10"]
-    tags: ["batch", "verify"]
-
-  - name: "batch-use-graph-conversion"
-    description: "Test USE GRAPH statement in batch (simulates \\use conversion)"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (u:UseConvert {name: 'UseTest'});"
-    expect:
-      exit_code: 0
-    tags: ["batch", "use"]
-
-  - name: "verify-use-conversion"
-    description: "Verify USE GRAPH worked in batch"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:UseConvert) RETURN n.name AS name;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["UseTest"]
-    tags: ["batch", "verify"]
-
-  # Transaction atomicity tests
-  - name: "batch-transaction-atomicity"
-    description: "Verify batch executes atomically within transaction"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (t1:TxnAtomicTest {seq: 1}); CREATE (t2:TxnAtomicTest {seq: 2}); CREATE (t3:TxnAtomicTest {seq: 3});"
-    expect:
-      exit_code: 0
-    tags: ["batch", "transaction"]
-
-  - name: "verify-transaction-atomicity"
-    description: "Verify all statements committed"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:TxnAtomicTest) RETURN count(n) AS cnt ORDER BY n.seq;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["3"]
-    tags: ["batch", "verify"]
-
-  # MERGE batch tests (for re-source idempotence)
-  - name: "batch-merge-idempotent"
-    description: "MERGE statements for idempotent batch execution"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MERGE (m1:MergeTest {id: 1}) ON CREATE SET m1.created = true; MERGE (m2:MergeTest {id: 2}) ON CREATE SET m2.created = true;"
-    expect:
-      exit_code: 0
-    tags: ["batch", "merge"]
-
-  - name: "batch-merge-rerun"
-    description: "Re-run MERGE batch (should be idempotent)"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MERGE (m1:MergeTest {id: 1}) ON CREATE SET m1.created = true; MERGE (m2:MergeTest {id: 2}) ON CREATE SET m2.created = true;"
-    expect:
-      exit_code: 0
-    tags: ["batch", "merge", "idempotent"]
-
-  - name: "verify-merge-idempotent"
-    description: "Verify MERGE created exactly 2 nodes despite double execution"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MergeTest) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["2"]
-    tags: ["batch", "verify"]
-
-  # Shell-specific tests (require manual testing or test harness support for file creation)
-  # These test the actual /source command behavior
-  - name: "shell-source-file-not-found"
-    description: "Test /source with non-existent file returns error"
-    skip: true  # Shell --non-interactive mode requires TTY
-    args: ["shell", "--insecure", "--non-interactive"]
-    stdin: |
-      \source /tmp/nonexistent_geode_test_file_xyz123.gql
-      \quit
-    expect:
-      exit_code: 0
-      stdout_contains: ["Error", "Cannot open file"]
-    tags: ["shell", "source", "error"]
-
-  - name: "shell-source-home-expansion"
-    description: "Test ~ expansion in file path"
-    skip: true  # Shell --non-interactive mode requires TTY
-    args: ["shell", "--insecure", "--non-interactive"]
-    stdin: |
-      \source ~/nonexistent_geode_test.gql
-      \quit
-    expect:
-      exit_code: 0
-      stdout_contains: ["Error", "Cannot open file"]
-    tags: ["shell", "source", "path"]
-
-  - name: "shell-source-slash-variant"
-    description: "Test /source (slash) variant of source command"
-    skip: true  # Shell --non-interactive mode requires TTY
-    args: ["shell", "--insecure", "--non-interactive"]
-    stdin: |
-      /source /tmp/nonexistent_geode_test.gql
-      \quit
-    expect:
-      exit_code: 0
-      stdout_contains: ["Error", "Cannot open file"]
-    tags: ["shell", "source", "slash"]
-
-  # Transaction auto-wrapping tests
-  # CANARY: REQ=REQ-SOURCE-PERF-013; FEATURE="SourceBatchTransaction"; ASPECT=E2ETests; STATUS=TESTED; OWNER=cli; UPDATED=2026-01-29
-
-  - name: "txn-auto-wrap-setup"
-    description: "Setup for transaction auto-wrap tests"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:TxnAutoWrap) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "setup"]
-
-  - name: "txn-auto-wrap-batch-atomicity"
-    description: "Test that batch without explicit transaction is wrapped atomically"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (t1:TxnAutoWrap {seq: 1}); CREATE (t2:TxnAutoWrap {seq: 2}); CREATE (t3:TxnAutoWrap {seq: 3}); CREATE (t4:TxnAutoWrap {seq: 4}); CREATE (t5:TxnAutoWrap {seq: 5});"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "atomicity"]
-
-  - name: "txn-auto-wrap-verify-all-created"
-    description: "Verify all nodes in auto-wrapped batch were created"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:TxnAutoWrap) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["5"]
-    tags: ["transaction", "verify"]
-
-  - name: "txn-explicit-begin-commit"
-    description: "Test batch with explicit BEGIN/COMMIT is not double-wrapped"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; BEGIN; CREATE (e1:ExplicitTxn {id: 1}); CREATE (e2:ExplicitTxn {id: 2}); COMMIT;"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "explicit"]
-
-  - name: "txn-explicit-verify"
-    description: "Verify explicit transaction nodes were created"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:ExplicitTxn) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["2"]
-    tags: ["transaction", "verify"]
-
-  - name: "txn-multiple-explicit-transactions"
-    description: "Test batch with multiple explicit transaction blocks"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; BEGIN; CREATE (m1:MultiTxn {block: 1}); COMMIT; BEGIN; CREATE (m2:MultiTxn {block: 2}); COMMIT;"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "multiple"]
-
-  - name: "txn-multiple-explicit-verify"
-    description: "Verify multiple transaction blocks completed"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MultiTxn) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["2"]
-    tags: ["transaction", "verify"]
-
-  - name: "txn-lowercase-detection"
-    description: "Test lowercase begin/commit detection"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; begin; CREATE (l:LowerTxn {case: 'lower'}); commit;"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "lowercase"]
-
-  - name: "txn-lowercase-verify"
-    description: "Verify lowercase transaction completed"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:LowerTxn) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]
-    tags: ["transaction", "verify"]
-
-  - name: "txn-mixed-case-detection"
-    description: "Test mixed case Begin/Commit detection"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; Begin; CREATE (m:MixedCaseTxn {case: 'mixed'}); Commit;"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "mixedcase"]
-
-  - name: "txn-mixed-case-verify"
-    description: "Verify mixed case transaction completed"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MixedCaseTxn) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]
-    tags: ["transaction", "verify"]
-
-  - name: "txn-no-false-positive-beginning"
-    description: "Test that BEGINNING (identifier) doesn't trigger transaction detection"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (n:BEGINNING {type: 'identifier_test'});"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "word-boundary"]
-
-  - name: "txn-no-false-positive-verify"
-    description: "Verify BEGINNING node was created (batch was auto-wrapped)"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:BEGINNING) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["1"]
-    tags: ["transaction", "verify"]
-
-  - name: "txn-commit-only-detection"
-    description: "Test that standalone COMMIT triggers detection"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (c:CommitOnlyTest {id: 1}); COMMIT;"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "commit-only"]
-
-  - name: "txn-rollback-detection"
-    description: "Test that ROLLBACK triggers detection"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; BEGIN; CREATE (r:RollbackTest {id: 1}); ROLLBACK;"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "rollback"]
-
-  - name: "txn-rollback-verify-empty"
-    description: "Verify ROLLBACK prevented node creation"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:RollbackTest) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["0"]
-    tags: ["transaction", "verify"]
-
-  - name: "txn-large-batch-atomicity"
-    description: "Test atomicity with larger batch (20 statements)"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; CREATE (n1:LargeBatch {id: 1}); CREATE (n2:LargeBatch {id: 2}); CREATE (n3:LargeBatch {id: 3}); CREATE (n4:LargeBatch {id: 4}); CREATE (n5:LargeBatch {id: 5}); CREATE (n6:LargeBatch {id: 6}); CREATE (n7:LargeBatch {id: 7}); CREATE (n8:LargeBatch {id: 8}); CREATE (n9:LargeBatch {id: 9}); CREATE (n10:LargeBatch {id: 10}); CREATE (n11:LargeBatch {id: 11}); CREATE (n12:LargeBatch {id: 12}); CREATE (n13:LargeBatch {id: 13}); CREATE (n14:LargeBatch {id: 14}); CREATE (n15:LargeBatch {id: 15}); CREATE (n16:LargeBatch {id: 16}); CREATE (n17:LargeBatch {id: 17}); CREATE (n18:LargeBatch {id: 18}); CREATE (n19:LargeBatch {id: 19}); CREATE (n20:LargeBatch {id: 20});"
-    expect:
-      exit_code: 0
-    tags: ["transaction", "large-batch"]
-
-  - name: "txn-large-batch-verify"
-    description: "Verify all 20 nodes in large batch were created atomically"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:LargeBatch) RETURN count(n) AS cnt;"
-    expect:
-      exit_code: 0
-      stdout_contains: ["20"]
-    tags: ["transaction", "verify"]
-
-  # Cleanup for transaction tests
-  - name: "cleanup-txn-auto-wrap"
-    description: "Clean up TxnAutoWrap test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:TxnAutoWrap) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
-  - name: "cleanup-explicit-txn"
-    description: "Clean up ExplicitTxn test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:ExplicitTxn) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
-  - name: "cleanup-multi-txn"
-    description: "Clean up MultiTxn test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MultiTxn) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
-  - name: "cleanup-lower-txn"
-    description: "Clean up LowerTxn test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:LowerTxn) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
-  - name: "cleanup-mixed-case-txn"
-    description: "Clean up MixedCaseTxn test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MixedCaseTxn) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
-  - name: "cleanup-beginning-node"
-    description: "Clean up BEGINNING test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:BEGINNING) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
-  - name: "cleanup-commit-only"
-    description: "Clean up CommitOnlyTest test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:CommitOnlyTest) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
-  - name: "cleanup-large-batch"
-    description: "Clean up LargeBatch test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:LargeBatch) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup", "transaction"]
-
-  # Cleanup tests
-  - name: "cleanup-batch-nodes"
-    description: "Clean up BatchNode test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:BatchNode) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-mixed-test"
-    description: "Clean up MixedTest test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MixedTest) DETACH DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-multi-prop"
-    description: "Clean up MultiProp test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MultiProp) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-ten-test"
-    description: "Clean up TenTest test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:TenTest) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-use-convert"
-    description: "Clean up UseConvert test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:UseConvert) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-txn-atomic"
-    description: "Clean up TxnAtomicTest test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:TxnAtomicTest) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-merge-test"
-    description: "Clean up MergeTest test data"
-    args: ["query", "--insecure", "-"]
-    stdin: "USE GRAPH source_batch_test; MATCH (n:MergeTest) DELETE n;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-source-test-graph"
-    description: "Drop test graph"
-    args: ["query", "--insecure", "-"]
-    stdin: "DROP GRAPH IF EXISTS source_batch_test;"
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
+    '
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Error
+    - Cannot open file
+  tags:
+  - shell
+  - source
+  - slash
+- name: txn-auto-wrap-setup
+  description: Setup for transaction auto-wrap tests
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:TxnAutoWrap) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - setup
+- name: txn-auto-wrap-batch-atomicity
+  description: Test that batch without explicit transaction is wrapped atomically
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (t1:TxnAutoWrap {seq: 1}); CREATE (t2:TxnAutoWrap
+    {seq: 2}); CREATE (t3:TxnAutoWrap {seq: 3}); CREATE (t4:TxnAutoWrap {seq: 4});
+    CREATE (t5:TxnAutoWrap {seq: 5});'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - atomicity
+- name: txn-auto-wrap-verify-all-created
+  description: Verify all nodes in auto-wrapped batch were created
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:TxnAutoWrap) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '5'
+  tags:
+  - transaction
+  - verify
+- name: txn-explicit-begin-commit
+  description: Test batch with explicit BEGIN/COMMIT is not double-wrapped
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; BEGIN; CREATE (e1:ExplicitTxn {id: 1}); CREATE
+    (e2:ExplicitTxn {id: 2}); COMMIT;'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - explicit
+- name: txn-explicit-verify
+  description: Verify explicit transaction nodes were created
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:ExplicitTxn) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '2'
+  tags:
+  - transaction
+  - verify
+- name: txn-multiple-explicit-transactions
+  description: Test batch with multiple explicit transaction blocks
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; BEGIN; CREATE (m1:MultiTxn {block: 1}); COMMIT;
+    BEGIN; CREATE (m2:MultiTxn {block: 2}); COMMIT;'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - multiple
+- name: txn-multiple-explicit-verify
+  description: Verify multiple transaction blocks completed
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MultiTxn) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '2'
+  tags:
+  - transaction
+  - verify
+- name: txn-lowercase-detection
+  description: Test lowercase begin/commit detection
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; begin; CREATE (l:LowerTxn {case: ''lower''});
+    commit;'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - lowercase
+- name: txn-lowercase-verify
+  description: Verify lowercase transaction completed
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:LowerTxn) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - transaction
+  - verify
+- name: txn-mixed-case-detection
+  description: Test mixed case Begin/Commit detection
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; Begin; CREATE (m:MixedCaseTxn {case: ''mixed''});
+    Commit;'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - mixedcase
+- name: txn-mixed-case-verify
+  description: Verify mixed case transaction completed
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MixedCaseTxn) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - transaction
+  - verify
+- name: txn-no-false-positive-beginning
+  description: Test that BEGINNING (identifier) doesn't trigger transaction detection
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (n:BEGINNING {type: ''identifier_test''});'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - word-boundary
+- name: txn-no-false-positive-verify
+  description: Verify BEGINNING node was created (batch was auto-wrapped)
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:BEGINNING) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - transaction
+  - verify
+- name: txn-commit-only-detection
+  description: Test that standalone COMMIT triggers detection
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (c:CommitOnlyTest {id: 1}); COMMIT;'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - commit-only
+- name: txn-rollback-detection
+  description: Test that ROLLBACK triggers detection
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; BEGIN; CREATE (r:RollbackTest {id: 1}); ROLLBACK;'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - rollback
+- name: txn-rollback-verify-empty
+  description: Verify ROLLBACK prevented node creation
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:RollbackTest) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0'
+  tags:
+  - transaction
+  - verify
+- name: txn-large-batch-atomicity
+  description: Test atomicity with larger batch (20 statements)
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: 'USE GRAPH source_batch_test; CREATE (n1:LargeBatch {id: 1}); CREATE (n2:LargeBatch
+    {id: 2}); CREATE (n3:LargeBatch {id: 3}); CREATE (n4:LargeBatch {id: 4}); CREATE
+    (n5:LargeBatch {id: 5}); CREATE (n6:LargeBatch {id: 6}); CREATE (n7:LargeBatch
+    {id: 7}); CREATE (n8:LargeBatch {id: 8}); CREATE (n9:LargeBatch {id: 9}); CREATE
+    (n10:LargeBatch {id: 10}); CREATE (n11:LargeBatch {id: 11}); CREATE (n12:LargeBatch
+    {id: 12}); CREATE (n13:LargeBatch {id: 13}); CREATE (n14:LargeBatch {id: 14});
+    CREATE (n15:LargeBatch {id: 15}); CREATE (n16:LargeBatch {id: 16}); CREATE (n17:LargeBatch
+    {id: 17}); CREATE (n18:LargeBatch {id: 18}); CREATE (n19:LargeBatch {id: 19});
+    CREATE (n20:LargeBatch {id: 20});'
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - large-batch
+- name: txn-large-batch-verify
+  description: Verify all 20 nodes in large batch were created atomically
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:LargeBatch) RETURN count(n) AS cnt;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '20'
+  tags:
+  - transaction
+  - verify
+- name: cleanup-txn-auto-wrap
+  description: Clean up TxnAutoWrap test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:TxnAutoWrap) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+- name: cleanup-explicit-txn
+  description: Clean up ExplicitTxn test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:ExplicitTxn) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+- name: cleanup-multi-txn
+  description: Clean up MultiTxn test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MultiTxn) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+- name: cleanup-lower-txn
+  description: Clean up LowerTxn test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:LowerTxn) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+- name: cleanup-mixed-case-txn
+  description: Clean up MixedCaseTxn test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MixedCaseTxn) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+- name: cleanup-beginning-node
+  description: Clean up BEGINNING test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:BEGINNING) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+- name: cleanup-commit-only
+  description: Clean up CommitOnlyTest test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:CommitOnlyTest) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+- name: cleanup-large-batch
+  description: Clean up LargeBatch test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:LargeBatch) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+- name: cleanup-batch-nodes
+  description: Clean up BatchNode test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:BatchNode) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-mixed-test
+  description: Clean up MixedTest test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MixedTest) DETACH DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-multi-prop
+  description: Clean up MultiProp test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MultiProp) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-ten-test
+  description: Clean up TenTest test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:TenTest) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-use-convert
+  description: Clean up UseConvert test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:UseConvert) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-txn-atomic
+  description: Clean up TxnAtomicTest test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:TxnAtomicTest) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-merge-test
+  description: Clean up MergeTest test data
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: USE GRAPH source_batch_test; MATCH (n:MergeTest) DELETE n;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-source-test-graph
+  description: Drop test graph
+  args:
+  - query
+  - --insecure
+  - '-'
+  stdin: DROP GRAPH IF EXISTS source_batch_test;
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup

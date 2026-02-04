@@ -1,263 +1,306 @@
-version: "1.0"
-name: "FLE Plaintext Verification - Relationship Properties"
-description: |
-  SECURITY CRITICAL TEST SUITE
+version: '1.0'
+name: FLE Plaintext Verification - Relationship Properties
+description: 'SECURITY CRITICAL TEST SUITE
+
 
   Verifies that FLE properly encrypts RELATIONSHIP properties, not just node properties:
+
   1. Relationship properties can be encrypted
+
   2. Encrypted relationship data does not appear as plaintext on disk
+
   3. Cross-node relationship encryption works correctly
 
+
   Test scenario: Financial transaction relationships with sensitive properties:
+
   - account_number (encrypted)
+
   - transaction_token (encrypted)
+
   - routing_info (encrypted)
 
-  CANARY: REQ=REQ-FLE-ENFORCE-009; FEATURE=FLEEnforcement; ASPECT=RelationshipProperties; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
 
+  CANARY: REQ=REQ-FLE-ENFORCE-009; FEATURE=FLEEnforcement; ASPECT=RelationshipProperties;
+  STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
-    cleanup: false  # DO NOT CLEANUP - we need to scan files after tests
-    args: ["--log-level", "info", "--enable-fle"]
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 env:
-  GEODE_FLE_ENABLED: "true"
-  GEODE_MASTER_KEY: "fle-relationship-master-key-32b!!"
-
-# Skip isolation suffix for FLE tests - the CALL geode.fle.configureField
-# must match the exact label names used in CREATE statements
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: fle-relationship-master-key-32b!!
 skip_isolation: true
-
 tests:
-  # ===============================
-  # PHASE 1: CONFIGURE FLE FOR RELATIONSHIP PROPERTIES
-  # ===============================
-
-  - name: "fle-rel-configure-account-number"
-    description: "Configure account_number on TRANSFERS relationship"
-    args: ["query",
-           "CALL geode.fle.configureField('TRANSFERS', 'account_number', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: ['finance_admin'],
-              relationshipProperty: true
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "relationship", "configure"]
-
-  - name: "fle-rel-configure-transaction-token"
-    description: "Configure transaction_token on TRANSFERS relationship"
-    args: ["query",
-           "CALL geode.fle.configureField('TRANSFERS', 'transaction_token', {
-              algorithm: 'ChaCha20-Poly1305',
-              keyVersion: 1,
-              visibility: ['payment_processor'],
-              relationshipProperty: true
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "relationship", "configure"]
-
-  - name: "fle-rel-configure-routing-info"
-    description: "Configure routing_info on TRANSFERS relationship"
-    args: ["query",
-           "CALL geode.fle.configureField('TRANSFERS', 'routing_info', {
-              algorithm: 'AES-256-GCM',
-              keyVersion: 1,
-              visibility: ['ach_admin'],
-              relationshipProperty: true
-            })
-            RETURN 'configured' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "relationship", "configure"]
-
-  # ===============================
-  # PHASE 2: CREATE NODES FOR RELATIONSHIPS
-  # ===============================
-
-  - name: "fle-rel-create-accounts"
-    description: "Create account nodes for relationship tests"
-    args: ["query",
-           "CREATE (a:FLETest_Account {account_id: 'ACC001', name: 'Checking'})
-            CREATE (b:FLETest_Account {account_id: 'ACC002', name: 'Savings'})
-            CREATE (c:FLETest_Account {account_id: 'ACC003', name: 'Investment'})
-            RETURN count(*) AS created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "relationship", "setup"]
-
-  # ===============================
-  # PHASE 3: CREATE RELATIONSHIPS WITH ENCRYPTED PROPERTIES
-  # ===============================
-
-  - name: "fle-rel-create-transfer-1"
-    description: "Create first transfer relationship with encrypted properties"
-    args: ["query",
-           "MATCH (a:FLETest_Account {account_id: 'ACC001'})
-            MATCH (b:FLETest_Account {account_id: 'ACC002'})
-            CREATE (a)-[r:TRANSFERS {
-              amount: 1000.00,
-              account_number: 'FLESECRET_REL_ACCT_1234567890',
-              transaction_token: 'FLESECRET_REL_TOKEN_txn_abc123xyz',
-              routing_info: 'FLESECRET_REL_ROUTE_021000021_wire',
-              timestamp: datetime()
-            }]->(b)
-            RETURN type(r) AS rel_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "relationship", "write", "transfer1"]
-
-  - name: "fle-rel-create-transfer-2"
-    description: "Create second transfer relationship with encrypted properties"
-    args: ["query",
-           "MATCH (a:FLETest_Account {account_id: 'ACC002'})
-            MATCH (b:FLETest_Account {account_id: 'ACC003'})
-            CREATE (a)-[r:TRANSFERS {
-              amount: 5000.00,
-              account_number: 'FLESECRET_REL_ACCT_0987654321',
-              transaction_token: 'FLESECRET_REL_TOKEN_txn_def456uvw',
-              routing_info: 'FLESECRET_REL_ROUTE_121042882_ach',
-              timestamp: datetime()
-            }]->(b)
-            RETURN type(r) AS rel_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "relationship", "write", "transfer2"]
-
-  - name: "fle-rel-create-transfer-3"
-    description: "Create third transfer relationship with encrypted properties"
-    args: ["query",
-           "MATCH (a:FLETest_Account {account_id: 'ACC003'})
-            MATCH (b:FLETest_Account {account_id: 'ACC001'})
-            CREATE (a)-[r:TRANSFERS {
-              amount: 250.00,
-              account_number: 'FLESECRET_REL_ACCT_5555666677',
-              transaction_token: 'FLESECRET_REL_TOKEN_txn_ghi789rst',
-              routing_info: 'FLESECRET_REL_ROUTE_322271627_swift',
-              timestamp: datetime()
-            }]->(b)
-            RETURN type(r) AS rel_type"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "relationship", "write", "transfer3"]
-
-  # ===============================
-  # PHASE 4: VERIFY RELATIONSHIPS READABLE
-  # ===============================
-
-  - name: "fle-rel-verify-transfers-readable"
-    description: "Verify all transfer relationships are readable"
-    args: ["query",
-           "MATCH (a)-[r:TRANSFERS]->(b)
-            RETURN count(r) AS total_transfers"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["fle", "relationship", "verify", "readable"]
-
-  # ===============================
-  # PHASE 5: FORCE FLUSH TO DISK
-  # ===============================
-
-  - name: "fle-rel-force-checkpoint"
-    description: "Force checkpoint to ensure all data is written to disk"
-    args: ["query",
-           "RETURN 'checkpoint_requested' AS status"]
-    expect:
-      exit_code: 0
-    tags: ["fle", "relationship", "checkpoint"]
-
-  # ===============================
-  # PHASE 6: SCAN DATA FILES
-  # ===============================
-
-  - name: "fle-rel-scan-no-acct1-plaintext"
-    description: "CRITICAL: Verify account number #1 marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_REL_ACCT_1234567890", "${data_dir}"]
-    expect:
-      exit_code: 1  # grep returns 1 when no match found (EXPECTED)
-    tags: ["fle", "relationship", "scan", "acct1", "critical"]
-
-  - name: "fle-rel-scan-no-acct2-plaintext"
-    description: "CRITICAL: Verify account number #2 marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_REL_ACCT_0987654321", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "relationship", "scan", "acct2", "critical"]
-
-  - name: "fle-rel-scan-no-acct3-plaintext"
-    description: "CRITICAL: Verify account number #3 marker does NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_REL_ACCT_5555666677", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "relationship", "scan", "acct3", "critical"]
-
-  - name: "fle-rel-scan-no-token-plaintext"
-    description: "CRITICAL: Verify transaction token markers do NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_REL_TOKEN_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "relationship", "scan", "token", "critical"]
-
-  - name: "fle-rel-scan-no-routing-plaintext"
-    description: "CRITICAL: Verify routing info markers do NOT appear in ANY data file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_REL_ROUTE_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["fle", "relationship", "scan", "routing", "critical"]
-
-  # ===============================
-  # PHASE 7: COMPREHENSIVE BINARY SCAN
-  # ===============================
-
-  - name: "fle-rel-binary-scan-flesecret-prefix"
-    description: "CRITICAL: Verify NO FLESECRET_REL_ prefix appears in ANY binary file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "FLESECRET_REL_", "${data_dir}"]
-    expect:
-      exit_code: 1  # No matches expected
-    tags: ["fle", "relationship", "binary-scan", "comprehensive", "critical"]
-
+- name: fle-rel-configure-account-number
+  description: Configure account_number on TRANSFERS relationship
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''TRANSFERS'', ''account_number'', { algorithm:
+    ''AES-256-GCM'', keyVersion: 1, visibility: [''finance_admin''], relationshipProperty:
+    true }) RETURN ''configured'' AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - relationship
+  - configure
+- name: fle-rel-configure-transaction-token
+  description: Configure transaction_token on TRANSFERS relationship
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''TRANSFERS'', ''transaction_token'', { algorithm:
+    ''ChaCha20-Poly1305'', keyVersion: 1, visibility: [''payment_processor''], relationshipProperty:
+    true }) RETURN ''configured'' AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - relationship
+  - configure
+- name: fle-rel-configure-routing-info
+  description: Configure routing_info on TRANSFERS relationship
+  args:
+  - query
+  - 'CALL geode.fle.configureField(''TRANSFERS'', ''routing_info'', { algorithm: ''AES-256-GCM'',
+    keyVersion: 1, visibility: [''ach_admin''], relationshipProperty: true }) RETURN
+    ''configured'' AS status'
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - relationship
+  - configure
+- name: fle-rel-create-accounts
+  description: Create account nodes for relationship tests
+  args:
+  - query
+  - 'CREATE (a:FLETest_Account {account_id: ''ACC001'', name: ''Checking''}) CREATE
+    (b:FLETest_Account {account_id: ''ACC002'', name: ''Savings''}) CREATE (c:FLETest_Account
+    {account_id: ''ACC003'', name: ''Investment''}) RETURN count(*) AS created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - relationship
+  - setup
+- name: fle-rel-create-transfer-1
+  description: Create first transfer relationship with encrypted properties
+  args:
+  - query
+  - 'MATCH (a:FLETest_Account {account_id: ''ACC001''}) MATCH (b:FLETest_Account {account_id:
+    ''ACC002''}) CREATE (a)-[r:TRANSFERS { amount: 1000.00, account_number: ''FLESECRET_REL_ACCT_1234567890'',
+    transaction_token: ''FLESECRET_REL_TOKEN_txn_abc123xyz'', routing_info: ''FLESECRET_REL_ROUTE_021000021_wire'',
+    timestamp: datetime() }]->(b) RETURN type(r) AS rel_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - relationship
+  - write
+  - transfer1
+- name: fle-rel-create-transfer-2
+  description: Create second transfer relationship with encrypted properties
+  args:
+  - query
+  - 'MATCH (a:FLETest_Account {account_id: ''ACC002''}) MATCH (b:FLETest_Account {account_id:
+    ''ACC003''}) CREATE (a)-[r:TRANSFERS { amount: 5000.00, account_number: ''FLESECRET_REL_ACCT_0987654321'',
+    transaction_token: ''FLESECRET_REL_TOKEN_txn_def456uvw'', routing_info: ''FLESECRET_REL_ROUTE_121042882_ach'',
+    timestamp: datetime() }]->(b) RETURN type(r) AS rel_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - relationship
+  - write
+  - transfer2
+- name: fle-rel-create-transfer-3
+  description: Create third transfer relationship with encrypted properties
+  args:
+  - query
+  - 'MATCH (a:FLETest_Account {account_id: ''ACC003''}) MATCH (b:FLETest_Account {account_id:
+    ''ACC001''}) CREATE (a)-[r:TRANSFERS { amount: 250.00, account_number: ''FLESECRET_REL_ACCT_5555666677'',
+    transaction_token: ''FLESECRET_REL_TOKEN_txn_ghi789rst'', routing_info: ''FLESECRET_REL_ROUTE_322271627_swift'',
+    timestamp: datetime() }]->(b) RETURN type(r) AS rel_type'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - relationship
+  - write
+  - transfer3
+- name: fle-rel-verify-transfers-readable
+  description: Verify all transfer relationships are readable
+  args:
+  - query
+  - MATCH (a)-[r:TRANSFERS]->(b) RETURN count(r) AS total_transfers
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - fle
+  - relationship
+  - verify
+  - readable
+- name: fle-rel-force-checkpoint
+  description: Force checkpoint to ensure all data is written to disk
+  args:
+  - query
+  - RETURN 'checkpoint_requested' AS status
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - relationship
+  - checkpoint
+- name: fle-rel-scan-no-acct1-plaintext
+  description: 'CRITICAL: Verify account number #1 marker does NOT appear in ANY data
+    file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_REL_ACCT_1234567890
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - relationship
+  - scan
+  - acct1
+  - critical
+- name: fle-rel-scan-no-acct2-plaintext
+  description: 'CRITICAL: Verify account number #2 marker does NOT appear in ANY data
+    file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_REL_ACCT_0987654321
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - relationship
+  - scan
+  - acct2
+  - critical
+- name: fle-rel-scan-no-acct3-plaintext
+  description: 'CRITICAL: Verify account number #3 marker does NOT appear in ANY data
+    file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_REL_ACCT_5555666677
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - relationship
+  - scan
+  - acct3
+  - critical
+- name: fle-rel-scan-no-token-plaintext
+  description: 'CRITICAL: Verify transaction token markers do NOT appear in ANY data
+    file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_REL_TOKEN_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - relationship
+  - scan
+  - token
+  - critical
+- name: fle-rel-scan-no-routing-plaintext
+  description: 'CRITICAL: Verify routing info markers do NOT appear in ANY data file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_REL_ROUTE_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - relationship
+  - scan
+  - routing
+  - critical
+- name: fle-rel-binary-scan-flesecret-prefix
+  description: 'CRITICAL: Verify NO FLESECRET_REL_ prefix appears in ANY binary file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - FLESECRET_REL_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - relationship
+  - binary-scan
+  - comprehensive
+  - critical
 invariants:
-  - type: "server_running"
-
+- type: server_running
 plaintext_verification:
   enabled: true
   patterns:
-    - "FLESECRET_REL_ACCT_1234567890"
-    - "FLESECRET_REL_ACCT_0987654321"
-    - "FLESECRET_REL_ACCT_5555666677"
-    - "FLESECRET_REL_TOKEN_"
-    - "FLESECRET_REL_ROUTE_"
-    - "FLESECRET_REL_"
+  - FLESECRET_REL_ACCT_1234567890
+  - FLESECRET_REL_ACCT_0987654321
+  - FLESECRET_REL_ACCT_5555666677
+  - FLESECRET_REL_TOKEN_
+  - FLESECRET_REL_ROUTE_
+  - FLESECRET_REL_
   fail_on_violation: true
   scan_binary_files: true
-
-tags: ["fle", "field-level-encryption", "security", "relationships", "plaintext-verification", "critical"]
+tags:
+- fle
+- field-level-encryption
+- security
+- relationships
+- plaintext-verification
+- critical

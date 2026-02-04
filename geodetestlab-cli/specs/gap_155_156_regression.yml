@@ -1,132 +1,166 @@
-# GAP-0155 and GAP-0156 Regression Tests
-# CANARY: REQ=REQ-GAP-155-156-REGRESSION; FEATURE="SecurityRegressionTests"; ASPECT=Testing; STATUS=TESTED; OWNER=security; UPDATED=2026-01-14
-#
-# GAP-0155: WAL Encryption Key Hex Parsing Uses Silent catch 0
-# - Unit tests verify parseWalHexKey function in src/wal/wal.zig
-# - Invalid hex keys are properly rejected with error
-#
-# GAP-0156: MFA Toggle Command Displays Hardcoded Secret '123456'
-# - Tests that MFA enable/disable commands do not output fake secrets
-# - Verifies proper output messages for MFA operations
+version: '1.0'
+name: GAP-0155 and GAP-0156 Security Regression Tests
+description: 'Regression tests for security gaps:
 
-version: "1.0"
-name: "GAP-0155 and GAP-0156 Security Regression Tests"
-description: |
-  Regression tests for security gaps:
   - GAP-0155: WAL encryption key hex parsing security fix
+
   - GAP-0156: MFA toggle command output security fix
 
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
-    args: ["--log-level", "error"]
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 30000
     tls_verify: false
-    format: "json"
-
+    format: json
 tests:
-  # =============================================================================
-  # GAP-0156: MFA Toggle Command Output Tests
-  # MFA commands are subcommands of 'user': geode user mfa enable/disable
-  # =============================================================================
-
-  - name: "gap-0156-create-test-user"
-    description: "Create a user to test MFA enable/disable output"
-    args: ["user", "create", "mfatestuser156", "mfa156@test.com", "--password", "SecurePass123!"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["User 'mfatestuser156' created successfully"]
-    tags: ["gap-0156", "mfa-security", "setup"]
-
-  - name: "gap-0156-mfa-enable-no-hardcoded-secret"
-    description: "MFA enable should output guidance to use mfa-setup, not a fake secret"
-    args: ["user", "mfa", "enable", "mfatestuser156"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["MFA enabled for mfatestuser156"]
-      stdout_not_contains: ["123456"]
-    tags: ["gap-0156", "mfa-security"]
-
-  - name: "gap-0156-mfa-disable-no-secret"
-    description: "MFA disable should not output any secret"
-    args: ["user", "mfa", "disable", "mfatestuser156"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["MFA disabled for mfatestuser156"]
-      stdout_not_contains: ["123456", "Secret:"]
-    tags: ["gap-0156", "mfa-security"]
-
-  - name: "gap-0156-delete-test-user"
-    description: "Clean up test user"
-    args: ["user", "delete", "mfatestuser156", "--yes"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["deleted"]
-    tags: ["gap-0156", "mfa-security", "cleanup"]
-
-  # =============================================================================
-  # GAP-0155: Query Tests (WAL encryption is internal, tested via unit tests)
-  # =============================================================================
-
-  - name: "gap-0155-basic-query-works"
-    description: "Verify basic query works (encryption not enabled by default)"
-    query: "RETURN 1 AS x"
-    expect:
-      success: true
-      result_contains: ["1"]
-    tags: ["gap-0155", "wal-security"]
-
-  - name: "gap-0155-server-healthy"
-    description: "Server should be running and healthy"
-    query: "RETURN 'healthy' AS status"
-    expect:
-      success: true
-      result_contains: ["healthy"]
-    tags: ["gap-0155", "wal-security"]
-
-  # =============================================================================
-  # MFA Setup Command Tests (positive tests to ensure proper MFA flow works)
-  # =============================================================================
-
-  - name: "mfa-setup-create-user"
-    description: "Create user for mfa-setup test"
-    args: ["user", "create", "mfasetupuser156", "mfasetup156@test.com", "--password", "SecurePass456!"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["User 'mfasetupuser156' created successfully"]
-    tags: ["mfa-setup", "setup"]
-
-  - name: "mfa-setup-configure"
-    description: "mfa-setup should configure MFA for user"
-    args: ["user", "mfa-setup", "mfasetupuser156"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["MFA secret:"]
-    tags: ["mfa-setup"]
-
-  - name: "mfa-setup-cleanup"
-    description: "Clean up mfa-setup test user"
-    args: ["user", "delete", "mfasetupuser156", "--yes"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["deleted"]
-    tags: ["mfa-setup", "cleanup"]
-
+- name: gap-0156-create-test-user
+  description: Create a user to test MFA enable/disable output
+  args:
+  - user
+  - create
+  - mfatestuser156
+  - mfa156@test.com
+  - --password
+  - SecurePass123!
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - User 'mfatestuser156' created successfully
+  tags:
+  - gap-0156
+  - mfa-security
+  - setup
+- name: gap-0156-mfa-enable-no-hardcoded-secret
+  description: MFA enable should output guidance to use mfa-setup, not a fake secret
+  args:
+  - user
+  - mfa
+  - enable
+  - mfatestuser156
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - MFA enabled for mfatestuser156
+    stdout_not_contains:
+    - '123456'
+  tags:
+  - gap-0156
+  - mfa-security
+- name: gap-0156-mfa-disable-no-secret
+  description: MFA disable should not output any secret
+  args:
+  - user
+  - mfa
+  - disable
+  - mfatestuser156
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - MFA disabled for mfatestuser156
+    stdout_not_contains:
+    - '123456'
+    - 'Secret:'
+  tags:
+  - gap-0156
+  - mfa-security
+- name: gap-0156-delete-test-user
+  description: Clean up test user
+  args:
+  - user
+  - delete
+  - mfatestuser156
+  - --yes
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - deleted
+  tags:
+  - gap-0156
+  - mfa-security
+  - cleanup
+- name: gap-0155-basic-query-works
+  description: Verify basic query works (encryption not enabled by default)
+  query: RETURN 1 AS x
+  expect:
+    success: true
+    result_contains:
+    - '1'
+  tags:
+  - gap-0155
+  - wal-security
+- name: gap-0155-server-healthy
+  description: Server should be running and healthy
+  query: RETURN 'healthy' AS status
+  expect:
+    success: true
+    result_contains:
+    - healthy
+  tags:
+  - gap-0155
+  - wal-security
+- name: mfa-setup-create-user
+  description: Create user for mfa-setup test
+  args:
+  - user
+  - create
+  - mfasetupuser156
+  - mfasetup156@test.com
+  - --password
+  - SecurePass456!
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - User 'mfasetupuser156' created successfully
+  tags:
+  - mfa-setup
+  - setup
+- name: mfa-setup-configure
+  description: mfa-setup should configure MFA for user
+  args:
+  - user
+  - mfa-setup
+  - mfasetupuser156
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'MFA secret:'
+  tags:
+  - mfa-setup
+- name: mfa-setup-cleanup
+  description: Clean up mfa-setup test user
+  args:
+  - user
+  - delete
+  - mfasetupuser156
+  - --yes
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - deleted
+  tags:
+  - mfa-setup
+  - cleanup
 metadata:
   gaps_covered:
-    - id: "GAP-0155"
-      title: "WAL Encryption Key Hex Parsing Uses Silent catch 0"
-      severity: "High"
-      gitlab_issue: 237
-    - id: "GAP-0156"
-      title: "MFA Toggle Command Displays Hardcoded Secret '123456'"
-      severity: "Medium"
-      gitlab_issue: 238
-  created: "2026-01-14"
-  author: "security-audit"
+  - id: GAP-0155
+    title: WAL Encryption Key Hex Parsing Uses Silent catch 0
+    severity: High
+    gitlab_issue: 237
+  - id: GAP-0156
+    title: MFA Toggle Command Displays Hardcoded Secret '123456'
+    severity: Medium
+    gitlab_issue: 238
+  created: '2026-01-14'
+  author: security-audit

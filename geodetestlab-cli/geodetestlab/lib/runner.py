@@ -321,6 +321,8 @@ def _start_server(
     env["GEODE_DISABLE_AUDIT"] = "1"
     # Allow auth to be disabled in release builds for testing
     env["GEODE_ALLOW_NO_AUTH"] = "1"
+    # Set a known admin password for testing (used by query commands)
+    env["GEODE_ADMIN_PASSWORD"] = "GeodeTestPassword123!"
 
     if verbose:
         print(f"Starting server: {' '.join(cmd)}")
@@ -431,11 +433,15 @@ def _run_single_test(
     """Run a single test case."""
     start_time = time.time()
 
+    # Get authentication credentials from environment
+    admin_password = env.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
+
     # Determine if this is a query test or command test
     if test_case.query:
         cmd = [binary, "query", test_case.query]
         cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
         cmd.extend(["--insecure"])
+        cmd.extend(["-U", "geode", "-P", admin_password])
     elif test_case.command:
         # Shell command test
         cmd = [test_case.command]
@@ -445,23 +451,34 @@ def _run_single_test(
         cmd = [binary]
         args = _substitute_variables(test_case.args, env, secrets, data_dir)
         cmd.extend(args)
-        # If this is a query command via args, add server and insecure flags
+        # If this is a query command via args, add server, insecure, and auth flags
         if args and args[0] == "query" and len(args) > 1:
             cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
             cmd.extend(["--insecure"])
+            cmd.extend(["-U", "geode", "-P", admin_password])
 
     # Merge test-specific environment
     test_env = env.copy()
     test_env.update(test_case.env)
 
     try:
+        # Substitute variables in stdin if present
+        stdin_input = test_case.stdin
+        if stdin_input and data_dir:
+            stdin_input = stdin_input.replace("${data_dir}", str(data_dir))
+            for key, value in env.items():
+                stdin_input = stdin_input.replace(f"${{{key}}}", value)
+                stdin_input = stdin_input.replace(f"${{env:{key}}}", value)
+            for key, value in secrets.items():
+                stdin_input = stdin_input.replace(f"${{secret:{key}}}", value)
+
         result = subprocess.run(
             cmd,
             env=test_env,
             capture_output=True,
             text=True,
             timeout=timeout_ms / 1000.0,
-            stdin=subprocess.PIPE,
+            input=stdin_input,  # Pass stdin content to the subprocess
         )
 
         output = result.stdout
@@ -559,20 +576,59 @@ def _check_expectations(
     if expected.status == "error" and exit_code == 0:
         return False
 
-    # Check result contains
+    # Check result contains (legacy format - single string)
     if expected.result_contains and expected.result_contains not in output:
         return False
 
-    # Check result not contains
+    # Check result not contains (legacy format - single string)
     if expected.result_not_contains and expected.result_not_contains in output:
         return False
 
-    # Check result matches (regex)
+    # Check result matches (legacy format - single regex)
     if expected.result_matches and not re.search(expected.result_matches, output):
         return False
 
-    # Check error contains
-    return not (expected.error_contains and expected.error_contains not in error)
+    # Check error contains (legacy format - single string)
+    if expected.error_contains and expected.error_contains not in error:
+        return False
+
+    # Check stdout_contains (list of substrings that must ALL be present)
+    if expected.stdout_contains:
+        for substring in expected.stdout_contains:
+            if substring not in output:
+                return False
+
+    # Check stderr_contains (list of substrings that must ALL be present)
+    if expected.stderr_contains:
+        for substring in expected.stderr_contains:
+            if substring not in error:
+                return False
+
+    # Check stdout_not_contains (list of substrings that must NOT be present)
+    if expected.stdout_not_contains:
+        for substring in expected.stdout_not_contains:
+            if substring in output:
+                return False
+
+    # Check stderr_not_contains (list of substrings that must NOT be present)
+    if expected.stderr_not_contains:
+        for substring in expected.stderr_not_contains:
+            if substring in error:
+                return False
+
+    # Check stdout_regex (list of regex patterns that must ALL match)
+    if expected.stdout_regex:
+        for pattern in expected.stdout_regex:
+            if not re.search(pattern, output):
+                return False
+
+    # Check stderr_regex (list of regex patterns that must ALL match)
+    if expected.stderr_regex:
+        for pattern in expected.stderr_regex:
+            if not re.search(pattern, error):
+                return False
+
+    return True
 
 
 def _run_plaintext_verification(

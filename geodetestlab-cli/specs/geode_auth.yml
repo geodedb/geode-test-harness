@@ -1,256 +1,420 @@
-version: "1.0"
-name: "Geode Authentication and Authorization Tests"
-description: "Comprehensive testing of Geode's authentication, authorization, and security features"
-
+version: '1.0'
+name: Geode Authentication and Authorization Tests
+description: Comprehensive testing of Geode's authentication, authorization, and security
+  features
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 60000
     cleanup: true
-    args: ["--log-level", "info", "--audit", "--audit-file", "/tmp/geode-audit.log"]
+    args:
+    - --log-level
+    - info
+    - --audit
+    - --audit-file
+    - /tmp/geode-audit.log
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 30000
-    format: "json"
-
+    format: json
 secrets:
   admin_password:
-    source: "env"
-    key: "GEODE_ADMIN_PASSWORD"
+    source: env
+    key: GEODE_ADMIN_PASSWORD
     required: false
   test_user_password:
-    source: "env"
-    key: "GEODE_TEST_PASSWORD"
+    source: env
+    key: GEODE_TEST_PASSWORD
     required: false
-    default: "TestP4ssw0rd123!"
+    default: TestP4ssw0rd123!
   api_token:
-    source: "keyring"
-    service: "geodetestlab"
-    key: "api_token"
+    source: keyring
+    service: geodetestlab
+    key: api_token
     required: false
-
 invariants:
-  - type: "server_running"
-  - type: "exit_code"
-    equals: 0
-
+- type: server_running
+- type: exit_code
+  equals: 0
 fuzz:
   enabled: true
-  provider: "mock"
+  provider: mock
   max_cases: 5
   include_auth: true
-  prompt_template: |
-    Generate authentication and authorization test cases for Geode.
+  prompt_template: 'Generate authentication and authorization test cases for Geode.
+
     Focus on login attempts, user management, role assignments, and permission testing.
+
     Include both valid and malicious scenarios.
 
+    '
 tests:
-  - name: "auth-help"
-    description: "Display authentication help"
-    args: ["auth", "--help"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["login", "logout", "Authentication"]
-    tags: ["auth", "help"]
-
-  - name: "auth-login-admin"
-    description: "Test admin user login"
-    args: ["auth", "login", "--user", "admin"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["successful", "login"]
-    tags: ["auth", "login", "admin"]
-
-  - name: "auth-login-invalid-user"
-    description: "Test login with non-existent user"
-    args: ["auth", "login", "--user", "nonexistent"]
-    expect:
-      exit_code: 3  # Authentication error
-      stderr_contains: ["Invalid", "user", "not found"]
-    tags: ["auth", "login", "error"]
-
-  - name: "auth-logout"
-    description: "Test user logout"
-    setup:
-      - "auth login --user admin"
-    args: ["auth", "logout"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["logout", "successful"]
-    tags: ["auth", "logout"]
-
-  - name: "user-create-basic"
-    description: "Create a new user"
-    args: ["user", "create", "testuser", "test@example.com", "--password", "TestP4ss123!"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["created", "testuser"]
-    tags: ["user", "create"]
-
-  - name: "user-create-with-password"
-    description: "Create user with password"
-    args: ["user", "create", "testuser2", "test2@example.com", "--password", "TestP4ssw0rd123!"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["created", "testuser2"]
-    tags: ["user", "create", "password"]
-
-  - name: "user-list"
-    description: "List all users"
-    args: ["user", "list"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["admin"]  # Default admin user should exist
-    tags: ["user", "list"]
-
-  - name: "user-show-details"
-    description: "Show user details"
-    setup:
-      - "user create alice alice@example.com --password Al1ceP4ss!"
-    args: ["user", "show", "alice"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["alice", "alice@example.com"]
-    cleanup:
-      - "user delete alice --yes"
-    tags: ["user", "show"]
-
-  - name: "user-enable-disable"
-    description: "Test user enable/disable functionality"
-    setup:
-      - "user create bob bob@example.com --password B0bP4ssw!"
-    args: ["user", "disable", "bob"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["disabled", "bob"]
-    cleanup:
-      - "user delete bob --yes"
-    tags: ["user", "enable", "disable"]
-
-  - name: "role-create"
-    description: "Create a new role"
-    args: ["role", "create", "test_role", "Test role for geodetestlab"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["created", "test_role"]
-    tags: ["role", "create"]
-
-  - name: "role-list"
-    description: "List all roles"
-    args: ["role", "list"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["admin", "user"]  # Default roles
-    tags: ["role", "list"]
-
-  - name: "grant-permission"
-    description: "Grant permission to a role"
-    setup:
-      - "role create reader 'Read-only role'"
-    args: ["grant", "read", "graph", "reader"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["granted", "read", "reader"]
-    cleanup:
-      - "role delete reader --yes"
-    tags: ["permission", "grant"]
-
-  - name: "revoke-permission"
-    description: "Revoke permission from a role"
-    setup:
-      - "role create writer 'Write role'"
-      - "grant write graph writer"
-    args: ["revoke", "write", "graph", "writer"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["revoked", "write", "writer"]
-    cleanup:
-      - "role delete writer --yes"
-    tags: ["permission", "revoke"]
-
-  - name: "policy-create-rls"
-    description: "Create row-level security policy"
-    args: ["policy", "create", "user_data_policy", "User can only see their own data", "--table", "users", "--using", "user_id = current_user_id()"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["policy", "created", "user_data_policy"]
-    tags: ["policy", "rls", "security"]
-
-  - name: "audit-log-check"
-    description: "Verify audit logging is working"
-    setup:
-      - "auth login --user admin"
-      - "user create audit_test audit@test.com --password Aud1tP4ss!"
-    args: ["user", "delete", "audit_test", "--yes"]
-    expect:
-      exit_code: 0
-    # Note: Actual audit log verification would need additional tooling
-    tags: ["audit", "logging", "security"]
-
-  - name: "password-policy-validation"
-    description: "Test password policy enforcement"
-    skip: true  # CLI-only command - doesn't work in server mode context
-    args: ["user", "create", "weakpass", "weak@example.com", "123"]
-    expect:
-      exit_code: 1  # Should fail due to weak password
-      stderr_contains: ["password", "policy", "requirements"]
-    tags: ["password", "policy", "security"]
-
-  - name: "mfa-enable"
-    description: "Test MFA functionality"
-    setup:
-      - "user create mfauser mfa@example.com --password MfaP4ss123!"
-    args: ["user", "mfa", "enable", "mfauser"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["MFA", "enabled"]
-    cleanup:
-      - "user delete mfauser --yes"
-    tags: ["mfa", "security", "2fa"]
-
-  - name: "session-management"
-    description: "Test session lifecycle"
-    args: ["auth", "sessions", "list"]
-    expect:
-      exit_code: 0
-      stdout_json_assert:
-        - expression: "sessions"
-          not_equals: null
-    tags: ["session", "auth"]
-
-  - name: "unauthorized-access"
-    description: "Test unauthorized access prevention"
-    args: ["query", "--user", "unauthorized",  "MATCH (n) RETURN count(n)"]
-    expect:
-      exit_code: 3  # Authentication error
-      stderr_contains: ["unauthorized", "access", "denied"]
-    tags: ["security", "unauthorized"]
-
-  - name: "privilege-escalation-prevention"
-    description: "Test privilege escalation prevention"
-    setup:
-      - "user create limited limited@example.com --password L1mitedP4ss!"
-      - "role create limited_role 'Limited permissions'"
-      - "user assign-role limited limited_role"
-    args: ["grant", "admin", "system", "limited_role"]
-    expect:
-      exit_code: 1  # Should fail
-      stderr_contains: ["permission", "denied", "insufficient"]
-    cleanup:
-      - "user delete limited --yes"
-      - "role delete limited_role --yes"
-    tags: ["security", "privilege", "escalation"]
-
-  - name: "token-based-auth"
-    description: "Test API token authentication"
-    args: ["query", "--token", "${secret:api_token}",  "RETURN current_user() AS user"]
-    expect:
-      exit_code: 0
-      stdout_json_assert:
-        - expression: "results[0].user"
-          not_equals: null
-    tags: ["auth", "token", "api"]
-
-tags: ["auth", "security", "user-management"]
+- name: auth-help
+  description: Display authentication help
+  args:
+  - auth
+  - --help
+  expect:
+    exit_code: 0
+    stderr_contains:
+    - login
+    - logout
+    - Authentication
+  tags:
+  - auth
+  - help
+- name: auth-login-admin
+  description: Test admin user login
+  args:
+  - auth
+  - login
+  - --user
+  - admin
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - successful
+    - login
+  tags:
+  - auth
+  - login
+  - admin
+- name: auth-login-invalid-user
+  description: Test login with non-existent user
+  args:
+  - auth
+  - login
+  - --user
+  - nonexistent
+  expect:
+    exit_code: 3
+    stderr_contains:
+    - Invalid
+    - user
+    - not found
+  tags:
+  - auth
+  - login
+  - error
+- name: auth-logout
+  description: Test user logout
+  setup:
+  - auth login --user admin
+  args:
+  - auth
+  - logout
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - logout
+    - successful
+  tags:
+  - auth
+  - logout
+- name: user-create-basic
+  description: Create a new user
+  args:
+  - user
+  - create
+  - testuser
+  - test@example.com
+  - --password
+  - TestP4ss123!
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - created
+    - testuser
+  tags:
+  - user
+  - create
+- name: user-create-with-password
+  description: Create user with password
+  args:
+  - user
+  - create
+  - testuser2
+  - test2@example.com
+  - --password
+  - TestP4ssw0rd123!
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - created
+    - testuser2
+  tags:
+  - user
+  - create
+  - password
+- name: user-list
+  description: List all users
+  args:
+  - user
+  - list
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - admin
+  tags:
+  - user
+  - list
+- name: user-show-details
+  description: Show user details
+  setup:
+  - user create alice alice@example.com --password Al1ceP4ss!
+  args:
+  - user
+  - show
+  - alice
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - alice
+    - alice@example.com
+  cleanup:
+  - user delete alice --yes
+  tags:
+  - user
+  - show
+- name: user-enable-disable
+  description: Test user enable/disable functionality
+  setup:
+  - user create bob bob@example.com --password B0bP4ssw!
+  args:
+  - user
+  - disable
+  - bob
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - disabled
+    - bob
+  cleanup:
+  - user delete bob --yes
+  tags:
+  - user
+  - enable
+  - disable
+- name: role-create
+  description: Create a new role
+  args:
+  - role
+  - create
+  - test_role
+  - Test role for geodetestlab
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - created
+    - test_role
+  tags:
+  - role
+  - create
+- name: role-list
+  description: List all roles
+  args:
+  - role
+  - list
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - admin
+    - user
+  tags:
+  - role
+  - list
+- name: grant-permission
+  description: Grant permission to a role
+  setup:
+  - role create reader 'Read-only role'
+  args:
+  - grant
+  - read
+  - graph
+  - reader
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - granted
+    - read
+    - reader
+  cleanup:
+  - role delete reader --yes
+  tags:
+  - permission
+  - grant
+- name: revoke-permission
+  description: Revoke permission from a role
+  setup:
+  - role create writer 'Write role'
+  - grant write graph writer
+  args:
+  - revoke
+  - write
+  - graph
+  - writer
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - revoked
+    - write
+    - writer
+  cleanup:
+  - role delete writer --yes
+  tags:
+  - permission
+  - revoke
+- name: policy-create-rls
+  description: Create row-level security policy
+  args:
+  - policy
+  - create
+  - user_data_policy
+  - User can only see their own data
+  - --table
+  - users
+  - --using
+  - user_id = current_user_id()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - policy
+    - created
+    - user_data_policy
+  tags:
+  - policy
+  - rls
+  - security
+- name: audit-log-check
+  description: Verify audit logging is working
+  setup:
+  - auth login --user admin
+  - user create audit_test audit@test.com --password Aud1tP4ss!
+  args:
+  - user
+  - delete
+  - audit_test
+  - --yes
+  expect:
+    exit_code: 0
+  tags:
+  - audit
+  - logging
+  - security
+- name: password-policy-validation
+  description: Test password policy enforcement
+  skip: true
+  args:
+  - user
+  - create
+  - weakpass
+  - weak@example.com
+  - '123'
+  expect:
+    exit_code: 1
+    stderr_contains:
+    - password
+    - policy
+    - requirements
+  tags:
+  - password
+  - policy
+  - security
+- name: mfa-enable
+  description: Test MFA functionality
+  setup:
+  - user create mfauser mfa@example.com --password MfaP4ss123!
+  args:
+  - user
+  - mfa
+  - enable
+  - mfauser
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - MFA
+    - enabled
+  cleanup:
+  - user delete mfauser --yes
+  tags:
+  - mfa
+  - security
+  - 2fa
+- name: session-management
+  description: Test session lifecycle
+  args:
+  - auth
+  - sessions
+  - list
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: sessions
+      not_equals: null
+  tags:
+  - session
+  - auth
+- name: unauthorized-access
+  description: Test unauthorized access prevention
+  args:
+  - query
+  - --user
+  - unauthorized
+  - MATCH (n) RETURN count(n)
+  expect:
+    exit_code: 3
+    stderr_contains:
+    - unauthorized
+    - access
+    - denied
+  tags:
+  - security
+  - unauthorized
+- name: privilege-escalation-prevention
+  description: Test privilege escalation prevention
+  setup:
+  - user create limited limited@example.com --password L1mitedP4ss!
+  - role create limited_role 'Limited permissions'
+  - user assign-role limited limited_role
+  args:
+  - grant
+  - admin
+  - system
+  - limited_role
+  expect:
+    exit_code: 1
+    stderr_contains:
+    - permission
+    - denied
+    - insufficient
+  cleanup:
+  - user delete limited --yes
+  - role delete limited_role --yes
+  tags:
+  - security
+  - privilege
+  - escalation
+- name: token-based-auth
+  description: Test API token authentication
+  args:
+  - query
+  - --token
+  - ${secret:api_token}
+  - RETURN current_user() AS user
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].user
+      not_equals: null
+  tags:
+  - auth
+  - token
+  - api
+tags:
+- auth
+- security
+- user-management

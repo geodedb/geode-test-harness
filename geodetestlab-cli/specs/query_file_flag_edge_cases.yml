@@ -1,497 +1,706 @@
-version: "1.0"
-name: "Geode Query File Flag Edge Cases and Error Handling"
-description: "Advanced edge cases, error handling, and boundary tests for --file flag"
-
-# CANARY: REQ=REQ-CLI-FILE-FLAG-TEST-002; FEATURE="QueryFileFlag"; ASPECT=EdgeCasesErrors; STATUS=TESTED; OWNER=test; UPDATED=2026-02-02
-# Advanced test scenarios for Issue GAP-384: --file flag edge cases and error conditions
-
+version: '1.0'
+name: Geode Query File Flag Edge Cases and Error Handling
+description: Advanced edge cases, error handling, and boundary tests for --file flag
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     startup_timeout_ms: 30000
-    args: ["--disable-auth", "--insecure", "--log-level", "error"]
-
+    args:
+    - --disable-auth
+    - --insecure
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
 secrets: {}
-
 invariants:
-  - type: "server_running"
-
+- type: server_running
 fuzz:
   enabled: false
-
 tests:
-  # ============================================================================
-  # Setup
-  # ============================================================================
+- name: setup-edge-case-graph
+  description: Create graph for edge case tests
+  args:
+  - query
+  - --insecure
+  - CREATE GRAPH IF NOT EXISTS edge_case_graph
+  expect:
+    exit_code: 0
+  tags:
+  - setup
+- name: file-flag-exact-32kb-boundary
+  description: Test file at exactly 32KB boundary (threshold for chunking)
+  skip: true
+  setup:
+    script: "#!/bin/bash\n# Generate file with exactly 32768 bytes\n{\n  echo \"USE\
+      \ GRAPH edge_case_graph;\"\n  # Calculate size and generate statements to reach\
+      \ exactly 32KB\n} > /tmp/geode_test_32kb_exact.gql\n"
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_32kb_exact.gql
+  expect:
+    exit_code: 0
+  tags:
+  - boundary
+  - chunked
+- name: file-flag-just-under-32kb
+  description: Test file just under 32KB (31KB) - should use single batch
+  skip: true
+  setup:
+    script: '#!/bin/bash
 
-  - name: "setup-edge-case-graph"
-    description: "Create graph for edge case tests"
-    args: ["query", "--insecure", "CREATE GRAPH IF NOT EXISTS edge_case_graph"]
+      # Generate file with 31KB of content
+
+      '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_31kb.gql
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - chunked execution
+  tags:
+  - boundary
+- name: file-flag-just-over-32kb
+  description: Test file just over 32KB (33KB) - should trigger chunking
+  skip: true
+  setup:
+    script: '#!/bin/bash
+
+      # Generate file with 33KB of content
+
+      '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_33kb.gql
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Large file detected
+    - chunked execution
+  tags:
+  - boundary
+  - chunked
+- name: file-flag-single-character
+  description: Test file with single character (should error - no valid statements)
+  setup:
+    files:
+    - path: /tmp/geode_test_single_char.gql
+      content: a
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_single_char.gql
+  expect:
+    exit_code: 2
+    stderr_contains:
+    - 'Error: File contains no valid GQL statements'
+  tags:
+  - boundary
+  - error
+- name: file-flag-max-file-size
+  description: Test file at maximum allowed size (16MB limit)
+  skip: true
+  setup:
+    script: '#!/bin/bash
+
+      # Generate file close to 16MB limit
+
+      '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_16mb.gql
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - chunked execution
+  tags:
+  - boundary
+  - large-file
+- name: file-flag-path-with-spaces
+  description: Test file path containing spaces
+  setup:
+    files:
+    - path: /tmp/geode test with spaces.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        CREATE (n:PathSpace {id: 1});
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode test with spaces.gql
+  expect:
+    exit_code: 0
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:PathSpace) DELETE n
+  - - rm
+    - -f
+    - /tmp/geode test with spaces.gql
+  tags:
+  - path
+  - edge-case
+- name: file-flag-path-with-special-chars
+  description: Test file path with special characters
+  setup:
+    files:
+    - path: /tmp/geode_test-file@2024#1.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        CREATE (n:SpecialPath {id: 2});
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test-file@2024#1.gql
+  expect:
+    exit_code: 0
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:SpecialPath) DELETE n
+  - - rm
+    - -f
+    - /tmp/geode_test-file@2024#1.gql
+  tags:
+  - path
+  - edge-case
+- name: file-flag-symlink-path
+  description: Test execution through symbolic link
+  skip: true
+  setup:
+    files:
+    - path: /tmp/geode_test_symlink_target.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        CREATE (n:SymlinkTest {id: 10});
+
+        '
+    script: 'ln -sf /tmp/geode_test_symlink_target.gql /tmp/geode_test_symlink.gql
+
+      '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_symlink.gql
+  expect:
+    exit_code: 0
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:SymlinkTest) DELETE n
+  - - rm
+    - -f
+    - /tmp/geode_test_symlink.gql
+    - /tmp/geode_test_symlink_target.gql
+  tags:
+  - path
+  - symlink
+- name: file-flag-very-long-path
+  description: Test with very long file path (near system limit)
+  skip: true
+  tags:
+  - path
+  - boundary
+- name: file-flag-only-whitespace-and-comments
+  description: Test file containing only whitespace and comments
+  setup:
+    files:
+    - path: /tmp/geode_test_only_comments.gql
+      content: '-- Comment 1
+
+        # Comment 2
+
+
+
+        -- Comment 3
+
+
+        # Comment 4
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_only_comments.gql
+  expect:
+    exit_code: 2
+    stderr_contains:
+    - 'Error: File contains no valid GQL statements'
+  tags:
+  - content
+  - edge-case
+  - error
+- name: file-flag-comment-after-statement
+  description: Test inline comments after statements (on same line)
+  skip: true
+  setup:
+    files:
+    - path: /tmp/geode_test_inline_comment.gql
+      content: 'USE GRAPH edge_case_graph; -- Using edge case graph
+
+        CREATE (n:InlineComment {id: 20}); # Create node
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_inline_comment.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:InlineComment) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '1'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:InlineComment) DELETE n
+  tags:
+  - content
+  - comments
+- name: file-flag-multiple-semicolons
+  description: Test statement with multiple trailing semicolons
+  setup:
+    files:
+    - path: /tmp/geode_test_multi_semi.gql
+      content: 'USE GRAPH edge_case_graph;;;
+
+        CREATE (n:MultiSemi {id: 21});;;
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_multi_semi.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:MultiSemi) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '1'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:MultiSemi) DELETE n
+  tags:
+  - content
+  - semicolon
+- name: file-flag-tab-characters
+  description: Test file with tab characters for indentation
+  setup:
+    script: '#!/bin/bash
+
+      printf "USE GRAPH edge_case_graph;\n\tCREATE (n:TabTest {id: 30});\n" > /tmp/geode_test_tabs.gql
+
+      '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_tabs.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:TabTest) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '1'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:TabTest) DELETE n
+  tags:
+  - content
+  - whitespace
+- name: file-flag-mixed-tab-space-indentation
+  description: Test file with mixed tabs and spaces
+  setup:
+    script: '#!/bin/bash
+
+      printf "USE GRAPH edge_case_graph;\n  \tCREATE (n:MixedIndent {id: 31});\n"
+      > /tmp/geode_test_mixed_indent.gql
+
+      '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_mixed_indent.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:MixedIndent) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '1'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:MixedIndent) DELETE n
+  tags:
+  - content
+  - whitespace
+- name: file-flag-null-bytes
+  description: Test file containing null bytes (should handle gracefully or error)
+  skip: true
+  tags:
+  - content
+  - binary
+- name: file-flag-very-long-line
+  description: Test file with single very long line (10KB single statement)
+  skip: true
+  tags:
+  - content
+  - boundary
+- name: file-flag-syntax-error-in-file
+  description: Test file containing syntax error
+  setup:
+    files:
+    - path: /tmp/geode_test_syntax_error.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        CREATE (n:SyntaxError {id: 40 INVALID SYNTAX});
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_syntax_error.gql
+  expect:
+    exit_code: 0
+  tags:
+  - error
+  - syntax
+- name: file-flag-partial-statement
+  description: Test file with incomplete statement at end
+  setup:
+    files:
+    - path: /tmp/geode_test_partial.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        CREATE (n:Complete {id: 50});
+
+        CREATE (n:Incomplete {id:
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_partial.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - 'USE GRAPH edge_case_graph; MATCH (n:Complete {id: 50}) RETURN count(n) AS cnt'
+    expect:
+      stdout_contains:
+      - '1'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:Complete) DELETE n
+  tags:
+  - error
+  - incomplete
+- name: file-flag-invalid-utf8
+  description: Test file with invalid UTF-8 sequences
+  skip: true
+  tags:
+  - error
+  - encoding
+- name: file-flag-concurrent-execution
+  description: Test multiple concurrent file executions (same file)
+  skip: true
+  tags:
+  - concurrent
+  - stress
+- name: file-flag-file-modified-during-execution
+  description: Test file modification during execution
+  skip: true
+  tags:
+  - concurrent
+  - race
+- name: file-flag-out-of-memory
+  description: Test behavior when file exceeds maximum size (>16MB)
+  skip: true
+  tags:
+  - resource
+  - boundary
+- name: file-flag-directory-instead-of-file
+  description: Test error when path is a directory, not a file
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp
+  expect:
+    exit_code: 2
+    stderr_contains:
+    - 'Error: Cannot read file: IsDir'
+  tags:
+  - error
+  - path
+- name: file-flag-device-file
+  description: Test error when attempting to read device file
+  skip: true
+  args:
+  - query
+  - --insecure
+  - --file
+  - /dev/null
+  expect:
+    exit_code: 2
+  tags:
+  - error
+  - device
+- name: file-flag-pipe-file
+  description: Test reading from named pipe (FIFO)
+  skip: true
+  tags:
+  - edge-case
+  - pipe
+- name: file-flag-unclosed-transaction
+  description: Test file with BEGIN but no COMMIT
+  setup:
+    files:
+    - path: /tmp/geode_test_unclosed_txn.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        BEGIN;
+
+        CREATE (n:UnclosedTxn {id: 60});
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_unclosed_txn.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:UnclosedTxn) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '1'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:UnclosedTxn) DELETE n
+  tags:
+  - transaction
+  - edge-case
+- name: file-flag-rollback-in-file
+  description: Test file with ROLLBACK statement
+  setup:
+    files:
+    - path: /tmp/geode_test_rollback.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        BEGIN;
+
+        CREATE (n:RolledBack {id: 70});
+
+        ROLLBACK;
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_rollback.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:RolledBack) RETURN count(n) AS cnt
+    expect:
+      stdout_contains:
+      - '0'
+  tags:
+  - transaction
+  - rollback
+- name: file-flag-nested-transactions
+  description: Test file with nested BEGIN statements (should error or handle)
+  setup:
+    files:
+    - path: /tmp/geode_test_nested_txn.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        BEGIN;
+
+        CREATE (n:OuterTxn {id: 80});
+
+        BEGIN;
+
+        CREATE (m:InnerTxn {id: 81});
+
+        COMMIT;
+
+        COMMIT;
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_nested_txn.gql
+  expect:
+    exit_code:
+    - 0
+    - 1
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:OuterTxn) DELETE n
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:InnerTxn) DELETE n
+  tags:
+  - transaction
+  - nested
+- name: file-flag-idempotent-execution
+  description: Test file can be executed multiple times (with MERGE)
+  setup:
+    files:
+    - path: /tmp/geode_test_idempotent.gql
+      content: 'USE GRAPH edge_case_graph;
+
+        MERGE (n:IdempotentTest {id: 100}) ON CREATE SET n.created = true;
+
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_idempotent.gql
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - --file
+    - /tmp/geode_test_idempotent.gql
     expect:
       exit_code: 0
-    tags: ["setup"]
-
-  # ============================================================================
-  # Boundary Value Tests
-  # ============================================================================
-
-  - name: "file-flag-exact-32kb-boundary"
-    description: "Test file at exactly 32KB boundary (threshold for chunking)"
-    skip: true  # Requires precise file generation
-    setup:
-      script: |
-        #!/bin/bash
-        # Generate file with exactly 32768 bytes
-        {
-          echo "USE GRAPH edge_case_graph;"
-          # Calculate size and generate statements to reach exactly 32KB
-        } > /tmp/geode_test_32kb_exact.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_32kb_exact.gql"]
+  - args:
+    - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:IdempotentTest) RETURN count(n) AS cnt
     expect:
-      exit_code: 0
-    tags: ["boundary", "chunked"]
+      stdout_contains:
+      - '1'
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:IdempotentTest) DELETE n
+  tags:
+  - idempotent
+  - merge
+- name: file-flag-complex-cypher
+  description: Test file with complex nested queries and patterns
+  setup:
+    files:
+    - path: /tmp/geode_test_complex.gql
+      content: 'USE GRAPH edge_case_graph;
 
-  - name: "file-flag-just-under-32kb"
-    description: "Test file just under 32KB (31KB) - should use single batch"
-    skip: true  # Requires precise file generation
-    setup:
-      script: |
-        #!/bin/bash
-        # Generate file with 31KB of content
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_31kb.gql"]
-    expect:
-      exit_code: 0
-      stdout_not_contains: ["chunked execution"]
-    tags: ["boundary"]
+        CREATE (a:Complex {id: 200, type: ''A''});
 
-  - name: "file-flag-just-over-32kb"
-    description: "Test file just over 32KB (33KB) - should trigger chunking"
-    skip: true  # Requires precise file generation
-    setup:
-      script: |
-        #!/bin/bash
-        # Generate file with 33KB of content
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_33kb.gql"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["Large file detected", "chunked execution"]
-    tags: ["boundary", "chunked"]
+        CREATE (b:Complex {id: 201, type: ''B''});
 
-  - name: "file-flag-single-character"
-    description: "Test file with single character (should error - no valid statements)"
-    setup:
-      files:
-        - path: "/tmp/geode_test_single_char.gql"
-          content: "a"
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_single_char.gql"]
-    expect:
-      exit_code: 2
-      stderr_contains: ["Error: File contains no valid GQL statements"]
-    tags: ["boundary", "error"]
+        CREATE (c:Complex {id: 202, type: ''C''});
 
-  - name: "file-flag-max-file-size"
-    description: "Test file at maximum allowed size (16MB limit)"
-    skip: true  # Requires large file generation
-    setup:
-      script: |
-        #!/bin/bash
-        # Generate file close to 16MB limit
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_16mb.gql"]
-    expect:
-      exit_code: 0
-      stdout_contains: ["chunked execution"]
-    tags: ["boundary", "large-file"]
+        MATCH (x:Complex {type: ''A''}), (y:Complex {type: ''B''}), (z:Complex {type:
+        ''C''})
 
-  # ============================================================================
-  # Path Edge Cases
-  # ============================================================================
+        CREATE (x)-[:LINK]->(y)-[:LINK]->(z);
 
-  - name: "file-flag-path-with-spaces"
-    description: "Test file path containing spaces"
-    setup:
-      files:
-        - path: "/tmp/geode test with spaces.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            CREATE (n:PathSpace {id: 1});
-    args: ["query", "--insecure", "--file", "/tmp/geode test with spaces.gql"]
-    expect:
-      exit_code: 0
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:PathSpace) DELETE n"]
-      - ["rm", "-f", "/tmp/geode test with spaces.gql"]
-    tags: ["path", "edge-case"]
+        MATCH (start:Complex {type: ''A''})-[:LINK*]->(end:Complex)
 
-  - name: "file-flag-path-with-special-chars"
-    description: "Test file path with special characters"
-    setup:
-      files:
-        - path: "/tmp/geode_test-file@2024#1.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            CREATE (n:SpecialPath {id: 2});
-    args: ["query", "--insecure", "--file", "/tmp/geode_test-file@2024#1.gql"]
-    expect:
-      exit_code: 0
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:SpecialPath) DELETE n"]
-      - ["rm", "-f", "/tmp/geode_test-file@2024#1.gql"]
-    tags: ["path", "edge-case"]
+        RETURN count(end) AS reachable;
 
-  - name: "file-flag-symlink-path"
-    description: "Test execution through symbolic link"
-    skip: true  # Requires symlink setup
-    setup:
-      files:
-        - path: "/tmp/geode_test_symlink_target.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            CREATE (n:SymlinkTest {id: 10});
-      script: |
-        ln -sf /tmp/geode_test_symlink_target.gql /tmp/geode_test_symlink.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_symlink.gql"]
-    expect:
-      exit_code: 0
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:SymlinkTest) DELETE n"]
-      - ["rm", "-f", "/tmp/geode_test_symlink.gql", "/tmp/geode_test_symlink_target.gql"]
-    tags: ["path", "symlink"]
-
-  - name: "file-flag-very-long-path"
-    description: "Test with very long file path (near system limit)"
-    skip: true  # Requires special path setup
-    tags: ["path", "boundary"]
-
-  # ============================================================================
-  # Content Edge Cases
-  # ============================================================================
-
-  - name: "file-flag-only-whitespace-and-comments"
-    description: "Test file containing only whitespace and comments"
-    setup:
-      files:
-        - path: "/tmp/geode_test_only_comments.gql"
-          content: |
-            -- Comment 1
-            # Comment 2
-
-
-            -- Comment 3
-
-            # Comment 4
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_only_comments.gql"]
-    expect:
-      exit_code: 2
-      stderr_contains: ["Error: File contains no valid GQL statements"]
-    tags: ["content", "edge-case", "error"]
-
-  - name: "file-flag-comment-after-statement"
-    description: "Test inline comments after statements (on same line)"
-    skip: true  # Geode file parser doesn't currently support inline comments after statements on same line
-    setup:
-      files:
-        - path: "/tmp/geode_test_inline_comment.gql"
-          content: |
-            USE GRAPH edge_case_graph; -- Using edge case graph
-            CREATE (n:InlineComment {id: 20}); # Create node
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_inline_comment.gql"]
-    expect:
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:InlineComment) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:InlineComment) DELETE n"]
-    tags: ["content", "comments"]
-
-  - name: "file-flag-multiple-semicolons"
-    description: "Test statement with multiple trailing semicolons"
-    setup:
-      files:
-        - path: "/tmp/geode_test_multi_semi.gql"
-          content: |
-            USE GRAPH edge_case_graph;;;
-            CREATE (n:MultiSemi {id: 21});;;
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_multi_semi.gql"]
-    expect:
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:MultiSemi) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:MultiSemi) DELETE n"]
-    tags: ["content", "semicolon"]
-
-  - name: "file-flag-tab-characters"
-    description: "Test file with tab characters for indentation"
-    setup:
-      script: |
-        #!/bin/bash
-        printf "USE GRAPH edge_case_graph;\n\tCREATE (n:TabTest {id: 30});\n" > /tmp/geode_test_tabs.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_tabs.gql"]
-    expect:
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:TabTest) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:TabTest) DELETE n"]
-    tags: ["content", "whitespace"]
-
-  - name: "file-flag-mixed-tab-space-indentation"
-    description: "Test file with mixed tabs and spaces"
-    setup:
-      script: |
-        #!/bin/bash
-        printf "USE GRAPH edge_case_graph;\n  \tCREATE (n:MixedIndent {id: 31});\n" > /tmp/geode_test_mixed_indent.gql
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_mixed_indent.gql"]
-    expect:
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:MixedIndent) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:MixedIndent) DELETE n"]
-    tags: ["content", "whitespace"]
-
-  - name: "file-flag-null-bytes"
-    description: "Test file containing null bytes (should handle gracefully or error)"
-    skip: true  # Binary file handling - may cause issues
-    tags: ["content", "binary"]
-
-  - name: "file-flag-very-long-line"
-    description: "Test file with single very long line (10KB single statement)"
-    skip: true  # Requires large statement generation
-    tags: ["content", "boundary"]
-
-  # ============================================================================
-  # Syntax Error Handling
-  # ============================================================================
-
-  - name: "file-flag-syntax-error-in-file"
-    description: "Test file containing syntax error"
-    setup:
-      files:
-        - path: "/tmp/geode_test_syntax_error.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            CREATE (n:SyntaxError {id: 40 INVALID SYNTAX});
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_syntax_error.gql"]
-    expect:
-      # Geode file parser extracts valid statements; the syntax "INVALID SYNTAX" is treated as
-      # an incomplete expression and filtered out, leaving only USE GRAPH which succeeds
-      exit_code: 0
-    tags: ["error", "syntax"]
-
-  - name: "file-flag-partial-statement"
-    description: "Test file with incomplete statement at end"
-    setup:
-      files:
-        - path: "/tmp/geode_test_partial.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            CREATE (n:Complete {id: 50});
-            CREATE (n:Incomplete {id:
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_partial.gql"]
-    expect:
-      # Geode file parser extracts complete statements and ignores incomplete trailing content
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:Complete {id: 50}) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1"]
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:Complete) DELETE n"]
-    tags: ["error", "incomplete"]
-
-  - name: "file-flag-invalid-utf8"
-    description: "Test file with invalid UTF-8 sequences"
-    skip: true  # Requires binary data injection
-    tags: ["error", "encoding"]
-
-  # ============================================================================
-  # Concurrent and Resource Tests
-  # ============================================================================
-
-  - name: "file-flag-concurrent-execution"
-    description: "Test multiple concurrent file executions (same file)"
-    skip: true  # Requires parallel execution framework
-    tags: ["concurrent", "stress"]
-
-  - name: "file-flag-file-modified-during-execution"
-    description: "Test file modification during execution"
-    skip: true  # Requires timing-based test framework
-    tags: ["concurrent", "race"]
-
-  - name: "file-flag-out-of-memory"
-    description: "Test behavior when file exceeds maximum size (>16MB)"
-    skip: true  # Requires very large file
-    tags: ["resource", "boundary"]
-
-  # ============================================================================
-  # Security Edge Cases
-  # ============================================================================
-
-  - name: "file-flag-directory-instead-of-file"
-    description: "Test error when path is a directory, not a file"
-    args: ["query", "--insecure", "--file", "/tmp"]
-    expect:
-      exit_code: 2
-      stderr_contains: ["Error: Cannot read file: IsDir"]
-    tags: ["error", "path"]
-
-  - name: "file-flag-device-file"
-    description: "Test error when attempting to read device file"
-    skip: true  # Platform-specific behavior
-    args: ["query", "--insecure", "--file", "/dev/null"]
-    expect:
-      exit_code: 2
-    tags: ["error", "device"]
-
-  - name: "file-flag-pipe-file"
-    description: "Test reading from named pipe (FIFO)"
-    skip: true  # Requires FIFO setup and timing
-    tags: ["edge-case", "pipe"]
-
-  # ============================================================================
-  # Transaction Edge Cases
-  # ============================================================================
-
-  - name: "file-flag-unclosed-transaction"
-    description: "Test file with BEGIN but no COMMIT"
-    setup:
-      files:
-        - path: "/tmp/geode_test_unclosed_txn.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            BEGIN;
-            CREATE (n:UnclosedTxn {id: 60});
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_unclosed_txn.gql"]
-    expect:
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:UnclosedTxn) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1"]  # Should auto-commit
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:UnclosedTxn) DELETE n"]
-    tags: ["transaction", "edge-case"]
-
-  - name: "file-flag-rollback-in-file"
-    description: "Test file with ROLLBACK statement"
-    setup:
-      files:
-        - path: "/tmp/geode_test_rollback.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            BEGIN;
-            CREATE (n:RolledBack {id: 70});
-            ROLLBACK;
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_rollback.gql"]
-    expect:
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:RolledBack) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["0"]  # Should be rolled back
-    tags: ["transaction", "rollback"]
-
-  - name: "file-flag-nested-transactions"
-    description: "Test file with nested BEGIN statements (should error or handle)"
-    setup:
-      files:
-        - path: "/tmp/geode_test_nested_txn.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            BEGIN;
-            CREATE (n:OuterTxn {id: 80});
-            BEGIN;
-            CREATE (m:InnerTxn {id: 81});
-            COMMIT;
-            COMMIT;
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_nested_txn.gql"]
-    expect:
-      exit_code: [0, 1]  # May succeed or error depending on transaction semantics
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:OuterTxn) DELETE n"]
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:InnerTxn) DELETE n"]
-    tags: ["transaction", "nested"]
-
-  # ============================================================================
-  # Idempotency Tests
-  # ============================================================================
-
-  - name: "file-flag-idempotent-execution"
-    description: "Test file can be executed multiple times (with MERGE)"
-    setup:
-      files:
-        - path: "/tmp/geode_test_idempotent.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            MERGE (n:IdempotentTest {id: 100}) ON CREATE SET n.created = true;
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_idempotent.gql"]
-    expect:
-      exit_code: 0
-    verify:
-      - args: ["query", "--insecure", "--file", "/tmp/geode_test_idempotent.gql"]
-        expect:
-          exit_code: 0
-      - args: ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:IdempotentTest) RETURN count(n) AS cnt"]
-        expect:
-          stdout_contains: ["1"]  # Still only 1 node after second execution
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:IdempotentTest) DELETE n"]
-    tags: ["idempotent", "merge"]
-
-  # ============================================================================
-  # Complex Statement Tests
-  # ============================================================================
-
-  - name: "file-flag-complex-cypher"
-    description: "Test file with complex nested queries and patterns"
-    setup:
-      files:
-        - path: "/tmp/geode_test_complex.gql"
-          content: |
-            USE GRAPH edge_case_graph;
-            CREATE (a:Complex {id: 200, type: 'A'});
-            CREATE (b:Complex {id: 201, type: 'B'});
-            CREATE (c:Complex {id: 202, type: 'C'});
-            MATCH (x:Complex {type: 'A'}), (y:Complex {type: 'B'}), (z:Complex {type: 'C'})
-            CREATE (x)-[:LINK]->(y)-[:LINK]->(z);
-            MATCH (start:Complex {type: 'A'})-[:LINK*]->(end:Complex)
-            RETURN count(end) AS reachable;
-    args: ["query", "--insecure", "--file", "/tmp/geode_test_complex.gql"]
-    expect:
-      exit_code: 0
-    cleanup:
-      - ["query", "--insecure", "USE GRAPH edge_case_graph; MATCH (n:Complex) DETACH DELETE n"]
-    tags: ["complex", "pattern"]
-
-  - name: "file-flag-with-subqueries"
-    description: "Test file containing subqueries"
-    skip: true  # Depends on subquery support
-    tags: ["complex", "subquery"]
-
-  # ============================================================================
-  # Cleanup
-  # ============================================================================
-
-  - name: "cleanup-edge-case-graph"
-    description: "Drop edge case test graph"
-    args: ["query", "--insecure", "DROP GRAPH IF EXISTS edge_case_graph"]
-    expect:
-      exit_code: 0
-    tags: ["cleanup"]
-
-  - name: "cleanup-all-temp-files"
-    description: "Remove all temporary test files"
-    skip: true  # File cleanup handled by OS
-    cleanup:
-      - ["bash", "-c", "rm -f /tmp/geode_test_*.gql"]
-    tags: ["cleanup"]
+        '
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_test_complex.gql
+  expect:
+    exit_code: 0
+  cleanup:
+  - - query
+    - --insecure
+    - USE GRAPH edge_case_graph; MATCH (n:Complex) DETACH DELETE n
+  tags:
+  - complex
+  - pattern
+- name: file-flag-with-subqueries
+  description: Test file containing subqueries
+  skip: true
+  tags:
+  - complex
+  - subquery
+- name: cleanup-edge-case-graph
+  description: Drop edge case test graph
+  args:
+  - query
+  - --insecure
+  - DROP GRAPH IF EXISTS edge_case_graph
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+- name: cleanup-all-temp-files
+  description: Remove all temporary test files
+  skip: true
+  cleanup:
+  - - bash
+    - -c
+    - rm -f /tmp/geode_test_*.gql
+  tags:
+  - cleanup

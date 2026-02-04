@@ -31,6 +31,10 @@ class ExpectedResult:
     exit_code: int | None = None
     stdout_contains: list[str] | None = None
     stderr_contains: list[str] | None = None
+    stdout_not_contains: list[str] | None = None
+    stderr_not_contains: list[str] | None = None
+    stdout_regex: list[str] | None = None
+    stderr_regex: list[str] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ExpectedResult:
@@ -39,14 +43,13 @@ class ExpectedResult:
         Supports both geodetestlab format (status, result_contains, etc.)
         and legacy CLI test format (exit_code, stdout_contains, etc.).
         """
-        # Handle stdout_contains which can be a list
-        stdout_contains = data.get("stdout_contains")
-        if stdout_contains is not None and not isinstance(stdout_contains, list):
-            stdout_contains = [stdout_contains]
-
-        stderr_contains = data.get("stderr_contains")
-        if stderr_contains is not None and not isinstance(stderr_contains, list):
-            stderr_contains = [stderr_contains]
+        # Helper function to normalize list fields
+        def normalize_list(value: Any) -> list[str] | None:
+            if value is None:
+                return None
+            if isinstance(value, list):
+                return value
+            return [value]
 
         return cls(
             status=data.get("status", "success"),
@@ -55,8 +58,12 @@ class ExpectedResult:
             result_matches=data.get("result_matches"),
             error_contains=data.get("error_contains"),
             exit_code=data.get("exit_code"),
-            stdout_contains=stdout_contains,
-            stderr_contains=stderr_contains,
+            stdout_contains=normalize_list(data.get("stdout_contains")),
+            stderr_contains=normalize_list(data.get("stderr_contains")),
+            stdout_not_contains=normalize_list(data.get("stdout_not_contains")),
+            stderr_not_contains=normalize_list(data.get("stderr_not_contains")),
+            stdout_regex=normalize_list(data.get("stdout_regex")),
+            stderr_regex=normalize_list(data.get("stderr_regex")),
         )
 
 
@@ -163,7 +170,10 @@ class TestSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestSpec:
-        """Create a TestSpec from a dictionary."""
+        """Create a TestSpec from a dictionary.
+
+        Supports both the new cli: block format and legacy flat format.
+        """
         secrets = {}
         for name, config in data.get("secrets", {}).items():
             secrets[name] = SecretConfig.from_dict(config) if isinstance(config, dict) else SecretConfig(source="env")
@@ -172,12 +182,29 @@ class TestSpec:
         for test_data in data.get("tests", []):
             tests.append(TestCase.from_dict(test_data))
 
+        # Extract configuration from cli: block if present (new format)
+        cli_config = data.get("cli", {})
+        server_config = cli_config.get("server", {})
+
+        # Determine mode: if cli.server.enabled is explicitly set, use it
+        # Otherwise fall back to legacy mode field
+        if "server" in cli_config and "enabled" in server_config:
+            mode = "server" if server_config.get("enabled", True) else "cli"
+        else:
+            mode = data.get("mode", "server")
+
+        # Get server args from cli.server.args or legacy server_args
+        server_args = server_config.get("args", data.get("server_args", []))
+
+        # Get environment from cli.server.env or legacy env
+        env = server_config.get("env", data.get("env", {}))
+
         return cls(
             name=data.get("name", "unnamed"),
             description=data.get("description", ""),
-            mode=data.get("mode", "server"),
-            server_args=data.get("server_args", []),
-            env=data.get("env", {}),
+            mode=mode,
+            server_args=server_args,
+            env=env,
             secrets=secrets,
             tests=tests,
             setup=data.get("setup"),

@@ -1,384 +1,534 @@
-version: "1.0"
-name: "TDE Plaintext Verification - Combined Page + WAL Encryption"
-description: |
-  SECURITY CRITICAL TEST SUITE
+version: '1.0'
+name: TDE Plaintext Verification - Combined Page + WAL Encryption
+description: 'SECURITY CRITICAL TEST SUITE
+
 
   Verifies that when BOTH TDE page encryption AND WAL encryption are enabled,
+
   NO plaintext data is written to disk in any form. This is the recommended
+
   production configuration for maximum security.
 
+
   This test:
+
   1. Enables both page encryption and WAL encryption
+
   2. Writes sensitive data across multiple node types
+
   3. Performs transactions with commits and rollbacks
+
   4. Scans ALL files (pages, WAL, indexes, metadata) for plaintext
+
   5. FAILS if ANY plaintext marker is found
 
+
   Combined encryption ensures:
+
   - Data pages are encrypted at rest
+
   - WAL records are encrypted before write
+
   - Transaction logs contain no plaintext
+
   - Index files are encrypted
+
   - Metadata files are protected
 
-  CANARY: REQ=REQ-TDE-ENFORCE-003; FEATURE=TDEEnforcement; ASPECT=CombinedEncryption; STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
 
+  CANARY: REQ=REQ-TDE-ENFORCE-003; FEATURE=TDEEnforcement; ASPECT=CombinedEncryption;
+  STATUS=TESTED; OWNER=security; UPDATED=2026-01-28
+
+  '
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   server:
     enabled: true
     port: null
     data_dir: null
     startup_timeout_ms: 30000
     cleanup: false
-    args: ["--log-level", "info", "--enable-tde", "--enable-wal-encryption", "--tde-provider", "MockKms"]
+    args:
+    - --log-level
+    - info
+    - --enable-tde
+    - --enable-wal-encryption
+    - --tde-provider
+    - MockKms
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
     timeout_ms: 15000
     tls_verify: false
-    format: "json"
-
+    format: json
 env:
-  # All keys must be exactly 64 hex characters (32 bytes for AES-256)
-  GEODE_TDE_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-  GEODE_WAL_KEY: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-  GEODE_TDE_ENABLED: "true"
-  GEODE_WAL_ENCRYPTION_ENABLED: "true"
-
+  GEODE_TDE_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  GEODE_WAL_KEY: abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789
+  GEODE_TDE_ENABLED: 'true'
+  GEODE_WAL_ENCRYPTION_ENABLED: 'true'
 tests:
-  # ===============================
-  # PHASE 1: COMPREHENSIVE DATA WRITE
-  # ===============================
-
-  - name: "tde-combined-financial-records"
-    description: "Write financial records with multiple sensitive fields"
-    args: ["query",
-           "CREATE (acc:CombinedTest_Account {
-              type: 'FinancialAccount',
-              account_number: 'COMBINED_ACCT_1234567890123456',
-              routing_number: 'COMBINED_RTN_021000089',
-              balance: 1500000.50,
-              holder_ssn: 'COMBINED_SSN_111223333',
-              holder_name: 'Secret Account Holder',
-              pin_hash: 'COMBINED_PIN_9876'
-            })
-            RETURN acc.account_number AS account"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "financial", "write"]
-
-  - name: "tde-combined-healthcare-records"
-    description: "Write HIPAA-sensitive healthcare records"
-    args: ["query",
-           "CREATE (patient:CombinedTest_Patient {
-              type: 'HealthcareRecord',
-              patient_id: 'COMBINED_PATIENT_P12345',
-              medical_record_number: 'COMBINED_MRN_MRN789456',
-              diagnosis: 'COMBINED_DX_CANCER_STAGE_IV',
-              medications: ['COMBINED_MED_CHEMO_AGENT_X', 'COMBINED_MED_PAINKILLER_Y'],
-              insurance_id: 'COMBINED_INS_BCBS123456789',
-              physician_notes: 'COMBINED_NOTES_Terminal_prognosis_6_months'
-            })
-            RETURN patient.patient_id AS patient"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "healthcare", "hipaa", "write"]
-
-  - name: "tde-combined-government-records"
-    description: "Write government/classified records"
-    args: ["query",
-           "CREATE (gov:CombinedTest_Government {
-              type: 'GovernmentRecord',
-              clearance_level: 'TOP_SECRET_SCI',
-              classification: 'COMBINED_CLASS_NOFORN_ORCON',
-              project_code: 'COMBINED_PROJECT_BLACKBIRD_OMEGA',
-              operative_id: 'COMBINED_AGENT_007_CLASSIFIED',
-              mission_details: 'COMBINED_MISSION_EXTRACTION_TARGET_ALPHA'
-            })
-            RETURN gov.project_code AS project"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "government", "classified", "write"]
-
-  - name: "tde-combined-corporate-secrets"
-    description: "Write corporate trade secrets"
-    args: ["query",
-           "CREATE (corp:CombinedTest_Corporate {
-              type: 'TradeSecret',
-              formula: 'COMBINED_FORMULA_SECRET_INGREDIENT_X27',
-              patent_pending: 'COMBINED_PATENT_PENDING_2026_001234',
-              strategic_plan: 'COMBINED_STRATEGY_ACQUISITION_COMPETITOR_Z',
-              executive_compensation: 'COMBINED_EXEC_COMP_CEO_25M_STOCK'
-            })
-            RETURN corp.formula AS formula"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "corporate", "tradesecret", "write"]
-
-  - name: "tde-combined-authentication-data"
-    description: "Write authentication/credential data"
-    args: ["query",
-           "CREATE (auth:CombinedTest_Auth {
-              type: 'AuthCredential',
-              api_key: 'COMBINED_APIKEY_sk_live_abcdef123456',
-              oauth_secret: 'COMBINED_OAUTH_SECRET_xyz789',
-              jwt_secret: 'COMBINED_JWT_SECRET_super_secret_key',
-              password_hash: 'COMBINED_PWDHASH_argon2id_salted',
-              mfa_seed: 'COMBINED_MFA_TOTP_SEED_BASE32'
-            })
-            RETURN auth.api_key AS key"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "auth", "credentials", "write"]
-
-  # ===============================
-  # PHASE 2: RELATIONSHIPS WITH SENSITIVE DATA
-  # ===============================
-
-  - name: "tde-combined-create-relationships"
-    description: "Create relationships with encrypted properties"
-    args: ["query",
-           "MATCH (acc:CombinedTest_Account), (patient:CombinedTest_Patient)
-            CREATE (acc)-[r:PAYS_FOR {
-              claim_id: 'COMBINED_CLAIM_CLM123456',
-              diagnosis_code: 'COMBINED_ICD10_C34_9',
-              amount_paid: 15000.00,
-              authorization: 'COMBINED_AUTH_PREAUTH_789'
-            }]->(patient)
-            RETURN r.claim_id AS claim"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "relationship", "write"]
-
-  # ===============================
-  # PHASE 3: TRANSACTION OPERATIONS
-  # ===============================
-
-  - name: "tde-combined-multi-statement-transaction"
-    description: "Multi-statement transaction with sensitive data"
-    args: ["query",
-           "CREATE (t1:CombinedTest_Txn1 {marker: 'COMBINED_TXN_MARKER_FIRST'}),
-                   (t2:CombinedTest_Txn2 {marker: 'COMBINED_TXN_MARKER_SECOND'}),
-                   (t3:CombinedTest_Txn3 {marker: 'COMBINED_TXN_MARKER_THIRD'})
-            RETURN count(*) AS created"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "transaction", "write"]
-
-  # ===============================
-  # PHASE 4: INDEX OPERATIONS
-  # ===============================
-
-  - name: "tde-combined-index-data"
-    description: "Create indexed data (indexes may contain plaintext)"
-    args: ["query",
-           "CREATE (idx:CombinedTest_Indexed {
-              indexed_field: 'COMBINED_INDEXED_VALUE_SECRET123',
-              search_term: 'COMBINED_SEARCH_CONFIDENTIAL_XYZ',
-              lookup_key: 'COMBINED_KEY_PRIVATE_ABC'
-            })
-            RETURN idx.indexed_field AS indexed"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "index", "write"]
-
-  # ===============================
-  # PHASE 5: VERIFY ALL DATA READABLE
-  # ===============================
-
-  - name: "tde-combined-verify-data-integrity"
-    description: "Verify all encrypted data is correctly readable"
-    args: ["query",
-           "MATCH (n)
-            WHERE n:CombinedTest_Account OR n:CombinedTest_Patient OR
-                  n:CombinedTest_Government OR n:CombinedTest_Corporate OR
-                  n:CombinedTest_Auth OR n:CombinedTest_Indexed
-            RETURN count(*) AS total, collect(labels(n)) AS types"]
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-    tags: ["tde", "combined", "verify", "integrity"]
-
-  # ===============================
-  # PHASE 6: COMPREHENSIVE PLAINTEXT SCAN
-  # ===============================
-
-  - name: "tde-combined-scan-no-account-number"
-    description: "CRITICAL: Verify account number NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_ACCT_1234567890123456", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "account", "critical"]
-
-  - name: "tde-combined-scan-no-ssn"
-    description: "CRITICAL: Verify SSN NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_SSN_111223333", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "ssn", "critical"]
-
-  - name: "tde-combined-scan-no-patient-id"
-    description: "CRITICAL: Verify patient ID NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_PATIENT_P12345", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "hipaa", "critical"]
-
-  - name: "tde-combined-scan-no-diagnosis"
-    description: "CRITICAL: Verify diagnosis NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_DX_CANCER_STAGE_IV", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "hipaa", "critical"]
-
-  - name: "tde-combined-scan-no-medications"
-    description: "CRITICAL: Verify medications NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_MED_CHEMO_AGENT_X", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "hipaa", "critical"]
-
-  - name: "tde-combined-scan-no-project-code"
-    description: "CRITICAL: Verify classified project code NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_PROJECT_BLACKBIRD_OMEGA", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "classified", "critical"]
-
-  - name: "tde-combined-scan-no-agent-id"
-    description: "CRITICAL: Verify operative ID NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_AGENT_007_CLASSIFIED", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "classified", "critical"]
-
-  - name: "tde-combined-scan-no-formula"
-    description: "CRITICAL: Verify trade secret formula NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_FORMULA_SECRET_INGREDIENT_X27", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "tradesecret", "critical"]
-
-  - name: "tde-combined-scan-no-api-key"
-    description: "CRITICAL: Verify API key NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_APIKEY_sk_live_abcdef123456", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "credentials", "critical"]
-
-  - name: "tde-combined-scan-no-jwt-secret"
-    description: "CRITICAL: Verify JWT secret NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_JWT_SECRET_super_secret_key", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "credentials", "critical"]
-
-  - name: "tde-combined-scan-no-mfa-seed"
-    description: "CRITICAL: Verify MFA seed NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_MFA_TOTP_SEED_BASE32", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "credentials", "critical"]
-
-  - name: "tde-combined-scan-no-claim-id"
-    description: "CRITICAL: Verify claim ID NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_CLAIM_CLM123456", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "relationship", "critical"]
-
-  - name: "tde-combined-scan-no-transaction-markers"
-    description: "CRITICAL: Verify transaction markers NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_TXN_MARKER", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "transaction", "critical"]
-
-  - name: "tde-combined-scan-no-indexed-value"
-    description: "CRITICAL: Verify indexed values NOT in any file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_INDEXED_VALUE_SECRET123", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "index", "critical"]
-
-  - name: "tde-combined-scan-comprehensive-prefix"
-    description: "CRITICAL: Verify NO COMBINED_ prefix in ANY file"
-    command: "grep"
-    args: ["-r", "-a", "-l", "COMBINED_", "${data_dir}"]
-    expect:
-      exit_code: 1
-    tags: ["tde", "combined", "scan", "comprehensive", "critical"]
-
+- name: tde-combined-financial-records
+  description: Write financial records with multiple sensitive fields
+  args:
+  - query
+  - 'CREATE (acc:CombinedTest_Account { type: ''FinancialAccount'', account_number:
+    ''COMBINED_ACCT_1234567890123456'', routing_number: ''COMBINED_RTN_021000089'',
+    balance: 1500000.50, holder_ssn: ''COMBINED_SSN_111223333'', holder_name: ''Secret
+    Account Holder'', pin_hash: ''COMBINED_PIN_9876'' }) RETURN acc.account_number
+    AS account'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - financial
+  - write
+- name: tde-combined-healthcare-records
+  description: Write HIPAA-sensitive healthcare records
+  args:
+  - query
+  - 'CREATE (patient:CombinedTest_Patient { type: ''HealthcareRecord'', patient_id:
+    ''COMBINED_PATIENT_P12345'', medical_record_number: ''COMBINED_MRN_MRN789456'',
+    diagnosis: ''COMBINED_DX_CANCER_STAGE_IV'', medications: [''COMBINED_MED_CHEMO_AGENT_X'',
+    ''COMBINED_MED_PAINKILLER_Y''], insurance_id: ''COMBINED_INS_BCBS123456789'',
+    physician_notes: ''COMBINED_NOTES_Terminal_prognosis_6_months'' }) RETURN patient.patient_id
+    AS patient'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - healthcare
+  - hipaa
+  - write
+- name: tde-combined-government-records
+  description: Write government/classified records
+  args:
+  - query
+  - 'CREATE (gov:CombinedTest_Government { type: ''GovernmentRecord'', clearance_level:
+    ''TOP_SECRET_SCI'', classification: ''COMBINED_CLASS_NOFORN_ORCON'', project_code:
+    ''COMBINED_PROJECT_BLACKBIRD_OMEGA'', operative_id: ''COMBINED_AGENT_007_CLASSIFIED'',
+    mission_details: ''COMBINED_MISSION_EXTRACTION_TARGET_ALPHA'' }) RETURN gov.project_code
+    AS project'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - government
+  - classified
+  - write
+- name: tde-combined-corporate-secrets
+  description: Write corporate trade secrets
+  args:
+  - query
+  - 'CREATE (corp:CombinedTest_Corporate { type: ''TradeSecret'', formula: ''COMBINED_FORMULA_SECRET_INGREDIENT_X27'',
+    patent_pending: ''COMBINED_PATENT_PENDING_2026_001234'', strategic_plan: ''COMBINED_STRATEGY_ACQUISITION_COMPETITOR_Z'',
+    executive_compensation: ''COMBINED_EXEC_COMP_CEO_25M_STOCK'' }) RETURN corp.formula
+    AS formula'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - corporate
+  - tradesecret
+  - write
+- name: tde-combined-authentication-data
+  description: Write authentication/credential data
+  args:
+  - query
+  - 'CREATE (auth:CombinedTest_Auth { type: ''AuthCredential'', api_key: ''COMBINED_APIKEY_sk_live_abcdef123456'',
+    oauth_secret: ''COMBINED_OAUTH_SECRET_xyz789'', jwt_secret: ''COMBINED_JWT_SECRET_super_secret_key'',
+    password_hash: ''COMBINED_PWDHASH_argon2id_salted'', mfa_seed: ''COMBINED_MFA_TOTP_SEED_BASE32''
+    }) RETURN auth.api_key AS key'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - auth
+  - credentials
+  - write
+- name: tde-combined-create-relationships
+  description: Create relationships with encrypted properties
+  args:
+  - query
+  - 'MATCH (acc:CombinedTest_Account), (patient:CombinedTest_Patient) CREATE (acc)-[r:PAYS_FOR
+    { claim_id: ''COMBINED_CLAIM_CLM123456'', diagnosis_code: ''COMBINED_ICD10_C34_9'',
+    amount_paid: 15000.00, authorization: ''COMBINED_AUTH_PREAUTH_789'' }]->(patient)
+    RETURN r.claim_id AS claim'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - relationship
+  - write
+- name: tde-combined-multi-statement-transaction
+  description: Multi-statement transaction with sensitive data
+  args:
+  - query
+  - 'CREATE (t1:CombinedTest_Txn1 {marker: ''COMBINED_TXN_MARKER_FIRST''}), (t2:CombinedTest_Txn2
+    {marker: ''COMBINED_TXN_MARKER_SECOND''}), (t3:CombinedTest_Txn3 {marker: ''COMBINED_TXN_MARKER_THIRD''})
+    RETURN count(*) AS created'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - transaction
+  - write
+- name: tde-combined-index-data
+  description: Create indexed data (indexes may contain plaintext)
+  args:
+  - query
+  - 'CREATE (idx:CombinedTest_Indexed { indexed_field: ''COMBINED_INDEXED_VALUE_SECRET123'',
+    search_term: ''COMBINED_SEARCH_CONFIDENTIAL_XYZ'', lookup_key: ''COMBINED_KEY_PRIVATE_ABC''
+    }) RETURN idx.indexed_field AS indexed'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - index
+  - write
+- name: tde-combined-verify-data-integrity
+  description: Verify all encrypted data is correctly readable
+  args:
+  - query
+  - MATCH (n) WHERE n:CombinedTest_Account OR n:CombinedTest_Patient OR n:CombinedTest_Government
+    OR n:CombinedTest_Corporate OR n:CombinedTest_Auth OR n:CombinedTest_Indexed RETURN
+    count(*) AS total, collect(labels(n)) AS types
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags:
+  - tde
+  - combined
+  - verify
+  - integrity
+- name: tde-combined-scan-no-account-number
+  description: 'CRITICAL: Verify account number NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_ACCT_1234567890123456
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - account
+  - critical
+- name: tde-combined-scan-no-ssn
+  description: 'CRITICAL: Verify SSN NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_SSN_111223333
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - ssn
+  - critical
+- name: tde-combined-scan-no-patient-id
+  description: 'CRITICAL: Verify patient ID NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_PATIENT_P12345
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - hipaa
+  - critical
+- name: tde-combined-scan-no-diagnosis
+  description: 'CRITICAL: Verify diagnosis NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_DX_CANCER_STAGE_IV
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - hipaa
+  - critical
+- name: tde-combined-scan-no-medications
+  description: 'CRITICAL: Verify medications NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_MED_CHEMO_AGENT_X
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - hipaa
+  - critical
+- name: tde-combined-scan-no-project-code
+  description: 'CRITICAL: Verify classified project code NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_PROJECT_BLACKBIRD_OMEGA
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - classified
+  - critical
+- name: tde-combined-scan-no-agent-id
+  description: 'CRITICAL: Verify operative ID NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_AGENT_007_CLASSIFIED
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - classified
+  - critical
+- name: tde-combined-scan-no-formula
+  description: 'CRITICAL: Verify trade secret formula NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_FORMULA_SECRET_INGREDIENT_X27
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - tradesecret
+  - critical
+- name: tde-combined-scan-no-api-key
+  description: 'CRITICAL: Verify API key NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_APIKEY_sk_live_abcdef123456
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - credentials
+  - critical
+- name: tde-combined-scan-no-jwt-secret
+  description: 'CRITICAL: Verify JWT secret NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_JWT_SECRET_super_secret_key
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - credentials
+  - critical
+- name: tde-combined-scan-no-mfa-seed
+  description: 'CRITICAL: Verify MFA seed NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_MFA_TOTP_SEED_BASE32
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - credentials
+  - critical
+- name: tde-combined-scan-no-claim-id
+  description: 'CRITICAL: Verify claim ID NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_CLAIM_CLM123456
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - relationship
+  - critical
+- name: tde-combined-scan-no-transaction-markers
+  description: 'CRITICAL: Verify transaction markers NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_TXN_MARKER
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - transaction
+  - critical
+- name: tde-combined-scan-no-indexed-value
+  description: 'CRITICAL: Verify indexed values NOT in any file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_INDEXED_VALUE_SECRET123
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - index
+  - critical
+- name: tde-combined-scan-comprehensive-prefix
+  description: 'CRITICAL: Verify NO COMBINED_ prefix in ANY file'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - COMBINED_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags:
+  - tde
+  - combined
+  - scan
+  - comprehensive
+  - critical
 invariants:
-  - type: "server_running"
-
+- type: server_running
 plaintext_verification:
   enabled: true
   patterns:
-    - "COMBINED_ACCT_"
-    - "COMBINED_RTN_"
-    - "COMBINED_SSN_"
-    - "COMBINED_PIN_"
-    - "COMBINED_PATIENT_"
-    - "COMBINED_MRN_"
-    - "COMBINED_DX_"
-    - "COMBINED_MED_"
-    - "COMBINED_INS_"
-    - "COMBINED_NOTES_"
-    - "COMBINED_CLASS_"
-    - "COMBINED_PROJECT_"
-    - "COMBINED_AGENT_"
-    - "COMBINED_MISSION_"
-    - "COMBINED_FORMULA_"
-    - "COMBINED_PATENT_"
-    - "COMBINED_STRATEGY_"
-    - "COMBINED_EXEC_"
-    - "COMBINED_APIKEY_"
-    - "COMBINED_OAUTH_"
-    - "COMBINED_JWT_"
-    - "COMBINED_PWDHASH_"
-    - "COMBINED_MFA_"
-    - "COMBINED_CLAIM_"
-    - "COMBINED_ICD10_"
-    - "COMBINED_AUTH_"
-    - "COMBINED_TXN_"
-    - "COMBINED_INDEXED_"
-    - "COMBINED_SEARCH_"
-    - "COMBINED_KEY_"
-    - "COMBINED_"
+  - COMBINED_ACCT_
+  - COMBINED_RTN_
+  - COMBINED_SSN_
+  - COMBINED_PIN_
+  - COMBINED_PATIENT_
+  - COMBINED_MRN_
+  - COMBINED_DX_
+  - COMBINED_MED_
+  - COMBINED_INS_
+  - COMBINED_NOTES_
+  - COMBINED_CLASS_
+  - COMBINED_PROJECT_
+  - COMBINED_AGENT_
+  - COMBINED_MISSION_
+  - COMBINED_FORMULA_
+  - COMBINED_PATENT_
+  - COMBINED_STRATEGY_
+  - COMBINED_EXEC_
+  - COMBINED_APIKEY_
+  - COMBINED_OAUTH_
+  - COMBINED_JWT_
+  - COMBINED_PWDHASH_
+  - COMBINED_MFA_
+  - COMBINED_CLAIM_
+  - COMBINED_ICD10_
+  - COMBINED_AUTH_
+  - COMBINED_TXN_
+  - COMBINED_INDEXED_
+  - COMBINED_SEARCH_
+  - COMBINED_KEY_
+  - COMBINED_
   fail_on_violation: true
   scan_binary_files: true
   scan_wal_files: true
   scan_index_files: true
-
-tags: ["tde", "combined-encryption", "page", "wal", "security", "plaintext-verification", "critical", "compliance", "hipaa", "pci", "classified"]
+tags:
+- tde
+- combined-encryption
+- page
+- wal
+- security
+- plaintext-verification
+- critical
+- compliance
+- hipaa
+- pci
+- classified

@@ -1,242 +1,309 @@
-version: "1.0"
-name: "Multi-Graph Functionality Tests"
-description: "Tests for multi-graph support including graph creation, switching, isolation, and security"
-
+version: '1.0'
+name: Multi-Graph Functionality Tests
+description: Tests for multi-graph support including graph creation, switching, isolation,
+  and security
 cli:
-  binary: "./zig-out/bin/geode"
+  binary: ./zig-out/bin/geode
   working_dir: null
   env:
-    GEODE_LOG_LEVEL: "info"
+    GEODE_LOG_LEVEL: info
   server:
     enabled: true
-    port: null  # Auto-allocate
-    data_dir: null  # Use temporary directory
+    port: null
+    data_dir: null
     startup_timeout_ms: 60000
     cleanup: true
-    args: ["--log-level", "info"]
-    env: {}
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
-    server_address: "127.0.0.1:3141"  # Will be overridden by managed server
+    server_address: 127.0.0.1:3141
     timeout_ms: 30000
     tls_verify: false
-    format: "json"
-
+    format: json
 invariants:
-  - type: "server_running"
-
+- type: server_running
 tests:
-  # ============================================================================
-  # Basic Graph Management
-  # ============================================================================
-
-  - name: "create-graph-basic"
-    description: "Create a new graph"
-    args: ["query", "-"]
-    stdin: "CREATE GRAPH testgraph"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "create"]
-
-  - name: "create-graph-if-not-exists"
-    description: "Create graph with IF NOT EXISTS"
-    args: ["query", "-"]
-    stdin: "CREATE GRAPH IF NOT EXISTS testgraph"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "create"]
-
-  - name: "show-graphs"
-    description: "List all graphs"
-    args: ["query", "-"]
-    stdin: "SHOW GRAPHS"
-    expect:
-      exit_code: 0
-      stdout_contains: ["name"]
-    tags: ["multi-graph", "show"]
-
-  - name: "use-graph"
-    description: "Switch to a different graph"
-    args: ["query", "-"]
-    stdin: "USE GRAPH testgraph"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "use"]
-
-  - name: "use-nonexistent-graph"
-    description: "Attempt to use a graph that doesn't exist"
-    args: ["query", "-"]
-    stdin: "USE GRAPH nonexistent_graph_xyz"
-    expect:
-      exit_code: 0
-      geode_query:
-        status_class: "42704"  # Graph not found
-    tags: ["multi-graph", "use", "error"]
-
-  - name: "drop-graph-basic"
-    description: "Drop an existing graph"
-    args: ["query", "-"]
-    stdin: "DROP GRAPH testgraph"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "drop"]
-
-  - name: "drop-graph-if-exists"
-    description: "Drop graph with IF EXISTS (should succeed even if not found)"
-    args: ["query", "-"]
-    stdin: "DROP GRAPH IF EXISTS nonexistent_graph"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "drop"]
-
-  # ============================================================================
-  # Graph Isolation Tests
-  # ============================================================================
-
-  - name: "graph-isolation-setup-graph1"
-    description: "Create first graph for isolation test"
-    args: ["query", "-"]
-    stdin: "CREATE GRAPH IF NOT EXISTS isolation_test_1"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "isolation"]
-
-  - name: "graph-isolation-setup-graph2"
-    description: "Create second graph for isolation test"
-    args: ["query", "-"]
-    stdin: "CREATE GRAPH IF NOT EXISTS isolation_test_2"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "isolation"]
-
-  - name: "graph-isolation-use-graph1"
-    description: "Switch to first graph"
-    args: ["query", "-"]
-    stdin: "USE GRAPH isolation_test_1"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "isolation"]
-
-  - name: "graph-isolation-create-node-graph1"
-    description: "Create a node in first graph"
-    args: ["query", "-"]
-    stdin: "CREATE (n:IsolationTest {name: 'graph1_node', value: 1}) RETURN n.name"
-    expect:
-      exit_code: 0
-      stdout_contains: ["graph1_node"]
-    tags: ["multi-graph", "isolation"]
-
-  - name: "graph-isolation-use-graph2"
-    description: "Switch to second graph"
-    args: ["query", "-"]
-    stdin: "USE GRAPH isolation_test_2"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "isolation"]
-
-  - name: "graph-isolation-create-node-graph2"
-    description: "Create a different node in second graph"
-    args: ["query", "-"]
-    stdin: "CREATE (n:IsolationTest {name: 'graph2_node', value: 2}) RETURN n.name"
-    expect:
-      exit_code: 0
-      stdout_contains: ["graph2_node"]
-    tags: ["multi-graph", "isolation"]
-
-  - name: "graph-isolation-verify-graph2-only"
-    description: "Verify only graph2's node is visible in graph2"
-    args: ["query", "-"]
-    stdin: "MATCH (n:IsolationTest) RETURN n.name AS name"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-      stdout_contains: ["graph2_node"]
-      stdout_not_contains: ["graph1_node"]
-    tags: ["multi-graph", "isolation"]
-
-  - name: "graph-isolation-switch-back-graph1"
-    description: "Switch back to first graph"
-    args: ["query", "-"]
-    stdin: "USE GRAPH isolation_test_1"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "isolation"]
-
-  - name: "graph-isolation-verify-graph1-only"
-    description: "Verify only graph1's node is visible in graph1"
-    args: ["query", "-"]
-    stdin: "MATCH (n:IsolationTest) RETURN n.name AS name"
-    expect:
-      exit_code: 0
-      geode_query:
-        row_count: 1
-      stdout_contains: ["graph1_node"]
-      stdout_not_contains: ["graph2_node"]
-    tags: ["multi-graph", "isolation"]
-
-  # ============================================================================
-  # Graph-Scoped Operations
-  # ============================================================================
-
-  - name: "graph-scoped-index-setup"
-    description: "Create graph for index test"
-    args: ["query", "-"]
-    stdin: "CREATE GRAPH IF NOT EXISTS index_test_graph"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "index"]
-
-  - name: "graph-scoped-index-use"
-    description: "Switch to index test graph"
-    args: ["query", "-"]
-    stdin: "USE GRAPH index_test_graph"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "index"]
-
-  - name: "graph-scoped-index-create-data"
-    description: "Create test data for index"
-    args: ["query", "-"]
-    stdin: "CREATE (n:IndexTest {email: 'test@example.com', age: 25}) RETURN n.email"
-    expect:
-      exit_code: 0
-      stdout_contains: ["test@example.com"]
-    tags: ["multi-graph", "index"]
-
-  - name: "graph-scoped-index-create"
-    description: "Create index in specific graph"
-    args: ["query", "-"]
-    stdin: "CREATE INDEX idx_email FOR (n:IndexTest) ON (n.email)"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "index"]
-
-  # ============================================================================
-  # Cleanup
-  # ============================================================================
-
-  - name: "cleanup-isolation-graph1"
-    description: "Drop isolation test graph 1"
-    args: ["query", "-"]
-    stdin: "DROP GRAPH IF EXISTS isolation_test_1"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "cleanup"]
-
-  - name: "cleanup-isolation-graph2"
-    description: "Drop isolation test graph 2"
-    args: ["query", "-"]
-    stdin: "DROP GRAPH IF EXISTS isolation_test_2"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "cleanup"]
-
-  - name: "cleanup-index-graph"
-    description: "Drop index test graph"
-    args: ["query", "-"]
-    stdin: "DROP GRAPH IF EXISTS index_test_graph"
-    expect:
-      exit_code: 0
-    tags: ["multi-graph", "cleanup"]
-
-tags: ["multi-graph", "core", "isolation", "security"]
+- name: create-graph-basic
+  description: Create a new graph
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH testgraph
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - create
+- name: create-graph-if-not-exists
+  description: Create graph with IF NOT EXISTS
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS testgraph
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - create
+- name: show-graphs
+  description: List all graphs
+  args:
+  - query
+  - '-'
+  stdin: SHOW GRAPHS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - name
+  tags:
+  - multi-graph
+  - show
+- name: use-graph
+  description: Switch to a different graph
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH testgraph
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - use
+- name: use-nonexistent-graph
+  description: Attempt to use a graph that doesn't exist
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH nonexistent_graph_xyz
+  expect:
+    exit_code: 0
+    geode_query:
+      status_class: '42704'
+  tags:
+  - multi-graph
+  - use
+  - error
+- name: drop-graph-basic
+  description: Drop an existing graph
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH testgraph
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - drop
+- name: drop-graph-if-exists
+  description: Drop graph with IF EXISTS (should succeed even if not found)
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH IF EXISTS nonexistent_graph
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - drop
+- name: graph-isolation-setup-graph1
+  description: Create first graph for isolation test
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS isolation_test_1
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-isolation-setup-graph2
+  description: Create second graph for isolation test
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS isolation_test_2
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-isolation-use-graph1
+  description: Switch to first graph
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH isolation_test_1
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-isolation-create-node-graph1
+  description: Create a node in first graph
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:IsolationTest {name: ''graph1_node'', value: 1}) RETURN n.name'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - graph1_node
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-isolation-use-graph2
+  description: Switch to second graph
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH isolation_test_2
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-isolation-create-node-graph2
+  description: Create a different node in second graph
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:IsolationTest {name: ''graph2_node'', value: 2}) RETURN n.name'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - graph2_node
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-isolation-verify-graph2-only
+  description: Verify only graph2's node is visible in graph2
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:IsolationTest) RETURN n.name AS name
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+    stdout_contains:
+    - graph2_node
+    stdout_not_contains:
+    - graph1_node
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-isolation-switch-back-graph1
+  description: Switch back to first graph
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH isolation_test_1
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-isolation-verify-graph1-only
+  description: Verify only graph1's node is visible in graph1
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:IsolationTest) RETURN n.name AS name
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+    stdout_contains:
+    - graph1_node
+    stdout_not_contains:
+    - graph2_node
+  tags:
+  - multi-graph
+  - isolation
+- name: graph-scoped-index-setup
+  description: Create graph for index test
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS index_test_graph
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - index
+- name: graph-scoped-index-use
+  description: Switch to index test graph
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH index_test_graph
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - index
+- name: graph-scoped-index-create-data
+  description: Create test data for index
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:IndexTest {email: ''test@example.com'', age: 25}) RETURN n.email'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - test@example.com
+  tags:
+  - multi-graph
+  - index
+- name: graph-scoped-index-create
+  description: Create index in specific graph
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX idx_email FOR (n:IndexTest) ON (n.email)
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - index
+- name: cleanup-isolation-graph1
+  description: Drop isolation test graph 1
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH IF EXISTS isolation_test_1
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - cleanup
+- name: cleanup-isolation-graph2
+  description: Drop isolation test graph 2
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH IF EXISTS isolation_test_2
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - cleanup
+- name: cleanup-index-graph
+  description: Drop index test graph
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH IF EXISTS index_test_graph
+  expect:
+    exit_code: 0
+  tags:
+  - multi-graph
+  - cleanup
+tags:
+- multi-graph
+- core
+- isolation
+- security
