@@ -6,9 +6,11 @@ server lifecycle, and collecting results.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import time
@@ -18,6 +20,29 @@ from typing import Any
 
 from .spec import PlaintextCheck, TestCase, TestSpec
 from .utils import find_geode_binary, get_free_port
+
+# Global list to track server processes for cleanup on exit
+_active_servers: list[subprocess.Popen] = []
+
+
+def _cleanup_servers() -> None:
+    """Clean up any active server processes on exit."""
+    for process in _active_servers[:]:  # Copy list to avoid modification during iteration
+        try:
+            if process.poll() is None:  # Still running
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1)
+        except Exception:
+            pass
+    _active_servers.clear()
+
+
+# Register cleanup handler
+atexit.register(_cleanup_servers)
 
 
 class RunnerError(Exception):
@@ -141,9 +166,27 @@ def run_tests(
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
         env["data_dir"] = str(data_dir)
 
+    # Set up signal handler for graceful shutdown in worker processes
+    interrupted = False
+
+    def _worker_signal_handler(signum: int, frame: Any) -> None:
+        nonlocal interrupted
+        interrupted = True
+        if server_process:
+            _stop_server(server_process, verbose=verbose)
+
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _worker_signal_handler)
+    signal.signal(signal.SIGTERM, _worker_signal_handler)
+
     try:
         # Run each test case
         for test_case in spec.tests:
+            # Check if we were interrupted
+            if interrupted:
+                break
+
             summary.total += 1
 
             if test_case.skip:
@@ -210,6 +253,10 @@ def run_tests(
                 summary.results.append(result)
 
     finally:
+        # Restore original signal handlers
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
+
         # Stop server if started
         if server_process:
             _stop_server(server_process, verbose=verbose)
@@ -269,16 +316,28 @@ def _start_server(
     ]
     cmd.extend(args)
 
+    # Set environment variables for testing
+    # Disable audit logging (avoids signing key requirements)
+    env["GEODE_DISABLE_AUDIT"] = "1"
+    # Allow auth to be disabled in release builds for testing
+    env["GEODE_ALLOW_NO_AUTH"] = "1"
+
     if verbose:
         print(f"Starting server: {' '.join(cmd)}")
 
+    # Start server process - use start_new_session to create a new process group
+    # This allows us to kill the entire group if needed
     process = subprocess.Popen(
         cmd,
         env=env,
         stdout=subprocess.PIPE if not verbose else None,
         stderr=subprocess.PIPE if not verbose else None,
         text=True,
+        start_new_session=True,  # Create new session so we can kill the group
     )
+
+    # Track this server for cleanup
+    _active_servers.append(process)
 
     # Wait for server to be ready
     start = time.time()
@@ -291,18 +350,34 @@ def _start_server(
                 f"Server exited unexpectedly with code {process.returncode}\nstdout: {stdout}\nstderr: {stderr}"
             )
 
-        # Check if port is bound
+        # Check if port is bound (try ss first, then netstat as fallback)
         try:
+            # Try ss first (more commonly available on modern systems)
             result = subprocess.run(
-                ["netstat", "-uln"],
+                ["ss", "-uln"],
                 capture_output=True,
                 text=True,
                 timeout=1.0,
             )
-            if f":{port}" in result.stdout:
+            if result.returncode == 0 and f":{port}" in result.stdout:
                 if verbose:
                     print(f"Server ready on port {port}")
                 return process
+        except FileNotFoundError:
+            # ss not available, try netstat
+            try:
+                result = subprocess.run(
+                    ["netstat", "-uln"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0,
+                )
+                if result.returncode == 0 and f":{port}" in result.stdout:
+                    if verbose:
+                        print(f"Server ready on port {port}")
+                    return process
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -317,14 +392,31 @@ def _stop_server(process: subprocess.Popen, verbose: bool = False) -> None:
     if verbose:
         print("Stopping server...")
 
+    # Remove from tracking list
+    if process in _active_servers:
+        _active_servers.remove(process)
+
     try:
+        # Try graceful termination first
         process.terminate()
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        if verbose:
-            print("Force killing server...")
-        process.kill()
-        process.wait(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            if verbose:
+                print("Force killing server...")
+            # Kill the entire process group if we created a new session
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    except Exception:
+        # Process may have already exited
+        pass
 
 
 def _run_single_test(
@@ -353,6 +445,10 @@ def _run_single_test(
         cmd = [binary]
         args = _substitute_variables(test_case.args, env, secrets, data_dir)
         cmd.extend(args)
+        # If this is a query command via args, add server and insecure flags
+        if args and args[0] == "query" and len(args) > 1:
+            cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
+            cmd.extend(["--insecure"])
 
     # Merge test-specific environment
     test_env = env.copy()

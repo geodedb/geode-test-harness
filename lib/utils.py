@@ -18,17 +18,16 @@ def get_free_port() -> int:
     """Get a free port number for server binding.
 
     This function finds an available port by binding to port 0 and letting
-    the OS assign a free port. This enables parallel test execution without
-    port conflicts.
+    the OS assign a free port. Uses UDP since QUIC runs over UDP.
+    This enables parallel test execution without port conflicts.
 
     Returns
     -------
     int
         An available port number.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.bind(("", 0))
-        s.listen(1)
         port = s.getsockname()[1]
     return port
 

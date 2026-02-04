@@ -126,6 +126,13 @@ class ServerManager:
         server_env = os.environ.copy()
         server_env.update(self.env)
 
+        # Allow --disable-auth in release builds for testing
+        if self.disable_auth:
+            server_env["GEODE_ALLOW_NO_AUTH"] = "1"
+
+        # Disable audit logging for testing (avoids signing key requirements)
+        server_env["GEODE_DISABLE_AUDIT"] = "1"
+
         # Start the server process
         try:
             stdout = None if self.verbose else subprocess.DEVNULL

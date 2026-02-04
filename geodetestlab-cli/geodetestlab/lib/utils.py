@@ -9,21 +9,29 @@ are imported from the shared lib module.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from pathlib import Path
 
 # Import shared utilities from the parent geode-test-harness lib
-# utils.py -> lib -> geodetestlab -> geodetestlab-cli -> geode-test-harness
+# We need to load the harness lib/utils.py directly to avoid name collision
+# with geodetestlab's own lib subpackage
 _harness_root = Path(__file__).parent.parent.parent.parent
-sys.path.insert(0, str(_harness_root))
+_harness_utils_path = _harness_root / "lib" / "utils.py"
 
-from lib.utils import (  # noqa: E402
-    find_geode_binary,
-    format_duration,
-    get_free_port,
-    sanitize_filename,
-)
+# Load the module directly by path to avoid import conflicts
+_spec = importlib.util.spec_from_file_location("harness_utils", _harness_utils_path)
+if _spec is None or _spec.loader is None:
+    raise ImportError(f"Cannot load shared utils from {_harness_utils_path}")
+_harness_utils = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_harness_utils)
+
+# Import functions from the loaded module
+find_geode_binary = _harness_utils.find_geode_binary
+format_duration = _harness_utils.format_duration
+get_free_port = _harness_utils.get_free_port
+sanitize_filename = _harness_utils.sanitize_filename
 
 # Re-export shared utilities
 __all__ = [

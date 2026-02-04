@@ -29,10 +29,25 @@ class ExpectedResult:
     result_matches: str | None = None
     error_contains: str | None = None
     exit_code: int | None = None
+    stdout_contains: list[str] | None = None
+    stderr_contains: list[str] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ExpectedResult:
-        """Create an ExpectedResult from a dictionary."""
+        """Create an ExpectedResult from a dictionary.
+
+        Supports both geodetestlab format (status, result_contains, etc.)
+        and legacy CLI test format (exit_code, stdout_contains, etc.).
+        """
+        # Handle stdout_contains which can be a list
+        stdout_contains = data.get("stdout_contains")
+        if stdout_contains is not None and not isinstance(stdout_contains, list):
+            stdout_contains = [stdout_contains]
+
+        stderr_contains = data.get("stderr_contains")
+        if stderr_contains is not None and not isinstance(stderr_contains, list):
+            stderr_contains = [stderr_contains]
+
         return cls(
             status=data.get("status", "success"),
             result_contains=data.get("result_contains"),
@@ -40,6 +55,8 @@ class ExpectedResult:
             result_matches=data.get("result_matches"),
             error_contains=data.get("error_contains"),
             exit_code=data.get("exit_code"),
+            stdout_contains=stdout_contains,
+            stderr_contains=stderr_contains,
         )
 
 
@@ -85,8 +102,12 @@ class TestCase:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestCase:
-        """Create a TestCase from a dictionary."""
-        expected_data = data.get("expected", {})
+        """Create a TestCase from a dictionary.
+
+        Supports both geodetestlab format and legacy CLI test format.
+        """
+        # Support both 'expected' and 'expect' keys for expected results
+        expected_data = data.get("expected") or data.get("expect") or {}
         plaintext_data = data.get("plaintext_check")
 
         return cls(
@@ -221,9 +242,13 @@ def load_spec(path: str | Path) -> TestSpec:
         if "name" not in test:
             raise SpecValidationError(f"Test case {i} must have a 'name' field")
 
-        # Must have either query or command
-        if "query" not in test and "command" not in test:
-            raise SpecValidationError(f"Test case '{test['name']}' must have either 'query' or 'command'")
+        # Must have either query, command, or args+stdin (legacy format)
+        has_query = "query" in test
+        has_command = "command" in test
+        has_args = "args" in test
+        has_stdin = "stdin" in test
+        if not (has_query or has_command or has_args or has_stdin):
+            raise SpecValidationError(f"Test case '{test['name']}' must have either 'query', 'command', 'args', or 'stdin'")
 
     # Validate mode
     mode = data.get("mode", "server")

@@ -103,9 +103,10 @@ help:
 	@echo ""
 	@echo "CLI Tests (geodetestlab-cli):"
 	@echo "  geodetestlab-setup      - Setup geodetestlab-cli environment"
-	@echo "  test-cli                - Run CLI tests"
-	@echo "  test-cli-comprehensive  - Run comprehensive CLI tests"
+	@echo "  test-cli                - Run CLI tests (parallel by default)"
+	@echo "  test-cli-comprehensive  - Run comprehensive CLI tests (parallel by default)"
 	@echo "  geodetestlab-run SPEC=  - Run specific CLI spec file"
+	@echo "  PARALLEL_WORKERS=N      - Override number of parallel workers (default: nproc)"
 	@echo ""
 	@echo "Shell Tests (shell_runner.py):"
 	@echo "  test-shell              - Run all shell tests (each manages own server)"
@@ -384,17 +385,20 @@ geodetestlab-setup:
 	@$(GEODETESTLAB_PIP) install -e $(GEODETESTLAB_CLI)
 	@echo "geodetestlab-cli setup complete"
 
+# Number of parallel workers for CLI tests (default: number of CPU cores)
+PARALLEL_WORKERS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
 # Run geodetestlab CLI tests (requires server)
 test-cli: geodetestlab-setup
-	@echo "Running CLI tests with geodetestlab..."
+	@echo "Running CLI tests with geodetestlab (parallel=$(PARALLEL_WORKERS))..."
 	@mkdir -p reports
-	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_results.json
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_results.json --verbose --parallel $(PARALLEL_WORKERS)
 
 # Run comprehensive CLI tests
 test-cli-comprehensive: geodetestlab-setup
-	@echo "Running comprehensive CLI tests with geodetestlab..."
+	@echo "Running comprehensive CLI tests with geodetestlab (parallel=$(PARALLEL_WORKERS))..."
 	@mkdir -p reports
-	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_comprehensive.json --verbose
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_comprehensive.json --verbose --parallel $(PARALLEL_WORKERS)
 
 # Run specific CLI spec
 geodetestlab-run: geodetestlab-setup

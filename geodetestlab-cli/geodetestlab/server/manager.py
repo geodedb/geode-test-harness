@@ -229,6 +229,12 @@ IP.1 = 127.0.0.1
         env = os.environ.copy()
         env.update(self.env_overrides)
 
+        # Set environment variables for testing
+        # Disable audit logging (avoids signing key requirements)
+        env["GEODE_DISABLE_AUDIT"] = "1"
+        # Allow auth to be disabled in release builds for testing
+        env["GEODE_ALLOW_NO_AUTH"] = "1"
+
         # Start the process
         try:
             self.process = subprocess.Popen(
@@ -347,11 +353,20 @@ IP.1 = 127.0.0.1
             # Check if process has been running for a reasonable time and port is bound
             if hasattr(self, "_start_time") and time.time() - self._start_time > 2.0:
                 # Check if UDP port is bound (QUIC uses UDP)
-                result = subprocess.run(["netstat", "-uln"], capture_output=True, text=True, timeout=1.0)
-                if result.returncode == 0:
-                    port_bound = f":{self.port}" in result.stdout
-                    if port_bound and self.is_running():
-                        return True
+                # Try ss first (more commonly available on modern systems)
+                try:
+                    result = subprocess.run(["ss", "-uln"], capture_output=True, text=True, timeout=1.0)
+                    if result.returncode == 0:
+                        port_bound = f":{self.port}" in result.stdout
+                        if port_bound and self.is_running():
+                            return True
+                except FileNotFoundError:
+                    # ss not available, try netstat
+                    result = subprocess.run(["netstat", "-uln"], capture_output=True, text=True, timeout=1.0)
+                    if result.returncode == 0:
+                        port_bound = f":{self.port}" in result.stdout
+                        if port_bound and self.is_running():
+                            return True
             return False
         except Exception:
             # Final fallback: just check if process is running for enough time

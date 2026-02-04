@@ -8,11 +8,14 @@ and handling error conditions and exit codes according to the requirements.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import signal
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -35,10 +38,144 @@ console = Console()
 console_err = Console(stderr=True)
 
 
+def _kill_geode_processes() -> None:
+    """Kill any orphaned geode server processes started by this test run.
+
+    This is a cleanup function to ensure geode processes don't linger after
+    the test harness is interrupted or exits.
+    """
+    import subprocess
+
+    try:
+        # Kill geode serve processes (matching temp dir pattern)
+        subprocess.run(
+            ["pkill", "-9", "-f", "geode serve.*geode-test-"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+    try:
+        # Also kill any geode query processes
+        subprocess.run(
+            ["pkill", "-9", "-f", "geode query"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _kill_child_processes() -> None:
+    """Kill all child processes of the current process."""
+    import subprocess
+
+    try:
+        # Use pkill to kill all children of our process group
+        subprocess.run(
+            ["pkill", "-9", "-P", str(os.getpid())],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+# Register cleanup on exit
+atexit.register(_kill_geode_processes)
+
+
+def _run_single_spec(
+    spec_file: Path,
+    llm_provider: str,
+    model: str | None,
+    max_cases: int | None,
+    timeout_ms: int,
+    server_timeout_ms: int,
+    dry_run: bool,
+    ci_mode: bool,
+    seed: int | None,
+    geode_binary: str | None,
+    server_port: int | None,
+    verbose: bool,
+) -> dict[str, Any]:
+    """Run tests for a single spec file.
+
+    This function is designed to be called from a ProcessPoolExecutor.
+    It returns a dict with the results instead of raising exceptions.
+    """
+    result: dict[str, Any] = {
+        "spec": str(spec_file),
+        "exit_code": 0,
+        "summary": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
+        "error": None,
+    }
+
+    try:
+        spec_obj = load_spec(spec_file)
+    except SpecValidationError as exc:
+        result["exit_code"] = 2
+        result["error"] = f"SCHEMA_ERROR in {spec_file}: {exc}"
+        return result
+    except Exception as exc:
+        result["exit_code"] = 2
+        result["error"] = f"SCHEMA_ERROR in {spec_file}: {exc}"
+        return result
+
+    try:
+        secrets, env_vars = resolve_secrets(spec_obj)
+    except SecretResolutionError as exc:
+        result["exit_code"] = 4
+        result["error"] = str(exc)
+        return result
+
+    try:
+        exit_code, summary = run_tests(
+            spec=spec_obj,
+            secrets=secrets,
+            env_overrides=env_vars,
+            llm_provider=llm_provider,
+            model=model,
+            max_cases=max_cases,
+            timeout_ms=timeout_ms,
+            server_timeout_ms=server_timeout_ms,
+            report_json=None,
+            dry_run=dry_run,
+            ci_mode=ci_mode,
+            seed=seed,
+            spec_path=str(spec_file),
+            geode_binary=geode_binary,
+            server_port=server_port,
+            verbose=verbose,
+        )
+        result["exit_code"] = exit_code
+        result["summary"] = summary
+    except RunnerError as exc:
+        result["exit_code"] = 3
+        result["error"] = str(exc)
+
+    return result
+
+
 @app.command("run")
 def run(
     *,
-    spec: Path = typer.Option(..., exists=True, readable=True, help="Path to the YAML test specification"),
+    spec: Optional[Path] = typer.Option(
+        None,
+        exists=True,
+        readable=True,
+        help="Path to a single YAML test specification file",
+    ),
+    specs: Optional[Path] = typer.Option(
+        None,
+        exists=True,
+        help="Path to a directory containing YAML test specifications",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        help="Alias for --report-json: path to write a full machine‑readable report JSON",
+    ),
     llm_provider: str = typer.Option(
         "mock",
         help="LLM provider to use for fuzzing (mock, openai, or geode-ai)",
@@ -97,71 +234,257 @@ def run(
         "-v",
         help="Enable verbose output including server logs",
     ),
+    parallel: int = typer.Option(
+        1,
+        "--parallel",
+        "-j",
+        min=1,
+        help="Number of spec files to run in parallel (default: 1, sequential)",
+    ),
 ) -> None:
-    """Execute all tests defined in a specification file.
+    """Execute all tests defined in a specification file or directory.
 
-    This command validates the provided YAML specification, resolves any
-    secrets referenced within it, optionally manages a Geode server instance,
+    This command validates the provided YAML specification(s), resolves any
+    secrets referenced within them, optionally manages a Geode server instance,
     uses an LLM provider to generate additional fuzzed cases, and then executes
     the target CLI binary according to the defined tests. A single‑line JSON
     summary is always printed to stdout. Exit codes are defined by the outcome
     of parsing, secret resolution, server management, runtime errors, and
     assertion results.
+
+    Use --spec for a single file or --specs for a directory of specs.
     """
+    # Handle --output as alias for --report-json
+    if output is not None and report_json is None:
+        report_json = output
+
+    # Validate that exactly one of --spec or --specs is provided
+    if spec is None and specs is None:
+        console_err.print("Error: Either --spec (file) or --specs (directory) must be provided", style="red")
+        raise typer.Exit(code=2)
+    if spec is not None and specs is not None:
+        console_err.print("Error: Cannot specify both --spec and --specs", style="red")
+        raise typer.Exit(code=2)
+
+    # Collect spec files to run
+    spec_files: list[Path] = []
+    if spec is not None:
+        spec_files = [spec]
+    elif specs is not None:
+        if not specs.is_dir():
+            console_err.print(f"Error: --specs path is not a directory: {specs}", style="red")
+            raise typer.Exit(code=2)
+        # Find all YAML files in the directory
+        spec_files = sorted(
+            list(specs.glob("*.yaml")) + list(specs.glob("*.yml"))
+        )
+        if not spec_files:
+            console_err.print(f"Error: No YAML files found in directory: {specs}", style="red")
+            raise typer.Exit(code=2)
+
     if not ci and verbose:
         console.print("[yellow]Starting Geode CLI test execution...[/yellow]")
+        if len(spec_files) > 1:
+            parallel_msg = f" (parallel={parallel})" if parallel > 1 else ""
+            console.print(f"[dim]Found {len(spec_files)} spec files to run{parallel_msg}[/dim]")
 
-    try:
-        spec_obj = load_spec(spec)
-    except SpecValidationError:
-        # Schema or specification validation error
-        console_err.print("SCHEMA_ERROR", style="red")
-        raise typer.Exit(code=2)
-    except Exception:
-        # Unexpected parsing error
-        console_err.print("SCHEMA_ERROR", style="red")
-        raise typer.Exit(code=2)
+    # Aggregate results across all spec files
+    total_exit_code = 0
+    aggregate_summary: dict = {"total": 0, "passed": 0, "failed": 0, "skipped": 0}
+    all_results: list[dict] = []
 
-    # Resolve secrets before attempting to run tests
-    try:
-        secrets, env_vars = resolve_secrets(spec_obj)
-    except SecretResolutionError as exc:
-        console_err.print(str(exc), style="red")
-        raise typer.Exit(code=4)
+    # Run specs in parallel or sequentially based on --parallel flag
+    if parallel > 1 and len(spec_files) > 1:
+        # Parallel execution using ProcessPoolExecutor
+        # Use min of parallel and spec_files count to avoid idle workers
+        max_workers = min(parallel, len(spec_files))
 
-    try:
-        exit_code, summary = run_tests(
-            spec=spec_obj,
-            secrets=secrets,
-            env_overrides=env_vars,
-            llm_provider=llm_provider,
-            model=model,
-            max_cases=max_cases,
-            timeout_ms=timeout_ms,
-            server_timeout_ms=server_timeout_ms,
-            report_json=report_json,
-            dry_run=dry_run,
-            ci_mode=ci,
-            seed=seed,
-            spec_path=str(spec),
-            geode_binary=geode_binary,
-            server_port=server_port,
-            verbose=verbose,
-        )
-    except RunnerError as exc:
-        # Runtime/setup error – typically binary not found or other unexpected issues
-        console_err.print(str(exc), style="red")
-        raise typer.Exit(code=3)
+        if not ci and verbose:
+            console.print(f"[dim]Starting {max_workers} parallel workers...[/dim]")
+
+        executor = None
+        interrupted = False
+
+        # Set up signal handler to gracefully handle Ctrl+C
+        original_sigint = signal.getsignal(signal.SIGINT)
+        original_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def signal_handler(signum: int, frame: Any) -> None:
+            nonlocal interrupted, executor
+            if interrupted:
+                # Second interrupt - force exit
+                if not ci:
+                    console.print("\n[red]Force exiting...[/red]")
+                _kill_geode_processes()
+                _kill_child_processes()
+                os._exit(130)
+
+            interrupted = True
+            if not ci:
+                console.print("\n[yellow]Interrupt received, shutting down workers...[/yellow]")
+
+            # Shutdown executor immediately
+            if executor:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+            # Kill all geode and child processes to ensure cleanup
+            _kill_geode_processes()
+            _kill_child_processes()
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        try:
+            executor = ProcessPoolExecutor(max_workers=max_workers)
+            # Submit all specs to the executor
+            future_to_spec = {
+                executor.submit(
+                    _run_single_spec,
+                    spec_file,
+                    llm_provider,
+                    model,
+                    max_cases,
+                    timeout_ms,
+                    server_timeout_ms,
+                    dry_run,
+                    ci,
+                    seed,
+                    geode_binary,
+                    None,  # server_port=None to auto-allocate unique ports
+                    verbose,
+                ): spec_file
+                for spec_file in spec_files
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_spec):
+                if interrupted:
+                    # Cancel remaining futures
+                    for f in future_to_spec:
+                        f.cancel()
+                    break
+
+                spec_file = future_to_spec[future]
+                try:
+                    result = future.result(timeout=1)
+                except Exception as exc:
+                    if interrupted:
+                        break
+                    console_err.print(f"Spec {spec_file} generated exception: {exc}", style="red")
+                    total_exit_code = max(total_exit_code, 3)
+                    continue
+
+                if result["error"]:
+                    console_err.print(result["error"], style="red")
+
+                total_exit_code = max(total_exit_code, result["exit_code"])
+                summary = result["summary"]
+                aggregate_summary["total"] += summary.get("total", 0)
+                aggregate_summary["passed"] += summary.get("passed", 0)
+                aggregate_summary["failed"] += summary.get("failed", 0)
+                aggregate_summary["skipped"] += summary.get("skipped", 0)
+                all_results.append({"spec": result["spec"], "summary": summary})
+
+                if not ci and verbose:
+                    passed = summary.get("passed", 0)
+                    failed = summary.get("failed", 0)
+                    status = "[green]PASS[/green]" if failed == 0 else "[red]FAIL[/red]"
+                    console.print(f"  {status} {spec_file.name}: {passed} passed, {failed} failed")
+
+        except KeyboardInterrupt:
+            interrupted = True
+            if not ci:
+                console.print("\n[yellow]Keyboard interrupt, shutting down...[/yellow]")
+        finally:
+            # Restore original signal handlers
+            signal.signal(signal.SIGINT, original_sigint)
+            signal.signal(signal.SIGTERM, original_sigterm)
+
+            # Shutdown executor
+            if executor:
+                executor.shutdown(wait=False, cancel_futures=True)
+
+            # Clean up any remaining geode and child processes
+            _kill_geode_processes()
+            _kill_child_processes()
+
+            if interrupted:
+                raise typer.Exit(code=130)  # Standard exit code for SIGINT
+
+    else:
+        # Sequential execution (original behavior)
+        for spec_file in spec_files:
+            if not ci and verbose and len(spec_files) > 1:
+                console.print(f"\n[cyan]Running spec: {spec_file.name}[/cyan]")
+
+            try:
+                spec_obj = load_spec(spec_file)
+            except SpecValidationError:
+                console_err.print(f"SCHEMA_ERROR in {spec_file}", style="red")
+                total_exit_code = max(total_exit_code, 2)
+                continue
+            except Exception:
+                console_err.print(f"SCHEMA_ERROR in {spec_file}", style="red")
+                total_exit_code = max(total_exit_code, 2)
+                continue
+
+            # Resolve secrets before attempting to run tests
+            try:
+                secrets, env_vars = resolve_secrets(spec_obj)
+            except SecretResolutionError as exc:
+                console_err.print(str(exc), style="red")
+                total_exit_code = max(total_exit_code, 4)
+                continue
+
+            try:
+                exit_code, summary = run_tests(
+                    spec=spec_obj,
+                    secrets=secrets,
+                    env_overrides=env_vars,
+                    llm_provider=llm_provider,
+                    model=model,
+                    max_cases=max_cases,
+                    timeout_ms=timeout_ms,
+                    server_timeout_ms=server_timeout_ms,
+                    report_json=None,  # We'll write aggregate report at the end
+                    dry_run=dry_run,
+                    ci_mode=ci,
+                    seed=seed,
+                    spec_path=str(spec_file),
+                    geode_binary=geode_binary,
+                    server_port=server_port,
+                    verbose=verbose,
+                )
+                # Aggregate results
+                total_exit_code = max(total_exit_code, exit_code)
+                aggregate_summary["total"] += summary.get("total", 0)
+                aggregate_summary["passed"] += summary.get("passed", 0)
+                aggregate_summary["failed"] += summary.get("failed", 0)
+                aggregate_summary["skipped"] += summary.get("skipped", 0)
+                all_results.append({"spec": str(spec_file), "summary": summary})
+            except RunnerError as exc:
+                console_err.print(str(exc), style="red")
+                total_exit_code = max(total_exit_code, 3)
+                continue
+
+    # Write aggregate report if requested
+    if report_json is not None:
+        report_data = {
+            "summary": aggregate_summary,
+            "specs": all_results,
+        }
+        report_json.parent.mkdir(parents=True, exist_ok=True)
+        report_json.write_text(json.dumps(report_data, indent=2))
 
     # Print final single‑line JSON summary
-    print(json.dumps({"summary": summary}, separators=(",", ":")))
+    print(json.dumps({"summary": aggregate_summary}, separators=(",", ":")))
 
     # Show rich summary if not in CI mode
     if not ci:
-        _show_rich_summary(summary)
+        _show_rich_summary(aggregate_summary)
 
     # Exit with determined exit code (0 for success, 1 if any test failed)
-    raise typer.Exit(code=exit_code)
+    raise typer.Exit(code=total_exit_code)
 
 
 secrets_app = typer.Typer(help="Subcommands for working with secrets defined in a test spec.")
