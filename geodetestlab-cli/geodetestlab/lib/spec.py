@@ -20,6 +20,97 @@ class SpecValidationError(Exception):
 
 
 @dataclass
+class HttpExpected:
+    """Expected result for an HTTP request."""
+
+    status_code: int | None = None
+    content_type: str | None = None
+    body_contains: list[str] | None = None
+    body_not_contains: list[str] | None = None
+    body_regex: list[str] | None = None
+    headers: dict[str, str] | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> HttpExpected:
+        """Create an HttpExpected from a dictionary."""
+        if data is None:
+            return cls()
+
+        def normalize_list(value: Any) -> list[str] | None:
+            if value is None:
+                return None
+            if isinstance(value, list):
+                return value
+            return [value]
+
+        return cls(
+            status_code=data.get("status_code"),
+            content_type=data.get("content_type"),
+            body_contains=normalize_list(data.get("body_contains")),
+            body_not_contains=normalize_list(data.get("body_not_contains")),
+            body_regex=normalize_list(data.get("body_regex")),
+            headers=data.get("headers"),
+        )
+
+
+@dataclass
+class HttpRequest:
+    """Definition of an HTTP request for testing."""
+
+    method: str = "GET"
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    body: str | None = None
+    timeout_ms: int = 5000
+    expected: HttpExpected = field(default_factory=HttpExpected)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> HttpRequest:
+        """Create an HttpRequest from a dictionary."""
+        return cls(
+            method=data.get("method", "GET"),
+            url=data.get("url", ""),
+            headers=data.get("headers", {}),
+            body=data.get("body"),
+            timeout_ms=data.get("timeout_ms", 5000),
+            expected=HttpExpected.from_dict(data.get("expect")),
+        )
+
+
+@dataclass
+class TestStep:
+    """A single step in a sequential test."""
+
+    step_type: str  # "gql", "http", "wait"
+    query: str | None = None
+    method: str | None = None
+    url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    body: str | None = None
+    timeout_ms: int = 5000
+    wait_ms: int = 0
+    expected: HttpExpected | None = None
+    gql_expected: dict[str, Any] | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TestStep:
+        """Create a TestStep from a dictionary."""
+        step_type = data.get("type", "gql")
+        return cls(
+            step_type=step_type,
+            query=data.get("query"),
+            method=data.get("method"),
+            url=data.get("url"),
+            headers=data.get("headers", {}),
+            body=data.get("body"),
+            timeout_ms=data.get("timeout_ms", 5000),
+            wait_ms=data.get("wait_ms", 0),
+            expected=HttpExpected.from_dict(data.get("expect")) if step_type == "http" else None,
+            gql_expected=data.get("expect") if step_type == "gql" else None,
+        )
+
+
+@dataclass
 class ExpectedResult:
     """Expected result for a test case."""
 
@@ -97,6 +188,7 @@ class TestCase:
 
     name: str
     description: str
+    test_type: str = "cli"  # "cli", "http", or "sequential"
     query: str | None = None
     command: str | None = None
     args: list[str] = field(default_factory=list)
@@ -106,20 +198,40 @@ class TestCase:
     skip: bool = False
     skip_reason: str | None = None
     plaintext_check: PlaintextCheck = field(default_factory=PlaintextCheck)
+    # HTTP test fields
+    http_requests: list[HttpRequest] = field(default_factory=list)
+    # Sequential test fields
+    steps: list[TestStep] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestCase:
         """Create a TestCase from a dictionary.
 
-        Supports both geodetestlab format and legacy CLI test format.
+        Supports geodetestlab format, legacy CLI test format, HTTP tests, and sequential tests.
         """
         # Support both 'expected' and 'expect' keys for expected results
         expected_data = data.get("expected") or data.get("expect") or {}
         plaintext_data = data.get("plaintext_check")
 
+        # Determine test type
+        test_type = data.get("type", "cli")
+
+        # Parse HTTP requests
+        http_requests = []
+        if "requests" in data:
+            for req in data["requests"]:
+                http_requests.append(HttpRequest.from_dict(req))
+
+        # Parse sequential steps
+        steps = []
+        if "steps" in data:
+            for step in data["steps"]:
+                steps.append(TestStep.from_dict(step))
+
         return cls(
             name=data["name"],
             description=data.get("description", ""),
+            test_type=test_type,
             query=data.get("query"),
             command=data.get("command"),
             args=data.get("args", []),
@@ -129,6 +241,8 @@ class TestCase:
             skip=data.get("skip", False),
             skip_reason=data.get("skip_reason"),
             plaintext_check=PlaintextCheck.from_dict(plaintext_data),
+            http_requests=http_requests,
+            steps=steps,
         )
 
 
@@ -196,8 +310,10 @@ class TestSpec:
         # Get server args from cli.server.args or legacy server_args
         server_args = server_config.get("args", data.get("server_args", []))
 
-        # Get environment from cli.server.env or legacy env
-        env = server_config.get("env", data.get("env", {}))
+        # Merge environment: start with top-level env, then overlay cli.server.env
+        # This ensures both legacy env vars and server-specific env vars are available
+        env = data.get("env", {}).copy()
+        env.update(server_config.get("env", {}))
 
         return cls(
             name=data.get("name", "unnamed"),
@@ -269,13 +385,26 @@ def load_spec(path: str | Path) -> TestSpec:
         if "name" not in test:
             raise SpecValidationError(f"Test case {i} must have a 'name' field")
 
-        # Must have either query, command, or args+stdin (legacy format)
-        has_query = "query" in test
-        has_command = "command" in test
-        has_args = "args" in test
-        has_stdin = "stdin" in test
-        if not (has_query or has_command or has_args or has_stdin):
-            raise SpecValidationError(f"Test case '{test['name']}' must have either 'query', 'command', 'args', or 'stdin'")
+        # Determine test type
+        test_type = test.get("type", "cli")
+
+        # Validate based on test type
+        if test_type == "http":
+            # HTTP tests must have requests
+            if "requests" not in test:
+                raise SpecValidationError(f"HTTP test case '{test['name']}' must have a 'requests' field")
+        elif test_type == "sequential":
+            # Sequential tests must have steps
+            if "steps" not in test:
+                raise SpecValidationError(f"Sequential test case '{test['name']}' must have a 'steps' field")
+        else:
+            # CLI tests must have either query, command, or args+stdin (legacy format)
+            has_query = "query" in test
+            has_command = "command" in test
+            has_args = "args" in test
+            has_stdin = "stdin" in test
+            if not (has_query or has_command or has_args or has_stdin):
+                raise SpecValidationError(f"Test case '{test['name']}' must have either 'query', 'command', 'args', or 'stdin'")
 
     # Validate mode
     mode = data.get("mode", "server")

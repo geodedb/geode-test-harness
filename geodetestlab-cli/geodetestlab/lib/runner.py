@@ -18,7 +18,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .spec import PlaintextCheck, TestCase, TestSpec
+import httpx
+
+from .spec import HttpExpected, HttpRequest, PlaintextCheck, TestCase, TestSpec, TestStep
 from .utils import find_geode_binary, get_free_port
 
 # Global list to track server processes for cleanup on exit
@@ -181,6 +183,37 @@ def run_tests(
     signal.signal(signal.SIGTERM, _worker_signal_handler)
 
     try:
+        # Run setup queries if defined
+        if spec.setup and not dry_run:
+            if verbose:
+                print(f"Running {len(spec.setup)} setup queries...")
+            for i, setup_item in enumerate(spec.setup):
+                if isinstance(setup_item, dict):
+                    # Create a minimal TestCase for the setup query
+                    setup_case = TestCase.from_dict({
+                        "name": f"setup-{i}",
+                        "description": "Setup query",
+                        **setup_item,
+                    })
+                    if verbose:
+                        print(f"  Executing setup-{i}...")
+                    result = _run_cli_test(
+                        test_case=setup_case,
+                        binary=binary,
+                        env=env,
+                        secrets=secrets,
+                        timeout_ms=timeout_ms,
+                        data_dir=data_dir,
+                        verbose=verbose,
+                    )
+                    if verbose:
+                        status = "OK" if result.passed else "FAILED"
+                        print(f"  Setup-{i}: {status}")
+                    if not result.passed:
+                        if verbose:
+                            print(f"    Error: {result.error}")
+                        # Continue anyway - some setup failures might be expected
+
         # Run each test case
         for test_case in spec.tests:
             # Check if we were interrupted
@@ -431,6 +464,26 @@ def _run_single_test(
     verbose: bool,
 ) -> TestResult:
     """Run a single test case."""
+    # Dispatch based on test type
+    if test_case.test_type == "http":
+        return _run_http_test(test_case, env, verbose)
+    elif test_case.test_type == "sequential":
+        return _run_sequential_test(test_case, binary, env, secrets, timeout_ms, data_dir, verbose)
+
+    # CLI test (default)
+    return _run_cli_test(test_case, binary, env, secrets, timeout_ms, data_dir, verbose)
+
+
+def _run_cli_test(
+    test_case: TestCase,
+    binary: str,
+    env: dict[str, str],
+    secrets: dict[str, str],
+    timeout_ms: int,
+    data_dir: Path | None,
+    verbose: bool,
+) -> TestResult:
+    """Run a CLI test case."""
     start_time = time.time()
 
     # Get authentication credentials from environment
@@ -510,6 +563,12 @@ def _run_single_test(
         exit_code=exit_code,
     )
 
+    # Debug output for failures
+    if not passed and verbose:
+        print(f"    Exit code: {exit_code}")
+        print(f"    Stdout: {output[:200] if output else '(empty)'}")
+        print(f"    Stderr: {error[:200] if error else '(empty)'}")
+
     # Run test-specific plaintext verification if enabled
     plaintext_violations = []
     if test_case.plaintext_check.enabled and data_dir:
@@ -528,6 +587,243 @@ def _run_single_test(
         output=output,
         error=error if not passed else "",
         plaintext_violations=plaintext_violations,
+    )
+
+
+def _run_http_test(
+    test_case: TestCase,
+    env: dict[str, str],
+    verbose: bool,
+) -> TestResult:
+    """Run an HTTP test case."""
+    start_time = time.time()
+    outputs = []
+    errors = []
+
+    try:
+        # Create an HTTP client with connection reuse
+        with httpx.Client(timeout=30.0, verify=False) as client:
+            for i, req in enumerate(test_case.http_requests):
+                # Substitute environment variables in URL
+                url = req.url
+                for key, value in env.items():
+                    url = url.replace(f"${{{key}}}", value)
+                    url = url.replace(f"${{env:{key}}}", value)
+
+                if verbose:
+                    print(f"  HTTP {req.method} {url}")
+
+                try:
+                    response = client.request(
+                        method=req.method,
+                        url=url,
+                        headers=req.headers,
+                        content=req.body,
+                        timeout=req.timeout_ms / 1000.0,
+                    )
+
+                    # Check expectations for this request
+                    passed = _check_http_expectations(response, req.expected, verbose)
+
+                    if not passed:
+                        errors.append(
+                            f"Request {i+1} failed: {req.method} {url}\n"
+                            f"Status: {response.status_code}\n"
+                            f"Body: {response.text[:500]}"
+                        )
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs),
+                            error="\n".join(errors),
+                        )
+
+                    outputs.append(f"Request {i+1}: {response.status_code} OK")
+
+                except httpx.RequestError as e:
+                    errors.append(f"Request {i+1} error: {e}")
+                    return TestResult(
+                        name=test_case.name,
+                        passed=False,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        output="\n".join(outputs),
+                        error="\n".join(errors),
+                    )
+
+    except Exception as e:
+        return TestResult(
+            name=test_case.name,
+            passed=False,
+            duration_ms=(time.time() - start_time) * 1000,
+            error=str(e),
+        )
+
+    return TestResult(
+        name=test_case.name,
+        passed=True,
+        duration_ms=(time.time() - start_time) * 1000,
+        output="\n".join(outputs),
+    )
+
+
+def _check_http_expectations(
+    response: httpx.Response,
+    expected: HttpExpected,
+    verbose: bool,
+) -> bool:
+    """Check if HTTP response matches expectations."""
+    # Check status code
+    if expected.status_code is not None and response.status_code != expected.status_code:
+        if verbose:
+            print(f"    Expected status {expected.status_code}, got {response.status_code}")
+        return False
+
+    # Check content type
+    if expected.content_type is not None:
+        content_type = response.headers.get("content-type", "")
+        if expected.content_type not in content_type:
+            if verbose:
+                print(f"    Expected content-type containing '{expected.content_type}', got '{content_type}'")
+            return False
+
+    # Check body contains
+    body = response.text
+    if expected.body_contains:
+        for substring in expected.body_contains:
+            if substring not in body:
+                if verbose:
+                    print(f"    Body missing expected substring: '{substring}'")
+                return False
+
+    # Check body not contains
+    if expected.body_not_contains:
+        for substring in expected.body_not_contains:
+            if substring in body:
+                if verbose:
+                    print(f"    Body contains unexpected substring: '{substring}'")
+                return False
+
+    # Check body regex
+    if expected.body_regex:
+        for pattern in expected.body_regex:
+            if not re.search(pattern, body):
+                if verbose:
+                    print(f"    Body doesn't match regex: '{pattern}'")
+                return False
+
+    # Check headers
+    if expected.headers:
+        for header_name, header_value in expected.headers.items():
+            actual = response.headers.get(header_name)
+            if actual is None or header_value not in actual:
+                if verbose:
+                    print(f"    Header '{header_name}' expected '{header_value}', got '{actual}'")
+                return False
+
+    return True
+
+
+def _run_sequential_test(
+    test_case: TestCase,
+    binary: str,
+    env: dict[str, str],
+    secrets: dict[str, str],
+    timeout_ms: int,
+    data_dir: Path | None,
+    verbose: bool,
+) -> TestResult:
+    """Run a sequential test case with multiple steps."""
+    start_time = time.time()
+    outputs = []
+    errors = []
+
+    # Get authentication credentials from environment
+    admin_password = env.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
+
+    try:
+        # Create an HTTP client for HTTP steps
+        with httpx.Client(timeout=30.0, verify=False) as http_client:
+            for i, step in enumerate(test_case.steps):
+                if verbose:
+                    print(f"  Step {i+1}: {step.step_type}")
+
+                if step.step_type == "wait":
+                    time.sleep(step.wait_ms / 1000.0)
+                    outputs.append(f"Step {i+1}: waited {step.wait_ms}ms")
+
+                elif step.step_type == "http":
+                    # Execute HTTP step
+                    url = step.url or ""
+                    for key, value in env.items():
+                        url = url.replace(f"${{{key}}}", value)
+                        url = url.replace(f"${{env:{key}}}", value)
+
+                    response = http_client.request(
+                        method=step.method or "GET",
+                        url=url,
+                        headers=step.headers,
+                        content=step.body,
+                        timeout=step.timeout_ms / 1000.0,
+                    )
+
+                    if step.expected:
+                        passed = _check_http_expectations(response, step.expected, verbose)
+                        if not passed:
+                            errors.append(f"Step {i+1} failed: HTTP {step.method} {url}")
+                            return TestResult(
+                                name=test_case.name,
+                                passed=False,
+                                duration_ms=(time.time() - start_time) * 1000,
+                                output="\n".join(outputs),
+                                error="\n".join(errors),
+                            )
+
+                    outputs.append(f"Step {i+1}: HTTP {response.status_code} OK")
+
+                elif step.step_type == "gql":
+                    # Execute GQL query step
+                    cmd = [binary, "query", step.query or ""]
+                    cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
+                    cmd.extend(["--insecure"])
+                    cmd.extend(["-U", "geode", "-P", admin_password])
+
+                    result = subprocess.run(
+                        cmd,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=step.timeout_ms / 1000.0,
+                    )
+
+                    if step.gql_expected:
+                        # Check GQL expectations
+                        expected_status = step.gql_expected.get("status_class")
+                        if expected_status and expected_status not in result.stdout:
+                            errors.append(f"Step {i+1} failed: expected status {expected_status}")
+                            return TestResult(
+                                name=test_case.name,
+                                passed=False,
+                                duration_ms=(time.time() - start_time) * 1000,
+                                output="\n".join(outputs),
+                                error="\n".join(errors),
+                            )
+
+                    outputs.append(f"Step {i+1}: GQL OK")
+
+    except Exception as e:
+        return TestResult(
+            name=test_case.name,
+            passed=False,
+            duration_ms=(time.time() - start_time) * 1000,
+            error=str(e),
+        )
+
+    return TestResult(
+        name=test_case.name,
+        passed=True,
+        duration_ms=(time.time() - start_time) * 1000,
+        output="\n".join(outputs),
     )
 
 
@@ -570,27 +866,49 @@ def _check_expectations(
     if expected.exit_code is not None and exit_code != expected.exit_code:
         return False
 
-    # Check status (success vs error)
-    if expected.status == "success" and exit_code != 0:
-        return False
-    if expected.status == "error" and exit_code == 0:
-        return False
+    # Check status (success vs error) - only if exit_code not explicitly specified
+    # This allows tests to specify exit_code without also needing to set status
+    if expected.exit_code is None:
+        if expected.status == "success" and exit_code != 0:
+            return False
+        if expected.status == "error" and exit_code == 0:
+            return False
 
-    # Check result contains (legacy format - single string)
-    if expected.result_contains and expected.result_contains not in output:
-        return False
+    # Check result contains (legacy format - single string or list)
+    if expected.result_contains:
+        if isinstance(expected.result_contains, list):
+            for item in expected.result_contains:
+                if item not in output:
+                    return False
+        elif expected.result_contains not in output:
+            return False
 
-    # Check result not contains (legacy format - single string)
-    if expected.result_not_contains and expected.result_not_contains in output:
-        return False
+    # Check result not contains (legacy format - single string or list)
+    if expected.result_not_contains:
+        if isinstance(expected.result_not_contains, list):
+            for item in expected.result_not_contains:
+                if item in output:
+                    return False
+        elif expected.result_not_contains in output:
+            return False
 
-    # Check result matches (legacy format - single regex)
-    if expected.result_matches and not re.search(expected.result_matches, output):
-        return False
+    # Check result matches (legacy format - single regex or list)
+    if expected.result_matches:
+        if isinstance(expected.result_matches, list):
+            for pattern in expected.result_matches:
+                if not re.search(pattern, output):
+                    return False
+        elif not re.search(expected.result_matches, output):
+            return False
 
-    # Check error contains (legacy format - single string)
-    if expected.error_contains and expected.error_contains not in error:
-        return False
+    # Check error contains (legacy format - single string or list)
+    if expected.error_contains:
+        if isinstance(expected.error_contains, list):
+            for item in expected.error_contains:
+                if item not in error:
+                    return False
+        elif expected.error_contains not in error:
+            return False
 
     # Check stdout_contains (list of substrings that must ALL be present)
     if expected.stdout_contains:

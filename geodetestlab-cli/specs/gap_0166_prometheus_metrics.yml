@@ -6,13 +6,17 @@ name: gap_0166_prometheus_metrics
 description: Tests for GAP-0166 Prometheus metrics endpoint wiring
 version: "1.0"
 
-# Test environment configuration
-environment:
+cli:
+  binary: ./zig-out/bin/geode
   server:
-    mode: embedded
-    metrics_enabled: true
-    metrics_port: 9091
-  cleanup: true
+    enabled: true
+    startup_timeout_ms: 30000
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_METRICS_PORT: '9091'
 
 tests:
   # Test 1: Verify metrics endpoint responds
@@ -21,13 +25,16 @@ tests:
     type: http
     requests:
       - method: GET
-        url: "http://localhost:9091/metrics"
+        url: "http://127.0.0.1:9091/metrics"
         expect:
           status_code: 200
           content_type: "text/plain"
           body_contains:
             - "geode_queries_total"
             - "geode_connections_active"
+    tags:
+    - prometheus
+    - metrics
 
   # Test 2: Verify health endpoint responds
   - name: health_endpoint_available
@@ -35,13 +42,16 @@ tests:
     type: http
     requests:
       - method: GET
-        url: "http://localhost:9091/health"
+        url: "http://127.0.0.1:9091/health"
         expect:
           status_code: 200
           content_type: "application/json"
           body_contains:
             - "status"
             - "ok"
+    tags:
+    - prometheus
+    - health
 
   # Test 3: Verify query metrics are updated
   - name: query_metrics_increment
@@ -60,11 +70,15 @@ tests:
       # Check metrics were updated
       - type: http
         method: GET
-        url: "http://localhost:9091/metrics"
+        url: "http://127.0.0.1:9091/metrics"
         expect:
           status_code: 200
           body_contains:
             - "geode_queries_total"
+    tags:
+    - prometheus
+    - query
+    - metrics
 
   # Test 4: Verify 404 for unknown paths
   - name: unknown_path_returns_404
@@ -72,9 +86,12 @@ tests:
     type: http
     requests:
       - method: GET
-        url: "http://localhost:9091/unknown"
+        url: "http://127.0.0.1:9091/unknown"
         expect:
           status_code: 404
+    tags:
+    - prometheus
+    - error
 
   # Test 5: Verify metric types are correct
   - name: metric_types_correct
@@ -82,10 +99,19 @@ tests:
     type: http
     requests:
       - method: GET
-        url: "http://localhost:9091/metrics"
+        url: "http://127.0.0.1:9091/metrics"
         expect:
           status_code: 200
           body_contains:
             - "# TYPE geode_queries_total counter"
             - "# TYPE geode_connections_active gauge"
             - "# HELP geode_queries_total"
+    tags:
+    - prometheus
+    - format
+
+tags:
+- prometheus
+- metrics
+- monitoring
+- gap-analysis
