@@ -108,10 +108,22 @@ const QueryResult = struct {
     }
 };
 
+// Default admin credentials for testing
+const DEFAULT_USERNAME = "geode";
+const DEFAULT_PASSWORD = "GeodeTestPassword123!";
+
+const TransportType = enum {
+    quic,
+    grpc,
+};
+
 const RunnerConfig = struct {
     spec_path: []const u8,
     host: []const u8,
     port: u16,
+    transport: TransportType,
+    username: []const u8,
+    password: []const u8,
     json_output: bool,
     verbose: bool,
 
@@ -680,7 +692,8 @@ fn parseArgs(allocator: Allocator) !RunnerConfig {
     _ = args.next(); // program name
 
     var spec_path_opt: ?[]const u8 = null;
-    var server: []const u8 = "localhost:8443";
+    var server: []const u8 = "localhost:3141";
+    var transport: TransportType = .quic;
     var json_output = false;
     var verbose = false;
 
@@ -689,12 +702,23 @@ fn parseArgs(allocator: Allocator) !RunnerConfig {
             spec_path_opt = args.next() orelse return error.MissingSpecValue;
         } else if (std.mem.eql(u8, arg, "--server")) {
             server = args.next() orelse return error.MissingServerValue;
+        } else if (std.mem.eql(u8, arg, "--transport")) {
+            const transport_str = args.next() orelse return error.MissingTransportValue;
+            if (std.mem.eql(u8, transport_str, "grpc")) {
+                transport = .grpc;
+            } else {
+                transport = .quic;
+            }
         } else if (std.mem.eql(u8, arg, "--json")) {
             json_output = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             verbose = true;
         }
     }
+
+    // Get credentials from environment or use defaults
+    const username = std.posix.getenv("GEODE_USERNAME") orelse DEFAULT_USERNAME;
+    const password = std.posix.getenv("GEODE_ADMIN_PASSWORD") orelse DEFAULT_PASSWORD;
 
     const spec_path = spec_path_opt orelse return error.MissingSpec;
     const server_parts = try parseServer(allocator, server);
@@ -704,6 +728,9 @@ fn parseArgs(allocator: Allocator) !RunnerConfig {
         .spec_path = spec_copy,
         .host = server_parts.host,
         .port = server_parts.port,
+        .transport = transport,
+        .username = username,
+        .password = password,
         .json_output = json_output,
         .verbose = verbose,
     };
@@ -713,6 +740,9 @@ const ClientContext = struct {
     allocator: Allocator,
     host: []const u8,
     port: u16,
+    transport: TransportType,
+    username: []const u8,
+    password: []const u8,
     client: ?GeodeClient = null,
     connections: std.StringHashMap(GeodeClient) = undefined,  // Connection registry for multi-connection tests
 
@@ -750,9 +780,11 @@ const ClientContext = struct {
 
     fn ensureConnected(self: *ClientContext, verbose: bool) !void {
         if (self.client != null) return;
-        var cli = GeodeClient.init(self.allocator, self.host, self.port, true, "", "");
+        // Pass username and password for authentication
+        var cli = GeodeClient.init(self.allocator, self.host, self.port, true, self.username, self.password);
         if (verbose) {
-            std.debug.print("  Connecting to {s}:{d}\n", .{ self.host, self.port });
+            const transport_str = if (self.transport == .grpc) "gRPC" else "QUIC";
+            std.debug.print("  Connecting to {s}:{d} via {s}\n", .{ self.host, self.port, transport_str });
         }
         try cli.connect();
         try cli.openStream();
@@ -1269,7 +1301,14 @@ pub fn main() !void {
     const spec = try parseSpec(allocator, spec_content);
     defer freeSpec(allocator, spec);
 
-    var ctx = ClientContext{ .allocator = allocator, .host = config.host, .port = config.port };
+    var ctx = ClientContext{
+        .allocator = allocator,
+        .host = config.host,
+        .port = config.port,
+        .transport = config.transport,
+        .username = config.username,
+        .password = config.password,
+    };
     ctx.initConnections();
     defer {
         ctx.deinitConnections();

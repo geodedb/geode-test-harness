@@ -58,6 +58,12 @@ make test-connections
 make test-auth
 make test-perf
 
+# Transport-specific tests
+make test-quic           # Run tests using QUIC transport (default)
+make test-grpc           # Run tests using gRPC transport
+make test-all-transports # Run tests with both QUIC and gRPC
+TRANSPORT=grpc make test # Run any test with specific transport
+
 # Reports and analysis
 make test-all-html          # Generate HTML report
 make test-with-coverage     # Tests + coverage report
@@ -67,6 +73,7 @@ make analyze-perf           # Analyze performance results
 # Direct runner invocation
 python3 run_tests.py --spec specs/basic.yaml --clients zig --verbose
 python3 run_tests.py --server localhost:3141 --no-manage-server --clients go,python
+python3 run_tests.py --transport grpc --server localhost:50051 --clients python --verbose
 ```
 
 ## Architecture
@@ -85,7 +92,7 @@ python3 run_tests.py --server localhost:3141 --no-manage-server --clients go,pyt
    - `runners/python_runner.py` - Python runner (uses geode-client-python)
    - `runners/rust_runner/` - Rust runner (uses geode-client-rust)
    - `runners/nodejs_runner.js` - Node.js runner (uses geode-client-nodejs)
-   - Runners accept `--spec <yaml> --server host:port --json` flags
+   - Runners accept `--spec <yaml> --server host:port --transport quic|grpc --json` flags
    - Output JSON with `summary` and `results` arrays
 
 3. **Test Specs** - YAML files in `specs/`:
@@ -185,8 +192,11 @@ The server listens on UDP port 3141 for QUIC connections.
 ### Testing Against External Server
 
 ```bash
-# Skip Docker management
+# Skip Docker management (QUIC transport)
 python3 run_tests.py --server my-server:3141 --no-manage-server --clients zig
+
+# Test with gRPC transport
+python3 run_tests.py --server my-server:50051 --transport grpc --no-manage-server --clients go
 ```
 
 ### Environment Variables
@@ -194,7 +204,10 @@ python3 run_tests.py --server my-server:3141 --no-manage-server --clients zig
 - `GEODE_IMAGE` - Docker image to use
 - `GEODE_CONTAINER` - Container name
 - `GEODE_HOST` - Server host (default: 127.0.0.1)
-- `GEODE_PORT` - Server port (default: 3141)
+- `GEODE_PORT` - QUIC server port (default: 3141, UDP)
+- `GEODE_GRPC_PORT` - gRPC server port (default: 50051, TCP)
+- `GEODE_ADMIN_PASSWORD` - Admin password for authentication (default: GeodeTestPassword123!)
+- `GEODE_USERNAME` - Username for authentication (default: geode)
 
 ## Requirements
 

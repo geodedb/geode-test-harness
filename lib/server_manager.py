@@ -17,6 +17,9 @@ from typing import Dict, Optional
 
 from .utils import get_free_port
 
+# Default admin password for testing
+DEFAULT_ADMIN_PASSWORD = "GeodeTestPassword123!"
+
 
 class ServerManager:
     """Manages a Geode server instance for testing.
@@ -41,13 +44,14 @@ class ServerManager:
         self,
         binary_path: str,
         port: Optional[int] = None,
+        grpc_port: Optional[int] = None,
         data_dir: Optional[str] = None,
         startup_timeout_ms: int = 60000,
         cleanup: bool = True,
         args: Optional[list] = None,
         env: Optional[Dict[str, str]] = None,
         verbose: bool = False,
-        disable_auth: bool = True,
+        admin_password: Optional[str] = None,
     ):
         """Initialize the server manager.
 
@@ -56,7 +60,9 @@ class ServerManager:
         binary_path : str
             Path to the geode binary
         port : Optional[int]
-            Port to bind the server to (auto-allocated if None)
+            QUIC port to bind the server to (auto-allocated if None)
+        grpc_port : Optional[int]
+            gRPC port to bind the server to (disabled if None)
         data_dir : Optional[str]
             Data directory for the server (temporary if None)
         startup_timeout_ms : int
@@ -69,25 +75,31 @@ class ServerManager:
             Environment variables to set for the server process
         verbose : bool
             Whether to print server logs
-        disable_auth : bool
-            Whether to start server with --disable-auth flag
+        admin_password : Optional[str]
+            Admin password for authentication (uses default if None)
         """
         self.binary_path = binary_path
         self.port = port or get_free_port()
+        self.grpc_port = grpc_port
         self.data_dir = data_dir
         self.startup_timeout_ms = startup_timeout_ms
         self.cleanup = cleanup
         self.args = args or []
         self.env = env or {}
         self.verbose = verbose
-        self.disable_auth = disable_auth
+        self.admin_password = admin_password or DEFAULT_ADMIN_PASSWORD
         self.process: Optional[subprocess.Popen] = None
         self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
 
     @property
     def address(self) -> str:
-        """Return the server address (host:port)."""
+        """Return the QUIC server address (host:port)."""
         return f"127.0.0.1:{self.port}"
+
+    @property
+    def grpc_address(self) -> Optional[str]:
+        """Return the gRPC server address (host:port), or None if gRPC is disabled."""
+        return f"127.0.0.1:{self.grpc_port}" if self.grpc_port else None
 
     def start(self) -> str:
         """Start the Geode server.
@@ -95,7 +107,7 @@ class ServerManager:
         Returns
         -------
         str
-            The server address (host:port)
+            The QUIC server address (host:port)
 
         Raises
         ------
@@ -117,8 +129,9 @@ class ServerManager:
             self.data_dir,
         ]
 
-        if self.disable_auth:
-            cmd.append("--disable-auth")
+        # Add gRPC port if specified
+        if self.grpc_port:
+            cmd.extend(["--listen-grpc", f"0.0.0.0:{self.grpc_port}"])
 
         cmd.extend(self.args)
 
@@ -126,12 +139,11 @@ class ServerManager:
         server_env = os.environ.copy()
         server_env.update(self.env)
 
-        # Allow --disable-auth in release builds for testing
-        if self.disable_auth:
-            server_env["GEODE_ALLOW_NO_AUTH"] = "1"
-
         # Disable audit logging for testing (avoids signing key requirements)
         server_env["GEODE_DISABLE_AUDIT"] = "1"
+
+        # Set admin password for testing authentication
+        server_env["GEODE_ADMIN_PASSWORD"] = self.admin_password
 
         # Start the server process
         try:

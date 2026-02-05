@@ -89,6 +89,8 @@ class GeodeServerManager:
     DEFAULT_IMAGE = "registry.gitlab.com/devnw/geode/geode:latest"
     DEFAULT_CONTAINER_NAME = "geode-test-harness"
     DEFAULT_PORT = 3141
+    DEFAULT_GRPC_PORT = 50051
+    DEFAULT_ADMIN_PASSWORD = "GeodeTestPassword123!"
 
     # Class-level tracking
     _all_servers: List['GeodeServerManager'] = []
@@ -98,17 +100,26 @@ class GeodeServerManager:
         image: Optional[str] = None,
         container_name: Optional[str] = None,
         port: Optional[int] = None,
-        verbose: bool = False
+        grpc_port: Optional[int] = None,
+        verbose: bool = False,
+        enable_grpc: bool = True,
     ):
         self.image = image or os.environ.get("GEODE_IMAGE", self.DEFAULT_IMAGE)
         self.container_name = container_name or os.environ.get("GEODE_CONTAINER", self.DEFAULT_CONTAINER_NAME)
         self.port = port or int(os.environ.get("GEODE_PORT", self.DEFAULT_PORT))
+        self.grpc_port = grpc_port or int(os.environ.get("GEODE_GRPC_PORT", self.DEFAULT_GRPC_PORT)) if enable_grpc else None
+        self.admin_password = os.environ.get("GEODE_ADMIN_PASSWORD", self.DEFAULT_ADMIN_PASSWORD)
         self.verbose = verbose
         self.host = os.environ.get("GEODE_HOST", "127.0.0.1")
         self._cleanup_registered = False
 
         # Register this instance for cleanup
         GeodeServerManager._all_servers.append(self)
+
+    @property
+    def grpc_address(self) -> Optional[str]:
+        """Return the gRPC server address (host:port), or None if gRPC is disabled."""
+        return f"{self.host}:{self.grpc_port}" if self.grpc_port else None
 
     @staticmethod
     def check_docker_available() -> bool:
@@ -153,7 +164,9 @@ class GeodeServerManager:
         if self.verbose:
             print(f"Starting Geode server container: {self.container_name}")
             print(f"  Image: {self.image}")
-            print(f"  Port: {self.port}")
+            print(f"  QUIC Port: {self.port}")
+            if self.grpc_port:
+                print(f"  gRPC Port: {self.grpc_port}")
 
         # Remove any existing container with the same name
         try:
@@ -161,16 +174,31 @@ class GeodeServerManager:
         except Exception:
             pass
 
+        # Build Docker run command
+        # QUIC uses UDP, gRPC uses TCP
+        docker_args = [
+            "run", "-d",
+            "--name", self.container_name,
+            "-p", f"{self.port}:3141/udp",
+            "-e", f"GEODE_ADMIN_PASSWORD={self.admin_password}",
+            "-e", "GEODE_DISABLE_AUDIT=1",
+        ]
+
+        # Add gRPC port if enabled
+        if self.grpc_port:
+            docker_args.extend(["-p", f"{self.grpc_port}:50051/tcp"])
+
+        # Add image and serve command
+        docker_args.append(self.image)
+        docker_args.extend(["serve", "--listen", "0.0.0.0:3141", "--log-level", "info"])
+
+        # Add gRPC listen if enabled
+        if self.grpc_port:
+            docker_args.extend(["--listen-grpc", "0.0.0.0:50051"])
+
         # Start the container
-        # Note: QUIC uses UDP
         try:
-            self._run_docker(
-                "run", "-d",
-                "--name", self.container_name,
-                "-p", f"{self.port}:3141/udp",
-                self.image,
-                "serve", "--listen", "0.0.0.0:3141", "--log-level", "info"
-            )
+            self._run_docker(*docker_args)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to start Docker container: {e.stderr}")
 
@@ -362,9 +390,10 @@ class ClientRunner:
 class PythonRunner(ClientRunner):
     """Python client test runner."""
 
-    def __init__(self, server: str):
+    def __init__(self, server: str, transport: str = "quic"):
         super().__init__("python", server)
         self.runner_path = Path(__file__).parent / "runners" / "python_runner.py"
+        self.transport = transport
         # Use venv Python if available
         venv_python = Path(__file__).parent / ".venv" / "bin" / "python3"
         self.python_exe = str(venv_python) if venv_python.exists() else sys.executable
@@ -390,6 +419,8 @@ class PythonRunner(ClientRunner):
                 str(test_file),
                 "--server",
                 self.server,
+                "--transport",
+                self.transport,
                 "--json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -459,9 +490,10 @@ class PythonRunner(ClientRunner):
 class GoRunner(ClientRunner):
     """Go client test runner."""
 
-    def __init__(self, server: str):
+    def __init__(self, server: str, transport: str = "quic"):
         super().__init__("go", server)
         self.runner_path = Path(__file__).parent / "runners" / "go_runner"
+        self.transport = transport
 
     async def run_test(self, spec: Dict[str, Any], test: Dict[str, Any]) -> TestResult:
         start_time = time.time()
@@ -483,6 +515,8 @@ class GoRunner(ClientRunner):
                 str(test_file),
                 "-server",
                 self.server,
+                "-transport",
+                self.transport,
                 "-json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -589,11 +623,12 @@ class GoRunner(ClientRunner):
 class RustRunner(ClientRunner):
     """Rust client test runner."""
 
-    def __init__(self, server: str):
+    def __init__(self, server: str, transport: str = "quic"):
         super().__init__("rust", server)
         self.runner_path = (
             Path(__file__).parent / "runners" / "rust_runner" / "target" / "release" / "rust_runner"
         )
+        self.transport = transport
 
     async def run_test(self, spec: Dict[str, Any], test: Dict[str, Any]) -> TestResult:
         start_time = time.time()
@@ -615,6 +650,8 @@ class RustRunner(ClientRunner):
                 str(test_file),
                 "--server",
                 self.server,
+                "--transport",
+                self.transport,
                 "--json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -715,9 +752,10 @@ class RustRunner(ClientRunner):
 class ZigRunner(ClientRunner):
     """Zig client test runner."""
 
-    def __init__(self, server: str):
+    def __init__(self, server: str, transport: str = "quic"):
         super().__init__("zig", server)
         self.runner_path = Path(__file__).parent / "runners" / "zig-out" / "bin" / "zig_runner"
+        self.transport = transport
 
     async def run_test(self, spec: Dict[str, Any], test: Dict[str, Any]) -> TestResult:
         start_time = time.time()
@@ -739,6 +777,8 @@ class ZigRunner(ClientRunner):
                 str(test_file),
                 "--server",
                 self.server,
+                "--transport",
+                self.transport,
                 "--json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -834,10 +874,11 @@ class ZigRunner(ClientRunner):
 class NodeJSRunner(ClientRunner):
     """Node.js client test runner."""
 
-    def __init__(self, server: str):
+    def __init__(self, server: str, transport: str = "quic"):
         super().__init__("nodejs", server)
         self.runner_path = Path(__file__).parent / "runners" / "nodejs_runner.js"
         self.node_modules = Path(__file__).parent / "runners" / "node_modules"
+        self.transport = transport
 
     async def run_test(self, spec: Dict[str, Any], test: Dict[str, Any]) -> TestResult:
         start_time = time.time()
@@ -860,6 +901,8 @@ class NodeJSRunner(ClientRunner):
                 str(test_file),
                 "--server",
                 self.server,
+                "--transport",
+                self.transport,
                 "--json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1107,6 +1150,7 @@ class TestHarness:
         restart_server_between_clients: bool = False,
         migrations_dir: Optional[Path] = None,
         skip_migrations: bool = False,
+        transport: str = "quic",
     ):
         self.server = server
         self.verbose = verbose
@@ -1119,6 +1163,7 @@ class TestHarness:
         self.skip_migrations = skip_migrations
         self.migrations_succeeded = False  # Track if migrations ran successfully
         self.server_manager: Optional[GeodeServerManager] = None
+        self.transport = transport
 
         # Initialize runners (will be configured with actual server address in setup())
         self.runners: Dict[str, ClientRunner] = {}
@@ -1154,18 +1199,18 @@ class TestHarness:
             print("ERROR: No server address provided and server management disabled", file=sys.stderr)
             return False
 
-        # Initialize runners with server address
+        # Initialize runners with server address and transport
         temp_runners = {}
         if "python" in self.requested_clients:
-            temp_runners["python"] = PythonRunner(self.server)
+            temp_runners["python"] = PythonRunner(self.server, transport=self.transport)
         if "go" in self.requested_clients:
-            temp_runners["go"] = GoRunner(self.server)
+            temp_runners["go"] = GoRunner(self.server, transport=self.transport)
         if "rust" in self.requested_clients:
-            temp_runners["rust"] = RustRunner(self.server)
+            temp_runners["rust"] = RustRunner(self.server, transport=self.transport)
         if "zig" in self.requested_clients:
-            temp_runners["zig"] = ZigRunner(self.server)
+            temp_runners["zig"] = ZigRunner(self.server, transport=self.transport)
         if "nodejs" in self.requested_clients:
-            temp_runners["nodejs"] = NodeJSRunner(self.server)
+            temp_runners["nodejs"] = NodeJSRunner(self.server, transport=self.transport)
         if "shell" in self.requested_clients:
             temp_runners["shell"] = ShellRunner(self.server)
 
@@ -1568,6 +1613,12 @@ async def main():
         "--skip-migrations", action="store_true",
         help="Skip running migrations before tests"
     )
+    parser.add_argument(
+        "--transport",
+        default="quic",
+        choices=["quic", "grpc"],
+        help="Transport protocol to use (default: quic)"
+    )
 
     args = parser.parse_args()
 
@@ -1589,6 +1640,7 @@ async def main():
         restart_server_between_clients=False,
         migrations_dir=args.migrations_dir,
         skip_migrations=args.skip_migrations,
+        transport=args.transport,
     )
 
     try:

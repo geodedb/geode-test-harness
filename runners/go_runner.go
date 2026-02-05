@@ -87,9 +87,14 @@ type Runner struct {
 	connections map[string]*sql.Conn // Connection registry for multi-connection tests
 }
 
+// Default admin credentials for testing
+const defaultUsername = "geode"
+const defaultPassword = "GeodeTestPassword123!"
+
 func main() {
 	specPath := flag.String("spec", "", "Test specification file")
 	server := flag.String("server", "localhost:3141", "Server address (default: localhost:3141)")
+	transport := flag.String("transport", "quic", "Transport protocol: quic or grpc (default: quic)")
 	jsonOutput := flag.Bool("json", false, "Output JSON")
 	verbose := flag.Bool("verbose", false, "Verbose output")
 	flag.Parse()
@@ -116,8 +121,23 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Create DSN for QUIC connection
-	dsn := fmt.Sprintf("%s?insecure=true", *server)
+	// Get credentials from environment or use defaults
+	username := os.Getenv("GEODE_USERNAME")
+	if username == "" {
+		username = defaultUsername
+	}
+	password := os.Getenv("GEODE_ADMIN_PASSWORD")
+	if password == "" {
+		password = defaultPassword
+	}
+
+	// Create DSN based on transport type
+	var dsn string
+	if *transport == "grpc" {
+		dsn = fmt.Sprintf("grpc://%s?tls=0&user=%s&pass=%s", *server, username, password)
+	} else {
+		dsn = fmt.Sprintf("quic://%s?insecure=true&user=%s&pass=%s", *server, username, password)
+	}
 
 	// Open database connection
 	db, err := sql.Open("geode", dsn)

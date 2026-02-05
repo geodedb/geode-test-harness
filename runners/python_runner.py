@@ -8,6 +8,7 @@ Executes test specifications using the Geode Python client library.
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import sys
 import time
@@ -48,8 +49,27 @@ class DecimalEncoder(json.JSONEncoder):
 class PythonTestRunner:
     """Test runner for Python client."""
 
-    def __init__(self, server: str, verbose: bool = False):
+    # Default admin credentials for testing
+    DEFAULT_USERNAME = "geode"
+    DEFAULT_PASSWORD = "GeodeTestPassword123!"
+
+    def __init__(
+        self,
+        server: str,
+        verbose: bool = False,
+        transport: str = "quic",
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+    ):
         host, port = server.split(":")
+
+        # Get credentials from environment or use defaults
+        self.username = username or os.environ.get("GEODE_USERNAME", self.DEFAULT_USERNAME)
+        self.password = password or os.environ.get("GEODE_ADMIN_PASSWORD", self.DEFAULT_PASSWORD)
+
+        # Determine transport type
+        from geode_client import TransportType
+        transport_type = TransportType.GRPC if transport.lower() == "grpc" else TransportType.QUIC
 
         # TLS Configuration:
         # - skip_verify=True: Required for test harness since Geode server uses
@@ -58,9 +78,13 @@ class PythonTestRunner:
         self.client = Client(
             host=host,
             port=int(port),
-            skip_verify=True
+            skip_verify=True,
+            transport_type=transport_type,
+            username=self.username,
+            password=self.password,
         )
         self.verbose = verbose
+        self.transport = transport
         self.connection: Optional[Connection] = None
         self.connections: Dict[str, Connection] = {}  # Connection registry for multi-connection tests
 
@@ -424,6 +448,10 @@ async def main():
     parser.add_argument(
         "--server", default="localhost:3141", help="Server address (default: localhost:3141)"
     )
+    parser.add_argument(
+        "--transport", default="quic", choices=["quic", "grpc"],
+        help="Transport protocol (default: quic)"
+    )
     parser.add_argument("--json", action="store_true", help="Output JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
 
@@ -450,7 +478,7 @@ async def main():
         spec = yaml.safe_load(f)
 
     # Run tests
-    runner = PythonTestRunner(args.server, args.verbose)
+    runner = PythonTestRunner(args.server, args.verbose, transport=args.transport)
     try:
         await runner.setup()
         result = await runner.run_spec(spec)

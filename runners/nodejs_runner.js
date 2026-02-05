@@ -29,6 +29,10 @@ try {
 
 const { createClient } = GeodeClient;
 
+// Default admin credentials for testing
+const DEFAULT_USERNAME = 'geode';
+const DEFAULT_PASSWORD = 'GeodeTestPassword123!';
+
 /**
  * Parse command-line arguments.
  */
@@ -37,6 +41,7 @@ function parseArgs() {
     const options = {
         spec: null,
         server: 'localhost:3141',
+        transport: 'quic',
         json: false,
         verbose: false,
     };
@@ -48,6 +53,9 @@ function parseArgs() {
                 break;
             case '--server':
                 options.server = args[++i];
+                break;
+            case '--transport':
+                options.transport = args[++i];
                 break;
             case '--json':
                 options.json = true;
@@ -66,14 +74,26 @@ function parseArgs() {
  * Test runner class.
  */
 class NodeJSTestRunner {
-    constructor(server, verbose = false) {
+    constructor(server, verbose = false, transport = 'quic') {
         this.server = server;
         this.verbose = verbose;
+        this.transport = transport;
+        this.username = process.env.GEODE_USERNAME || DEFAULT_USERNAME;
+        this.password = process.env.GEODE_ADMIN_PASSWORD || DEFAULT_PASSWORD;
         this.client = null;
         this.connection = null;
         this.transaction = null;
         this.inTransaction = false;
         this.connections = new Map();  // Connection registry for multi-connection tests
+    }
+
+    /**
+     * Build DSN based on transport type and credentials.
+     */
+    buildDsn() {
+        const scheme = this.transport === 'grpc' ? 'grpc' : 'quic';
+        const tlsParam = this.transport === 'grpc' ? 'tls=0' : 'insecure=true';
+        return `${scheme}://${this.server}?${tlsParam}&user=${this.username}&pass=${encodeURIComponent(this.password)}`;
     }
 
     async setup() {
@@ -120,7 +140,7 @@ class NodeJSTestRunner {
     }
 
     async poolAcquire(connectionId) {
-        const dsn = `quic://${this.server}?insecure=true`;
+        const dsn = this.buildDsn();
         const client = await createClient(dsn, { pooling: false });
         this.connections.set(connectionId, { client, connection: null });
     }
@@ -149,7 +169,7 @@ class NodeJSTestRunner {
 
     async connect() {
         if (!this.client) {
-            const dsn = `quic://${this.server}?insecure=true`;
+            const dsn = this.buildDsn();
             this.client = await createClient(dsn, { pooling: false });
         }
     }
@@ -606,7 +626,7 @@ async function main() {
     }
 
     // Run tests
-    const runner = new NodeJSTestRunner(options.server, options.verbose);
+    const runner = new NodeJSTestRunner(options.server, options.verbose, options.transport);
 
     try {
         await runner.setup();

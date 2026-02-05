@@ -15,6 +15,7 @@
 .PHONY: test-shell test-shell-all test-shell-comprehensive
 .PHONY: test-full test-full-parallel
 .PHONY: test-unit test-unit-verbose
+.PHONY: test-quic test-grpc test-all-transports
 
 # Default target: run full test suite with Docker
 all: clean docker-start test-all docker-stop
@@ -27,6 +28,14 @@ GEODE_IMAGE ?= registry.gitlab.com/devnw/geode/geode:latest
 GEODE_CONTAINER ?= geode-test-harness
 GEODE_HOST ?= 127.0.0.1
 GEODE_PORT ?= 3141
+GEODE_GRPC_PORT ?= 50051
+
+# Authentication settings
+GEODE_ADMIN_PASSWORD ?= GeodeTestPassword123!
+GEODE_USERNAME ?= geode
+
+# Transport selection (quic or grpc)
+TRANSPORT ?= quic
 
 # Python virtual environment settings
 VENV_DIR := .venv
@@ -135,9 +144,17 @@ help:
 	@echo "  clean            - Stop containers and remove build artifacts"
 	@echo "  clean-all        - Clean everything including Docker image"
 	@echo ""
+	@echo "Transport-Specific Tests:"
+	@echo "  test-quic          - Run tests using QUIC transport (default)"
+	@echo "  test-grpc          - Run tests using gRPC transport"
+	@echo "  test-all-transports - Run tests with both QUIC and gRPC"
+	@echo ""
 	@echo "Configuration:"
 	@echo "  GEODE_IMAGE=$(GEODE_IMAGE)"
-	@echo "  GEODE_PORT=$(GEODE_PORT)"
+	@echo "  GEODE_PORT=$(GEODE_PORT) (QUIC/UDP)"
+	@echo "  GEODE_GRPC_PORT=$(GEODE_GRPC_PORT) (gRPC/TCP)"
+	@echo "  TRANSPORT=$(TRANSPORT) (quic or grpc)"
+	@echo "  GEODE_ADMIN_PASSWORD=<set> (authentication)"
 
 # ==============================================================================
 # Docker Server Management
@@ -148,13 +165,18 @@ docker-start:
 	@$(DOCKER) rm -f $(GEODE_CONTAINER) 2>/dev/null || true
 	@$(DOCKER) run -d --name $(GEODE_CONTAINER) \
 		-p $(GEODE_PORT):3141/udp \
+		-p $(GEODE_GRPC_PORT):50051/tcp \
+		-e GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) \
+		-e GEODE_DISABLE_AUDIT=1 \
 		$(GEODE_IMAGE) \
-		serve --listen 0.0.0.0:3141 --log-level info
+		serve --listen 0.0.0.0:3141 --listen-grpc 0.0.0.0:50051 --log-level info
 	@echo "Waiting for server to be ready..."
 	@for i in 1 2 3 4 5 6 7 8 9 10; do \
 		sleep 1; \
-		if $(DOCKER) logs $(GEODE_CONTAINER) 2>&1 | grep -q "Server ready\|accepting QUIC connections"; then \
-			echo "Geode server ready on $(GEODE_HOST):$(GEODE_PORT)"; \
+		if $(DOCKER) logs $(GEODE_CONTAINER) 2>&1 | grep -q "Server ready\|accepting QUIC connections\|gRPC server"; then \
+			echo "Geode server ready:"; \
+			echo "  QUIC: $(GEODE_HOST):$(GEODE_PORT) (UDP)"; \
+			echo "  gRPC: $(GEODE_HOST):$(GEODE_GRPC_PORT) (TCP)"; \
 			exit 0; \
 		fi; \
 		echo "  Waiting... ($$i/10)"; \
@@ -306,8 +328,9 @@ build-nodejs:
 # ==============================================================================
 
 test: setup
-	@echo "Running basic tests..."
-	$(RUN_PYTHON) run_tests.py --spec specs/basic.yaml --verbose
+	@echo "Running basic tests (transport: $(TRANSPORT))..."
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --spec specs/basic.yaml --verbose --transport $(TRANSPORT)
 
 test-docker: setup docker-start
 	@echo "Running all tests with Docker..."
@@ -315,32 +338,38 @@ test-docker: setup docker-start
 	@$(MAKE) docker-stop
 
 test-all: setup
-	@echo "Running all test suites..."
+	@echo "Running all test suites (transport: $(TRANSPORT))..."
 	@mkdir -p reports
-	$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results.json
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results.json --transport $(TRANSPORT)
 
 test-comprehensive: test-all
 
 # Single client tests
 test-zig: setup
-	@echo "Running tests on Zig client..."
-	$(RUN_PYTHON) run_tests.py --clients zig --verbose
+	@echo "Running tests on Zig client (transport: $(TRANSPORT))..."
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --clients zig --verbose --transport $(TRANSPORT)
 
 test-go: setup
-	@echo "Running tests on Go client..."
-	$(RUN_PYTHON) run_tests.py --clients go --verbose
+	@echo "Running tests on Go client (transport: $(TRANSPORT))..."
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --clients go --verbose --transport $(TRANSPORT)
 
 test-python: setup
-	@echo "Running tests on Python client..."
-	$(RUN_PYTHON) run_tests.py --clients python --verbose
+	@echo "Running tests on Python client (transport: $(TRANSPORT))..."
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --clients python --verbose --transport $(TRANSPORT)
 
 test-rust: setup
-	@echo "Running tests on Rust client..."
-	$(RUN_PYTHON) run_tests.py --clients rust --verbose
+	@echo "Running tests on Rust client (transport: $(TRANSPORT))..."
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --clients rust --verbose --transport $(TRANSPORT)
 
 test-nodejs: setup
-	@echo "Running tests on Node.js client..."
-	$(RUN_PYTHON) run_tests.py --clients nodejs --verbose
+	@echo "Running tests on Node.js client (transport: $(TRANSPORT))..."
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --clients nodejs --verbose --transport $(TRANSPORT)
 
 # Specific test suites
 test-transactions: setup
@@ -363,7 +392,45 @@ test-perf: setup
 test-graph: setup
 	@echo "Running graph query tests (with migrations)..."
 	@mkdir -p reports
-	$(RUN_PYTHON) run_tests.py --spec specs/graph.yaml --verbose --report-json reports/graph_results.json
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --spec specs/graph.yaml --verbose --report-json reports/graph_results.json --transport $(TRANSPORT)
+
+# ==============================================================================
+# Transport-Specific Tests
+# ==============================================================================
+
+# Run tests using QUIC transport (default)
+test-quic: setup
+	@echo "Running tests using QUIC transport..."
+	@mkdir -p reports
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results_quic.json --transport quic
+
+# Run tests using gRPC transport
+test-grpc: setup
+	@echo "Running tests using gRPC transport..."
+	@mkdir -p reports
+	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results_grpc.json --transport grpc \
+		--server $(GEODE_HOST):$(GEODE_GRPC_PORT)
+
+# Run tests with both QUIC and gRPC transports
+test-all-transports: setup
+	@echo "Running tests with both QUIC and gRPC transports..."
+	@mkdir -p reports
+	@echo ""
+	@echo "=== QUIC Transport Tests ==="
+	-GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results_quic.json --transport quic
+	@echo ""
+	@echo "=== gRPC Transport Tests ==="
+	-GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
+		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results_grpc.json --transport grpc \
+		--server $(GEODE_HOST):$(GEODE_GRPC_PORT)
+	@echo ""
+	@echo "Transport test results:"
+	@echo "  QUIC: reports/results_quic.json"
+	@echo "  gRPC: reports/results_grpc.json"
 
 # ==============================================================================
 # CLI Tests (geodetestlab-cli)
