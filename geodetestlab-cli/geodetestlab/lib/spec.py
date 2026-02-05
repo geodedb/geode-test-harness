@@ -126,6 +126,8 @@ class ExpectedResult:
     stderr_not_contains: list[str] | None = None
     stdout_regex: list[str] | None = None
     stderr_regex: list[str] | None = None
+    stdout_exact: str | None = None  # Exact stdout match (stripped)
+    stderr_exact: str | None = None  # Exact stderr match (stripped)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ExpectedResult:
@@ -155,6 +157,8 @@ class ExpectedResult:
             stderr_not_contains=normalize_list(data.get("stderr_not_contains")),
             stdout_regex=normalize_list(data.get("stdout_regex")),
             stderr_regex=normalize_list(data.get("stderr_regex")),
+            stdout_exact=data.get("stdout_exact"),
+            stderr_exact=data.get("stderr_exact"),
         )
 
 
@@ -220,6 +224,21 @@ class TestCase:
             expected_data = dict(expected_data)  # Make a copy to avoid mutation
             expected_data["exit_code"] = data["expected_exit_code"]
 
+        # Support expected_stdout at top level (exact match converted to stdout_contains)
+        if "expected_stdout" in data:
+            if not isinstance(expected_data, dict):
+                expected_data = {}
+            expected_data = dict(expected_data)  # Make a copy to avoid mutation
+            # Treat as exact match - strip and compare
+            expected_data["stdout_exact"] = data["expected_stdout"]
+
+        # Support expected_stderr at top level
+        if "expected_stderr" in data:
+            if not isinstance(expected_data, dict):
+                expected_data = {}
+            expected_data = dict(expected_data)  # Make a copy to avoid mutation
+            expected_data["stderr_exact"] = data["expected_stderr"]
+
         # Determine test type
         test_type = data.get("type", "cli")
 
@@ -261,6 +280,7 @@ class SecretConfig:
     key: str | None = None
     service: str | None = None
     required: bool = True
+    default: str | None = None  # Default value if not found
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SecretConfig:
@@ -270,6 +290,7 @@ class SecretConfig:
             key=data.get("key"),
             service=data.get("service"),
             required=data.get("required", True),
+            default=data.get("default"),
         )
 
 

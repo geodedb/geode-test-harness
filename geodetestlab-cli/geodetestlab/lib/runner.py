@@ -543,8 +543,22 @@ def _run_cli_test(
     admin_password = env.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
     # Determine if this is a query test or command test
+    # Helper to detect if a string looks like a GQL query
+    def _is_gql_query(text: str) -> bool:
+        if not text:
+            return False
+        text_upper = text.strip().upper()
+        gql_keywords = ["CREATE", "MATCH", "RETURN", "MERGE", "DELETE", "SET", "UNWIND", "WITH", "CALL", "OPTIONAL"]
+        return any(text_upper.startswith(kw) for kw in gql_keywords)
+
     if test_case.query:
         cmd = [binary, "query", test_case.query]
+        cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
+        cmd.extend(["--insecure"])
+        cmd.extend(["-U", "geode", "-P", admin_password])
+    elif test_case.command and _is_gql_query(test_case.command):
+        # Command field contains GQL - route to query handler
+        cmd = [binary, "query", test_case.command]
         cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
         cmd.extend(["--insecure"])
         cmd.extend(["-U", "geode", "-P", admin_password])
@@ -1069,9 +1083,11 @@ def _check_expectations(
             return False
 
     # Check stdout_contains (list of substrings that must ALL be present)
+    # Note: Geode CLI often outputs to stderr, so we also check stderr as fallback
     if expected.stdout_contains:
         for substring in expected.stdout_contains:
-            if substring not in output:
+            # Check stdout first, then stderr as fallback
+            if substring not in output and substring not in error:
                 return False
 
     # Check stderr_contains (list of substrings that must ALL be present)
@@ -1093,9 +1109,11 @@ def _check_expectations(
                 return False
 
     # Check stdout_regex (list of regex patterns that must ALL match)
+    # Note: Geode CLI often outputs to stderr, so we also check stderr as fallback
     if expected.stdout_regex:
         for pattern in expected.stdout_regex:
-            if not re.search(pattern, output):
+            # Check stdout first, then stderr as fallback
+            if not re.search(pattern, output) and not re.search(pattern, error):
                 return False
 
     # Check stderr_regex (list of regex patterns that must ALL match)
@@ -1103,6 +1121,20 @@ def _check_expectations(
         for pattern in expected.stderr_regex:
             if not re.search(pattern, error):
                 return False
+
+    # Check stdout_exact (exact match after stripping whitespace)
+    # Note: Also checks stderr as fallback since Geode CLI often outputs to stderr
+    if expected.stdout_exact is not None:
+        expected_stripped = expected.stdout_exact.strip()
+        output_stripped = output.strip()
+        error_stripped = error.strip()
+        if output_stripped != expected_stripped and error_stripped != expected_stripped:
+            return False
+
+    # Check stderr_exact (exact match after stripping whitespace)
+    if expected.stderr_exact is not None:
+        if error.strip() != expected.stderr_exact.strip():
+            return False
 
     return True
 

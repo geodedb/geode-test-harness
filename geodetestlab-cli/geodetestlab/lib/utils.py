@@ -121,10 +121,12 @@ def _resolve_secret(name: str, config: SecretConfig) -> str | None:
     Optional[str]
         The resolved secret value, or None if not found.
     """
+    value = None
+
     if config.source == "env":
         # Environment variable
         env_key = config.key or name
-        return os.environ.get(env_key)
+        value = os.environ.get(env_key)
 
     elif config.source == "keyring":
         # System keyring (requires keyring package)
@@ -133,16 +135,19 @@ def _resolve_secret(name: str, config: SecretConfig) -> str | None:
 
             service = config.service or "geodetestlab"
             key = config.key or name
-            return keyring.get_password(service, key)
+            value = keyring.get_password(service, key)
         except ImportError:
-            return None
+            pass
 
     elif config.source == "file":
         # Read from file
         if config.key:
             path = Path(config.key).expanduser()
             if path.exists():
-                return path.read_text().strip()
-        return None
+                value = path.read_text().strip()
 
-    return None
+    # Use default if no value found
+    if value is None and config.default is not None:
+        value = config.default
+
+    return value

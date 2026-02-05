@@ -388,7 +388,13 @@ def run(
                 if not ci and verbose:
                     passed = summary.get("passed", 0)
                     failed = summary.get("failed", 0)
-                    status = "[green]PASS[/green]" if failed == 0 else "[red]FAIL[/red]"
+                    total = summary.get("total", 0)
+                    has_error = result.get("error") is not None
+                    # FAIL if: failed > 0, or error occurred, or no tests ran at all
+                    if failed > 0 or has_error or total == 0:
+                        status = "[red]FAIL[/red]"
+                    else:
+                        status = "[green]PASS[/green]"
                     console.print(f"  {status} {spec_file.name}: {passed} passed, {failed} failed")
 
         except KeyboardInterrupt:
