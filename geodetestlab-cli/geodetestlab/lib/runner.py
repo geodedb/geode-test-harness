@@ -32,15 +32,36 @@ def _cleanup_servers() -> None:
     for process in _active_servers[:]:  # Copy list to avoid modification during iteration
         try:
             if process.poll() is None:  # Still running
+                # Kill the entire process group first (for servers started with start_new_session)
+                try:
+                    pgid = os.getpgid(process.pid)
+                    os.killpg(pgid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+                # Then kill the process directly as fallback
                 process.terminate()
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    process.wait(timeout=1)
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
         except Exception:
             pass
     _active_servers.clear()
+
+
+def _kill_stale_servers() -> None:
+    """Kill any stale Geode servers from previous runs."""
+    try:
+        subprocess.run(["pkill", "-f", "geode serve"], capture_output=True, timeout=5)
+        time.sleep(0.5)  # Give processes time to terminate
+    except Exception:
+        pass
 
 
 # Register cleanup handler
@@ -131,6 +152,9 @@ def run_tests(
     Tuple[int, Dict[str, Any]]
         Exit code (0 for success, 1 for failures) and summary dictionary.
     """
+    # Clean up any stale Geode servers from previous runs
+    _kill_stale_servers()
+
     summary = RunSummary()
     start_time = time.time()
 
@@ -445,18 +469,32 @@ def _stop_server(process: subprocess.Popen, verbose: bool = False) -> None:
         _active_servers.remove(process)
 
     try:
-        # Try graceful termination first
+        # Try to get the process group ID (server was started with start_new_session=True)
+        try:
+            pgid = os.getpgid(process.pid)
+        except (OSError, ProcessLookupError):
+            pgid = None
+
+        # Try graceful termination of process group first
+        if pgid:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (OSError, ProcessLookupError):
+                pass
+
+        # Also terminate the main process
         process.terminate()
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=3)
         except subprocess.TimeoutExpired:
             if verbose:
                 print("Force killing server...")
-            # Kill the entire process group if we created a new session
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
+            # Force kill the entire process group
+            if pgid:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
             process.kill()
             try:
                 process.wait(timeout=2)
