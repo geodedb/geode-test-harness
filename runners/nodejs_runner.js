@@ -120,7 +120,7 @@ class NodeJSTestRunner {
     }
 
     async poolAcquire(connectionId) {
-        const dsn = `geode://${this.server}?insecure=true`;
+        const dsn = `quic://${this.server}?insecure=true`;
         const client = await createClient(dsn, { pooling: false });
         this.connections.set(connectionId, { client, connection: null });
     }
@@ -149,7 +149,7 @@ class NodeJSTestRunner {
 
     async connect() {
         if (!this.client) {
-            const dsn = `geode://${this.server}?insecure=true`;
+            const dsn = `quic://${this.server}?insecure=true`;
             this.client = await createClient(dsn, { pooling: false });
         }
     }

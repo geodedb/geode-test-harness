@@ -654,6 +654,18 @@ fn jsonValueToParamString(allocator: Allocator, val: JsonValue) ![]u8 {
     };
 }
 
+fn jsonValueToProtoValue(val: JsonValue) proto.Value {
+    return switch (val) {
+        .null => proto.Value.initNull(),
+        .bool => |b| proto.Value.initBool(b),
+        .integer => |i| proto.Value.initInt(i),
+        .float => |f| proto.Value.initDouble(f),
+        .string => |s| proto.Value.initString(s),
+        .number_string => |s| proto.Value.initString(s),
+        .array, .object => proto.Value.initNull(), // Complex types not supported
+    };
+}
+
 fn parseServer(allocator: Allocator, server: []const u8) !struct { host: []const u8, port: u16 } {
     var host_port = std.mem.splitScalar(u8, server, ':');
     const host_part = host_port.next() orelse "localhost";
@@ -797,25 +809,18 @@ const ClientContext = struct {
             .session_id = "",
             .query = query_text,
         };
+        defer execute.deinit(self.allocator);
 
-        // Convert JSON params to string map if provided
-        var param_strings = try std.ArrayList([]u8).initCapacity(self.allocator, 0);
-        defer {
-            for (param_strings.items) |s| self.allocator.free(s);
-            param_strings.deinit(self.allocator);
-        }
-
+        // Convert JSON params to proto.Value and add to execute request
         if (params) |p| {
             if (p == .object) {
                 var it = p.object.iterator();
                 while (it.next()) |entry| {
-                    const val_str = try jsonValueToParamString(self.allocator, entry.value_ptr.*);
-                    try param_strings.append(self.allocator, val_str);
-                    try execute.parameters.put(self.allocator, entry.key_ptr.*, val_str);
+                    const proto_val = jsonValueToProtoValue(entry.value_ptr.*);
+                    try execute.addParam(self.allocator, entry.key_ptr.*, proto_val);
                 }
             }
         }
-        defer execute.parameters.deinit(self.allocator);
 
         const msg = proto.QuicClientMessage{
             .execute = execute,
