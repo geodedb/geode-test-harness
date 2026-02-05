@@ -153,6 +153,19 @@ def run_tests(
         data_dir = Path(tempfile.mkdtemp(prefix="geode-test-"))
         port = server_port or get_free_port()
 
+        # Run pre_server commands (e.g., cleanup of shared state files)
+        if spec.pre_server and not dry_run:
+            if verbose:
+                print(f"Running {len(spec.pre_server)} pre-server commands...")
+            for i, cmd in enumerate(spec.pre_server):
+                if verbose:
+                    print(f"  pre_server[{i}]: {cmd}")
+                try:
+                    subprocess.run(cmd, shell=True, check=False)
+                except Exception as e:
+                    if verbose:
+                        print(f"  pre_server[{i}] warning: {e}")
+
         # Start server
         if not dry_run:
             server_process = _start_server(
@@ -862,9 +875,13 @@ def _check_expectations(
     """Check if test output matches expectations."""
     expected = test_case.expected
 
-    # Check exit code
-    if expected.exit_code is not None and exit_code != expected.exit_code:
-        return False
+    # Check exit code (supports single int or list of ints)
+    if expected.exit_code is not None:
+        if isinstance(expected.exit_code, list):
+            if exit_code not in expected.exit_code:
+                return False
+        elif exit_code != expected.exit_code:
+            return False
 
     # Check status (success vs error) - only if exit_code not explicitly specified
     # This allows tests to specify exit_code without also needing to set status

@@ -119,7 +119,7 @@ class ExpectedResult:
     result_not_contains: str | None = None
     result_matches: str | None = None
     error_contains: str | None = None
-    exit_code: int | None = None
+    exit_code: int | list[int] | None = None
     stdout_contains: list[str] | None = None
     stderr_contains: list[str] | None = None
     stdout_not_contains: list[str] | None = None
@@ -279,6 +279,7 @@ class TestSpec:
     tests: list[TestCase] = field(default_factory=list)
     setup: list[str] | None = None
     teardown: list[str] | None = None
+    pre_server: list[str] | None = None  # Shell commands to run before server starts
     tde_config: dict[str, Any] | None = None
     plaintext_verification: PlaintextCheck = field(default_factory=PlaintextCheck)
 
@@ -325,6 +326,7 @@ class TestSpec:
             tests=tests,
             setup=data.get("setup"),
             teardown=data.get("teardown"),
+            pre_server=data.get("pre_server"),
             tde_config=data.get("tde_config"),
             plaintext_verification=PlaintextCheck.from_dict(data.get("plaintext_verification")),
         )
