@@ -213,6 +213,13 @@ class TestCase:
         expected_data = data.get("expected") or data.get("expect") or {}
         plaintext_data = data.get("plaintext_check")
 
+        # For shell tests, expected_exit_code is at top level
+        if data.get("type") == "shell" and "expected_exit_code" in data:
+            if not isinstance(expected_data, dict):
+                expected_data = {}
+            expected_data = dict(expected_data)  # Make a copy to avoid mutation
+            expected_data["exit_code"] = data["expected_exit_code"]
+
         # Determine test type
         test_type = data.get("type", "cli")
 

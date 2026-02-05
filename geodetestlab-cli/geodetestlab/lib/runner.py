@@ -520,6 +520,8 @@ def _run_single_test(
         return _run_http_test(test_case, env, verbose)
     elif test_case.test_type == "sequential":
         return _run_sequential_test(test_case, binary, env, secrets, timeout_ms, data_dir, verbose)
+    elif test_case.test_type == "shell":
+        return _run_shell_test(test_case, env, verbose)
 
     # CLI test (default)
     return _run_cli_test(test_case, binary, env, secrets, timeout_ms, data_dir, verbose)
@@ -716,6 +718,107 @@ def _run_http_test(
         duration_ms=(time.time() - start_time) * 1000,
         output="\n".join(outputs),
     )
+
+
+def _run_shell_test(
+    test_case: TestCase,
+    env: dict[str, str],
+    verbose: bool,
+) -> TestResult:
+    """Run a shell test case.
+
+    Shell tests execute bash commands/scripts, typically used for source code
+    verification tests that grep for patterns in the codebase.
+    """
+    start_time = time.time()
+
+    # Get the command to execute
+    command = test_case.command
+    if not command:
+        return TestResult(
+            name=test_case.name,
+            passed=False,
+            duration_ms=(time.time() - start_time) * 1000,
+            error="Shell test missing 'command' field",
+        )
+
+    # Determine the working directory - shell tests typically need to run from Geode source
+    # The test harness is in geode-test-harness, and geode source is in ../geode
+    harness_dir = Path(__file__).parent.parent.parent.parent.parent
+    geode_source = harness_dir / "geode"
+
+    # If geode source doesn't exist, try the parent directory structure
+    if not geode_source.exists():
+        # Try /home/benji/src/gl/devnw/codepros/geode/geode
+        geode_source = Path("/home/benji/src/gl/devnw/codepros/geode/geode")
+
+    if not geode_source.exists():
+        return TestResult(
+            name=test_case.name,
+            passed=False,
+            duration_ms=(time.time() - start_time) * 1000,
+            error=f"Geode source directory not found: {geode_source}",
+        )
+
+    # Merge test-specific environment
+    test_env = env.copy()
+    test_env.update(test_case.env)
+
+    try:
+        result = subprocess.run(
+            ["bash", "-c", command],
+            env=test_env,
+            capture_output=True,
+            text=True,
+            timeout=30.0,  # 30 second timeout for shell tests
+            cwd=str(geode_source),  # Run from Geode source directory
+        )
+
+        stdout = result.stdout
+        stderr = result.stderr
+        exit_code = result.returncode
+
+        # Check expected exit code
+        expected_exit_code = test_case.expected.exit_code
+        if expected_exit_code is None:
+            expected_exit_code = 0
+
+        # Handle both single int and list of valid exit codes
+        if isinstance(expected_exit_code, list):
+            passed = exit_code in expected_exit_code
+        else:
+            passed = exit_code == expected_exit_code
+
+        if verbose:
+            status = "PASS" if passed else "FAIL"
+            print(f"    Shell: exit_code={exit_code}, expected={expected_exit_code} [{status}]")
+            if stdout.strip():
+                print(f"    stdout: {stdout.strip()[:200]}")
+            if stderr.strip() and not passed:
+                print(f"    stderr: {stderr.strip()[:200]}")
+
+        return TestResult(
+            name=test_case.name,
+            passed=passed,
+            duration_ms=(time.time() - start_time) * 1000,
+            output=stdout,
+            error=stderr if not passed else None,
+        )
+
+    except subprocess.TimeoutExpired:
+        return TestResult(
+            name=test_case.name,
+            passed=False,
+            duration_ms=(time.time() - start_time) * 1000,
+            error="Shell test timed out after 30 seconds",
+        )
+    except Exception as e:
+        return TestResult(
+            name=test_case.name,
+            passed=False,
+            duration_ms=(time.time() - start_time) * 1000,
+            error=str(e),
+        )
 
 
 def _check_http_expectations(
