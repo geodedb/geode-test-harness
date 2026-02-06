@@ -77,6 +77,26 @@ function parseArgs() {
 /**
  * Test runner class.
  */
+/**
+ * Recursively convert BigInt values to Number for JSON serialization.
+ */
+function convertBigInts(value) {
+    if (typeof value === 'bigint') {
+        return Number(value);
+    }
+    if (Array.isArray(value)) {
+        return value.map(convertBigInts);
+    }
+    if (value !== null && typeof value === 'object') {
+        const result = {};
+        for (const [k, v] of Object.entries(value)) {
+            result[k] = convertBigInts(v);
+        }
+        return result;
+    }
+    return value;
+}
+
 class NodeJSTestRunner {
     constructor(server, verbose = false, transport = 'quic') {
         this.server = server;
@@ -225,7 +245,8 @@ class NodeJSTestRunner {
             if (row instanceof Map) {
                 for (const [key, value] of row) {
                     // Value might be a GQLValue with toJS(), or already a primitive
-                    rowObj[key] = value && typeof value.toJS === 'function' ? value.toJS() : value;
+                    const jsVal = value && typeof value.toJS === 'function' ? value.toJS() : value;
+                    rowObj[key] = convertBigInts(jsVal);
                 }
             } else if (typeof row === 'object' && row !== null) {
                 // Already an object
