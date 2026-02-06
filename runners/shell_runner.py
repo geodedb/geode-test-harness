@@ -109,7 +109,6 @@ class ShellTestRunner:
                 port=None if self._auto_allocate else int(self.server.split(":")[-1]) if self.server else None,
                 data_dir=self.data_dir,
                 verbose=self.verbose,
-                disable_auth=True,
             )
 
             # Start the server
