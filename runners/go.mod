@@ -21,4 +21,3 @@ require (
 	google.golang.org/protobuf v1.36.10 // indirect
 )
 
-replace geodedb.com/geode => ../../geode-client-go

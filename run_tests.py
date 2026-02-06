@@ -86,7 +86,7 @@ class GeodeServerManager:
     """Manages Geode server using Docker containers."""
 
     # Docker settings
-    DEFAULT_IMAGE = "registry.gitlab.com/devnw/geode/geode:latest"
+    DEFAULT_IMAGE = "geodedb/geode:latest"
     DEFAULT_CONTAINER_NAME = "geode-test-harness"
     DEFAULT_PORT = 3141
     DEFAULT_GRPC_PORT = 50051

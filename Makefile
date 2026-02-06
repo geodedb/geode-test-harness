@@ -24,7 +24,7 @@ all: clean docker-start test-all docker-stop
 
 # Docker settings (matching client repos)
 DOCKER ?= docker
-GEODE_IMAGE ?= registry.gitlab.com/devnw/geode/geode:latest
+GEODE_IMAGE ?= geodedb/geode:latest
 GEODE_CONTAINER ?= geode-test-harness
 GEODE_HOST ?= 127.0.0.1
 GEODE_PORT ?= 3141
@@ -44,7 +44,7 @@ VENV_PYTHON := $(VENV_DIR)/bin/python3
 VENV_PIP := $(VENV_DIR)/bin/pip
 ACTIVATE := . $(VENV_DIR)/bin/activate
 
-# External client repo paths (sibling directories)
+# External client repo paths (sibling directories, used for local development)
 GO_CLIENT_PATH := ../geode-client-go
 PYTHON_CLIENT_PATH := ../geode-client-python
 RUST_CLIENT_PATH := ../geode-client-rust

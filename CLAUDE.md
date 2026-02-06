@@ -17,7 +17,7 @@ Client libraries are located in sibling directories:
 - `../geode-client-zig/` - Zig client (module: geode_client)
 - `../geode-client-nodejs/` - Node.js client (package: @geode/client)
 
-Docker image: `registry.gitlab.com/devnw/geode/geode:latest`
+Docker image: `geodedb/geode:latest`
 
 ## Build & Test Commands
 
@@ -153,7 +153,7 @@ The test harness uses Docker for server management:
 
 ```bash
 # Default settings
-GEODE_IMAGE=registry.gitlab.com/devnw/geode/geode:latest
+GEODE_IMAGE=geodedb/geode:latest
 GEODE_CONTAINER=geode-test-harness
 GEODE_PORT=3141
 
@@ -183,11 +183,11 @@ The server listens on UDP port 3141 for QUIC connections.
 
 ### Client Dependencies
 
-- **Zig**: Uses `build.zig.zon` to reference `../../geode-client-zig`
-- **Go**: Uses `go.mod` replace directive to `../../geode-client-go`
-- **Rust**: Uses Cargo path dependency to `../../../geode-client-rust`
-- **Python**: Imports from installed package or `../geode-client-python`
-- **Node.js**: Uses npm file dependency to `../../geode-client-nodejs`
+- **Zig**: Uses `build.zig.zon` git URL to `gitlab.com/devnw/codepros/geode/geode-client-zig`
+- **Go**: Uses `go.mod` with public module `geodedb.com/geode`
+- **Rust**: Uses Cargo git dependency from `gitlab.com/devnw/codepros/geode/geode-client-rust`
+- **Python**: Imports from installed package `geode-client`
+- **Node.js**: Uses npm package `@geodedb/client`
 
 ### Testing Against External Server
 

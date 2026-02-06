@@ -222,7 +222,7 @@ steps:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `GEODE_IMAGE` | `registry.gitlab.com/devnw/geode/geode:latest` | Docker image |
+| `GEODE_IMAGE` | `geodedb/geode:latest` | Docker image |
 | `GEODE_CONTAINER` | `geode-test-harness` | Container name |
 | `GEODE_HOST` | `127.0.0.1` | Server host |
 | `GEODE_PORT` | `3141` | Server port |
