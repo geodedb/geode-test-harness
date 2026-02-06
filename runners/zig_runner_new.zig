@@ -786,17 +786,16 @@ const ClientContext = struct {
             const transport_str = if (self.transport == .grpc) "gRPC" else "QUIC";
             std.debug.print("  Connecting to {s}:{d} via {s}\n", .{ self.host, self.port, transport_str });
         }
-        try cli.connect();
-        try cli.openStream();
-        try cli.sendHello();
-        // Keep the client even if the HELLO ack is missing; subsequent messages should still flow.
-        self.client = cli;
-        _ = self.client.?.receiveProto(2000) catch |err| {
-            if (verbose) {
-                std.debug.print("  HELLO receive skipped: {any}\n", .{err});
-            }
-            return;
+        cli.connect() catch |err| {
+            return err;
         };
+        cli.openStream() catch |err| {
+            return err;
+        };
+        cli.sendHello() catch |err| {
+            return err;
+        };
+        self.client = cli;
     }
 
     fn close(self: *ClientContext) void {
@@ -859,58 +858,70 @@ const ClientContext = struct {
         };
         try self.client.?.sendProto(msg);
 
-        // Receive the response
-        const response = try self.client.?.receiveProto(30000);
+        // The server sends multiple ExecutionResponse messages:
+        // 1. Schema definition (columns)
+        // 2. Data page(s) with rows
+        // Read messages until we have both schema and data
 
-        // Check for errors
-        if (response.execute) |exec| {
-            if (exec.err) |_| {
-                return error.QueryError;
-            }
-
-            // Parse columns from schema
-            var columns = try std.ArrayList([]u8).initCapacity(self.allocator, 0);
-            errdefer {
-                for (columns.items) |col| self.allocator.free(col);
-                columns.deinit(self.allocator);
-            }
-
-            if (exec.schema) |schema| {
-                for (schema.columns.items) |col| {
-                    const col_name = try self.allocator.dupe(u8, col.name);
-                    try columns.append(self.allocator, col_name);
-                }
-            }
-
-            // Parse rows from data page
-            var all_rows = try std.ArrayList(JsonValue).initCapacity(self.allocator, 0);
-            errdefer {
-                for (all_rows.items) |*row| freeJsonValue(self.allocator, row);
-                all_rows.deinit(self.allocator);
-            }
-
-            if (exec.page) |page| {
-                for (page.rows.items) |row| {
-                    // Convert each row to a JSON object with column names as keys
-                    var row_obj = JsonObject.init(self.allocator);
-                    errdefer row_obj.deinit();
-
-                    for (row.values.items, 0..) |val, idx| {
-                        const col_name = if (idx < columns.items.len) columns.items[idx] else "";
-                        const json_val = try protoValueToJson(self.allocator, val);
-                        const key_copy = try self.allocator.dupe(u8, col_name);
-                        try row_obj.put(key_copy, json_val);
-                    }
-                    try all_rows.append(self.allocator, JsonValue{ .object = row_obj });
-                }
-            }
-
-            const cols_slice = try columns.toOwnedSlice(self.allocator);
-            const rows_slice = try all_rows.toOwnedSlice(self.allocator);
-            return QueryResult{ .columns = cols_slice, .rows = rows_slice };
+        var columns = try std.ArrayList([]u8).initCapacity(self.allocator, 0);
+        errdefer {
+            for (columns.items) |col| self.allocator.free(col);
+            columns.deinit(self.allocator);
         }
 
-        return error.InvalidResponse;
+        var all_rows = try std.ArrayList(JsonValue).initCapacity(self.allocator, 0);
+        errdefer {
+            for (all_rows.items) |*row| freeJsonValue(self.allocator, row);
+            all_rows.deinit(self.allocator);
+        }
+
+        var got_page = false;
+        var msg_count: usize = 0;
+        while (msg_count < 10) : (msg_count += 1) {
+            const response = try self.client.?.receiveProto(30000);
+
+            if (response.execute) |exec| {
+                // Check for errors
+                if (exec.err) |_| {
+                    return error.QueryError;
+                }
+
+                // Parse columns from schema
+                if (exec.schema) |schema| {
+                    for (schema.columns.items) |col| {
+                        const col_name = try self.allocator.dupe(u8, col.name);
+                        try columns.append(self.allocator, col_name);
+                    }
+                }
+
+                // Parse rows from data page
+                if (exec.page) |page| {
+                    for (page.rows.items) |row| {
+                        var row_obj = JsonObject.init(self.allocator);
+                        errdefer row_obj.deinit();
+
+                        for (row.values.items, 0..) |val, idx| {
+                            const col_name = if (idx < columns.items.len) columns.items[idx] else "";
+                            const json_val = try protoValueToJson(self.allocator, val);
+                            const key_copy = try self.allocator.dupe(u8, col_name);
+                            try row_obj.put(key_copy, json_val);
+                        }
+                        try all_rows.append(self.allocator, JsonValue{ .object = row_obj });
+                    }
+                    got_page = true;
+                    if (page.@"final") break;
+                }
+
+                // If we got a page, we're done for simple queries
+                if (got_page) break;
+            } else {
+                return error.InvalidResponse;
+            }
+        }
+
+        const cols_slice = try columns.toOwnedSlice(self.allocator);
+        const rows_slice = try all_rows.toOwnedSlice(self.allocator);
+        return QueryResult{ .columns = cols_slice, .rows = rows_slice };
     }
 };
 

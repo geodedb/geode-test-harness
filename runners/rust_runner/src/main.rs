@@ -21,6 +21,10 @@ struct Args {
     #[arg(long, default_value = "localhost:3141")]
     server: String,
 
+    /// Transport protocol (quic or grpc)
+    #[arg(long, default_value = "quic")]
+    transport: String,
+
     /// Output JSON format
     #[arg(long)]
     json: bool,
@@ -175,9 +179,15 @@ impl Runner {
     fn new(server: &str, verbose: bool) -> Self {
         let parts: Vec<&str> = server.split(':').collect();
         let host = parts[0];
-        let port: u16 = parts.get(1).unwrap_or(&"8443").parse().unwrap_or(8443);
+        let port: u16 = parts.get(1).unwrap_or(&"3141").parse().unwrap_or(3141);
 
-        let client = Client::new(host, port).skip_verify(true);
+        let username = std::env::var("GEODE_USERNAME").unwrap_or_else(|_| "geode".to_string());
+        let password = std::env::var("GEODE_ADMIN_PASSWORD").unwrap_or_else(|_| "GeodeTestPassword123!".to_string());
+
+        let client = Client::new(host, port)
+            .skip_verify(true)
+            .username(&username)
+            .password(&password);
 
         Self {
             client,
@@ -657,11 +667,10 @@ impl Runner {
                     Ok(())
                 }
                 "query" => {
-                    let result = self
-                        .execute_query(&step.text, &step.params, &step.expect)
-                        .await?;
-                    self.validate_expectations(&result, &step.expect)?;
-                    Ok(())
+                    match self.execute_query(&step.text, &step.params, &step.expect).await {
+                        Ok(result) => self.validate_expectations(&result, &step.expect),
+                        Err(e) => Err(e),
+                    }
                 }
                 _ => {
                     if self.verbose {

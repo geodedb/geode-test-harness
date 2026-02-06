@@ -9,25 +9,29 @@ const fs = require('fs');
 const path = require('path');
 const yaml = require('yaml');
 
-// Try to load the Geode client from various locations
-let GeodeClient;
-try {
-    // First try the installed package
-    GeodeClient = require('@geode/client');
-} catch (e) {
-    // Try loading from sibling directory
-    const clientPath = path.join(__dirname, '..', '..', 'geode-client-nodejs', 'dist');
+// Load the Geode client dynamically (ESM module)
+let createClient;
+
+async function loadGeodeClient() {
     try {
-        GeodeClient = require(clientPath);
-    } catch (e2) {
-        console.error('Error: Geode Node.js client not found.');
-        console.error('Install it from: npm install @geode/client');
-        console.error('Or ensure ../geode-client-nodejs/dist exists');
-        process.exit(1);
+        // First try the installed package
+        const mod = await import('@geode/client');
+        return mod.createClient || mod.default?.createClient;
+    } catch (e) {
+        // Try loading from sibling directory
+        const clientPath = path.join(__dirname, '..', '..', 'geode-client-nodejs', 'dist', 'index.js');
+        try {
+            const mod = await import(clientPath);
+            return mod.createClient || mod.default?.createClient;
+        } catch (e2) {
+            console.error('Error: Geode Node.js client not found.');
+            console.error('Install it from: npm install @geode/client');
+            console.error('Or ensure ../geode-client-nodejs/dist exists');
+            console.error('Details:', e2.message);
+            process.exit(1);
+        }
     }
 }
-
-const { createClient } = GeodeClient;
 
 // Default admin credentials for testing
 const DEFAULT_USERNAME = 'geode';
@@ -614,6 +618,9 @@ async function main() {
         console.error('ERROR: --spec is required');
         process.exit(2);
     }
+
+    // Load ESM client module
+    createClient = await loadGeodeClient();
 
     // Load spec
     let spec;
