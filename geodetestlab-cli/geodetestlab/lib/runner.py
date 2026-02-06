@@ -152,8 +152,9 @@ def run_tests(
     Tuple[int, Dict[str, Any]]
         Exit code (0 for success, 1 for failures) and summary dictionary.
     """
-    # Clean up any stale Geode servers from previous runs
-    _kill_stale_servers()
+    # NOTE: _kill_stale_servers() is intentionally NOT called here.
+    # It must only be called once before parallel workers start, not
+    # inside each worker. See cli.py run() for the single invocation.
 
     summary = RunSummary()
     start_time = time.time()
@@ -203,6 +204,7 @@ def run_tests(
             )
 
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
+        env["PORT"] = str(port)
         env["data_dir"] = str(data_dir)
 
     # Set up signal handler for graceful shutdown in worker processes
@@ -279,6 +281,38 @@ def run_tests(
                 )
                 summary.passed += 1
             else:
+                # Check if server is still alive before running the test
+                # (server may have crashed due to QUIC memory bugs)
+                if server_process and server_process.poll() is not None:
+                    if verbose:
+                        print(f"  Server crashed (exit code {server_process.returncode}), restarting...")
+                    # Clean up old server
+                    if server_process in _active_servers:
+                        _active_servers.remove(server_process)
+                    try:
+                        server_process = _start_server(
+                            binary=binary,
+                            data_dir=data_dir,
+                            port=port,
+                            env=env,
+                            args=spec.server_args,
+                            timeout_ms=server_timeout_ms,
+                            verbose=verbose,
+                        )
+                    except RunnerError as e:
+                        if verbose:
+                            print(f"  Failed to restart server: {e}")
+                        # Mark remaining tests as failed
+                        result = TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=0,
+                            error=f"Server crashed and failed to restart: {e}",
+                        )
+                        summary.failed += 1
+                        summary.results.append(result)
+                        continue
+
                 result = _run_single_test(
                     test_case=test_case,
                     binary=binary,
@@ -288,6 +322,26 @@ def run_tests(
                     data_dir=data_dir,
                     verbose=verbose,
                 )
+
+                # If test failed with connection timeout and server is dead, restart server
+                if not result.passed and "connection timeout" in (result.error or "") and server_process:
+                    if server_process.poll() is not None:
+                        if verbose:
+                            print(f"  Server died during test, restarting for next test...")
+                        if server_process in _active_servers:
+                            _active_servers.remove(server_process)
+                        try:
+                            server_process = _start_server(
+                                binary=binary,
+                                data_dir=data_dir,
+                                port=port,
+                                env=env,
+                                args=spec.server_args,
+                                timeout_ms=server_timeout_ms,
+                                verbose=verbose,
+                            )
+                        except RunnerError:
+                            pass  # Will be caught at the top of the next iteration
 
                 if result.passed:
                     summary.passed += 1
@@ -539,6 +593,24 @@ def _run_cli_test(
     """Run a CLI test case."""
     start_time = time.time()
 
+    # Create setup files if defined (e.g., for --file flag tests)
+    if test_case.setup_files:
+        for file_spec in test_case.setup_files:
+            file_path = file_spec.get("path", "")
+            file_content = file_spec.get("content", "")
+            if file_path and file_content:
+                try:
+                    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+                    with open(file_path, "w") as f:
+                        f.write(file_content)
+                except Exception as e:
+                    return TestResult(
+                        name=test_case.name,
+                        passed=False,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        error=f"Failed to create setup file {file_path}: {e}",
+                    )
+
     # Get authentication credentials from environment
     admin_password = env.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
@@ -563,19 +635,56 @@ def _run_cli_test(
         cmd.extend(["--insecure"])
         cmd.extend(["-U", "geode", "-P", admin_password])
     elif test_case.command:
-        # Shell command test
-        cmd = [test_case.command]
-        args = _substitute_variables(test_case.args, env, secrets, data_dir)
-        cmd.extend(args)
+        # Substitute variables in command string
+        command_str = test_case.command
+        # Replace relative geode binary paths with the resolved binary path
+        # Process longer paths first to avoid partial matches, and only replace once
+        for geode_path in ["./zig-out/bin/geode", "zig-out/bin/geode"]:
+            if geode_path in command_str:
+                command_str = command_str.replace(geode_path, binary, 1)
+                break  # Only replace the first matching pattern once
+        if data_dir:
+            command_str = command_str.replace("${data_dir}", str(data_dir))
+        for key, value in env.items():
+            command_str = command_str.replace(f"${{{key}}}", value)
+            command_str = command_str.replace(f"${{env:{key}}}", value)
+        for key, value in secrets.items():
+            command_str = command_str.replace(f"${{secret:{key}}}", value)
+
+        # Inject auth credentials if this is a query command without auth flags
+        if "query" in command_str and "-U" not in command_str and "-P" not in command_str:
+            # Find where to insert auth flags (before the trailing '-' if present, or at end)
+            command_str = command_str.strip()
+            if command_str.endswith(" -"):
+                command_str = command_str[:-2] + f" -U geode -P {admin_password} -"
+            else:
+                command_str += f" -U geode -P {admin_password}"
+
+        # Shell command test - detect shell metacharacters
+        shell_metacharacters = ["|", "&&", "||", ";", "$(", "`", ">", "<"]
+        if any(mc in command_str for mc in shell_metacharacters):
+            # Complex shell command - run through bash
+            args = _substitute_variables(test_case.args, env, secrets, data_dir)
+            if args:
+                command_str += " " + " ".join(args)
+            cmd = ["bash", "-c", command_str]
+        else:
+            import shlex
+            cmd = shlex.split(command_str)
+            args = _substitute_variables(test_case.args, env, secrets, data_dir)
+            cmd.extend(args)
     else:
         cmd = [binary]
         args = _substitute_variables(test_case.args, env, secrets, data_dir)
         cmd.extend(args)
         # If this is a query command via args, add server, insecure, and auth flags
         if args and args[0] == "query" and len(args) > 1:
-            cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
-            cmd.extend(["--insecure"])
-            cmd.extend(["-U", "geode", "-P", admin_password])
+            if "--server" not in args:
+                cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
+            if "--insecure" not in args:
+                cmd.extend(["--insecure"])
+            if "-U" not in args:
+                cmd.extend(["-U", "geode", "-P", admin_password])
 
     # Merge test-specific environment
     test_env = env.copy()
@@ -792,20 +901,17 @@ def _run_shell_test(
         stderr = result.stderr
         exit_code = result.returncode
 
-        # Check expected exit code
-        expected_exit_code = test_case.expected.exit_code
-        if expected_exit_code is None:
-            expected_exit_code = 0
-
-        # Handle both single int and list of valid exit codes
-        if isinstance(expected_exit_code, list):
-            passed = exit_code in expected_exit_code
-        else:
-            passed = exit_code == expected_exit_code
+        # Use full expectation checking (same as CLI tests)
+        passed = _check_expectations(
+            test_case=test_case,
+            output=stdout,
+            error=stderr,
+            exit_code=exit_code,
+        )
 
         if verbose:
             status = "PASS" if passed else "FAIL"
-            print(f"    Shell: exit_code={exit_code}, expected={expected_exit_code} [{status}]")
+            print(f"    Shell: exit_code={exit_code} [{status}]")
             if stdout.strip():
                 print(f"    stdout: {stdout.strip()[:200]}")
             if stderr.strip() and not passed:

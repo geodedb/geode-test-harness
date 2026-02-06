@@ -144,6 +144,13 @@ class ExpectedResult:
                 return value
             return [value]
 
+        # Support "contains" as shorthand for "stdout_contains"
+        stdout_contains = normalize_list(data.get("stdout_contains")) or normalize_list(data.get("contains"))
+        # Support "not_contains" as shorthand for "stdout_not_contains"
+        stdout_not_contains = normalize_list(data.get("stdout_not_contains")) or normalize_list(data.get("not_contains"))
+        # Support "regex" / "matches" as shorthand for "stdout_regex"
+        stdout_regex = normalize_list(data.get("stdout_regex")) or normalize_list(data.get("regex")) or normalize_list(data.get("matches"))
+
         return cls(
             status=data.get("status", "success"),
             result_contains=data.get("result_contains"),
@@ -151,11 +158,11 @@ class ExpectedResult:
             result_matches=data.get("result_matches"),
             error_contains=data.get("error_contains"),
             exit_code=data.get("exit_code"),
-            stdout_contains=normalize_list(data.get("stdout_contains")),
+            stdout_contains=stdout_contains,
             stderr_contains=normalize_list(data.get("stderr_contains")),
-            stdout_not_contains=normalize_list(data.get("stdout_not_contains")),
+            stdout_not_contains=stdout_not_contains,
             stderr_not_contains=normalize_list(data.get("stderr_not_contains")),
-            stdout_regex=normalize_list(data.get("stdout_regex")),
+            stdout_regex=stdout_regex,
             stderr_regex=normalize_list(data.get("stderr_regex")),
             stdout_exact=data.get("stdout_exact"),
             stderr_exact=data.get("stderr_exact"),
@@ -202,6 +209,8 @@ class TestCase:
     skip: bool = False
     skip_reason: str | None = None
     plaintext_check: PlaintextCheck = field(default_factory=PlaintextCheck)
+    # Setup files to create before running the test
+    setup_files: list[dict[str, str]] = field(default_factory=list)
     # HTTP test fields
     http_requests: list[HttpRequest] = field(default_factory=list)
     # Sequential test fields
@@ -239,6 +248,48 @@ class TestCase:
             expected_data = dict(expected_data)  # Make a copy to avoid mutation
             expected_data["stderr_exact"] = data["expected_stderr"]
 
+        # Support expected_output: {contains: [...]} legacy format
+        if "expected_output" in data:
+            if not isinstance(expected_data, dict):
+                expected_data = {}
+            expected_data = dict(expected_data)
+            eo = data["expected_output"]
+            if isinstance(eo, dict):
+                if "contains" in eo:
+                    existing = expected_data.get("stdout_contains") or []
+                    contains_val = eo["contains"]
+                    if isinstance(contains_val, list):
+                        existing.extend(contains_val)
+                    else:
+                        existing.append(contains_val)
+                    expected_data["stdout_contains"] = existing
+
+        # Support expected_output_contains at top level
+        if "expected_output_contains" in data:
+            if not isinstance(expected_data, dict):
+                expected_data = {}
+            expected_data = dict(expected_data)
+            eoc = data["expected_output_contains"]
+            existing = expected_data.get("stdout_contains") or []
+            if isinstance(eoc, list):
+                existing.extend(eoc)
+            else:
+                existing.append(eoc)
+            expected_data["stdout_contains"] = existing
+
+        # Support expected_output_pattern at top level
+        if "expected_output_pattern" in data:
+            if not isinstance(expected_data, dict):
+                expected_data = {}
+            expected_data = dict(expected_data)
+            eop = data["expected_output_pattern"]
+            existing = expected_data.get("stdout_regex") or []
+            if isinstance(eop, list):
+                existing.extend(eop)
+            else:
+                existing.append(eop)
+            expected_data["stdout_regex"] = existing
+
         # Determine test type
         test_type = data.get("type", "cli")
 
@@ -254,6 +305,12 @@ class TestCase:
             for step in data["steps"]:
                 steps.append(TestStep.from_dict(step))
 
+        # Parse setup files (files to create before running the test)
+        setup_files = []
+        setup_data = data.get("setup")
+        if isinstance(setup_data, dict) and "files" in setup_data:
+            setup_files = setup_data["files"]
+
         return cls(
             name=data["name"],
             description=data.get("description", ""),
@@ -267,6 +324,7 @@ class TestCase:
             skip=data.get("skip", False),
             skip_reason=data.get("skip_reason"),
             plaintext_check=PlaintextCheck.from_dict(plaintext_data),
+            setup_files=setup_files,
             http_requests=http_requests,
             steps=steps,
         )
@@ -330,9 +388,11 @@ class TestSpec:
         server_config = cli_config.get("server", {})
 
         # Determine mode: if cli.server.enabled is explicitly set, use it
-        # Otherwise fall back to legacy mode field
+        # Otherwise fall back to legacy mode field or skip_server flag
         if "server" in cli_config and "enabled" in server_config:
             mode = "server" if server_config.get("enabled", True) else "cli"
+        elif data.get("skip_server", False):
+            mode = "cli"
         else:
             mode = data.get("mode", "server")
 

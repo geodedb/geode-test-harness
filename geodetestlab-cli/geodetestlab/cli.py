@@ -23,7 +23,7 @@ from rich.table import Table
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib.runner import RunnerError, run_tests
+from lib.runner import RunnerError, _kill_stale_servers, run_tests
 from lib.spec import SpecValidationError, load_spec
 from lib.utils import SecretResolutionError, resolve_secrets
 from server.simple_manager import ServerManager
@@ -287,6 +287,11 @@ def run(
         if len(spec_files) > 1:
             parallel_msg = f" (parallel={parallel})" if parallel > 1 else ""
             console.print(f"[dim]Found {len(spec_files)} spec files to run{parallel_msg}[/dim]")
+
+    # Kill stale servers once before running any specs
+    # This must happen exactly once, not per-worker, to avoid
+    # parallel workers killing each other's servers.
+    _kill_stale_servers()
 
     # Aggregate results across all spec files
     total_exit_code = 0

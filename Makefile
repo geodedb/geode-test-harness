@@ -452,8 +452,10 @@ geodetestlab-setup:
 	@$(GEODETESTLAB_PIP) install -e $(GEODETESTLAB_CLI)
 	@echo "geodetestlab-cli setup complete"
 
-# Number of parallel workers for CLI tests (default: number of CPU cores)
-PARALLEL_WORKERS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+# Number of parallel workers for CLI tests
+# Cap at 4 to prevent QUIC server crashes from too many simultaneous
+# server instances (QUIC memory bugs cause double-free under high load)
+PARALLEL_WORKERS ?= $(shell echo $$(( $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) > 4 ? 4 : $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )))
 
 # Run geodetestlab CLI tests (requires server)
 test-cli: geodetestlab-setup
