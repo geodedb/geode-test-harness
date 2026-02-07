@@ -1,0 +1,227 @@
+version: '1.0'
+name: Auto-Index ID Advanced Tests
+description: Advanced scenarios for automatic btree index creation on the id property
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+tests:
+- name: auto-idx-adv-bulk-create
+  description: Bulk creation with multiple nodes creates auto-indexes for all labels
+  args:
+  - query
+  - "CREATE (a:AdvCity {id: 1, name: 'NYC'}), (b:AdvCountry {id: 1, name: 'USA'})"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - advanced
+  - bulk
+
+- name: auto-idx-adv-bulk-indexes-visible
+  description: Both auto-indexes are visible after bulk create
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AdvCity_id"
+  tags:
+  - auto-index
+  - advanced
+  - bulk
+
+- name: auto-idx-adv-country-index-visible
+  description: Country auto-index also visible
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AdvCountry_id"
+  tags:
+  - auto-index
+  - advanced
+  - bulk
+
+- name: auto-idx-adv-insert-trigger
+  description: INSERT statement triggers auto-index
+  args:
+  - query
+  - "INSERT (n:AdvAnimal {id: 42, name: 'Dog'})"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - advanced
+  - insert
+
+- name: auto-idx-adv-insert-index-visible
+  description: Auto-index created by INSERT is visible
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AdvAnimal_id"
+  tags:
+  - auto-index
+  - advanced
+  - insert
+
+- name: auto-idx-adv-merge-trigger
+  description: MERGE statement triggers auto-index when creating new node
+  args:
+  - query
+  - "MERGE (n:AdvFruit {id: 7, name: 'Apple'})"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - advanced
+  - merge
+
+- name: auto-idx-adv-merge-index-visible
+  description: Auto-index created by MERGE is visible
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AdvFruit_id"
+  tags:
+  - auto-index
+  - advanced
+  - merge
+
+- name: auto-idx-adv-integer-id-lookup
+  description: Integer id lookup works with auto-index
+  args:
+  - query
+  - "MATCH (n:AdvCity) WHERE n.id = 1 RETURN n.name AS name"
+  expect:
+    exit_code: 0
+    result_contains: "NYC"
+  tags:
+  - auto-index
+  - advanced
+  - lookup
+
+- name: auto-idx-adv-relationship-chain
+  description: Relationship chain creation creates indexes for all labels and edge types
+  args:
+  - query
+  - "CREATE (a:AdvPerson {id: 1, name: 'Eve'})-[r:ADV_LIVES_IN {id: 1}]->(b:AdvPlace {id: 1, name: 'London'})"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - advanced
+  - chain
+
+- name: auto-idx-adv-chain-person-index
+  description: Person auto-index from chain creation
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AdvPerson_id"
+  tags:
+  - auto-index
+  - advanced
+  - chain
+
+- name: auto-idx-adv-chain-place-index
+  description: Place auto-index from chain creation
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AdvPlace_id"
+  tags:
+  - auto-index
+  - advanced
+  - chain
+
+- name: auto-idx-adv-chain-edge-index
+  description: Edge type auto-index from chain creation
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_ADV_LIVES_IN_id"
+  tags:
+  - auto-index
+  - advanced
+  - chain
+
+- name: auto-idx-adv-explain-index-seek
+  description: EXPLAIN detects IndexSeek when WHERE clause matches auto-index
+  args:
+  - query
+  - "EXPLAIN MATCH (n:AdvCity) WHERE n.id = 1 RETURN n"
+  expect:
+    exit_code: 0
+    stdout_contains: "IndexSeek"
+  tags:
+  - auto-index
+  - advanced
+  - explain
+
+- name: auto-idx-adv-explain-no-label-full-scan
+  description: EXPLAIN shows Scan (not IndexSeek) when no label is specified (no index available)
+  args:
+  - query
+  - "EXPLAIN MATCH (n) WHERE n.id = 1 RETURN n"
+  expect:
+    exit_code: 0
+    stdout_contains: "Scan"
+    stdout_not_contains: "IndexSeek"
+  tags:
+  - auto-index
+  - advanced
+  - explain
+
+- name: auto-idx-adv-explain-inline-prop-index
+  description: EXPLAIN detects IndexSeek for inline property matching too
+  args:
+  - query
+  - "EXPLAIN MATCH (n:AdvCity {id: 1}) RETURN n"
+  expect:
+    exit_code: 0
+    stdout_contains: "IndexSeek"
+  tags:
+  - auto-index
+  - advanced
+  - explain
+
+- name: auto-idx-adv-cleanup
+  description: Clean up advanced test data
+  args:
+  - query
+  - "MATCH (n) WHERE n.name IN ['NYC', 'USA', 'Dog', 'Apple', 'Eve', 'London'] DETACH DELETE n"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - advanced
+  - cleanup
+
+tags:
+- auto-index
+- advanced
+- index

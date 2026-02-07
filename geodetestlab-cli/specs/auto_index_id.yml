@@ -1,0 +1,173 @@
+version: '1.0'
+name: Auto-Index ID Tests
+description: Tests for automatic btree index creation on the id property when nodes/edges are created
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+tests:
+- name: auto-idx-create-node
+  description: CREATE node triggers auto-index creation
+  args:
+  - query
+  - "CREATE (n:AutoIdxPerson {id: 1, name: 'Alice'})"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - create
+
+- name: auto-idx-show-indexes
+  description: Auto-index visible in SHOW INDEXES
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AutoIdxPerson_id"
+  tags:
+  - auto-index
+  - show
+
+- name: auto-idx-query-by-id
+  description: Query by id property works
+  args:
+  - query
+  - "MATCH (n:AutoIdxPerson) WHERE n.id = 1 RETURN n.name AS name"
+  expect:
+    exit_code: 0
+    result_contains: "Alice"
+  tags:
+  - auto-index
+  - query
+
+- name: auto-idx-idempotent
+  description: Creating more nodes does not create duplicate indexes
+  args:
+  - query
+  - "CREATE (n:AutoIdxPerson {id: 2, name: 'Bob'})"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - idempotent
+
+- name: auto-idx-query-second
+  description: Query second node by id
+  args:
+  - query
+  - "MATCH (n:AutoIdxPerson) WHERE n.id = 2 RETURN n.name AS name"
+  expect:
+    exit_code: 0
+    result_contains: "Bob"
+  tags:
+  - auto-index
+  - query
+
+- name: auto-idx-multiple-labels
+  description: Different labels get separate auto-indexes
+  args:
+  - query
+  - "CREATE (c:AutoIdxCompany {id: 10, name: 'Acme'})"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - labels
+
+- name: auto-idx-company-visible
+  description: Company auto-index visible
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AutoIdxCompany_id"
+  tags:
+  - auto-index
+  - show
+
+- name: auto-idx-edge-create
+  description: Edge creation triggers auto-index
+  args:
+  - query
+  - "MATCH (a:AutoIdxPerson {id: 1}), (b:AutoIdxPerson {id: 2}) CREATE (a)-[r:AUTOKNOWS {id: 100}]->(b)"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - edge
+
+- name: auto-idx-edge-visible
+  description: Edge auto-index visible
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AUTOKNOWS_id"
+  tags:
+  - auto-index
+  - edge
+  - show
+
+- name: auto-idx-manual-compat
+  description: Manual CREATE INDEX IF NOT EXISTS does not conflict with auto-index
+  args:
+  - query
+  - "CREATE INDEX IF NOT EXISTS auto_idx_AutoIdxPerson_id ON AutoIdxPerson(id)"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - compat
+
+- name: auto-idx-no-id-still-created
+  description: Node without id property still gets auto-index for label
+  args:
+  - query
+  - "CREATE (n:AutoIdxNoId {name: 'NoId'})"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - no-id
+
+- name: auto-idx-no-id-index-exists
+  description: Auto-index exists even without id property on node
+  args:
+  - query
+  - "SHOW INDEXES"
+  expect:
+    exit_code: 0
+    stdout_contains: "auto_idx_AutoIdxNoId_id"
+  tags:
+  - auto-index
+  - no-id
+  - show
+
+- name: auto-idx-cleanup
+  description: Clean up test data
+  args:
+  - query
+  - "MATCH (n) WHERE n.name IN ['Alice', 'Bob', 'Acme', 'NoId'] DETACH DELETE n"
+  expect:
+    exit_code: 0
+  tags:
+  - auto-index
+  - cleanup
+
+tags:
+- auto-index
+- index
