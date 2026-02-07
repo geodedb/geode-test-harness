@@ -1154,21 +1154,50 @@ def _check_expectations(
 
     # Check result contains (legacy format - single string or list)
     if expected.result_contains:
-        if isinstance(expected.result_contains, list):
-            for item in expected.result_contains:
-                if item not in output:
+        if isinstance(expected.result_contains, dict):
+            # Dict: check each key-value pair appears in output
+            for k, v in expected.result_contains.items():
+                if str(k) not in output or str(v) not in output:
                     return False
-        elif expected.result_contains not in output:
-            return False
+        elif isinstance(expected.result_contains, list):
+            for item in expected.result_contains:
+                if isinstance(item, dict):
+                    for k, v in item.items():
+                        if str(k) not in output or str(v) not in output:
+                            return False
+                else:
+                    if str(item) not in output:
+                        return False
+        else:
+            if str(expected.result_contains) not in output:
+                return False
 
     # Check result not contains (legacy format - single string or list)
     if expected.result_not_contains:
-        if isinstance(expected.result_not_contains, list):
+        if isinstance(expected.result_not_contains, dict):
+            all_found = True
+            for k, v in expected.result_not_contains.items():
+                if str(k) not in output or str(v) not in output:
+                    all_found = False
+                    break
+            if all_found:
+                return False
+        elif isinstance(expected.result_not_contains, list):
             for item in expected.result_not_contains:
-                if item in output:
-                    return False
-        elif expected.result_not_contains in output:
-            return False
+                if isinstance(item, dict):
+                    all_found = True
+                    for k, v in item.items():
+                        if str(k) not in output or str(v) not in output:
+                            all_found = False
+                            break
+                    if all_found:
+                        return False
+                else:
+                    if str(item) in output:
+                        return False
+        else:
+            if str(expected.result_not_contains) in output:
+                return False
 
     # Check result matches (legacy format - single regex or list)
     if expected.result_matches:
@@ -1183,34 +1212,59 @@ def _check_expectations(
     if expected.error_contains:
         if isinstance(expected.error_contains, list):
             for item in expected.error_contains:
-                if item not in error:
+                if str(item) not in error:
                     return False
-        elif expected.error_contains not in error:
-            return False
+        else:
+            if str(expected.error_contains) not in error:
+                return False
 
     # Check stdout_contains (list of substrings that must ALL be present)
     # Note: Geode CLI often outputs to stderr, so we also check stderr as fallback
     if expected.stdout_contains:
-        for substring in expected.stdout_contains:
-            # Check stdout first, then stderr as fallback
-            if substring not in output and substring not in error:
-                return False
+        combined = output + error
+        for item in expected.stdout_contains:
+            if isinstance(item, dict):
+                # Dict items represent expected key-value pairs in result rows.
+                # Check that each key and its stringified value appear in the output.
+                for k, v in item.items():
+                    k_str = str(k)
+                    v_str = str(v)
+                    if k_str not in combined or v_str not in combined:
+                        return False
+            else:
+                substring = str(item) if not isinstance(item, str) else item
+                # Check stdout first, then stderr as fallback
+                if substring not in output and substring not in error:
+                    return False
 
     # Check stderr_contains (list of substrings that must ALL be present)
     if expected.stderr_contains:
-        for substring in expected.stderr_contains:
+        for item in expected.stderr_contains:
+            substring = str(item) if not isinstance(item, str) else item
             if substring not in error:
                 return False
 
     # Check stdout_not_contains (list of substrings that must NOT be present)
     if expected.stdout_not_contains:
-        for substring in expected.stdout_not_contains:
-            if substring in output:
-                return False
+        for item in expected.stdout_not_contains:
+            if isinstance(item, dict):
+                # For not_contains with dicts, fail if ALL key-value pairs are found
+                all_found = True
+                for k, v in item.items():
+                    if str(k) not in output or str(v) not in output:
+                        all_found = False
+                        break
+                if all_found:
+                    return False
+            else:
+                substring = str(item) if not isinstance(item, str) else item
+                if substring in output:
+                    return False
 
     # Check stderr_not_contains (list of substrings that must NOT be present)
     if expected.stderr_not_contains:
-        for substring in expected.stderr_not_contains:
+        for item in expected.stderr_not_contains:
+            substring = str(item) if not isinstance(item, str) else item
             if substring in error:
                 return False
 
