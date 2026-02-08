@@ -125,6 +125,7 @@ def run_tests(
     geode_binary: str | None = None,
     server_port: int | None = None,
     verbose: bool = False,
+    transport: str = "quic",
 ) -> tuple[int, dict[str, Any]]:
     """Run all tests defined in a specification.
 
@@ -191,6 +192,11 @@ def run_tests(
                     if verbose:
                         print(f"  pre_server[{i}] warning: {e}")
 
+        # Allocate gRPC port if needed
+        grpc_port = None
+        if transport == "grpc":
+            grpc_port = get_free_port()
+
         # Start server
         if not dry_run:
             server_process = _start_server(
@@ -201,11 +207,15 @@ def run_tests(
                 args=spec.server_args,
                 timeout_ms=server_timeout_ms,
                 verbose=verbose,
+                grpc_port=grpc_port,
             )
 
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
         env["PORT"] = str(port)
         env["data_dir"] = str(data_dir)
+        env["GEODE_TRANSPORT"] = transport
+        if grpc_port:
+            env["GEODE_GRPC_ADDRESS"] = f"127.0.0.1:{grpc_port}"
 
     # Set up signal handler for graceful shutdown in worker processes
     interrupted = False
@@ -298,6 +308,7 @@ def run_tests(
                             args=spec.server_args,
                             timeout_ms=server_timeout_ms,
                             verbose=verbose,
+                            grpc_port=grpc_port,
                         )
                     except RunnerError as e:
                         if verbose:
@@ -339,6 +350,7 @@ def run_tests(
                                 args=spec.server_args,
                                 timeout_ms=server_timeout_ms,
                                 verbose=verbose,
+                                grpc_port=grpc_port,
                             )
                         except RunnerError:
                             pass  # Will be caught at the top of the next iteration
@@ -426,6 +438,7 @@ def _start_server(
     args: list[str],
     timeout_ms: int,
     verbose: bool,
+    grpc_port: int | None = None,
 ) -> subprocess.Popen:
     """Start a Geode server process."""
     cmd = [
@@ -438,6 +451,8 @@ def _start_server(
         "--log-level",
         "info" if verbose else "warn",
     ]
+    if grpc_port:
+        cmd.extend(["--listen-grpc", f"127.0.0.1:{grpc_port}"])
     cmd.extend(args)
 
     # Set environment variables for testing
@@ -477,8 +492,10 @@ def _start_server(
             )
 
         # Check if port is bound (try ss first, then netstat as fallback)
+        quic_ready = False
+        grpc_ready = grpc_port is None  # If no gRPC, consider it ready
         try:
-            # Try ss first (more commonly available on modern systems)
+            # Check QUIC (UDP) port
             result = subprocess.run(
                 ["ss", "-uln"],
                 capture_output=True,
@@ -486,8 +503,25 @@ def _start_server(
                 timeout=1.0,
             )
             if result.returncode == 0 and f":{port}" in result.stdout:
+                quic_ready = True
+
+            # Check gRPC (TCP) port if needed
+            if grpc_port and not grpc_ready:
+                result = subprocess.run(
+                    ["ss", "-tln"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1.0,
+                )
+                if result.returncode == 0 and f":{grpc_port}" in result.stdout:
+                    grpc_ready = True
+
+            if quic_ready and grpc_ready:
                 if verbose:
-                    print(f"Server ready on port {port}")
+                    msg = f"Server ready on port {port}"
+                    if grpc_port:
+                        msg += f" (gRPC on {grpc_port})"
+                    print(msg)
                 return process
         except FileNotFoundError:
             # ss not available, try netstat
@@ -614,6 +648,13 @@ def _run_cli_test(
     # Get authentication credentials from environment
     admin_password = env.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
+    # Transport-aware server address and flags
+    use_grpc = env.get("GEODE_TRANSPORT") == "grpc"
+    if use_grpc:
+        server_addr = env.get("GEODE_GRPC_ADDRESS", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3142"))
+    else:
+        server_addr = env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")
+
     # Determine if this is a query test or command test
     # Helper to detect if a string looks like a GQL query
     def _is_gql_query(text: str) -> bool:
@@ -625,14 +666,20 @@ def _run_cli_test(
 
     if test_case.query:
         cmd = [binary, "query", test_case.query]
-        cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
-        cmd.extend(["--insecure"])
+        cmd.extend(["--server", server_addr])
+        if use_grpc:
+            cmd.append("--grpc")
+        else:
+            cmd.extend(["--insecure"])
         cmd.extend(["-U", "geode", "-P", admin_password])
     elif test_case.command and _is_gql_query(test_case.command):
         # Command field contains GQL - route to query handler
         cmd = [binary, "query", test_case.command]
-        cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
-        cmd.extend(["--insecure"])
+        cmd.extend(["--server", server_addr])
+        if use_grpc:
+            cmd.append("--grpc")
+        else:
+            cmd.extend(["--insecure"])
         cmd.extend(["-U", "geode", "-P", admin_password])
     elif test_case.command:
         # Substitute variables in command string
@@ -660,6 +707,15 @@ def _run_cli_test(
             else:
                 command_str += f" -U geode -P {admin_password}"
 
+        # Inject gRPC transport flag for query commands
+        if use_grpc and "query" in command_str and "--grpc" not in command_str:
+            command_str += " --grpc"
+            # Replace server address with gRPC address if present
+            quic_addr = env.get("GEODE_SERVER_ADDRESS", "")
+            grpc_addr = env.get("GEODE_GRPC_ADDRESS", "")
+            if quic_addr and grpc_addr and quic_addr in command_str:
+                command_str = command_str.replace(quic_addr, grpc_addr)
+
         # Shell command test - detect shell metacharacters
         shell_metacharacters = ["|", "&&", "||", ";", "$(", "`", ">", "<"]
         if any(mc in command_str for mc in shell_metacharacters):
@@ -680,8 +736,10 @@ def _run_cli_test(
         # If this is a query command via args, add server, insecure, and auth flags
         if args and args[0] == "query" and len(args) > 1:
             if "--server" not in args:
-                cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
-            if "--insecure" not in args:
+                cmd.extend(["--server", server_addr])
+            if use_grpc and "--grpc" not in args:
+                cmd.append("--grpc")
+            elif not use_grpc and "--insecure" not in args:
                 cmd.extend(["--insecure"])
             if "-U" not in args:
                 cmd.extend(["-U", "geode", "-P", admin_password])
@@ -1015,6 +1073,13 @@ def _run_sequential_test(
     # Get authentication credentials from environment
     admin_password = env.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
+    # Transport-aware server address and flags
+    use_grpc = env.get("GEODE_TRANSPORT") == "grpc"
+    if use_grpc:
+        server_addr = env.get("GEODE_GRPC_ADDRESS", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3142"))
+    else:
+        server_addr = env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")
+
     try:
         # Create an HTTP client for HTTP steps
         with httpx.Client(timeout=30.0, verify=False) as http_client:
@@ -1058,8 +1123,11 @@ def _run_sequential_test(
                 elif step.step_type == "gql":
                     # Execute GQL query step
                     cmd = [binary, "query", step.query or ""]
-                    cmd.extend(["--server", env.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")])
-                    cmd.extend(["--insecure"])
+                    cmd.extend(["--server", server_addr])
+                    if use_grpc:
+                        cmd.append("--grpc")
+                    else:
+                        cmd.extend(["--insecure"])
                     cmd.extend(["-U", "geode", "-P", admin_password])
 
                     result = subprocess.run(
