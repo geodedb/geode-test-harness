@@ -17,7 +17,7 @@ variables:
   # Docker registry authentication
   DOCKER_AUTH_CONFIG: '{"auths":{"registry.gitlab.com":{"auth":"${CI_REGISTRY_AUTH}"}}}'
   # Zig version — bump here to update all jobs
-  ZIG_VERSION: "0.15.1"
+  ZIG_VERSION: "0.15.2"
   # glab CLI version
   GLAB_VERSION: "1.36.0"
 
@@ -397,11 +397,15 @@ analyze-coverage:
   needs:
     - job: test-all
       artifacts: true
+      optional: true
   script:
     - pip install pyyaml
     - |
       python3 -c "
-      import json
+      import json, os, sys
+      if not os.path.exists('reports/results.json'):
+          print('No results file found, skipping coverage analysis')
+          sys.exit(0)
       with open('reports/results.json') as f:
           data = json.load(f)
       summary = data.get('summary', {})
@@ -456,11 +460,19 @@ generate-html-report:
   needs:
     - job: test-all
       artifacts: true
+      optional: true
     - job: triage-failures
       artifacts: true
       optional: true
   script:
     - pip install pyyaml
+    - |
+      if [ ! -f reports/results.json ]; then
+        echo "No results file, skipping report"
+        mkdir -p public
+        echo "<html><body><p>No test results available</p></body></html>" > public/index.html
+        exit 0
+      fi
     - mkdir -p public
     - |
       python3 << 'PYTHON_SCRIPT'
