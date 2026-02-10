@@ -49,7 +49,7 @@ class TestExpectations:
     server_responsive: bool | None = None
 
 
-def _extract_rows_from_geode_output(data: Any) -> list[dict] | None:
+def _extract_rows_from_geode_output(data: Any) -> list[dict[str, Any]] | None:
     """Extract rows from various Geode output formats.
 
     Parameters
@@ -59,7 +59,7 @@ def _extract_rows_from_geode_output(data: Any) -> list[dict] | None:
 
     Returns
     -------
-    list[dict] | None
+    list[dict[str, Any]] | None
         Extracted rows, or None if format is unrecognized.
     """
     if isinstance(data, list):
@@ -68,7 +68,7 @@ def _extract_rows_from_geode_output(data: Any) -> list[dict] | None:
     if isinstance(data, dict):
         for key in ("results", "rows", "data"):
             if key in data and isinstance(data[key], list):
-                return data[key]
+                return data[key]  # type: ignore[no-any-return]
 
     return None
 

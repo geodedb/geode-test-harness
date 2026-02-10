@@ -330,7 +330,7 @@ WITH ["Alice", "Bob", "Carol"] AS names UNWIND names AS name CREATE (p:Person {{
             response = client.post(url, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            return str(data["choices"][0]["message"]["content"])
 
     def _parse_response(self, response_text: str, max_cases: int) -> list[list[str]]:
         """Parse API response into argument arrays."""

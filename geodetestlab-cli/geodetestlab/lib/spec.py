@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 
 class SpecValidationError(Exception):
@@ -36,7 +36,7 @@ class HttpExpected:
         if data is None:
             return cls()
 
-        def normalize_list(value: Any) -> list[str] | None:
+        def normalize_list(value: Any) -> list[Any] | None:
             if value is None:
                 return None
             if isinstance(value, list):
@@ -115,14 +115,14 @@ class ExpectedResult:
     """Expected result for a test case."""
 
     status: str = "success"
-    result_contains: str | None = None
-    result_not_contains: str | None = None
-    result_matches: str | None = None
-    error_contains: str | None = None
+    result_contains: str | list[Any] | dict[str, Any] | None = None
+    result_not_contains: str | list[Any] | dict[str, Any] | None = None
+    result_matches: str | list[str] | None = None
+    error_contains: str | list[str] | None = None
     exit_code: int | list[int] | None = None
-    stdout_contains: list[str] | None = None
+    stdout_contains: list[str | dict[str, Any]] | None = None
     stderr_contains: list[str] | None = None
-    stdout_not_contains: list[str] | None = None
+    stdout_not_contains: list[str | dict[str, Any]] | None = None
     stderr_not_contains: list[str] | None = None
     stdout_regex: list[str] | None = None
     stderr_regex: list[str] | None = None
@@ -138,7 +138,7 @@ class ExpectedResult:
         """
 
         # Helper function to normalize list fields
-        def normalize_list(value: Any) -> list[str] | None:
+        def normalize_list(value: Any) -> list[Any] | None:
             if value is None:
                 return None
             if isinstance(value, list):
@@ -370,7 +370,7 @@ class TestSpec:
     env: dict[str, str] = field(default_factory=dict)
     secrets: dict[str, SecretConfig] = field(default_factory=dict)
     tests: list[TestCase] = field(default_factory=list)
-    setup: list[str] | None = None
+    setup: list[str | dict[str, Any]] | None = None
     teardown: list[str] | None = None
     pre_server: list[str] | None = None  # Shell commands to run before server starts
     tde_config: dict[str, Any] | None = None

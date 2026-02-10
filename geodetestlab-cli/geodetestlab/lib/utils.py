@@ -217,7 +217,7 @@ def _replace_placeholder(text: str, secrets: dict[str, str]) -> str:
         If a referenced secret is not defined.
     """
 
-    def replacer(match: re.Match) -> str:
+    def replacer(match: re.Match[str]) -> str:
         name = match.group(1)
         if name not in secrets:
             raise KeyError(f"Secret '{name}' is not defined")

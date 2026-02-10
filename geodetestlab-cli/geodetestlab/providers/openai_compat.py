@@ -106,7 +106,7 @@ class OpenAICompatProvider:
             response = client.post(url, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            return str(data["choices"][0]["message"]["content"])
 
     def _build_geode_prompt(self, base_prompt: str, max_cases: int) -> str:
         """Build a Geode-specific prompt for general CLI fuzzing."""

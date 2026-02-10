@@ -18,14 +18,14 @@ from geodetestlab.lib.utils import (
 )
 
 
-def test_sanitize_args_valid():
+def test_sanitize_args_valid() -> None:
     """Test argument sanitization with valid arguments."""
     args = ["geode", "query", "RETURN 1", "--format", "json"]
     sanitized = sanitize_args(args)
     assert sanitized == args
 
 
-def test_sanitize_args_invalid_chars():
+def test_sanitize_args_invalid_chars() -> None:
     """Test argument sanitization with invalid characters."""
     with pytest.raises(ValueError, match="Invalid character"):
         sanitize_args(["geode", "query; rm -rf /"])
@@ -34,7 +34,7 @@ def test_sanitize_args_invalid_chars():
         sanitize_args(["geode", "query", "RETURN 1 | cat"])
 
 
-def test_sanitize_args_nonprintable():
+def test_sanitize_args_nonprintable() -> None:
     """Test argument sanitization with non-printable characters."""
     with pytest.raises(ValueError, match="Non\u2011printable character"):
         sanitize_args(["arg\x00null"])
@@ -43,7 +43,7 @@ def test_sanitize_args_nonprintable():
         sanitize_args(["arg\x1fcontrol"])
 
 
-def test_replace_placeholder():
+def test_replace_placeholder() -> None:
     """Test secret placeholder replacement."""
     secrets = {"token": "secret123", "password": "pass456"}
 
@@ -64,7 +64,7 @@ def test_replace_placeholder():
         _replace_placeholder("${secret:missing}", secrets)
 
 
-def test_resolve_secrets_env():
+def test_resolve_secrets_env() -> None:
     """Test secret resolution from environment variables."""
     spec = TestSpec(
         name="test-spec",
@@ -87,7 +87,7 @@ def test_resolve_secrets_env():
         del os.environ["TEST_TOKEN"]
 
 
-def test_resolve_secrets_missing_required():
+def test_resolve_secrets_missing_required() -> None:
     """Test error when required secret is missing."""
     spec = TestSpec(
         name="test-spec",
@@ -100,13 +100,13 @@ def test_resolve_secrets_missing_required():
         resolve_secrets(spec)
 
 
-def test_get_free_port():
+def test_get_free_port() -> None:
     """Test free port allocation."""
     port = get_free_port()
     assert 1024 <= port <= 65535
 
 
-def test_is_valid_gql():
+def test_is_valid_gql() -> None:
     """Test GQL query validation."""
     # Valid queries
     assert is_valid_gql("MATCH (n) RETURN n") is True
@@ -124,7 +124,7 @@ def test_is_valid_gql():
     assert is_valid_gql("MATCH [n) RETURN n") is False
 
 
-def test_extract_json_from_output():
+def test_extract_json_from_output() -> None:
     """Test JSON extraction from CLI output."""
     # Pure JSON
     output = '{"result": 42, "status": "success"}'
@@ -156,7 +156,7 @@ def test_extract_json_from_output():
     assert result is None
 
 
-def test_find_geode_binary_explicit():
+def test_find_geode_binary_explicit() -> None:
     """Test finding Geode binary with explicit path."""
     # Create a temporary executable file
     with tempfile.NamedTemporaryFile(mode="w", suffix="", delete=False) as f:
@@ -174,13 +174,13 @@ def test_find_geode_binary_explicit():
         os.unlink(temp_path)
 
 
-def test_find_geode_binary_not_found():
+def test_find_geode_binary_not_found() -> None:
     """Test error when Geode binary cannot be found."""
     with pytest.raises(FileNotFoundError):
         find_geode_binary("/nonexistent/path/to/geode")
 
 
-def test_find_geode_binary_environment():
+def test_find_geode_binary_environment() -> None:
     """Test finding Geode binary via environment variable."""
     # Create a temporary executable file
     with tempfile.NamedTemporaryFile(mode="w", suffix="", delete=False) as f:

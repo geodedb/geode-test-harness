@@ -7,7 +7,7 @@ from geodetestlab.providers.geode_ai import GeodeAIProvider
 from geodetestlab.providers.mock import MockProvider
 
 
-def test_get_mock_provider():
+def test_get_mock_provider() -> None:
     """Test getting mock provider."""
     provider = get_provider("mock")
     assert isinstance(provider, MockProvider)
@@ -16,7 +16,7 @@ def test_get_mock_provider():
     assert isinstance(provider, MockProvider)
 
 
-def test_get_geode_ai_provider():
+def test_get_geode_ai_provider() -> None:
     """Test getting Geode AI provider."""
     provider = get_provider("geode-ai", model="gpt-4")
     assert isinstance(provider, GeodeAIProvider)
@@ -28,13 +28,13 @@ def test_get_geode_ai_provider():
     assert isinstance(provider, GeodeAIProvider)
 
 
-def test_unknown_provider():
+def test_unknown_provider() -> None:
     """Test error on unknown provider."""
     with pytest.raises(ValueError, match="Unknown LLM provider"):
         get_provider("unknown_provider")
 
 
-def test_mock_provider_fuzz():
+def test_mock_provider_fuzz() -> None:
     """Test mock provider fuzzing."""
     provider = MockProvider()
 
@@ -58,7 +58,7 @@ def test_mock_provider_fuzz():
         assert all(isinstance(arg, str) for arg in case)
 
 
-def test_mock_provider_geode_patterns():
+def test_mock_provider_geode_patterns() -> None:
     """Test mock provider Geode-specific functionality."""
     provider = MockProvider()
 
@@ -78,7 +78,7 @@ def test_mock_provider_geode_patterns():
     assert len(complex_queries) > 0
 
 
-def test_geode_ai_provider_patterns():
+def test_geode_ai_provider_patterns() -> None:
     """Test Geode AI provider pattern generation."""
     provider = GeodeAIProvider()
 
@@ -109,7 +109,7 @@ def test_geode_ai_provider_patterns():
     assert "{property}" not in filled_gql
 
 
-def test_provider_error_handling():
+def test_provider_error_handling() -> None:
     """Test provider error handling."""
     provider = MockProvider()
 

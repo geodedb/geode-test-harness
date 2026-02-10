@@ -306,8 +306,8 @@ def run(
 
     # Aggregate results across all spec files
     total_exit_code = 0
-    aggregate_summary: dict = {"total": 0, "passed": 0, "failed": 0, "skipped": 0}
-    all_results: list[dict] = []
+    aggregate_summary: dict[str, int] = {"total": 0, "passed": 0, "failed": 0, "skipped": 0}
+    all_results: list[dict[str, Any]] = []
 
     # Run specs for each transport
     for current_transport in transports_to_run:
@@ -346,7 +346,7 @@ def run(
 
                 # Shutdown executor immediately
                 if executor:  # noqa: B023
-                    executor.shutdown(wait=False, cancel_futures=True)  # noqa: B023
+                    executor.shutdown(wait=False, cancel_futures=True)  # type: ignore[unreachable]  # noqa: B023
 
                 # Kill all geode and child processes to ensure cleanup
                 _kill_geode_processes()
@@ -391,7 +391,7 @@ def run(
                         result = future.result(timeout=1)
                     except Exception as exc:
                         if interrupted:
-                            break
+                            break  # type: ignore[unreachable]
                         console_err.print(f"Spec {spec_file} generated exception: {exc}", style="red")
                         total_exit_code = max(total_exit_code, 3)
                         continue
@@ -675,7 +675,7 @@ def server_status(
     console.print(table)
 
 
-def _show_rich_summary(summary: dict) -> None:
+def _show_rich_summary(summary: dict[str, int]) -> None:
     """Display a rich formatted summary of test results."""
     table = Table(title="Test Results Summary")
     table.add_column("Metric", style="cyan")

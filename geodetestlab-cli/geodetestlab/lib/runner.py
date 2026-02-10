@@ -261,6 +261,7 @@ def run_tests(
                     # Clean up old server
                     untrack_server(server_process)
                     try:
+                        assert data_dir is not None
                         server_process = start_server(
                             binary=binary,
                             data_dir=data_dir,
@@ -302,6 +303,7 @@ def run_tests(
                             print("  Server died during test, restarting for next test...")
                         untrack_server(server_process)
                         try:
+                            assert data_dir is not None
                             server_process = start_server(
                                 binary=binary,
                                 data_dir=data_dir,

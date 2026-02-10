@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ADMIN_PASSWORD = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
 # Global list to track server processes for cleanup on exit
-_active_servers: list[subprocess.Popen] = []
+_active_servers: list[subprocess.Popen[str]] = []
 
 
 class ServerError(Exception):
@@ -78,7 +78,7 @@ def start_server(
     timeout_ms: int,
     verbose: bool,
     grpc_port: int | None = None,
-) -> subprocess.Popen:
+) -> subprocess.Popen[str]:
     """Start a Geode server process.
 
     Returns the server process handle. Raises ``ServerError`` if the
@@ -190,7 +190,7 @@ def start_server(
     raise ServerError(f"Server failed to start within {timeout_s} seconds")
 
 
-def stop_server(process: subprocess.Popen, verbose: bool = False) -> None:
+def stop_server(process: subprocess.Popen[str], verbose: bool = False) -> None:
     """Stop a Geode server process."""
     if verbose:
         print("Stopping server...")
@@ -236,7 +236,7 @@ def stop_server(process: subprocess.Popen, verbose: bool = False) -> None:
         pass
 
 
-def untrack_server(process: subprocess.Popen) -> None:
+def untrack_server(process: subprocess.Popen[str]) -> None:
     """Remove a server process from the active tracking list."""
     if process in _active_servers:
         _active_servers.remove(process)

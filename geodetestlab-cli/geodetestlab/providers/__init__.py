@@ -38,9 +38,9 @@ def get_provider(name: str, model: str | None = None) -> LLMProvider:
     """
     norm = (name or "").strip().lower()
     if norm in {"mock", "none"}:
-        return MockProvider()  # type: ignore[return-value]
+        return MockProvider()
     if norm in {"openai", "openai_compat"}:
-        return OpenAICompatProvider(model=model)  # type: ignore[return-value]
+        return OpenAICompatProvider(model=model)
     if norm in {"geode-ai", "geode_ai", "geodai"}:
-        return GeodeAIProvider(model=model)  # type: ignore[return-value]
+        return GeodeAIProvider(model=model)
     raise ValueError(f"Unknown LLM provider: {name}")

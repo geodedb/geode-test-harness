@@ -1,5 +1,7 @@
 """Tests for assertion evaluation."""
 
+from typing import Any
+
 from geodetestlab.lib.assertions import (
     GeodeQueryAssert,
     StdoutJsonAssert,
@@ -9,7 +11,7 @@ from geodetestlab.lib.assertions import (
 )
 
 
-def test_exit_code_assertion():
+def test_exit_code_assertion() -> None:
     """Test exit code assertion."""
     expect = TestExpectations(exit_code=0)
     results = evaluate_assertions(expect, 0, "", "")
@@ -25,7 +27,7 @@ def test_exit_code_assertion():
     assert results[0]["ok"] is False
 
 
-def test_stdout_exact_assertion():
+def test_stdout_exact_assertion() -> None:
     """Test exact stdout matching."""
     expect = TestExpectations(stdout_exact="Hello, World!")
     results = evaluate_assertions(expect, 0, "Hello, World!", "")
@@ -39,7 +41,7 @@ def test_stdout_exact_assertion():
     assert results[0]["ok"] is False
 
 
-def test_stdout_contains_assertion():
+def test_stdout_contains_assertion() -> None:
     """Test stdout contains assertion."""
     expect = TestExpectations(stdout_contains=["Hello", "World"])
     results = evaluate_assertions(expect, 0, "Hello, beautiful World!", "")
@@ -54,7 +56,7 @@ def test_stdout_contains_assertion():
     assert results[1]["ok"] is False  # "World" not found
 
 
-def test_stdout_regex_assertion():
+def test_stdout_regex_assertion() -> None:
     """Test stdout regex assertion."""
     expect = TestExpectations(stdout_regex=[r"\d+", r"result:\s*\w+"])
     results = evaluate_assertions(expect, 0, "Found 42 items, result: success", "")
@@ -70,7 +72,7 @@ def test_stdout_regex_assertion():
     assert "error" in results[0]
 
 
-def test_stderr_assertions():
+def test_stderr_assertions() -> None:
     """Test stderr contains and regex assertions."""
     expect = TestExpectations(stderr_contains=["Error", "failed"], stderr_regex=[r"Error \d+", r"failed.*execution"])
 
@@ -82,7 +84,7 @@ def test_stderr_assertions():
     assert all(r["ok"] for r in results)
 
 
-def test_json_assert_equals():
+def test_json_assert_equals() -> None:
     """Test JSON assertion with equals."""
     json_assert = StdoutJsonAssert(expression="result.count", equals=42)
     expect = TestExpectations(stdout_json_assert=[json_assert])
@@ -96,7 +98,7 @@ def test_json_assert_equals():
     assert results[0]["extracted_value"] == 42
 
 
-def test_json_assert_not_equals():
+def test_json_assert_not_equals() -> None:
     """Test JSON assertion with not_equals."""
     json_assert = StdoutJsonAssert(expression="status", not_equals="error")
     expect = TestExpectations(stdout_json_assert=[json_assert])
@@ -109,7 +111,7 @@ def test_json_assert_not_equals():
     assert results[0]["extracted_value"] == "success"
 
 
-def test_json_assert_regex():
+def test_json_assert_regex() -> None:
     """Test JSON assertion with regex matching."""
     json_assert = StdoutJsonAssert(expression="message", matches_regex=r"completed in \d+ms")
     expect = TestExpectations(stdout_json_assert=[json_assert])
@@ -121,7 +123,7 @@ def test_json_assert_regex():
     assert results[0]["ok"] is True
 
 
-def test_json_assert_invalid_json():
+def test_json_assert_invalid_json() -> None:
     """Test JSON assertion with invalid JSON."""
     json_assert = StdoutJsonAssert(expression="result", equals=42)
     expect = TestExpectations(stdout_json_assert=[json_assert])
@@ -134,7 +136,7 @@ def test_json_assert_invalid_json():
     assert "error" in results[0]
 
 
-def test_geode_query_row_count():
+def test_geode_query_row_count() -> None:
     """Test Geode query row count assertion."""
     geode_assert = GeodeQueryAssert(row_count=2)
     expect = TestExpectations(geode_query=geode_assert)
@@ -149,7 +151,7 @@ def test_geode_query_row_count():
     assert row_count_result["actual"] == 2
 
 
-def test_geode_query_min_max_rows():
+def test_geode_query_min_max_rows() -> None:
     """Test Geode query min/max rows assertions."""
     geode_assert = GeodeQueryAssert(min_rows=1, max_rows=5)
     expect = TestExpectations(geode_query=geode_assert)
@@ -170,7 +172,7 @@ def test_geode_query_min_max_rows():
     assert max_result["actual"] == 3
 
 
-def test_geode_query_columns():
+def test_geode_query_columns() -> None:
     """Test Geode query columns assertion."""
     geode_assert = GeodeQueryAssert(columns=["id", "name"])
     expect = TestExpectations(geode_query=geode_assert)
@@ -184,7 +186,7 @@ def test_geode_query_columns():
     assert set(columns_result["expected"]) <= set(columns_result["actual"])
 
 
-def test_geode_query_contains_node():
+def test_geode_query_contains_node() -> None:
     """Test Geode query contains node assertion."""
     geode_assert = GeodeQueryAssert(contains_node={"name": "Alice", "age": 30})
     expect = TestExpectations(geode_query=geode_assert)
@@ -197,7 +199,7 @@ def test_geode_query_contains_node():
     assert node_result["ok"] is True
 
 
-def test_geode_query_execution_time():
+def test_geode_query_execution_time() -> None:
     """Test Geode query execution time assertion."""
     geode_assert = GeodeQueryAssert(execution_time_ms=1000)
     expect = TestExpectations(geode_query=geode_assert)
@@ -212,10 +214,10 @@ def test_geode_query_execution_time():
     assert time_result["actual_time_ms"] == 500
 
 
-def test_extract_rows_from_geode_output():
+def test_extract_rows_from_geode_output() -> None:
     """Test extracting rows from different Geode output formats."""
     # Standard results format
-    data = {"results": [{"id": 1}, {"id": 2}]}
+    data: Any = {"results": [{"id": 1}, {"id": 2}]}
     rows = _extract_rows_from_geode_output(data)
     assert rows == [{"id": 1}, {"id": 2}]
 
@@ -240,7 +242,7 @@ def test_extract_rows_from_geode_output():
     assert rows is None
 
 
-def test_server_responsive_assertion():
+def test_server_responsive_assertion() -> None:
     """Test server responsive assertion."""
     expect = TestExpectations(server_responsive=True)
     results = evaluate_assertions(expect, 0, "", "")
@@ -255,7 +257,7 @@ def test_server_responsive_assertion():
     assert server_result["ok"] is False
 
 
-def test_multiple_assertions():
+def test_multiple_assertions() -> None:
     """Test evaluation of multiple assertions together."""
     expect = TestExpectations(
         exit_code=0, stdout_contains=["success"], geode_query=GeodeQueryAssert(row_count=1), server_responsive=True

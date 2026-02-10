@@ -425,7 +425,7 @@ def _run_shell_test(
             passed=passed,
             duration_ms=(time.time() - start_time) * 1000,
             output=stdout,
-            error=stderr if not passed else None,
+            error=stderr if not passed else "",
         )
 
     except subprocess.TimeoutExpired:

@@ -4,13 +4,13 @@ import json
 import tempfile
 from pathlib import Path
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 from typer.testing import CliRunner
 
 from geodetestlab.cli import app
 
 
-def test_cli_help():
+def test_cli_help() -> None:
     """Test CLI help command."""
     runner = CliRunner()
     result = runner.invoke(app, ["--help"])
@@ -20,7 +20,7 @@ def test_cli_help():
     assert "geodetestlab" in result.output
 
 
-def test_run_command_help():
+def test_run_command_help() -> None:
     """Test run command help."""
     runner = CliRunner()
     result = runner.invoke(app, ["run", "--help"])
@@ -31,7 +31,7 @@ def test_run_command_help():
     assert "--llm-provider" in result.output
 
 
-def test_secrets_command_help():
+def test_secrets_command_help() -> None:
     """Test secrets subcommand help."""
     runner = CliRunner()
     result = runner.invoke(app, ["secrets", "--help"])
@@ -40,7 +40,7 @@ def test_secrets_command_help():
     assert "secrets" in result.output.lower()
 
 
-def test_server_command_help():
+def test_server_command_help() -> None:
     """Test server subcommand help."""
     runner = CliRunner()
     result = runner.invoke(app, ["server", "--help"])
@@ -49,7 +49,7 @@ def test_server_command_help():
     assert "server" in result.output.lower()
 
 
-def test_run_with_invalid_spec():
+def test_run_with_invalid_spec() -> None:
     """Test run command with invalid spec file."""
     runner = CliRunner()
     result = runner.invoke(app, ["run", "--spec", "/nonexistent/file.yml"])
@@ -58,7 +58,7 @@ def test_run_with_invalid_spec():
     assert "does not exist" in result.stderr
 
 
-def test_run_with_malformed_spec():
+def test_run_with_malformed_spec() -> None:
     """Test run command with malformed YAML."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
         f.write("invalid: yaml: content: [")
@@ -76,7 +76,7 @@ def test_run_with_malformed_spec():
         temp_path.unlink()
 
 
-def test_run_dry_run():
+def test_run_dry_run() -> None:
     """Test run command in dry-run mode."""
     spec_data = {
         "name": "dry-run-test",
@@ -106,7 +106,7 @@ def test_run_dry_run():
         temp_path.unlink()
 
 
-def test_run_empty_spec():
+def test_run_empty_spec() -> None:
     """Test run command with empty test spec."""
     spec_data = {"name": "empty-test", "tests": []}
 
@@ -131,7 +131,7 @@ def test_run_empty_spec():
         temp_path.unlink()
 
 
-def test_secrets_check_no_secrets():
+def test_secrets_check_no_secrets() -> None:
     """Test secrets check with spec that has no secrets."""
     spec_data = {"name": "secrets-check-test", "tests": []}
 
@@ -150,7 +150,7 @@ def test_secrets_check_no_secrets():
         temp_path.unlink()
 
 
-def test_secrets_list_no_secrets():
+def test_secrets_list_no_secrets() -> None:
     """Test secrets list with spec that has no secrets."""
     spec_data = {"name": "secrets-list-test", "tests": []}
 
@@ -169,7 +169,7 @@ def test_secrets_list_no_secrets():
         temp_path.unlink()
 
 
-def test_run_with_fuzz_parameters():
+def test_run_with_fuzz_parameters() -> None:
     """Test run command with fuzzing parameters."""
     spec_data = {
         "name": "fuzz-test",
@@ -213,7 +213,7 @@ def test_run_with_fuzz_parameters():
         temp_path.unlink()
 
 
-def test_cli_error_handling():
+def test_cli_error_handling() -> None:
     """Test CLI error handling for various scenarios."""
     runner = CliRunner()
 

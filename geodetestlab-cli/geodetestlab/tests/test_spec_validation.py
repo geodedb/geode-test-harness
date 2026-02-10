@@ -4,12 +4,12 @@ import tempfile
 from pathlib import Path
 
 import pytest
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from geodetestlab.lib.spec import SpecValidationError, load_spec
 
 
-def test_valid_basic_spec():
+def test_valid_basic_spec() -> None:
     """Test loading a valid basic specification."""
     spec_data = {
         "name": "basic-test",
@@ -29,10 +29,10 @@ def test_valid_basic_spec():
         temp_path.unlink()
 
 
-def test_missing_required_fields():
+def test_missing_required_fields() -> None:
     """Test that missing required fields raise errors."""
     # Missing 'name' field
-    spec_data = {
+    spec_data: dict[str, list[str]] = {
         "tests": [],
     }
 
@@ -47,7 +47,7 @@ def test_missing_required_fields():
         temp_path.unlink()
 
 
-def test_missing_tests_field():
+def test_missing_tests_field() -> None:
     """Test that missing tests field raises error."""
     spec_data = {
         "name": "no-tests",
@@ -64,7 +64,7 @@ def test_missing_tests_field():
         temp_path.unlink()
 
 
-def test_geode_specific_fields():
+def test_geode_specific_fields() -> None:
     """Test Geode-specific specification fields."""
     spec_data = {
         "name": "Test Suite",
@@ -123,7 +123,7 @@ def test_geode_specific_fields():
         temp_path.unlink()
 
 
-def test_json_assert_validation():
+def test_json_assert_validation() -> None:
     """Test loading specs with stdout_json_assert expectations."""
     spec_data = {
         "name": "json-assert-test",
@@ -147,7 +147,7 @@ def test_json_assert_validation():
         temp_path.unlink()
 
 
-def test_malformed_yaml():
+def test_malformed_yaml() -> None:
     """Test handling of malformed YAML."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
         f.write("invalid: yaml: content: [unclosed")
@@ -160,13 +160,13 @@ def test_malformed_yaml():
         temp_path.unlink()
 
 
-def test_nonexistent_file():
+def test_nonexistent_file() -> None:
     """Test handling of non-existent file."""
     with pytest.raises(FileNotFoundError):
         load_spec(Path("/nonexistent/file.yml"))
 
 
-def test_http_test_spec():
+def test_http_test_spec() -> None:
     """Test loading a spec with HTTP test cases."""
     spec_data = {
         "name": "http-test",
@@ -191,7 +191,7 @@ def test_http_test_spec():
         temp_path.unlink()
 
 
-def test_sequential_test_spec():
+def test_sequential_test_spec() -> None:
     """Test loading a spec with sequential test cases."""
     spec_data = {
         "name": "sequential-test",
