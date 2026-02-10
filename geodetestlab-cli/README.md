@@ -361,44 +361,37 @@ export GEODETESTLAB_VERBOSE=true               # Verbose output
 
 ## CI/CD Integration
 
-### GitHub Actions Example
+### GitLab CI Example
 
 ```yaml
-name: Geode CLI Tests
-on: [push, pull_request]
+geode-cli-tests:
+  image: python:3.11
+  stage: test
+  before_script:
+    - cd geodetestlab
+    - pip install -e .
+  script:
+    - make build
+    - geodetestlab run --spec geodetestlab/specs/geode_basic.yml --ci
+  artifacts:
+    reports:
+      junit: results.xml
+    when: always
 
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
-
-      - name: Install geodetestlab
-        run: |
-          cd geodetestlab
-          pip install -e .
-
-      - name: Build Geode
-        run: make build
-
-      - name: Run basic tests
-        run: |
-          geodetestlab run --spec geodetestlab/specs/geode_basic.yml --ci
-
-      - name: Run fuzzing tests
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: |
-          geodetestlab run \
-            --spec geodetestlab/specs/geode_fuzz.yml \
-            --llm-provider openai \
-            --max-cases 10 \
-            --ci
+geode-fuzz-tests:
+  image: python:3.11
+  stage: test
+  variables:
+    OPENAI_API_KEY: $OPENAI_API_KEY
+  before_script:
+    - cd geodetestlab
+    - pip install -e .
+  script:
+    - geodetestlab run
+        --spec geodetestlab/specs/geode_fuzz.yml
+        --llm-provider openai
+        --max-cases 10
+        --ci
 ```
 
 ### Exit Codes
@@ -526,4 +519,4 @@ MIT License - see LICENSE file for details.
 4. Ensure all tests pass: `pytest`
 5. Submit a pull request
 
-For bugs and feature requests, please use the GitHub issue tracker.
+For bugs and feature requests, please use the [GitLab issue tracker](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues).

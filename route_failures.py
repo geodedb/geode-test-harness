@@ -387,8 +387,8 @@ def get_ci_info() -> Dict[str, str]:
     """Get CI/CD environment information."""
     return {
         "pipeline_url": os.environ.get("CI_PIPELINE_URL", "N/A"),
-        "commit_sha": os.environ.get("CI_COMMIT_SHA", os.environ.get("GITHUB_SHA", "N/A")),
-        "branch": os.environ.get("CI_COMMIT_BRANCH", os.environ.get("GITHUB_REF_NAME", "N/A")),
+        "commit_sha": os.environ.get("CI_COMMIT_SHA", "N/A"),
+        "branch": os.environ.get("CI_COMMIT_BRANCH", "N/A"),
         "job_url": os.environ.get("CI_JOB_URL", "N/A"),
         "project": os.environ.get("CI_PROJECT_PATH", "N/A"),
     }
