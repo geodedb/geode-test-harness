@@ -12,10 +12,10 @@
 .PHONY: migrate migrate-status migrate-create test-graph
 .PHONY: route-failures route-failures-dry-run
 .PHONY: test-cli test-cli-comprehensive geodetestlab-setup geodetestlab-run
-.PHONY: test-shell test-shell-all test-shell-comprehensive
 .PHONY: test-full test-full-parallel
 .PHONY: test-unit test-unit-verbose
 .PHONY: test-quic test-grpc test-all-transports
+.PHONY: lint format type-check security-check quality
 
 # Default target: run full test suite with Docker
 all: clean docker-start test-all docker-stop
@@ -93,47 +93,22 @@ help:
 	@echo "  build-nodejs     - Setup Node.js runner"
 	@echo ""
 	@echo "Test Commands:"
-	@echo "  test             - Run basic tests on all clients"
+	@echo "  test             - Run basic tests (geodetestlab-cli)"
 	@echo "  test-all         - Run all test suites (JSON report)"
 	@echo "  test-all-html    - Run all tests and generate HTML report"
 	@echo "  test-docker      - Start Docker, run all tests, stop Docker"
-	@echo ""
-	@echo "  test-zig         - Run tests on Zig client only"
-	@echo "  test-go          - Run tests on Go client only"
-	@echo "  test-python      - Run tests on Python client only"
-	@echo "  test-rust        - Run tests on Rust client only"
-	@echo "  test-nodejs      - Run tests on Node.js client only"
-	@echo ""
-	@echo "  test-transactions - Run transaction tests"
-	@echo "  test-connections  - Run connection tests"
-	@echo "  test-auth        - Run authentication tests"
-	@echo "  test-perf        - Run performance benchmarks"
-	@echo "  test-graph       - Run graph query tests (requires migrations)"
 	@echo ""
 	@echo "CLI Tests (geodetestlab-cli):"
 	@echo "  geodetestlab-setup      - Setup geodetestlab-cli environment"
 	@echo "  test-cli                - Run CLI tests (parallel by default)"
 	@echo "  test-cli-comprehensive  - Run comprehensive CLI tests (parallel by default)"
 	@echo "  geodetestlab-run SPEC=  - Run specific CLI spec file"
-	@echo "  PARALLEL_WORKERS=N      - Override number of parallel workers (default: nproc)"
-	@echo ""
-	@echo "Shell Tests (shell_runner.py):"
-	@echo "  test-shell              - Run all shell tests (each manages own server)"
-	@echo "  test-shell-spec SPEC=   - Run single shell spec"
-	@echo "  test-shell-all          - Run all shell tests with JSON output"
-	@echo ""
-	@echo "Combined Tests:"
-	@echo "  test-full               - Run geodetestlab + shell tests sequentially"
-	@echo "  test-full-parallel      - Run geodetestlab + shell tests in parallel"
 	@echo ""
 	@echo "Unit Tests (test harness internals):"
 	@echo "  test-unit               - Run unit tests for shared lib modules"
 	@echo "  test-unit-verbose       - Run unit tests with verbose output"
 	@echo ""
 	@echo "Analysis:"
-	@echo "  test-with-coverage - Run tests and generate coverage report"
-	@echo "  analyze-coverage   - Analyze test coverage"
-	@echo "  analyze-perf       - Analyze performance results"
 	@echo "  report-html        - Generate HTML report from JSON results"
 	@echo ""
 	@echo "Failure Routing (CI/CD):"
@@ -148,6 +123,13 @@ help:
 	@echo "  test-quic          - Run tests using QUIC transport (default)"
 	@echo "  test-grpc          - Run tests using gRPC transport"
 	@echo "  test-all-transports - Run tests with both QUIC and gRPC"
+	@echo ""
+	@echo "Code Quality:"
+	@echo "  lint              - Run ruff linter"
+	@echo "  format            - Format with ruff"
+	@echo "  type-check        - Run mypy"
+	@echo "  security-check    - Run bandit"
+	@echo "  quality           - All quality checks"
 	@echo ""
 	@echo "Configuration:"
 	@echo "  GEODE_IMAGE=$(GEODE_IMAGE)"
@@ -253,17 +235,12 @@ setup: $(VENV_DIR)
 	@echo "Setting up test harness..."
 	@echo "Installing Python dependencies..."
 	@$(VENV_PIP) install --upgrade pip
-	@$(VENV_PIP) install -r requirements.txt
+	@if [ -f requirements.txt ]; then $(VENV_PIP) install -r requirements.txt; fi
 	@if [ -d "$(PYTHON_CLIENT_PATH)" ]; then \
 		echo "Installing Geode Python client..."; \
 		$(VENV_PIP) install -e $(PYTHON_CLIENT_PATH); \
 	fi
 	@echo "Python dependencies installed"
-	@echo "Making scripts executable..."
-	@chmod +x run_tests.py 2>/dev/null || true
-	@chmod +x generate_html_report.py 2>/dev/null || true
-	@chmod +x analyze_performance.py 2>/dev/null || true
-	@chmod +x analyze_coverage.py 2>/dev/null || true
 	@$(MAKE) build-all
 	@echo "Setup complete!"
 	@if [ "$(IN_VENV)" = "0" ] && [ "$(IN_NIX)" = "0" ]; then \
@@ -324,116 +301,7 @@ build-nodejs:
 	@echo "Node.js runner ready"
 
 # ==============================================================================
-# Test Commands
-# ==============================================================================
-
-test: setup
-	@echo "Running basic tests (transport: $(TRANSPORT))..."
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --spec specs/basic.yaml --verbose --transport $(TRANSPORT)
-
-test-docker: setup docker-start
-	@echo "Running all tests with Docker..."
-	@$(MAKE) test-all || ($(MAKE) docker-stop; exit 1)
-	@$(MAKE) docker-stop
-
-test-all: setup
-	@echo "Running all test suites (transport: $(TRANSPORT))..."
-	@mkdir -p reports
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results.json --transport $(TRANSPORT)
-
-test-comprehensive: test-all
-
-# Single client tests
-test-zig: setup
-	@echo "Running tests on Zig client (transport: $(TRANSPORT))..."
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --clients zig --verbose --transport $(TRANSPORT)
-
-test-go: setup
-	@echo "Running tests on Go client (transport: $(TRANSPORT))..."
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --clients go --verbose --transport $(TRANSPORT)
-
-test-python: setup
-	@echo "Running tests on Python client (transport: $(TRANSPORT))..."
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --clients python --verbose --transport $(TRANSPORT)
-
-test-rust: setup
-	@echo "Running tests on Rust client (transport: $(TRANSPORT))..."
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --clients rust --verbose --transport $(TRANSPORT)
-
-test-nodejs: setup
-	@echo "Running tests on Node.js client (transport: $(TRANSPORT))..."
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --clients nodejs --verbose --transport $(TRANSPORT)
-
-# Specific test suites
-test-transactions: setup
-	@echo "Running transaction tests..."
-	$(RUN_PYTHON) run_tests.py --spec specs/transactions.yaml --verbose
-
-test-connections: setup
-	@echo "Running connection tests..."
-	$(RUN_PYTHON) run_tests.py --spec specs/connections.yaml --verbose
-
-test-auth: setup
-	@echo "Running authentication tests..."
-	$(RUN_PYTHON) run_tests.py --spec specs/auth.yaml --verbose
-
-test-perf: setup
-	@echo "Running performance benchmarks..."
-	@mkdir -p reports
-	$(RUN_PYTHON) run_tests.py --spec specs/performance.yaml --verbose --report-json reports/perf_results.json
-
-test-graph: setup
-	@echo "Running graph query tests (with migrations)..."
-	@mkdir -p reports
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --spec specs/graph.yaml --verbose --report-json reports/graph_results.json --transport $(TRANSPORT)
-
-# ==============================================================================
-# Transport-Specific Tests
-# ==============================================================================
-
-# Run tests using QUIC transport (default)
-test-quic: setup
-	@echo "Running tests using QUIC transport..."
-	@mkdir -p reports
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results_quic.json --transport quic
-
-# Run tests using gRPC transport
-test-grpc: setup
-	@echo "Running tests using gRPC transport..."
-	@mkdir -p reports
-	GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results_grpc.json --transport grpc \
-		--server $(GEODE_HOST):$(GEODE_GRPC_PORT)
-
-# Run tests with both QUIC and gRPC transports
-test-all-transports: setup
-	@echo "Running tests with both QUIC and gRPC transports..."
-	@mkdir -p reports
-	@echo ""
-	@echo "=== QUIC Transport Tests ==="
-	-GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results_quic.json --transport quic
-	@echo ""
-	@echo "=== gRPC Transport Tests ==="
-	-GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) GEODE_USERNAME=$(GEODE_USERNAME) \
-		$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results_grpc.json --transport grpc \
-		--server $(GEODE_HOST):$(GEODE_GRPC_PORT)
-	@echo ""
-	@echo "Transport test results:"
-	@echo "  QUIC: reports/results_quic.json"
-	@echo "  gRPC: reports/results_grpc.json"
-
-# ==============================================================================
-# CLI Tests (geodetestlab-cli)
+# geodetestlab-cli setup
 # ==============================================================================
 
 # Path to geodetestlab-cli
@@ -457,17 +325,32 @@ geodetestlab-setup:
 # server instances (QUIC memory bugs cause double-free under high load)
 PARALLEL_WORKERS ?= $(shell echo $$(( $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) > 4 ? 4 : $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )))
 
-# Run geodetestlab CLI tests (requires server)
-test-cli: geodetestlab-setup
-	@echo "Running CLI tests with geodetestlab (parallel=$(PARALLEL_WORKERS))..."
+# ==============================================================================
+# Test Commands (all use geodetestlab-cli)
+# ==============================================================================
+
+test: geodetestlab-setup
+	@echo "Running tests (transport: $(TRANSPORT))..."
 	@mkdir -p reports
-	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_results.json --verbose --parallel $(PARALLEL_WORKERS)
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/results.json --verbose --parallel $(PARALLEL_WORKERS) --transport $(TRANSPORT)
+
+test-docker: geodetestlab-setup docker-start
+	@echo "Running all tests with Docker..."
+	@$(MAKE) test-all || ($(MAKE) docker-stop; exit 1)
+	@$(MAKE) docker-stop
+
+test-all: geodetestlab-setup
+	@echo "Running all test suites (transport: $(TRANSPORT))..."
+	@mkdir -p reports
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/results.json --verbose --parallel $(PARALLEL_WORKERS) --transport $(TRANSPORT)
+
+test-comprehensive: test-all
+
+# Run geodetestlab CLI tests (alias for test-all)
+test-cli: test-all
 
 # Run comprehensive CLI tests
-test-cli-comprehensive: geodetestlab-setup
-	@echo "Running comprehensive CLI tests with geodetestlab (parallel=$(PARALLEL_WORKERS))..."
-	@mkdir -p reports
-	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_comprehensive.json --verbose --parallel $(PARALLEL_WORKERS)
+test-cli-comprehensive: test-all
 
 # Run specific CLI spec
 geodetestlab-run: geodetestlab-setup
@@ -476,158 +359,72 @@ geodetestlab-run: geodetestlab-setup
 		exit 1; \
 	fi
 	@echo "Running $(SPEC)..."
-	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs/$(SPEC) --verbose
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --spec $(GEODETESTLAB_CLI)/specs/$(SPEC) --verbose
+
+# Combined tests (alias for test-all since shell tests are now in geodetestlab-cli/specs/)
+test-full: test-all
+
+test-full-parallel: test-all
 
 # ==============================================================================
-# Shell Tests (shell_runner.py - manages own server)
+# Transport-Specific Tests
 # ==============================================================================
 
-# Shell test configuration
-SHELL_RUNNER := runners/shell_runner.py
-SHELL_SPECS := $(wildcard specs/shell*.yaml)
-GEODE_BINARY ?= ../geode/zig-out/bin/geode
-
-# Run all shell tests (each spec manages its own server)
-test-shell: setup
-	@echo "Running shell tests..."
+# Run tests using QUIC transport (default)
+test-quic: geodetestlab-setup
+	@echo "Running tests using QUIC transport..."
 	@mkdir -p reports
-	@PASSED=0; FAILED=0; \
-	for spec in $(SHELL_SPECS); do \
-		echo "Running: $$spec"; \
-		if $(RUN_PYTHON) $(SHELL_RUNNER) --spec $$spec --geode-binary $(GEODE_BINARY) --verbose; then \
-			PASSED=$$((PASSED + 1)); \
-		else \
-			FAILED=$$((FAILED + 1)); \
-		fi; \
-	done; \
-	echo ""; \
-	echo "Shell Tests: $$PASSED passed, $$FAILED failed"; \
-	[ $$FAILED -eq 0 ]
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/results_quic.json --verbose --parallel $(PARALLEL_WORKERS) --transport quic
 
-# Run a single shell spec
-test-shell-spec: setup
-	@if [ -z "$(SPEC)" ]; then \
-		echo "Usage: make test-shell-spec SPEC=shell_basic.yaml"; \
-		exit 1; \
-	fi
-	@echo "Running shell spec: $(SPEC)"
-	$(RUN_PYTHON) $(SHELL_RUNNER) --spec specs/$(SPEC) --geode-binary $(GEODE_BINARY) --verbose --json
-
-# Run shell tests with JSON output
-test-shell-all: setup
-	@echo "Running all shell tests with JSON reports..."
+# Run tests using gRPC transport
+test-grpc: geodetestlab-setup
+	@echo "Running tests using gRPC transport..."
 	@mkdir -p reports
-	@for spec in $(SHELL_SPECS); do \
-		name=$$(basename $$spec .yaml); \
-		echo "Running: $$name"; \
-		$(RUN_PYTHON) $(SHELL_RUNNER) --spec $$spec --geode-binary $(GEODE_BINARY) --json > reports/$${name}_results.json 2>&1 || true; \
-	done
-	@echo "Shell test reports written to reports/"
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/results_grpc.json --verbose --parallel $(PARALLEL_WORKERS) --transport grpc
 
-# ==============================================================================
-# Combined Tests (geodetestlab + shell tests in parallel)
-# ==============================================================================
-
-# Run both geodetestlab and shell tests sequentially
-test-full: geodetestlab-setup setup
-	@echo "Running full test suite (geodetestlab + shell tests)..."
+# Run tests with both QUIC and gRPC transports
+test-all-transports: geodetestlab-setup
+	@echo "Running tests with both QUIC and gRPC transports..."
 	@mkdir -p reports
 	@echo ""
-	@echo "=== Running geodetestlab CLI tests ==="
-	-$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_results.json --verbose
+	@echo "=== QUIC Transport Tests ==="
+	-$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/results_quic.json --verbose --parallel $(PARALLEL_WORKERS) --transport quic
 	@echo ""
-	@echo "=== Running shell tests ==="
-	-$(MAKE) test-shell
+	@echo "=== gRPC Transport Tests ==="
+	-$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/results_grpc.json --verbose --parallel $(PARALLEL_WORKERS) --transport grpc
 	@echo ""
-	@echo "Full test suite complete. Reports in reports/"
-
-# Run both geodetestlab and shell tests in parallel (background jobs)
-test-full-parallel: geodetestlab-setup setup
-	@echo "Running full test suite in PARALLEL (geodetestlab + shell tests)..."
-	@mkdir -p reports
-	@echo ""
-	@echo "Starting geodetestlab CLI tests in background..."
-	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/cli_results.json --verbose > reports/geodetestlab.log 2>&1 &
-	@CLI_PID=$$!; \
-	echo "geodetestlab PID: $$CLI_PID"; \
-	echo ""; \
-	echo "Starting shell tests in background..."; \
-	$(MAKE) test-shell > reports/shell_tests.log 2>&1 & \
-	SHELL_PID=$$!; \
-	echo "shell tests PID: $$SHELL_PID"; \
-	echo ""; \
-	echo "Waiting for both test suites to complete..."; \
-	CLI_EXIT=0; SHELL_EXIT=0; \
-	wait $$CLI_PID || CLI_EXIT=$$?; \
-	wait $$SHELL_PID || SHELL_EXIT=$$?; \
-	echo ""; \
-	echo "=== Test Results ==="; \
-	if [ $$CLI_EXIT -eq 0 ]; then \
-		echo "geodetestlab: PASSED"; \
-	else \
-		echo "geodetestlab: FAILED (see reports/geodetestlab.log)"; \
-	fi; \
-	if [ $$SHELL_EXIT -eq 0 ]; then \
-		echo "shell tests:  PASSED"; \
-	else \
-		echo "shell tests:  FAILED (see reports/shell_tests.log)"; \
-	fi; \
-	echo ""; \
-	echo "Full test logs: reports/geodetestlab.log, reports/shell_tests.log"; \
-	[ $$CLI_EXIT -eq 0 ] && [ $$SHELL_EXIT -eq 0 ]
+	@echo "Transport test results:"
+	@echo "  QUIC: reports/results_quic.json"
+	@echo "  gRPC: reports/results_grpc.json"
 
 # ==============================================================================
 # Unit Tests (for test harness internals)
 # ==============================================================================
 
-# Run unit tests for shared lib modules
-test-unit: setup
+# Run unit tests for geodetestlab-cli
+test-unit: geodetestlab-setup
 	@echo "Running unit tests..."
-	$(VENV_PYTHON) -m pytest tests/ -v
+	$(GEODETESTLAB_PYTHON) -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v
 
 # Run unit tests with verbose output
-test-unit-verbose: setup
+test-unit-verbose: geodetestlab-setup
 	@echo "Running unit tests (verbose)..."
-	$(VENV_PYTHON) -m pytest tests/ -v --tb=long
+	$(GEODETESTLAB_PYTHON) -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v --tb=long
 
 # ==============================================================================
 # Reporting & Analysis
 # ==============================================================================
 
-test-all-html: setup
-	@echo "Running all tests and generating HTML report..."
+test-all-html: geodetestlab-setup
+	@echo "Running all tests and generating report..."
 	@mkdir -p reports
-	$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results.json --report-html reports/test_report.html
+	$(GEODETESTLAB_PYTHON) -m geodetestlab run --specs $(GEODETESTLAB_CLI)/specs --output reports/results.json --verbose --parallel $(PARALLEL_WORKERS) --transport $(TRANSPORT)
 	@echo ""
-	@echo "Reports generated:"
-	@echo "  JSON: reports/results.json"
-	@echo "  HTML: reports/test_report.html"
+	@echo "Report: reports/results.json"
 
 report-html:
-	@echo "Generating HTML report from JSON results..."
-	@mkdir -p reports
-	$(RUN_PYTHON) generate_html_report.py ${REPORT:-reports/results.json} --output reports/test_report.html
-	@echo "HTML report generated: reports/test_report.html"
-
-analyze-perf:
-	@echo "Analyzing performance results..."
-	$(RUN_PYTHON) analyze_performance.py reports/perf_results.json --verbose --markdown reports/perf_report.md
-	@echo "Performance analysis complete!"
-	@echo "  Report: reports/perf_report.md"
-
-analyze-coverage:
-	@echo "Analyzing test coverage..."
-	$(RUN_PYTHON) analyze_coverage.py ${REPORT:-reports/results.json} --verbose --markdown reports/coverage_report.md
-	@echo "Coverage analysis complete!"
-	@echo "  Report: reports/coverage_report.md"
-
-test-with-coverage: setup
-	@echo "Running all tests with coverage analysis..."
-	@mkdir -p reports
-	@$(RUN_PYTHON) run_tests.py --verbose --report-json reports/results.json
-	@$(RUN_PYTHON) analyze_coverage.py reports/results.json --verbose --markdown reports/coverage_report.md
-	@echo ""
-	@echo "Coverage report generated: reports/coverage_report.md"
+	@echo "JSON reports are in reports/"
+	@ls -la reports/*.json 2>/dev/null || echo "No reports found. Run 'make test-all' first."
 
 # ==============================================================================
 # Failure Routing (for CI/CD integration)
@@ -639,10 +436,10 @@ route-failures:
 		echo "No results file found. Run 'make test-all' first."; \
 		exit 1; \
 	fi
-	$(RUN_PYTHON) route_failures.py reports/results.json --verbose --output reports/created_issues.json
-	@echo ""
-	@if [ -f reports/created_issues.json ]; then \
-		echo "Created issues saved to: reports/created_issues.json"; \
+	@if [ -f route_failures.py ]; then \
+		$(RUN_PYTHON) route_failures.py reports/results.json --verbose --output reports/created_issues.json; \
+	else \
+		echo "route_failures.py not found (legacy script removed)"; \
 	fi
 
 route-failures-dry-run:
@@ -651,7 +448,11 @@ route-failures-dry-run:
 		echo "No results file found. Run 'make test-all' first."; \
 		exit 1; \
 	fi
-	$(RUN_PYTHON) route_failures.py reports/results.json --dry-run --verbose
+	@if [ -f route_failures.py ]; then \
+		$(RUN_PYTHON) route_failures.py reports/results.json --dry-run --verbose; \
+	else \
+		echo "route_failures.py not found (legacy script removed)"; \
+	fi
 
 # ==============================================================================
 # Cleanup
@@ -680,3 +481,22 @@ clean-all: clean
 	@echo "Removing Docker image..."
 	@$(DOCKER) rmi $(GEODE_IMAGE) 2>/dev/null || true
 	@echo "Full cleanup complete!"
+
+# =============================================================================
+# Code Quality Targets
+# =============================================================================
+
+lint: ## Run ruff linter on Python code
+	cd geodetestlab-cli && . .venv/bin/activate && ruff check geodetestlab/
+
+format: ## Format Python code with ruff
+	cd geodetestlab-cli && . .venv/bin/activate && ruff format geodetestlab/
+
+type-check: ## Run mypy type checker
+	cd geodetestlab-cli && . .venv/bin/activate && mypy geodetestlab/ --ignore-missing-imports
+
+security-check: ## Run bandit security scanner
+	cd geodetestlab-cli && . .venv/bin/activate && pip install -q bandit && bandit -r geodetestlab/ -s B101
+
+quality: lint type-check security-check ## Run all quality checks
+	@echo "All quality checks passed!"

@@ -9,15 +9,13 @@ fuzzing patterns).
 
 from __future__ import annotations
 
-from typing import Optional
-
 from .base import LLMProvider
 from .geode_ai import GeodeAIProvider
 from .mock import MockProvider
 from .openai_compat import OpenAICompatProvider
 
 
-def get_provider(name: str, model: Optional[str] = None) -> LLMProvider:
+def get_provider(name: str, model: str | None = None) -> LLMProvider:
     """Instantiate an LLM provider by name.
 
     Parameters

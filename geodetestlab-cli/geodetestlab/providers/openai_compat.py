@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Optional
 
 import httpx
 
@@ -21,10 +20,10 @@ import httpx
 class OpenAICompatProvider:
     """LLM provider that talks to an OpenAI‑compatible API over HTTP."""
 
-    def __init__(self, model: Optional[str] = None) -> None:
+    def __init__(self, model: str | None = None) -> None:
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
 
-    def fuzz(self, prompt: str, max_cases: int, seed: Optional[int]) -> List[List[str]]:
+    def fuzz(self, prompt: str, max_cases: int, seed: int | None) -> list[list[str]]:
         """Generate fuzz cases using OpenAI-compatible API."""
         if max_cases <= 0:
             return []
@@ -36,15 +35,15 @@ class OpenAICompatProvider:
             response_text = self._call_api(enhanced_prompt, seed)
             return self._parse_response(response_text, max_cases)
         except Exception as exc:
-            raise RuntimeError(f"OpenAI API request failed: {exc}")
+            raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
 
     def supports_geode_patterns(self) -> bool:
         """OpenAI provider supports Geode patterns through enhanced prompts."""
         return True
 
     def generate_gql_queries(
-        self, max_queries: int, complexity: str = "simple", seed: Optional[int] = None
-    ) -> List[str]:
+        self, max_queries: int, complexity: str = "simple", seed: int | None = None
+    ) -> list[str]:
         """Generate GQL queries using the OpenAI API."""
         if max_queries <= 0:
             return []
@@ -66,9 +65,9 @@ class OpenAICompatProvider:
                         break
             return queries
         except Exception as exc:
-            raise RuntimeError(f"OpenAI API request failed: {exc}")
+            raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
 
-    def _call_api(self, prompt: str, seed: Optional[int]) -> str:
+    def _call_api(self, prompt: str, seed: int | None) -> str:
         """Make API call to OpenAI-compatible endpoint."""
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
@@ -162,9 +161,9 @@ Example patterns for reference:
 Ensure all queries are syntactically valid GQL.
 """
 
-    def _parse_response(self, response_text: str, max_cases: int) -> List[List[str]]:
+    def _parse_response(self, response_text: str, max_cases: int) -> list[list[str]]:
         """Parse API response into argument arrays."""
-        cases: List[List[str]] = []
+        cases: list[list[str]] = []
 
         for line in response_text.splitlines():
             trimmed = line.strip()

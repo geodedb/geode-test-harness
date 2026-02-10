@@ -1,4 +1,5 @@
 stages:
+  - lint
   - build
   - integration
   - triage
@@ -15,6 +16,110 @@ variables:
   # GITLAB_TOKEN should be a project access token with api scope
   # Docker registry authentication
   DOCKER_AUTH_CONFIG: '{"auths":{"registry.gitlab.com":{"auth":"${CI_REGISTRY_AUTH}"}}}'
+  # Zig version — bump here to update all jobs
+  ZIG_VERSION: "0.15.1"
+  # glab CLI version
+  GLAB_VERSION: "1.36.0"
+
+# =============================================================================
+# Lint Stage: Static analysis and quality gates
+# =============================================================================
+
+lint-python:
+  stage: lint
+  tags:
+    - company
+    - linux
+  image: python:3.13-slim
+  cache:
+    key: pip-${CI_COMMIT_REF_SLUG}
+    paths:
+      - geodetestlab-cli/.venv/
+  before_script:
+    - cd geodetestlab-cli
+    - python -m venv .venv
+    - . .venv/bin/activate
+    - pip install -q -e ".[dev]"
+  script:
+    - . .venv/bin/activate
+    - ruff check geodetestlab/
+    - ruff format --check geodetestlab/
+  rules:
+    - changes:
+        - "geodetestlab-cli/**/*.py"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+lint-mypy:
+  stage: lint
+  tags:
+    - company
+    - linux
+  image: python:3.13-slim
+  cache:
+    key: pip-${CI_COMMIT_REF_SLUG}
+    paths:
+      - geodetestlab-cli/.venv/
+  before_script:
+    - cd geodetestlab-cli
+    - python -m venv .venv
+    - . .venv/bin/activate
+    - pip install -q -e ".[dev]"
+  script:
+    - . .venv/bin/activate
+    - mypy geodetestlab/ --ignore-missing-imports
+  allow_failure: true
+  rules:
+    - changes:
+        - "geodetestlab-cli/**/*.py"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+test-unit:
+  stage: lint
+  tags:
+    - company
+    - linux
+  image: python:3.13-slim
+  cache:
+    key: pip-${CI_COMMIT_REF_SLUG}
+    paths:
+      - geodetestlab-cli/.venv/
+  before_script:
+    - cd geodetestlab-cli
+    - python -m venv .venv
+    - . .venv/bin/activate
+    - pip install -q -e ".[dev]"
+  script:
+    - . .venv/bin/activate
+    - python -m pytest geodetestlab/tests/ -v --tb=short
+  rules:
+    - changes:
+        - "geodetestlab-cli/**/*.py"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+lint-security:
+  stage: lint
+  tags:
+    - company
+    - linux
+  image: python:3.13-slim
+  before_script:
+    - pip install -q bandit
+  script:
+    - bandit -r geodetestlab-cli/geodetestlab/ -s B101 -f json -o reports/bandit.json || true
+    - bandit -r geodetestlab-cli/geodetestlab/ -s B101
+  artifacts:
+    paths:
+      - reports/bandit.json
+    when: always
+  allow_failure: true
+  rules:
+    - changes:
+        - "geodetestlab-cli/**/*.py"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Build Stage
+# =============================================================================
 
 .build-template:
   stage: build
@@ -31,18 +136,26 @@ variables:
 
 build-zig:
   extends: .build-template
-  image: alpine:latest
+  image: alpine:3.21
+  cache:
+    key: zig-${ZIG_VERSION}
+    paths:
+      - zig-linux-x86_64-${ZIG_VERSION}/
   before_script:
     - apk add --no-cache curl xz tar
-    # Use Zig 0.14.0 (latest stable available)
-    - curl -L https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz | tar xJ
-    - export PATH="$PWD/zig-linux-x86_64-0.14.0:$PATH"
+    - |
+      if [ ! -d "zig-linux-x86_64-${ZIG_VERSION}" ]; then
+        curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+        tar xJf zig.tar.xz
+        rm zig.tar.xz
+      fi
+    - export PATH="$PWD/zig-linux-x86_64-${ZIG_VERSION}:$PATH"
     - zig version
   script:
-    - export PATH="$PWD/zig-linux-x86_64-0.14.0:$PATH"
+    - export PATH="$PWD/zig-linux-x86_64-${ZIG_VERSION}:$PATH"
     - cd runners
-    - zig build -Doptimize=ReleaseSafe || echo "Zig build failed - may need Zig 0.15+"
-    - cp zig-out/bin/zig_runner ./zig_runner 2>/dev/null || echo "Zig runner not built"
+    - zig build -Doptimize=ReleaseFast
+    - cp zig-out/bin/zig_runner ./zig_runner
   rules:
     - exists:
         - runners/build.zig
@@ -51,11 +164,16 @@ build-go:
   extends: .build-template
   image: golang:1.24
   allow_failure: true
+  cache:
+    key: go-mod-${CI_COMMIT_REF_SLUG}
+    paths:
+      - runners/.go-cache/
   before_script:
     # Clone the Go client repo using CI job token
     # Note: Requires "Allow access to this project with a CI_JOB_TOKEN" enabled in geode-client-go settings
     - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git ../geode-client-go
   script:
+    - export GOMODCACHE=$PWD/runners/.go-cache
     - cd runners
     - go mod edit -replace geodedb.com/geode=../../geode-client-go
     - GONOSUMCHECK=geodedb.com/geode go build -o go_runner go_runner.go
@@ -66,10 +184,14 @@ build-go:
 build-rust:
   extends: .build-template
   image: rust:1.85
+  cache:
+    key: rust-${CI_COMMIT_REF_SLUG}
+    paths:
+      - runners/rust_runner/target/
   before_script:
     # Clone the Rust client repo using CI job token for auth
     - apt-get update -qq && apt-get install -y -qq git
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-rust.git ../geode-client-rust || echo "Client clone failed"
+    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-rust.git ../geode-client-rust
   script:
     - cd runners/rust_runner
     # Override git dependency to use locally cloned repo
@@ -82,7 +204,7 @@ build-rust:
 
 build-python:
   extends: .build-template
-  image: python:3.11
+  image: python:3.13-slim
   script:
     - pip install pyyaml
     - python3 -c "import yaml; print('Python dependencies installed')"
@@ -91,88 +213,95 @@ build-python:
 
 build-nodejs:
   extends: .build-template
-  image: node:20
+  image: node:20-slim
+  cache:
+    key: node-${CI_COMMIT_REF_SLUG}
+    paths:
+      - runners/node_modules/
   script:
     - cd runners
-    - npm install yaml || echo "Node.js dependencies installed"
+    - npm install yaml
   artifacts:
     paths: []
 
-# NOTE: Integration tests require Geode server. The Kubernetes executor cannot pull
-# the private Geode registry image for services. Integration tests should be run locally:
-#   make docker-start && make test-all
+# =============================================================================
+# Integration Stage: Build Geode server + run geodetestlab-cli tests
+# =============================================================================
 #
-# To enable CI integration tests:
-# 1. Make the Geode Docker image public, OR
-# 2. Configure imagePullSecrets in the Kubernetes namespace, OR
-# 3. Use a shell executor runner with Docker access
+# The integration job clones the Geode server repo, builds it with Zig
+# (already cached from build-zig), and runs the geodetestlab-cli test suite.
+# This eliminates the need for Docker-in-Docker or private registry access.
 
-.integration-template:
+test-all:
   stage: integration
   tags:
     - company
     - linux
-  image: python:3.11
-  # Service-based approach disabled due to private registry auth issues
-  # services:
-  #   - name: $GEODE_IMAGE
-  #     alias: geode
-  #     command: ["serve", "--listen", "0.0.0.0:3141", "--log-level", "info"]
+  image: alpine:3.21
+  cache:
+    - key: zig-${ZIG_VERSION}
+      paths:
+        - zig-linux-x86_64-${ZIG_VERSION}/
+    - key: pip-integration-${CI_COMMIT_REF_SLUG}
+      paths:
+        - geodetestlab-cli/.venv/
   variables:
     GEODE_HOST: "127.0.0.1"
     GEODE_PORT: "3141"
   before_script:
-    - pip install pyyaml --quiet
+    - apk add --no-cache curl xz tar python3 py3-pip python3-dev gcc musl-dev linux-headers
+    # Install Zig (reuses cache from build-zig job)
+    - |
+      if [ ! -d "zig-linux-x86_64-${ZIG_VERSION}" ]; then
+        curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+        tar xJf zig.tar.xz
+        rm zig.tar.xz
+      fi
+    - export PATH="$PWD/zig-linux-x86_64-${ZIG_VERSION}:$PATH"
+    # Clone and build Geode server
+    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
+    - cd ../geode
+    - zig build -Doptimize=ReleaseFast -Denable-openssl=false
+    - export GEODE_BINARY="$PWD/zig-out/bin/geode"
+    - echo "Geode binary built at $GEODE_BINARY"
+    - cd "$CI_PROJECT_DIR"
+    # Setup geodetestlab-cli
+    - cd geodetestlab-cli
+    - python3 -m venv .venv
+    - . .venv/bin/activate
+    - pip install -q -e .
+    - cd "$CI_PROJECT_DIR"
     - mkdir -p reports
+  script:
+    - export PATH="$PWD/zig-linux-x86_64-${ZIG_VERSION}:$PATH"
+    - export GEODE_BINARY="$PWD/../geode/zig-out/bin/geode"
+    - cd geodetestlab-cli
+    - . .venv/bin/activate
+    - |
+      python -m geodetestlab run \
+        --specs specs \
+        --output "$CI_PROJECT_DIR/reports/results.json" \
+        --verbose \
+        --parallel 2 \
+        --transport quic \
+        --binary "$GEODE_BINARY"
+    - cd "$CI_PROJECT_DIR"
+    - cat reports/results.json | python3 -c "
+      import json, sys
+      data = json.load(sys.stdin)
+      s = data.get('summary', {})
+      print(f\"Results: {s.get('passed',0)}/{s.get('total',0)} passed, {s.get('failed',0)} failed, {s.get('skipped',0)} skipped\")
+      "
   artifacts:
     paths:
       - reports/
-    reports:
-      junit: reports/junit-*.xml
     expire_in: 1 week
     when: always
-  # Allow failures until Geode image auth is configured
+  # Allow failures while CI integration stabilizes
   allow_failure: true
-
-test-all:
-  extends: .integration-template
-  dependencies:
-    - build-zig
-    - build-go
-    - build-rust
-    - build-python
-    - build-nodejs
-  script:
-    - echo "NOTE - Integration tests skipped in CI (Geode server not available)"
-    - echo "Run integration tests locally with - make docker-start && make test-all"
-    - python3 -c "import json; d={'summary':{'total':0,'passed':0,'failed':0,'skipped':1,'errors':0},'results':[{'test':'ci-placeholder','status':'skipped','skip_reason':'Geode server not available in CI'}]}; print(json.dumps(d))" > reports/results.json
-    - cat reports/results.json
   rules:
-    - when: always
-
-# Individual language tests are disabled - use test-all instead
-# These jobs require a Geode server but can't easily run Docker-in-Docker
-# Uncomment and configure if you need per-language CI jobs
-
-# test-zig:
-#   stage: integration
-#   tags:
-#     - company
-#     - linux
-#   image: python:3.11
-#   dependencies:
-#     - build-zig
-#     - test-all
-#   needs:
-#     - job: test-all
-#       artifacts: true
-#       optional: true
-#   script:
-#     - echo "Zig tests run as part of test-all job"
-#   rules:
-#     - when: never
-
-# test-go, test-rust, test-python, test-nodejs disabled - covered by test-all
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: manual
 
 # =============================================================================
 # Triage Stage: Route failures to appropriate repositories
@@ -183,12 +312,15 @@ test-all:
   tags:
     - company
     - linux
-  image: python:3.11
+  image: python:3.13-slim
   before_script:
-    # Install glab CLI
+    # Install glab CLI with version pinning
     - apt-get update -qq && apt-get install -y -qq curl
-    - curl -L "https://gitlab.com/gitlab-org/cli/-/releases/v1.36.0/downloads/glab_1.36.0_Linux_x86_64.tar.gz" | tar xz
-    - mv bin/glab /usr/local/bin/
+    - |
+      curl -fSL "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_Linux_x86_64.tar.gz" -o glab.tar.gz
+      tar xzf glab.tar.gz
+      mv bin/glab /usr/local/bin/
+      rm glab.tar.gz
     - glab --version
     # Configure glab with CI token
     - |
@@ -233,12 +365,12 @@ triage-failures:
       " || FAILURES_EXIST=$?
     - |
       if [ "$FAILURES_EXIST" = "2" ]; then
-        if [ -n "$GITLAB_TOKEN" ]; then
+        echo "Failures detected. Review reports/results.json for details."
+        if [ -n "$GITLAB_TOKEN" ] && [ -f route_failures.py ]; then
           echo "Routing failures to appropriate repositories..."
           python3 route_failures.py reports/results.json --verbose --output reports/created_issues.json
         else
-          echo "Skipping issue creation (no GITLAB_TOKEN)"
-          python3 route_failures.py reports/results.json --dry-run --verbose
+          echo "Manual triage required — review reports/results.json"
         fi
       fi
   rules:
@@ -256,7 +388,7 @@ analyze-coverage:
   tags:
     - company
     - linux
-  image: python:3.11
+  image: python:3.13-slim
   dependencies:
     - test-all
   needs:
@@ -314,7 +446,7 @@ generate-html-report:
   tags:
     - company
     - linux
-  image: python:3.11
+  image: python:3.13-slim
   dependencies:
     - test-all
     - triage-failures
@@ -344,7 +476,7 @@ generate-html-report:
       try:
           with open('reports/created_issues.json') as f:
               created_issues = json.load(f)
-      except:
+      except Exception:
           pass
 
       # Group results by client

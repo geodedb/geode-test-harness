@@ -11,14 +11,12 @@ testing of the database functionality.
 
 from __future__ import annotations
 
-from typing import List, Optional
-
 
 class MockProvider:
     """Mock LLM provider returning a deterministic set of argument arrays."""
 
     # Predefined fuzz cases for general CLI testing
-    _general_cases: List[List[str]] = [
+    _general_cases: list[list[str]] = [
         ["--help"],
         ["--version"],
         ["serve", "--help"],
@@ -27,7 +25,7 @@ class MockProvider:
     ]
 
     # Geode-specific test cases focusing on database operations
-    _geode_cases: List[List[str]] = [
+    _geode_cases: list[list[str]] = [
         # Basic query operations
         ["query", "RETURN 1 AS result"],
         ["query", "MATCH (n) RETURN count(n) AS node_count"],
@@ -58,7 +56,7 @@ class MockProvider:
     ]
 
     # GQL queries for specialized testing
-    _gql_queries: List[str] = [
+    _gql_queries: list[str] = [
         "RETURN 1",
         "MATCH (n) RETURN n LIMIT 1",
         "CREATE (n:Test) RETURN n",
@@ -71,7 +69,7 @@ class MockProvider:
         "MATCH (n) SET n.timestamp = timestamp() RETURN count(n)",
     ]
 
-    def fuzz(self, prompt: str, max_cases: int, seed: Optional[int]) -> List[List[str]]:
+    def fuzz(self, prompt: str, max_cases: int, seed: int | None) -> list[list[str]]:
         """Generate deterministic fuzz cases.
 
         The mock provider combines general CLI cases with Geode-specific cases
@@ -101,8 +99,8 @@ class MockProvider:
         return True
 
     def generate_gql_queries(
-        self, max_queries: int, complexity: str = "simple", seed: Optional[int] = None
-    ) -> List[str]:
+        self, max_queries: int, complexity: str = "simple", seed: int | None = None
+    ) -> list[str]:
         """Generate mock GQL queries based on complexity level."""
         if max_queries <= 0:
             return []

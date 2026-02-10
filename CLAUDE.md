@@ -4,9 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is the **Geode Test Harness** - a cross-language test framework for validating Geode client library implementations. It runs identical YAML test specifications against different client runners (Zig, Go, Python, Rust, Node.js) from external repositories.
-
-The harness uses Docker containers for Geode server management, parses test specs, executes tests through language-specific runners, and produces JSON/HTML reports.
+This is the **Geode Test Harness** (`geodetestlab-cli`) — a CLI-based integration test framework for the Geode graph database. It executes YAML test specifications against a Geode server binary, validating CLI commands, GQL queries, HTTP endpoints, and shell operations. It also supports cross-language client runners (Zig, Go, Python, Rust, Node.js) in the `runners/` directory.
 
 ## External Dependencies
 
@@ -17,6 +15,7 @@ Client libraries are located in sibling directories:
 - `../geode-client-zig/` - Zig client (module: geode_client)
 - `../geode-client-nodejs/` - Node.js client (package: @geode/client)
 
+Geode server binary: `../geode/zig-out/bin/geode`
 Docker image: `geodedb/geode:latest`
 
 ## Build & Test Commands
@@ -29,234 +28,141 @@ make docker-logs       # View container logs
 make docker-status     # Check container status
 make docker-pull       # Pull latest Geode image
 
-# Initial setup (creates venv, installs deps, builds runners)
-make setup
+# Initial setup
+make setup             # Install dependencies and build runners
+make geodetestlab-setup # Setup geodetestlab-cli venv
 
-# Build specific runners
-make build-all         # Build all client runners
-make build-zig         # Build Zig runner
-make build-go          # Build Go runner
-make build-rust        # Build Rust runner (may take time)
-make build-python      # Setup Python runner
-make build-nodejs      # Setup Node.js runner
-
-# Run tests
-make test              # Run basic tests
+# Run tests (all use geodetestlab-cli)
+make test              # Run all tests (parallel)
 make test-all          # Run all tests with JSON report
 make test-docker       # Start Docker, run tests, stop Docker
-
-# Single-client tests
-make test-zig          # Run tests on Zig client only
-make test-go           # Run tests on Go client only
-make test-python       # Run tests on Python client only
-make test-rust         # Run tests on Rust client only
-make test-nodejs       # Run tests on Node.js client only
-
-# Specific test suites
-make test-transactions
-make test-connections
-make test-auth
-make test-perf
+make test-unit         # Run unit tests (57 tests)
 
 # Transport-specific tests
-make test-quic           # Run tests using QUIC transport (default)
-make test-grpc           # Run tests using gRPC transport
+make test-quic         # Run tests using QUIC transport (default)
+make test-grpc         # Run tests using gRPC transport
 make test-all-transports # Run tests with both QUIC and gRPC
-TRANSPORT=grpc make test # Run any test with specific transport
 
-# Reports and analysis
-make test-all-html          # Generate HTML report
-make test-with-coverage     # Tests + coverage report
-make analyze-coverage REPORT=reports/results.json
-make analyze-perf           # Analyze performance results
+# Code quality
+make lint              # Run ruff linter
+make format            # Format with ruff
+make type-check        # Run mypy
+make security-check    # Run bandit
+make quality           # All quality checks
 
-# Direct runner invocation
-python3 run_tests.py --spec specs/basic.yaml --clients zig --verbose
-python3 run_tests.py --server localhost:3141 --no-manage-server --clients go,python
-python3 run_tests.py --transport grpc --server localhost:50051 --clients python --verbose
+# Direct geodetestlab-cli invocation
+cd geodetestlab-cli
+source .venv/bin/activate
+python -m geodetestlab run --spec specs/filename.yml -v
+python -m geodetestlab run --specs specs --parallel 4 -v
+python -m geodetestlab run --specs specs --transport grpc -v
 ```
 
 ## Architecture
 
 ### Test Flow
 
-1. `run_tests.py` - Main orchestrator that:
-   - Starts a managed Geode server (Docker container)
-   - Loads YAML specs from `specs/` directory
-   - Dispatches tests to language-specific runners
-   - Collects results and generates reports
-
-2. **Runners** - Language-specific executables in `runners/`:
-   - `runners/zig_runner` - Zig runner (uses geode-client-zig)
-   - `runners/go_runner` - Go runner (uses geode-client-go)
-   - `runners/python_runner.py` - Python runner (uses geode-client-python)
-   - `runners/rust_runner/` - Rust runner (uses geode-client-rust)
-   - `runners/nodejs_runner.js` - Node.js runner (uses geode-client-nodejs)
-   - Runners accept `--spec <yaml> --server host:port --transport quic|grpc --json` flags
-   - Output JSON with `summary` and `results` arrays
-
-3. **Test Specs** - YAML files in `specs/`:
-   - `basic.yaml` - Core GQL operations, parameters, data types
-   - `transactions.yaml` - BEGIN/COMMIT/ROLLBACK
-   - `connections.yaml` - Connection management
-   - `auth.yaml` - Authentication tests
-   - `performance.yaml` - Benchmarks
+1. `geodetestlab-cli/geodetestlab/cli.py` — Typer CLI entry point
+2. `geodetestlab-cli/geodetestlab/lib/runner.py` — Test orchestration
+   - Imports from sub-modules: `server.py`, `executor.py`, `checks.py`, `runner_types.py`
+3. `geodetestlab-cli/geodetestlab/lib/spec.py` — YAML spec parsing
+4. `geodetestlab-cli/specs/` — 243 YAML test specifications
 
 ### Key Files
 
-- `run_tests.py` - Main test harness coordinator
-  - `GeodeServerManager` - Docker container management
-  - `*Runner` classes - Language-specific test runners
-  - `TestHarness` - Test orchestration
-- `Makefile` - Build and test commands
-- `runners/build.zig` - Zig runner build config
-- `runners/go.mod` - Go runner module config
-- `runners/rust_runner/Cargo.toml` - Rust runner config
-- `runners/package.json` - Node.js runner dependencies
+```
+geodetestlab-cli/
+├── geodetestlab/
+│   ├── cli.py                 # Typer CLI (run, secrets, server commands)
+│   ├── lib/
+│   │   ├── runner.py          # Test orchestration (396 lines)
+│   │   ├── runner_types.py    # Shared data classes (TestResult, RunSummary)
+│   │   ├── server.py          # Server lifecycle (start/stop/cleanup)
+│   │   ├── executor.py        # Test execution (CLI/HTTP/shell/sequential)
+│   │   ├── checks.py          # Expectation checking
+│   │   ├── spec.py            # YAML spec parser
+│   │   ├── assertions.py      # Test assertion functions
+│   │   ├── utils.py           # Utilities (binary finder, port allocator)
+│   │   └── plaintext_scanner.py # FLE plaintext verification
+│   ├── providers/             # LLM fuzz testing providers
+│   ├── server/                # Server manager (importlib-based)
+│   └── tests/                 # Unit tests (57 tests)
+├── specs/                     # 243 YAML test specifications
+└── pyproject.toml             # Python package config (ruff, mypy, pytest)
+```
 
 ### Test Spec Format
 
 ```yaml
-version: "1.0"
 name: "Test Suite Name"
+mode: server           # auto-manages a Geode server per spec
+server_args: []        # extra args for the server
 tests:
-  - name: "test-name"
-    description: "What this tests"
-    query: "RETURN $param AS result"
-    params:
-      param: "value"
-    expect:
-      rows: 1
-      columns: ["result"]
-      values:
-        - result: "value"
-    timeout_ms: 5000
-    skip: false
-    expect_error: false
+  - name: "query-test"
+    query: "RETURN 1 AS x"
+    expected:
+      exit_code: 0
+      stdout_contains: ["x"]
 
-  # Multi-step tests
-  - name: "multi-step-test"
-    steps:
-      - type: connect
-      - type: begin
-      - type: query
-        text: "CREATE (n:Node {id: 1})"
-      - type: commit
-      - type: disconnect
+  - name: "command-test"
+    command: "zig-out/bin/geode query 'RETURN 1' --server ${GEODE_SERVER_ADDRESS}"
+    expected:
+      exit_code: 0
+      stdout_contains: ["1"]
+
+  - name: "http-test"
+    test_type: http
+    http_requests:
+      - method: GET
+        url: "http://${GEODE_HOST}:${PORT}/health"
+        expected:
+          status_code: 200
 ```
 
-Step types: `connect`, `disconnect`, `begin`, `commit`, `rollback`, `query`
+### Cross-Language Runners
+
+The `runners/` directory contains language-specific test runners for cross-client validation:
+- `runners/zig_runner` / `zig_runner_new.zig` - Zig client runner
+- `runners/go_runner` / `go_runner.go` - Go client runner
+- `runners/python_runner.py` - Python client runner
+- `runners/rust_runner/` - Rust client runner
+- `runners/nodejs_runner.js` - Node.js client runner
+- `runners/shell_runner.py` - Shell test runner
+
+Runners accept `--spec <yaml> --server host:port --transport quic|grpc --json` flags.
 
 ## Docker Server Configuration
-
-The test harness uses Docker for server management:
 
 ```bash
 # Default settings
 GEODE_IMAGE=geodedb/geode:latest
 GEODE_CONTAINER=geode-test-harness
-GEODE_PORT=3141
+GEODE_PORT=3141        # QUIC (UDP)
+GEODE_GRPC_PORT=50051  # gRPC (TCP)
 
 # Override via environment or make variables
 GEODE_PORT=8443 make docker-start
-GEODE_IMAGE=my-registry/geode:custom make docker-start
 ```
 
-The server listens on UDP port 3141 for QUIC connections.
-
-## Development Notes
-
-### Adding a New Client Runner
-
-1. Create runner file in `runners/` (e.g., `newlang_runner.ext`)
-2. Implement CLI interface: `--spec <file> --server <host:port> --json`
-3. Output JSON format:
-   ```json
-   {
-     "summary": {"total": N, "passed": N, "failed": N, "errors": N, "skipped": N},
-     "results": [{"test": "name", "status": "passed|failed|error|skipped", ...}]
-   }
-   ```
-4. Add `NewLangRunner` class to `run_tests.py`
-5. Add build target to `Makefile`
-6. Update `--clients` default in `run_tests.py`
-
-### Client Dependencies
-
-- **Zig**: Uses `build.zig.zon` git URL to `gitlab.com/devnw/codepros/geode/geode-client-zig`
-- **Go**: Uses `go.mod` with public module `geodedb.com/geode`
-- **Rust**: Uses Cargo git dependency from `gitlab.com/devnw/codepros/geode/geode-client-rust`
-- **Python**: Imports from installed package `geode-client`
-- **Node.js**: Uses npm package `@geodedb/client`
-
-### Testing Against External Server
-
-```bash
-# Skip Docker management (QUIC transport)
-python3 run_tests.py --server my-server:3141 --no-manage-server --clients zig
-
-# Test with gRPC transport
-python3 run_tests.py --server my-server:50051 --transport grpc --no-manage-server --clients go
-```
-
-### Environment Variables
+## Environment Variables
 
 - `GEODE_IMAGE` - Docker image to use
-- `GEODE_CONTAINER` - Container name
 - `GEODE_HOST` - Server host (default: 127.0.0.1)
 - `GEODE_PORT` - QUIC server port (default: 3141, UDP)
 - `GEODE_GRPC_PORT` - gRPC server port (default: 50051, TCP)
-- `GEODE_ADMIN_PASSWORD` - Admin password for authentication (default: GeodeTestPassword123!)
-- `GEODE_USERNAME` - Username for authentication (default: geode)
+- `GEODE_ADMIN_PASSWORD` - Admin password (default: GeodeTestPassword123!)
+- `GEODE_USERNAME` - Username (default: geode)
+- `GEODE_VERIFY_SSL` - Enable SSL verification (default: 0)
 
 ## Requirements
 
 ### Required
+- Python 3.11+ (for geodetestlab-cli)
+- Geode binary (`../geode/zig-out/bin/geode`)
 
-- Python 3.9+ (for test harness)
-- Docker (for server management)
-
-### Optional (for specific clients)
-
-- **Zig**: Zig 0.15.1+ for Zig runner
-- **Go**: Go 1.24+ for Go runner
-- **Rust**: Rust 1.70+ for Rust runner
-- **Node.js**: Node.js 20+ for Node.js runner
-
-## Troubleshooting
-
-### Docker Issues
-
-```bash
-# Check if container is running
-make docker-status
-
-# View logs for debugging
-make docker-logs
-
-# Force restart
-make docker-stop && make docker-start
-```
-
-### Build Issues
-
-```bash
-# Clean all build artifacts
-make clean
-
-# Rebuild specific runner
-make build-zig  # or build-go, build-rust, etc.
-```
-
-### Client Not Found
-
-Ensure sibling client repositories exist:
-```bash
-ls ../geode-client-{go,python,rust,zig,nodejs}
-```
-
-If missing, clone from GitLab:
-```bash
-git clone git@gitlab.com:devnw/geode/geode-client-go.git ../geode-client-go
-# etc.
-```
+### Optional
+- Docker (for containerized server management)
+- **Zig**: 0.15.1+ for Zig runner
+- **Go**: 1.24+ for Go runner
+- **Rust**: 1.70+ for Rust runner
+- **Node.js**: 20+ for Node.js runner

@@ -14,13 +14,13 @@ operations.
 
 from __future__ import annotations
 
-from typing import List, Optional, Protocol
+from typing import Protocol
 
 
 class LLMProvider(Protocol):
     """Protocol that all LLM providers must implement."""
 
-    def fuzz(self, prompt: str, max_cases: int, seed: Optional[int]) -> List[List[str]]:
+    def fuzz(self, prompt: str, max_cases: int, seed: int | None) -> list[list[str]]:
         """Generate additional argument arrays based on the prompt.
 
         Parameters
@@ -52,8 +52,8 @@ class LLMProvider(Protocol):
         return False
 
     def generate_gql_queries(
-        self, max_queries: int, complexity: str = "simple", seed: Optional[int] = None
-    ) -> List[str]:
+        self, max_queries: int, complexity: str = "simple", seed: int | None = None
+    ) -> list[str]:
         """Generate GQL queries for testing.
 
         Parameters

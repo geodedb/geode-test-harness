@@ -1,7 +1,7 @@
 """Utility functions for geodetestlab.
 
 This module provides helper functions for finding binaries, managing ports,
-and resolving secrets.
+resolving secrets, and validating inputs.
 
 Common utilities (get_free_port, find_geode_binary, format_duration, sanitize_filename)
 are imported from the shared lib module.
@@ -10,9 +10,11 @@ are imported from the shared lib module.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
-import sys
+import re
 from pathlib import Path
+from typing import Any
 
 # Import shared utilities from the parent geode-test-harness lib
 # We need to load the harness lib/utils.py directly to avoid name collision
@@ -41,9 +43,166 @@ __all__ = [
     "sanitize_filename",
     "resolve_secrets",
     "SecretResolutionError",
+    "GeodeBinaryNotFoundError",
+    "sanitize_args",
+    "is_valid_gql",
+    "extract_json_from_output",
 ]
 
-from .spec import SecretConfig, TestSpec
+
+class GeodeBinaryNotFoundError(FileNotFoundError):
+    """Raised when the Geode binary cannot be found."""
+
+    pass
+
+
+# Shell metacharacters that should not appear in CLI arguments
+_SHELL_METACHARACTERS = frozenset(";|&`$(){}!")
+
+
+def sanitize_args(args: list[str]) -> list[str]:
+    """Validate CLI arguments for unsafe characters.
+
+    Parameters
+    ----------
+    args : list[str]
+        List of CLI arguments to validate.
+
+    Returns
+    -------
+    list[str]
+        The same arguments if all are safe.
+
+    Raises
+    ------
+    ValueError
+        If any argument contains unsafe characters.
+    """
+    for arg in args:
+        # Check for non-printable characters
+        for ch in arg:
+            if ord(ch) < 0x20 and ch not in ("\n", "\r"):
+                raise ValueError(
+                    f"Non\u2011printable character in argument: {arg!r}"
+                )
+        # Check for shell metacharacters
+        for ch in arg:
+            if ch in _SHELL_METACHARACTERS:
+                raise ValueError(
+                    f"Invalid character '{ch}' in argument: {arg!r}"
+                )
+    return args
+
+
+# GQL keywords that indicate a valid query start
+_GQL_KEYWORDS = {
+    "MATCH", "CREATE", "DELETE", "DETACH", "SET", "REMOVE", "MERGE",
+    "RETURN", "WITH", "UNWIND", "CALL", "EXPLAIN", "PROFILE",
+    "INSERT", "DROP", "ALTER", "BEGIN", "COMMIT", "ROLLBACK",
+    "SESSION", "OPTIONAL", "FOR", "LET", "FILTER", "LIMIT",
+    "ORDER", "SKIP", "WHERE", "YIELD", "USE", "SHOW",
+}
+
+
+def is_valid_gql(query: str) -> bool:
+    """Check if a string looks like a valid GQL query.
+
+    This performs basic syntactic validation, not full parsing.
+
+    Parameters
+    ----------
+    query : str
+        The query string to validate.
+
+    Returns
+    -------
+    bool
+        True if the query appears to be valid GQL.
+    """
+    if not query or not query.strip():
+        return False
+
+    stripped = query.strip()
+
+    # Check first word is a GQL keyword
+    first_word = stripped.split()[0].upper()
+    if first_word not in _GQL_KEYWORDS:
+        return False
+
+    # Check bracket balance
+    stack: list[str] = []
+    matching = {"(": ")", "[": "]", "{": "}"}
+    for ch in stripped:
+        if ch in matching:
+            stack.append(matching[ch])
+        elif ch in matching.values():
+            if not stack or stack[-1] != ch:
+                return False
+            stack.pop()
+
+    return len(stack) == 0
+
+
+def extract_json_from_output(output: str) -> Any:
+    """Extract and parse JSON from CLI output that may contain non-JSON text.
+
+    Parameters
+    ----------
+    output : str
+        Raw CLI output potentially containing JSON.
+
+    Returns
+    -------
+    Any
+        Parsed JSON data, or None if no valid JSON found.
+    """
+    # Try the whole string first
+    try:
+        return json.loads(output.strip())
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try to find JSON object or array in the output
+    for line in output.strip().splitlines():
+        line = line.strip()
+        if line.startswith(("{", "[")):
+            try:
+                return json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+    return None
+
+
+def _replace_placeholder(text: str, secrets: dict[str, str]) -> str:
+    """Replace ${secret:NAME} placeholders with resolved values.
+
+    Parameters
+    ----------
+    text : str
+        Text containing placeholders.
+    secrets : dict[str, str]
+        Mapping of secret names to values.
+
+    Returns
+    -------
+    str
+        Text with placeholders replaced.
+
+    Raises
+    ------
+    KeyError
+        If a referenced secret is not defined.
+    """
+    def replacer(match: re.Match) -> str:
+        name = match.group(1)
+        if name not in secrets:
+            raise KeyError(f"Secret '{name}' is not defined")
+        return secrets[name]
+
+    return re.sub(r"\$\{secret:(\w+)\}", replacer, text)
+
+from .spec import SecretConfig, TestSpec  # noqa: E402  # circular import
 
 
 class SecretResolutionError(Exception):

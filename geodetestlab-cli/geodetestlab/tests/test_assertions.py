@@ -1,7 +1,12 @@
 """Tests for assertion evaluation."""
 
-from geodetestlab.core.assertions import _extract_rows_from_geode_output, evaluate_assertions
-from geodetestlab.core.spec import GeodeQueryAssert, StdoutJsonAssert, TestExpectations
+from geodetestlab.lib.assertions import (
+    GeodeQueryAssert,
+    StdoutJsonAssert,
+    TestExpectations,
+    _extract_rows_from_geode_output,
+    evaluate_assertions,
+)
 
 
 def test_exit_code_assertion():

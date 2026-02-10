@@ -15,7 +15,7 @@ import signal
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -163,18 +163,18 @@ def _run_single_spec(
 @app.command("run")
 def run(
     *,
-    spec: Optional[Path] = typer.Option(
+    spec: Path | None = typer.Option(
         None,
         exists=True,
         readable=True,
         help="Path to a single YAML test specification file",
     ),
-    specs: Optional[Path] = typer.Option(
+    specs: Path | None = typer.Option(
         None,
         exists=True,
         help="Path to a directory containing YAML test specifications",
     ),
-    output: Optional[Path] = typer.Option(
+    output: Path | None = typer.Option(
         None,
         help="Alias for --report-json: path to write a full machine‑readable report JSON",
     ),
@@ -183,11 +183,11 @@ def run(
         help="LLM provider to use for fuzzing (mock, openai, or geode-ai)",
         show_default=True,
     ),
-    model: Optional[str] = typer.Option(
+    model: str | None = typer.Option(
         None,
         help="LLM model identifier when using openai or geode-ai provider",
     ),
-    max_cases: Optional[int] = typer.Option(
+    max_cases: int | None = typer.Option(
         None,
         min=0,
         help="Maximum number of additional fuzzed cases to generate",
@@ -204,7 +204,7 @@ def run(
         help="Server startup/shutdown timeout in milliseconds",
         show_default=True,
     ),
-    report_json: Optional[Path] = typer.Option(
+    report_json: Path | None = typer.Option(
         None,
         help="Optional path to write a full machine‑readable report JSON",
     ),
@@ -216,15 +216,15 @@ def run(
         False,
         help="Run in CI mode (non-interactive, simplified output)",
     ),
-    seed: Optional[int] = typer.Option(
+    seed: int | None = typer.Option(
         None,
         help="Random seed to pass to the LLM provider for deterministic fuzzing",
     ),
-    geode_binary: Optional[str] = typer.Option(
+    geode_binary: str | None = typer.Option(
         None,
         help="Path to the geode binary (auto-detected if not specified)",
     ),
-    server_port: Optional[int] = typer.Option(
+    server_port: int | None = typer.Option(
         None,
         min=1024,
         max=65535,
@@ -347,8 +347,8 @@ def run(
                     console.print("\n[yellow]Interrupt received, shutting down workers...[/yellow]")
 
                 # Shutdown executor immediately
-                if executor:
-                    executor.shutdown(wait=False, cancel_futures=True)
+                if executor:  # noqa: B023
+                    executor.shutdown(wait=False, cancel_futures=True)  # noqa: B023
 
                 # Kill all geode and child processes to ensure cleanup
                 _kill_geode_processes()
@@ -532,12 +532,12 @@ def secrets_check(*, spec: Path = typer.Option(..., exists=True, readable=True, 
         spec_obj = load_spec(spec)
     except SpecValidationError:
         console_err.print("SCHEMA_ERROR", style="red")
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=2) from None
     try:
         resolve_secrets(spec_obj)
     except SecretResolutionError as exc:
         console_err.print(str(exc), style="red")
-        raise typer.Exit(code=4)
+        raise typer.Exit(code=4) from None
     # No missing secrets
     console.print("[green]All required secrets are resolvable[/green]")
     raise typer.Exit(code=0)
@@ -559,12 +559,12 @@ def secrets_list(
         spec_obj = load_spec(spec)
     except SpecValidationError:
         console_err.print("SCHEMA_ERROR", style="red")
-        raise typer.Exit(code=2)
+        raise typer.Exit(code=2) from None
     try:
         secrets, _ = resolve_secrets(spec_obj)
     except SecretResolutionError as exc:
         console_err.print(str(exc), style="red")
-        raise typer.Exit(code=4)
+        raise typer.Exit(code=4) from None
     if not spec_obj.secrets:
         console.print("[yellow]No secrets defined in spec[/yellow]")
         raise typer.Exit(code=0)
@@ -590,8 +590,8 @@ server_app = typer.Typer(help="Subcommands for managing Geode server instances."
 def server_start(
     *,
     port: int = typer.Option(8443, min=1024, max=65535, help="Port to bind the server to"),
-    data_dir: Optional[Path] = typer.Option(None, help="Data directory for the server"),
-    geode_binary: Optional[str] = typer.Option(None, help="Path to the geode binary"),
+    data_dir: Path | None = typer.Option(None, help="Data directory for the server"),
+    geode_binary: str | None = typer.Option(None, help="Path to the geode binary"),
     timeout_ms: int = typer.Option(60000, min=1000, help="Startup timeout in milliseconds"),
     background: bool = typer.Option(False, help="Start server in background and exit"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose server output"),
@@ -629,7 +629,7 @@ def server_start(
 
     except Exception as exc:
         console_err.print(f"[red]Failed to start server: {exc}[/red]")
-        raise typer.Exit(code=3)
+        raise typer.Exit(code=3) from None
 
 
 @server_app.command("stop")
@@ -647,13 +647,13 @@ def server_stop(
             raise typer.Exit(code=1)
     except Exception as exc:
         console_err.print(f"[red]Failed to stop server: {exc}[/red]")
-        raise typer.Exit(code=3)
+        raise typer.Exit(code=3) from None
 
 
 @server_app.command("status")
 def server_status(
     *,
-    port: Optional[int] = typer.Option(None, min=1024, max=65535, help="Check specific port"),
+    port: int | None = typer.Option(None, min=1024, max=65535, help="Check specific port"),
 ) -> None:
     """Show status of running Geode server instances."""
     servers = ServerManager.list_servers(port)

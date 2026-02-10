@@ -73,12 +73,9 @@ def test_mock_provider_geode_patterns():
     simple_queries = provider.generate_gql_queries(10, complexity="simple", seed=42)
     complex_queries = provider.generate_gql_queries(10, complexity="complex", seed=42)
 
-    # Simple queries should generally be shorter
-    if simple_queries and complex_queries:
-        avg_simple_len = sum(len(q.split()) for q in simple_queries) / len(simple_queries)
-        avg_complex_len = sum(len(q.split()) for q in complex_queries) / len(complex_queries)
-        # This might not always hold, but it's a reasonable expectation
-        # assert avg_simple_len <= avg_complex_len
+    # Verify both query sets were generated
+    assert len(simple_queries) > 0
+    assert len(complex_queries) > 0
 
 
 def test_geode_ai_provider_patterns():

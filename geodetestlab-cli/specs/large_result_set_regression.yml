@@ -1,0 +1,152 @@
+version: '1.0'
+name: Large Result Set Regression
+description: >
+  Regression test for QUIC partial write bug where queries returning >7 rows
+  failed with 35s timeout. Verifies that result sets of 5, 8, 10, 15, and 20
+  rows all return correctly without timeout.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+tests:
+- name: large-rs-setup-nodes
+  description: Create 20 nodes for large result set testing
+  args:
+  - query
+  - >
+    CREATE (:LargeRSItem {id: 1, name: 'item-01', value: 100}),
+           (:LargeRSItem {id: 2, name: 'item-02', value: 200}),
+           (:LargeRSItem {id: 3, name: 'item-03', value: 300}),
+           (:LargeRSItem {id: 4, name: 'item-04', value: 400}),
+           (:LargeRSItem {id: 5, name: 'item-05', value: 500}),
+           (:LargeRSItem {id: 6, name: 'item-06', value: 600}),
+           (:LargeRSItem {id: 7, name: 'item-07', value: 700}),
+           (:LargeRSItem {id: 8, name: 'item-08', value: 800}),
+           (:LargeRSItem {id: 9, name: 'item-09', value: 900}),
+           (:LargeRSItem {id: 10, name: 'item-10', value: 1000}),
+           (:LargeRSItem {id: 11, name: 'item-11', value: 1100}),
+           (:LargeRSItem {id: 12, name: 'item-12', value: 1200}),
+           (:LargeRSItem {id: 13, name: 'item-13', value: 1300}),
+           (:LargeRSItem {id: 14, name: 'item-14', value: 1400}),
+           (:LargeRSItem {id: 15, name: 'item-15', value: 1500}),
+           (:LargeRSItem {id: 16, name: 'item-16', value: 1600}),
+           (:LargeRSItem {id: 17, name: 'item-17', value: 1700}),
+           (:LargeRSItem {id: 18, name: 'item-18', value: 1800}),
+           (:LargeRSItem {id: 19, name: 'item-19', value: 1900}),
+           (:LargeRSItem {id: 20, name: 'item-20', value: 2000})
+  expect:
+    exit_code: 0
+  tags:
+  - large-result-set
+  - setup
+
+- name: large-rs-5-rows
+  description: Query returning exactly 5 rows (below old threshold)
+  args:
+  - query
+  - "MATCH (n:LargeRSItem) WHERE n.id <= 5 RETURN n.id AS id, n.name AS name ORDER BY n.id"
+  expect:
+    exit_code: 0
+    result_contains: "item-05"
+  tags:
+  - large-result-set
+  - regression
+
+- name: large-rs-8-rows
+  description: Query returning 8 rows (at old failure threshold)
+  args:
+  - query
+  - "MATCH (n:LargeRSItem) WHERE n.id <= 8 RETURN n.id AS id, n.name AS name ORDER BY n.id"
+  expect:
+    exit_code: 0
+    result_contains: "item-08"
+  tags:
+  - large-result-set
+  - regression
+
+- name: large-rs-10-rows
+  description: Query returning 10 rows (above old failure threshold)
+  args:
+  - query
+  - "MATCH (n:LargeRSItem) WHERE n.id <= 10 RETURN n.id AS id, n.name AS name ORDER BY n.id"
+  expect:
+    exit_code: 0
+    result_contains: "item-10"
+  tags:
+  - large-result-set
+  - regression
+
+- name: large-rs-15-rows
+  description: Query returning 15 rows (well above old threshold)
+  args:
+  - query
+  - "MATCH (n:LargeRSItem) WHERE n.id <= 15 RETURN n.id AS id, n.name AS name ORDER BY n.id"
+  expect:
+    exit_code: 0
+    result_contains: "item-15"
+  tags:
+  - large-result-set
+  - regression
+
+- name: large-rs-20-rows
+  description: Query returning all 20 rows
+  args:
+  - query
+  - "MATCH (n:LargeRSItem) RETURN n.id AS id, n.name AS name, n.value AS value ORDER BY n.id"
+  expect:
+    exit_code: 0
+    result_contains: "item-20"
+  tags:
+  - large-result-set
+  - regression
+
+- name: large-rs-return-star-8
+  description: RETURN * with 8 rows (tests larger per-row payload with all properties)
+  args:
+  - query
+  - "MATCH (n:LargeRSItem) WHERE n.id <= 8 RETURN n ORDER BY n.id"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - "item-01"
+    - "item-08"
+  tags:
+  - large-result-set
+  - regression
+
+- name: large-rs-return-star-20
+  description: RETURN * with all 20 rows (largest payload)
+  args:
+  - query
+  - "MATCH (n:LargeRSItem) RETURN n ORDER BY n.id"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - "item-01"
+    - "item-20"
+  tags:
+  - large-result-set
+  - regression
+
+- name: large-rs-count-verify
+  description: Verify total count matches expected 20 nodes
+  args:
+  - query
+  - "MATCH (n:LargeRSItem) RETURN COUNT(n) AS total"
+  expect:
+    exit_code: 0
+    result_contains: "20"
+  tags:
+  - large-result-set
+  - verification

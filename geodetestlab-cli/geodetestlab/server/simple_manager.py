@@ -8,51 +8,44 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from pathlib import Path
-from types import ModuleType
 
 # Import shared modules from the parent geode-test-harness lib
 # We load them directly by path to avoid name collision with geodetestlab's lib
 _harness_root = Path(__file__).parent.parent.parent.parent
 _harness_lib_path = _harness_root / "lib"
 
+# Synthetic package name to avoid collisions with geodetestlab.lib
+_PKG = "harness_lib"
 
-def _load_module_from_path(name: str, path: Path) -> ModuleType:
-    """Load a Python module from a file path."""
+
+def _load_module(name: str, path: Path) -> types.ModuleType:
+    """Load a Python module by file path and register it in sys.modules."""
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load module from {path}")
     module = importlib.util.module_from_spec(spec)
-    return module, spec
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-# Load utils first (server_manager depends on it)
-_utils_module, _utils_spec = _load_module_from_path(
-    "harness_lib_utils", _harness_lib_path / "utils.py"
-)
-_utils_spec.loader.exec_module(_utils_module)
+# Register a synthetic package so that ``from .utils import get_free_port``
+# inside server_manager.py resolves via normal importlib (no exec/compile).
+if _PKG not in sys.modules:
+    _pkg_mod = types.ModuleType(_PKG)
+    _pkg_mod.__path__ = [str(_harness_lib_path)]
+    _pkg_mod.__package__ = _PKG
+    sys.modules[_PKG] = _pkg_mod
 
-# Load server_manager, but we need to handle its relative import
-# by pre-injecting the function it needs
-_sm_path = _harness_lib_path / "server_manager.py"
-_sm_source = _sm_path.read_text()
-# Replace the relative import with an absolute one using our loaded module
-_sm_source = _sm_source.replace(
-    "from .utils import get_free_port",
-    "pass  # get_free_port injected externally"
-)
-_sm_code = compile(_sm_source, str(_sm_path), "exec")
+# Load utils first (server_manager depends on it via relative import)
+_load_module(f"{_PKG}.utils", _harness_lib_path / "utils.py")
 
-# Create a module namespace with the required imports pre-loaded
-_sm_namespace = {
-    "__name__": "harness_lib_server_manager",
-    "__file__": str(_sm_path),
-    "__builtins__": __builtins__,
-    "get_free_port": _utils_module.get_free_port,
-}
-exec(_sm_code, _sm_namespace)
+# Load server_manager using standard importlib — no exec() needed
+_sm = _load_module(f"{_PKG}.server_manager", _harness_lib_path / "server_manager.py")
 
-# Extract the ServerManager class
-ServerManager = _sm_namespace["ServerManager"]
+# Re-export the ServerManager class
+ServerManager = _sm.ServerManager
 
 __all__ = ["ServerManager"]
