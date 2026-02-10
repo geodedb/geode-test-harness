@@ -140,79 +140,95 @@ def evaluate_assertions(
 
     # Exit code
     if expect.exit_code is not None:
-        results.append({
-            "type": "exit_code",
-            "ok": exit_code == expect.exit_code,
-            "expected": expect.exit_code,
-            "actual": exit_code,
-        })
+        results.append(
+            {
+                "type": "exit_code",
+                "ok": exit_code == expect.exit_code,
+                "expected": expect.exit_code,
+                "actual": exit_code,
+            }
+        )
 
     # Stdout exact
     if expect.stdout_exact is not None:
-        results.append({
-            "type": "stdout_exact",
-            "ok": stdout.strip() == expect.stdout_exact.strip(),
-            "expected": expect.stdout_exact,
-            "actual": stdout,
-        })
+        results.append(
+            {
+                "type": "stdout_exact",
+                "ok": stdout.strip() == expect.stdout_exact.strip(),
+                "expected": expect.stdout_exact,
+                "actual": stdout,
+            }
+        )
 
     # Stdout contains
     if expect.stdout_contains:
         for item in expect.stdout_contains:
-            results.append({
-                "type": "stdout_contains",
-                "ok": item in stdout,
-                "expected": item,
-                "actual": stdout,
-            })
+            results.append(
+                {
+                    "type": "stdout_contains",
+                    "ok": item in stdout,
+                    "expected": item,
+                    "actual": stdout,
+                }
+            )
 
     # Stdout regex
     if expect.stdout_regex:
         for pattern in expect.stdout_regex:
             try:
                 matched = bool(re.search(pattern, stdout))
-                results.append({
-                    "type": "stdout_regex",
-                    "ok": matched,
-                    "pattern": pattern,
-                    "actual": stdout,
-                })
+                results.append(
+                    {
+                        "type": "stdout_regex",
+                        "ok": matched,
+                        "pattern": pattern,
+                        "actual": stdout,
+                    }
+                )
             except re.error as e:
-                results.append({
-                    "type": "stdout_regex",
-                    "ok": False,
-                    "pattern": pattern,
-                    "error": f"Invalid regex: {e}",
-                })
+                results.append(
+                    {
+                        "type": "stdout_regex",
+                        "ok": False,
+                        "pattern": pattern,
+                        "error": f"Invalid regex: {e}",
+                    }
+                )
 
     # Stderr contains
     if expect.stderr_contains:
         for item in expect.stderr_contains:
-            results.append({
-                "type": "stderr_contains",
-                "ok": item in stderr,
-                "expected": item,
-                "actual": stderr,
-            })
+            results.append(
+                {
+                    "type": "stderr_contains",
+                    "ok": item in stderr,
+                    "expected": item,
+                    "actual": stderr,
+                }
+            )
 
     # Stderr regex
     if expect.stderr_regex:
         for pattern in expect.stderr_regex:
             try:
                 matched = bool(re.search(pattern, stderr))
-                results.append({
-                    "type": "stderr_regex",
-                    "ok": matched,
-                    "pattern": pattern,
-                    "actual": stderr,
-                })
+                results.append(
+                    {
+                        "type": "stderr_regex",
+                        "ok": matched,
+                        "pattern": pattern,
+                        "actual": stderr,
+                    }
+                )
             except re.error as e:
-                results.append({
-                    "type": "stderr_regex",
-                    "ok": False,
-                    "pattern": pattern,
-                    "error": f"Invalid regex: {e}",
-                })
+                results.append(
+                    {
+                        "type": "stderr_regex",
+                        "ok": False,
+                        "pattern": pattern,
+                        "error": f"Invalid regex: {e}",
+                    }
+                )
 
     # Stdout JSON assertions
     if expect.stdout_json_assert:
@@ -251,39 +267,47 @@ def evaluate_assertions(
         row_count = len(rows) if rows is not None else 0
 
         if gq.row_count is not None:
-            results.append({
-                "type": "geode_row_count",
-                "ok": row_count == gq.row_count,
-                "expected": gq.row_count,
-                "actual": row_count,
-            })
+            results.append(
+                {
+                    "type": "geode_row_count",
+                    "ok": row_count == gq.row_count,
+                    "expected": gq.row_count,
+                    "actual": row_count,
+                }
+            )
 
         if gq.min_rows is not None:
-            results.append({
-                "type": "geode_min_rows",
-                "ok": row_count >= gq.min_rows,
-                "minimum": gq.min_rows,
-                "actual": row_count,
-            })
+            results.append(
+                {
+                    "type": "geode_min_rows",
+                    "ok": row_count >= gq.min_rows,
+                    "minimum": gq.min_rows,
+                    "actual": row_count,
+                }
+            )
 
         if gq.max_rows is not None:
-            results.append({
-                "type": "geode_max_rows",
-                "ok": row_count <= gq.max_rows,
-                "maximum": gq.max_rows,
-                "actual": row_count,
-            })
+            results.append(
+                {
+                    "type": "geode_max_rows",
+                    "ok": row_count <= gq.max_rows,
+                    "maximum": gq.max_rows,
+                    "actual": row_count,
+                }
+            )
 
         if gq.columns is not None:
             actual_columns = list(parsed.get("columns", []))
             if not actual_columns and rows:
                 actual_columns = list(rows[0].keys())
-            results.append({
-                "type": "geode_columns",
-                "ok": set(gq.columns) <= set(actual_columns),
-                "expected": gq.columns,
-                "actual": actual_columns,
-            })
+            results.append(
+                {
+                    "type": "geode_columns",
+                    "ok": set(gq.columns) <= set(actual_columns),
+                    "expected": gq.columns,
+                    "actual": actual_columns,
+                }
+            )
 
         if gq.contains_node is not None:
             found = False
@@ -291,41 +315,42 @@ def evaluate_assertions(
                 for row in rows:
                     # Check direct match or nested values
                     values_to_check = [row]
-                    values_to_check.extend(
-                        v for v in row.values() if isinstance(v, dict)
-                    )
+                    values_to_check.extend(v for v in row.values() if isinstance(v, dict))
                     for obj in values_to_check:
-                        if all(
-                            str(obj.get(k)) == str(v)
-                            for k, v in gq.contains_node.items()
-                        ):
+                        if all(str(obj.get(k)) == str(v) for k, v in gq.contains_node.items()):
                             found = True
                             break
                     if found:
                         break
-            results.append({
-                "type": "geode_contains_node",
-                "ok": found,
-                "expected_node": gq.contains_node,
-            })
+            results.append(
+                {
+                    "type": "geode_contains_node",
+                    "ok": found,
+                    "expected_node": gq.contains_node,
+                }
+            )
 
         if gq.execution_time_ms is not None:
             metadata = parsed.get("metadata", {})
             actual_time = metadata.get("execution_time_ms", 0)
-            results.append({
-                "type": "geode_execution_time",
-                "ok": actual_time <= gq.execution_time_ms,
-                "max_time_ms": gq.execution_time_ms,
-                "actual_time_ms": actual_time,
-            })
+            results.append(
+                {
+                    "type": "geode_execution_time",
+                    "ok": actual_time <= gq.execution_time_ms,
+                    "max_time_ms": gq.execution_time_ms,
+                    "actual_time_ms": actual_time,
+                }
+            )
 
     # Server responsive
     if expect.server_responsive is not None:
-        results.append({
-            "type": "server_responsive",
-            "ok": (exit_code == 0) == expect.server_responsive,
-            "expected_responsive": expect.server_responsive,
-            "exit_code": exit_code,
-        })
+        results.append(
+            {
+                "type": "server_responsive",
+                "ok": (exit_code == 0) == expect.server_responsive,
+                "expected_responsive": expect.server_responsive,
+                "exit_code": exit_code,
+            }
+        )
 
     return results

@@ -136,6 +136,7 @@ class ExpectedResult:
         Supports both geodetestlab format (status, result_contains, etc.)
         and legacy CLI test format (exit_code, stdout_contains, etc.).
         """
+
         # Helper function to normalize list fields
         def normalize_list(value: Any) -> list[str] | None:
             if value is None:
@@ -147,9 +148,15 @@ class ExpectedResult:
         # Support "contains" as shorthand for "stdout_contains"
         stdout_contains = normalize_list(data.get("stdout_contains")) or normalize_list(data.get("contains"))
         # Support "not_contains" as shorthand for "stdout_not_contains"
-        stdout_not_contains = normalize_list(data.get("stdout_not_contains")) or normalize_list(data.get("not_contains"))
+        stdout_not_contains = normalize_list(data.get("stdout_not_contains")) or normalize_list(
+            data.get("not_contains")
+        )
         # Support "regex" / "matches" as shorthand for "stdout_regex"
-        stdout_regex = normalize_list(data.get("stdout_regex")) or normalize_list(data.get("regex")) or normalize_list(data.get("matches"))
+        stdout_regex = (
+            normalize_list(data.get("stdout_regex"))
+            or normalize_list(data.get("regex"))
+            or normalize_list(data.get("matches"))
+        )
 
         return cls(
             status=data.get("status", "success"),
@@ -494,7 +501,9 @@ def load_spec(path: str | Path) -> TestSpec:
             has_args = "args" in test
             has_stdin = "stdin" in test
             if not (has_query or has_command or has_args or has_stdin):
-                raise SpecValidationError(f"Test case '{test['name']}' must have either 'query', 'command', 'args', or 'stdin'")
+                raise SpecValidationError(
+                    f"Test case '{test['name']}' must have either 'query', 'command', 'args', or 'stdin'"
+                )
 
     # Validate mode
     mode = data.get("mode", "server")

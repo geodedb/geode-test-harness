@@ -98,9 +98,7 @@ class MockProvider:
         """Mock provider supports Geode patterns."""
         return True
 
-    def generate_gql_queries(
-        self, max_queries: int, complexity: str = "simple", seed: int | None = None
-    ) -> list[str]:
+    def generate_gql_queries(self, max_queries: int, complexity: str = "simple", seed: int | None = None) -> list[str]:
         """Generate mock GQL queries based on complexity level."""
         if max_queries <= 0:
             return []

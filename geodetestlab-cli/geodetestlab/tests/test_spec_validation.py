@@ -174,9 +174,7 @@ def test_http_test_spec():
             {
                 "name": "http-get",
                 "type": "http",
-                "requests": [
-                    {"method": "GET", "url": "http://localhost:8080/health", "expect": {"status_code": 200}}
-                ],
+                "requests": [{"method": "GET", "url": "http://localhost:8080/health", "expect": {"status_code": 200}}],
             }
         ],
     }

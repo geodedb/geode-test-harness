@@ -82,25 +82,47 @@ def sanitize_args(args: list[str]) -> list[str]:
         # Check for non-printable characters
         for ch in arg:
             if ord(ch) < 0x20 and ch not in ("\n", "\r"):
-                raise ValueError(
-                    f"Non\u2011printable character in argument: {arg!r}"
-                )
+                raise ValueError(f"Non\u2011printable character in argument: {arg!r}")
         # Check for shell metacharacters
         for ch in arg:
             if ch in _SHELL_METACHARACTERS:
-                raise ValueError(
-                    f"Invalid character '{ch}' in argument: {arg!r}"
-                )
+                raise ValueError(f"Invalid character '{ch}' in argument: {arg!r}")
     return args
 
 
 # GQL keywords that indicate a valid query start
 _GQL_KEYWORDS = {
-    "MATCH", "CREATE", "DELETE", "DETACH", "SET", "REMOVE", "MERGE",
-    "RETURN", "WITH", "UNWIND", "CALL", "EXPLAIN", "PROFILE",
-    "INSERT", "DROP", "ALTER", "BEGIN", "COMMIT", "ROLLBACK",
-    "SESSION", "OPTIONAL", "FOR", "LET", "FILTER", "LIMIT",
-    "ORDER", "SKIP", "WHERE", "YIELD", "USE", "SHOW",
+    "MATCH",
+    "CREATE",
+    "DELETE",
+    "DETACH",
+    "SET",
+    "REMOVE",
+    "MERGE",
+    "RETURN",
+    "WITH",
+    "UNWIND",
+    "CALL",
+    "EXPLAIN",
+    "PROFILE",
+    "INSERT",
+    "DROP",
+    "ALTER",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "SESSION",
+    "OPTIONAL",
+    "FOR",
+    "LET",
+    "FILTER",
+    "LIMIT",
+    "ORDER",
+    "SKIP",
+    "WHERE",
+    "YIELD",
+    "USE",
+    "SHOW",
 }
 
 
@@ -194,6 +216,7 @@ def _replace_placeholder(text: str, secrets: dict[str, str]) -> str:
     KeyError
         If a referenced secret is not defined.
     """
+
     def replacer(match: re.Match) -> str:
         name = match.group(1)
         if name not in secrets:
@@ -201,6 +224,7 @@ def _replace_placeholder(text: str, secrets: dict[str, str]) -> str:
         return secrets[name]
 
     return re.sub(r"\$\{secret:(\w+)\}", replacer, text)
+
 
 from .spec import SecretConfig, TestSpec  # noqa: E402  # circular import
 

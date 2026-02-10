@@ -18,9 +18,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-DEFAULT_ADMIN_PASSWORD = os.environ.get(
-    "GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"
-)
+DEFAULT_ADMIN_PASSWORD = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
 # Global list to track server processes for cleanup on exit
 _active_servers: list[subprocess.Popen] = []

@@ -51,9 +51,7 @@ class LLMProvider(Protocol):
         """
         return False
 
-    def generate_gql_queries(
-        self, max_queries: int, complexity: str = "simple", seed: int | None = None
-    ) -> list[str]:
+    def generate_gql_queries(self, max_queries: int, complexity: str = "simple", seed: int | None = None) -> list[str]:
         """Generate GQL queries for testing.
 
         Parameters

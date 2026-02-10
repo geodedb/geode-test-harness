@@ -41,9 +41,7 @@ class OpenAICompatProvider:
         """OpenAI provider supports Geode patterns through enhanced prompts."""
         return True
 
-    def generate_gql_queries(
-        self, max_queries: int, complexity: str = "simple", seed: int | None = None
-    ) -> list[str]:
+    def generate_gql_queries(self, max_queries: int, complexity: str = "simple", seed: int | None = None) -> list[str]:
         """Generate GQL queries using the OpenAI API."""
         if max_queries <= 0:
             return []

@@ -281,9 +281,7 @@ def run(
             console_err.print(f"Error: --specs path is not a directory: {specs}", style="red")
             raise typer.Exit(code=2)
         # Find all YAML files in the directory
-        spec_files = sorted(
-            list(specs.glob("*.yaml")) + list(specs.glob("*.yml"))
-        )
+        spec_files = sorted(list(specs.glob("*.yaml")) + list(specs.glob("*.yml")))
         if not spec_files:
             console_err.print(f"Error: No YAML files found in directory: {specs}", style="red")
             raise typer.Exit(code=2)

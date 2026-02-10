@@ -52,9 +52,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DEFAULT_QUIC_PORT = 3141
 DEFAULT_GRPC_PORT = 50051
-DEFAULT_ADMIN_PASSWORD = os.environ.get(
-    "GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"
-)
+DEFAULT_ADMIN_PASSWORD = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
 
 def _kill_stale_servers() -> None:
@@ -201,11 +199,13 @@ def run_tests(
             for i, setup_item in enumerate(spec.setup):
                 if isinstance(setup_item, dict):
                     # Create a minimal TestCase for the setup query
-                    setup_case = TestCase.from_dict({
-                        "name": f"setup-{i}",
-                        "description": "Setup query",
-                        **setup_item,
-                    })
+                    setup_case = TestCase.from_dict(
+                        {
+                            "name": f"setup-{i}",
+                            "description": "Setup query",
+                            **setup_item,
+                        }
+                    )
                     if verbose:
                         print(f"  Executing setup-{i}...")
                     result = run_cli_test(
@@ -359,11 +359,10 @@ def run_tests(
 
         # Cleanup data directory — skip for plaintext verification specs
         if data_dir and spec.mode == "server":
-            has_plaintext_checks = any(
-                getattr(t, "plaintext_checks", None) for t in spec.tests
-            )
+            has_plaintext_checks = any(getattr(t, "plaintext_checks", None) for t in spec.tests)
             if not has_plaintext_checks:
                 import shutil
+
                 try:
                     shutil.rmtree(data_dir, ignore_errors=True)
                 except Exception:

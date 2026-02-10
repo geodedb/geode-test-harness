@@ -25,9 +25,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DEFAULT_QUIC_PORT = 3141
 DEFAULT_GRPC_PORT = 50051
-DEFAULT_ADMIN_PASSWORD = os.environ.get(
-    "GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"
-)
+DEFAULT_ADMIN_PASSWORD = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 DEFAULT_HTTP_TIMEOUT_S = 30.0
 DEFAULT_SHELL_TIMEOUT_S = 30.0
 SSL_VERIFY = os.environ.get("GEODE_VERIFY_SSL", "0").lower() in ("1", "true", "yes")
@@ -160,8 +158,7 @@ def run_cli_test(
                 command_str = command_str.replace(quic_addr, grpc_addr)
         elif use_grpc and "query" not in command_str:
             logger.warning(
-                "gRPC transport requested but command '%s' is not a query — "
-                "falling back to QUIC for admin commands",
+                "gRPC transport requested but command '%s' is not a query — falling back to QUIC for admin commands",
                 command_str.split()[1] if len(command_str.split()) > 1 else command_str,
             )
 
@@ -309,7 +306,7 @@ def _run_http_test(
 
                     if not passed:
                         errors.append(
-                            f"Request {i+1} failed: {req.method} {url}\n"
+                            f"Request {i + 1} failed: {req.method} {url}\n"
                             f"Status: {response.status_code}\n"
                             f"Body: {response.text[:500]}"
                         )
@@ -321,10 +318,10 @@ def _run_http_test(
                             error="\n".join(errors),
                         )
 
-                    outputs.append(f"Request {i+1}: {response.status_code} OK")
+                    outputs.append(f"Request {i + 1}: {response.status_code} OK")
 
                 except httpx.RequestError as e:
-                    errors.append(f"Request {i+1} error: {e}")
+                    errors.append(f"Request {i + 1} error: {e}")
                     return TestResult(
                         name=test_case.name,
                         passed=False,
@@ -476,11 +473,11 @@ def _run_sequential_test(
         with httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT_S, verify=SSL_VERIFY) as http_client:
             for i, step in enumerate(test_case.steps):
                 if verbose:
-                    print(f"  Step {i+1}: {step.step_type}")
+                    print(f"  Step {i + 1}: {step.step_type}")
 
                 if step.step_type == "wait":
                     time.sleep(step.wait_ms / 1000.0)
-                    outputs.append(f"Step {i+1}: waited {step.wait_ms}ms")
+                    outputs.append(f"Step {i + 1}: waited {step.wait_ms}ms")
 
                 elif step.step_type == "http":
                     # Execute HTTP step
@@ -500,7 +497,7 @@ def _run_sequential_test(
                     if step.expected:
                         passed = check_http_expectations(response, step.expected, verbose)
                         if not passed:
-                            errors.append(f"Step {i+1} failed: HTTP {step.method} {url}")
+                            errors.append(f"Step {i + 1} failed: HTTP {step.method} {url}")
                             return TestResult(
                                 name=test_case.name,
                                 passed=False,
@@ -509,7 +506,7 @@ def _run_sequential_test(
                                 error="\n".join(errors),
                             )
 
-                    outputs.append(f"Step {i+1}: HTTP {response.status_code} OK")
+                    outputs.append(f"Step {i + 1}: HTTP {response.status_code} OK")
 
                 elif step.step_type == "gql":
                     # Execute GQL query step
@@ -533,7 +530,7 @@ def _run_sequential_test(
                         # Check GQL expectations
                         expected_status = step.gql_expected.get("status_class")
                         if expected_status and expected_status not in result.stdout:
-                            errors.append(f"Step {i+1} failed: expected status {expected_status}")
+                            errors.append(f"Step {i + 1} failed: expected status {expected_status}")
                             return TestResult(
                                 name=test_case.name,
                                 passed=False,
@@ -542,7 +539,7 @@ def _run_sequential_test(
                                 error="\n".join(errors),
                             )
 
-                    outputs.append(f"Step {i+1}: GQL OK")
+                    outputs.append(f"Step {i + 1}: GQL OK")
 
     except Exception as e:
         return TestResult(

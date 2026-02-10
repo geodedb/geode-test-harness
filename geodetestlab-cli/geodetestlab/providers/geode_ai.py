@@ -104,9 +104,7 @@ class GeodeAIProvider:
         """Geode AI provider fully supports Geode patterns."""
         return True
 
-    def generate_gql_queries(
-        self, max_queries: int, complexity: str = "simple", seed: int | None = None
-    ) -> list[str]:
+    def generate_gql_queries(self, max_queries: int, complexity: str = "simple", seed: int | None = None) -> list[str]:
         """Generate sophisticated GQL queries."""
         if max_queries <= 0:
             return []
