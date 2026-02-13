@@ -1,0 +1,674 @@
+version: '1.0'
+name: 'Issue #479: Rapid Sequential Writes Stress Test'
+description: >
+  Regression test for GitLab issue #479 - gRPC handler segfault on aarch64 under
+  rapid sequential writes. Tests bulk MERGE/CREATE operations that trigger partial
+  writes in the transport layer, validating data integrity after many sequential
+  write operations. While geodetestlab uses QUIC transport (not gRPC), the write-all
+  fix applies to both paths and this spec validates the server handles large batches
+  of mutations correctly without corruption or crashes.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+
+# === Phase 1: Rapid sequential node creation (the #479 pattern) ===
+
+- name: rapid-create-batch-01
+  description: 'Create first batch of 10 nodes rapidly (simulates #479 pattern)'
+  args:
+  - query
+  - >
+    CREATE (n1:RapidTest {id: 1, batch: 1, data: 'payload_001'}),
+    (n2:RapidTest {id: 2, batch: 1, data: 'payload_002'}),
+    (n3:RapidTest {id: 3, batch: 1, data: 'payload_003'}),
+    (n4:RapidTest {id: 4, batch: 1, data: 'payload_004'}),
+    (n5:RapidTest {id: 5, batch: 1, data: 'payload_005'}),
+    (n6:RapidTest {id: 6, batch: 1, data: 'payload_006'}),
+    (n7:RapidTest {id: 7, batch: 1, data: 'payload_007'}),
+    (n8:RapidTest {id: 8, batch: 1, data: 'payload_008'}),
+    (n9:RapidTest {id: 9, batch: 1, data: 'payload_009'}),
+    (n10:RapidTest {id: 10, batch: 1, data: 'payload_010'})
+    RETURN count(*) AS created
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - created
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - rapid-writes
+
+- name: rapid-create-batch-02
+  description: Create second batch of 10 nodes rapidly
+  args:
+  - query
+  - >
+    CREATE (n1:RapidTest {id: 11, batch: 2, data: 'payload_011'}),
+    (n2:RapidTest {id: 12, batch: 2, data: 'payload_012'}),
+    (n3:RapidTest {id: 13, batch: 2, data: 'payload_013'}),
+    (n4:RapidTest {id: 14, batch: 2, data: 'payload_014'}),
+    (n5:RapidTest {id: 15, batch: 2, data: 'payload_015'}),
+    (n6:RapidTest {id: 16, batch: 2, data: 'payload_016'}),
+    (n7:RapidTest {id: 17, batch: 2, data: 'payload_017'}),
+    (n8:RapidTest {id: 18, batch: 2, data: 'payload_018'}),
+    (n9:RapidTest {id: 19, batch: 2, data: 'payload_019'}),
+    (n10:RapidTest {id: 20, batch: 2, data: 'payload_020'})
+    RETURN count(*) AS created
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - created
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - rapid-writes
+
+- name: rapid-create-batch-03
+  description: Create third batch of 10 nodes rapidly
+  args:
+  - query
+  - >
+    CREATE (n1:RapidTest {id: 21, batch: 3, data: 'payload_021'}),
+    (n2:RapidTest {id: 22, batch: 3, data: 'payload_022'}),
+    (n3:RapidTest {id: 23, batch: 3, data: 'payload_023'}),
+    (n4:RapidTest {id: 24, batch: 3, data: 'payload_024'}),
+    (n5:RapidTest {id: 25, batch: 3, data: 'payload_025'}),
+    (n6:RapidTest {id: 26, batch: 3, data: 'payload_026'}),
+    (n7:RapidTest {id: 27, batch: 3, data: 'payload_027'}),
+    (n8:RapidTest {id: 28, batch: 3, data: 'payload_028'}),
+    (n9:RapidTest {id: 29, batch: 3, data: 'payload_029'}),
+    (n10:RapidTest {id: 30, batch: 3, data: 'payload_030'})
+    RETURN count(*) AS created
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - created
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - rapid-writes
+
+- name: verify-all-nodes-created
+  description: Verify all 30 nodes were created without data corruption
+  args:
+  - query
+  - 'MATCH (n:RapidTest {batch: 1}) RETURN count(n) AS batch1_count'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - batch1_count
+      execution_time_ms: 5000
+  tags:
+  - regression
+  - issue-479
+  - verification
+
+- name: verify-batch-integrity
+  description: Verify each batch has exactly 10 nodes
+  args:
+  - query
+  - >
+    MATCH (n:RapidTest)
+    RETURN n.batch AS batch, count(n) AS count
+    ORDER BY batch
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 3
+      columns:
+      - batch
+      - count
+      execution_time_ms: 5000
+  tags:
+  - regression
+  - issue-479
+  - verification
+
+# === Phase 2: Rapid sequential MERGE operations (the exact #479 pattern) ===
+
+- name: rapid-merge-batch-01
+  description: 'MERGE first batch - exact pattern from #479 bug report'
+  args:
+  - query
+  - >
+    MERGE (a:MergeTest {id: 1})
+    MERGE (b:MergeTest {id: 2})
+    MERGE (c:MergeTest {id: 3})
+    MERGE (d:MergeTest {id: 4})
+    MERGE (e:MergeTest {id: 5})
+    RETURN count(*) AS merged
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - merge
+
+- name: rapid-merge-batch-02
+  description: MERGE second batch
+  args:
+  - query
+  - >
+    MERGE (a:MergeTest {id: 6})
+    MERGE (b:MergeTest {id: 7})
+    MERGE (c:MergeTest {id: 8})
+    MERGE (d:MergeTest {id: 9})
+    MERGE (e:MergeTest {id: 10})
+    RETURN count(*) AS merged
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - merge
+
+- name: rapid-merge-with-relationships
+  description: 'MERGE nodes with relationships - #479 pattern with edges'
+  args:
+  - query
+  - >
+    MERGE (a:MergeTest {id: 1})
+    MERGE (b:MergeTest {id: 2})
+    CREATE (a)-[:LINKED {seq: 1}]->(b)
+    WITH a, b
+    MERGE (c:MergeTest {id: 3})
+    CREATE (b)-[:LINKED {seq: 2}]->(c)
+    RETURN count(*) AS ops
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - merge
+  - relationships
+
+- name: rapid-merge-idempotency
+  description: Re-MERGE same nodes to verify idempotency under rapid writes
+  args:
+  - query
+  - >
+    MERGE (a:MergeTest {id: 1})
+    MERGE (b:MergeTest {id: 2})
+    MERGE (c:MergeTest {id: 3})
+    MERGE (d:MergeTest {id: 4})
+    MERGE (e:MergeTest {id: 5})
+    MERGE (f:MergeTest {id: 6})
+    MERGE (g:MergeTest {id: 7})
+    MERGE (h:MergeTest {id: 8})
+    MERGE (i:MergeTest {id: 9})
+    MERGE (j:MergeTest {id: 10})
+    RETURN count(*) AS merged
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - merge
+  - idempotency
+
+- name: verify-merge-count
+  description: Verify MERGEs did not create duplicates
+  args:
+  - query
+  - MATCH (n:MergeTest) RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - total
+      execution_time_ms: 5000
+  tags:
+  - regression
+  - issue-479
+  - verification
+
+# === Phase 3: Rapid sequential relationship creation ===
+
+- name: rapid-relationship-chain
+  description: Create a chain of relationships rapidly
+  args:
+  - query
+  - >
+    MATCH (a:MergeTest {id: 1}), (b:MergeTest {id: 2}),
+          (c:MergeTest {id: 3}), (d:MergeTest {id: 4}),
+          (e:MergeTest {id: 5}), (f:MergeTest {id: 6}),
+          (g:MergeTest {id: 7}), (h:MergeTest {id: 8}),
+          (i:MergeTest {id: 9}), (j:MergeTest {id: 10})
+    CREATE (a)-[:CHAIN {pos: 1}]->(b),
+           (b)-[:CHAIN {pos: 2}]->(c),
+           (c)-[:CHAIN {pos: 3}]->(d),
+           (d)-[:CHAIN {pos: 4}]->(e),
+           (e)-[:CHAIN {pos: 5}]->(f),
+           (f)-[:CHAIN {pos: 6}]->(g),
+           (g)-[:CHAIN {pos: 7}]->(h),
+           (h)-[:CHAIN {pos: 8}]->(i),
+           (i)-[:CHAIN {pos: 9}]->(j)
+    RETURN count(*) AS relationships
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - relationships
+  - chain
+
+- name: verify-chain-traversal
+  description: Traverse the chain to verify no corruption in relationship data
+  args:
+  - query
+  - >
+    MATCH (start:MergeTest {id: 1})-[:CHAIN*]->(end:MergeTest)
+    RETURN end.id AS reached_id
+    ORDER BY reached_id
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - reached_id
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - verification
+  - traversal
+
+# === Phase 4: Mixed rapid operations (CREATE + MATCH + SET) ===
+
+- name: rapid-mixed-operations-01
+  description: Mixed CREATE and SET operations in rapid succession
+  args:
+  - query
+  - >
+    CREATE (x:MixedTest {id: 1, status: 'new'})
+    WITH x
+    SET x.status = 'updated', x.modified = true
+    RETURN x.id AS id, x.status AS status
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - id
+      - status
+      execution_time_ms: 5000
+    stdout_contains: updated
+  tags:
+  - regression
+  - issue-479
+  - mixed-ops
+
+- name: rapid-mixed-operations-02
+  description: Multiple mixed operations
+  args:
+  - query
+  - >
+    CREATE (x1:MixedTest {id: 2, status: 'new'}),
+           (x2:MixedTest {id: 3, status: 'new'}),
+           (x3:MixedTest {id: 4, status: 'new'})
+    WITH x1, x2, x3
+    SET x1.status = 'processed', x2.status = 'processed', x3.status = 'processed'
+    CREATE (x1)-[:DEPENDS_ON]->(x2), (x2)-[:DEPENDS_ON]->(x3)
+    RETURN count(*) AS ops
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - mixed-ops
+
+- name: rapid-mixed-operations-03
+  description: Rapid MATCH + SET across existing nodes (batch 1)
+  args:
+  - query
+  - >
+    MATCH (n:RapidTest {batch: 1})
+    SET n.verified = true, n.check_count = 1
+    RETURN count(n) AS updated
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - updated
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - mixed-ops
+  - bulk-update
+
+- name: rapid-mixed-operations-04
+  description: Another rapid bulk update on different batch (batch 2)
+  args:
+  - query
+  - >
+    MATCH (n:RapidTest {batch: 2})
+    SET n.verified = true, n.check_count = 1
+    RETURN count(n) AS updated
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - updated
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - mixed-ops
+  - bulk-update
+
+- name: rapid-mixed-operations-05
+  description: Final rapid bulk update on last batch (batch 3)
+  args:
+  - query
+  - >
+    MATCH (n:RapidTest {batch: 3})
+    SET n.verified = true, n.check_count = 1
+    RETURN count(n) AS updated
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - updated
+      execution_time_ms: 10000
+  tags:
+  - regression
+  - issue-479
+  - mixed-ops
+  - bulk-update
+
+# === Phase 5: Verify data integrity after all rapid operations ===
+
+- name: verify-all-rapid-nodes-verified
+  description: Verify all RapidTest nodes have verified flag set
+  args:
+  - query
+  - >
+    MATCH (n:RapidTest)
+    WHERE n.verified = true
+    RETURN count(n) AS verified_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - verified_count
+      execution_time_ms: 5000
+    stdout_contains: '30'
+  tags:
+  - regression
+  - issue-479
+  - verification
+  - integrity
+
+- name: verify-data-payload-integrity
+  description: Verify data payloads not corrupted by rapid writes
+  args:
+  - query
+  - >
+    MATCH (n:RapidTest)
+    WHERE n.id = 1
+    RETURN n.data AS data
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - data
+      execution_time_ms: 5000
+    stdout_contains: payload_001
+  tags:
+  - regression
+  - issue-479
+  - verification
+  - integrity
+
+- name: verify-merge-relationship-integrity
+  description: Verify LINKED relationships survived rapid writes
+  args:
+  - query
+  - >
+    MATCH ()-[r:LINKED]->()
+    RETURN count(r) AS link_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - link_count
+      execution_time_ms: 5000
+  tags:
+  - regression
+  - issue-479
+  - verification
+  - integrity
+
+- name: verify-chain-relationship-integrity
+  description: Verify CHAIN relationships survived rapid writes
+  args:
+  - query
+  - >
+    MATCH ()-[r:CHAIN]->()
+    RETURN count(r) AS chain_count
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - chain_count
+      execution_time_ms: 5000
+    stdout_contains: '9'
+  tags:
+  - regression
+  - issue-479
+  - verification
+  - integrity
+
+# === Phase 6: Large single-query batch (stress test) ===
+
+- name: stress-large-single-create
+  description: Large single CREATE with many nodes (stress test for write path)
+  args:
+  - query
+  - >
+    CREATE (s1:StressTest {id: 1, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s2:StressTest {id: 2, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s3:StressTest {id: 3, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s4:StressTest {id: 4, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s5:StressTest {id: 5, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s6:StressTest {id: 6, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s7:StressTest {id: 7, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s8:StressTest {id: 8, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s9:StressTest {id: 9, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s10:StressTest {id: 10, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s11:StressTest {id: 11, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s12:StressTest {id: 12, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s13:StressTest {id: 13, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s14:StressTest {id: 14, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s15:StressTest {id: 15, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s16:StressTest {id: 16, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s17:StressTest {id: 17, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s18:StressTest {id: 18, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s19:StressTest {id: 19, payload: 'abcdefghijklmnopqrstuvwxyz'}),
+           (s20:StressTest {id: 20, payload: 'abcdefghijklmnopqrstuvwxyz'})
+    RETURN count(*) AS created
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - created
+      execution_time_ms: 15000
+  tags:
+  - regression
+  - issue-479
+  - stress
+
+- name: stress-verify-large-batch
+  description: Verify all stress test nodes created
+  args:
+  - query
+  - MATCH (s:StressTest) RETURN count(s) AS total
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - total
+      execution_time_ms: 5000
+    stdout_contains: '20'
+  tags:
+  - regression
+  - issue-479
+  - stress
+  - verification
+
+- name: stress-rapid-relationship-web
+  description: Create a web of relationships between stress test nodes
+  args:
+  - query
+  - >
+    MATCH (a:StressTest), (b:StressTest)
+    WHERE a.id < b.id AND a.id <= 5
+    CREATE (a)-[:WEB {weight: a.id * b.id}]->(b)
+    RETURN count(*) AS edges
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - edges
+      execution_time_ms: 15000
+  tags:
+  - regression
+  - issue-479
+  - stress
+  - relationships
+
+# === Cleanup ===
+
+- name: cleanup-rapid-test
+  description: Clean up RapidTest nodes
+  args:
+  - query
+  - MATCH (n:RapidTest) DETACH DELETE n RETURN count(n) AS deleted
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - cleanup
+
+- name: cleanup-merge-test
+  description: Clean up MergeTest nodes
+  args:
+  - query
+  - MATCH (n:MergeTest) DETACH DELETE n RETURN count(n) AS deleted
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - cleanup
+
+- name: cleanup-mixed-test
+  description: Clean up MixedTest nodes
+  args:
+  - query
+  - MATCH (n:MixedTest) DETACH DELETE n RETURN count(n) AS deleted
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - cleanup
+
+- name: cleanup-stress-test
+  description: Clean up StressTest nodes
+  args:
+  - query
+  - MATCH (n:StressTest) DETACH DELETE n RETURN count(n) AS deleted
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 10000
+  tags:
+  - cleanup
+
+- name: verify-complete-cleanup
+  description: Verify all test data cleaned up
+  args:
+  - query
+  - >
+    MATCH (n)
+    WHERE n:RapidTest OR n:MergeTest OR n:MixedTest OR n:StressTest
+    RETURN count(n) AS remaining
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      execution_time_ms: 5000
+    stdout_contains: '0'
+  tags:
+  - cleanup
+  - verification
+
+invariants:
+- type: server_running
+tags:
+- regression
+- issue-479
+- rapid-writes
+- stress
+- data-integrity
