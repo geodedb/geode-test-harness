@@ -218,3 +218,43 @@ def test_sequential_test_spec() -> None:
         assert len(spec.tests[0].steps) == 3
     finally:
         temp_path.unlink()
+
+
+def test_parallel_tests_field() -> None:
+    """Test that parallel_tests: true is parsed correctly."""
+    spec_data = {
+        "name": "parallel-test",
+        "parallel_tests": True,
+        "tests": [
+            {"name": "test1", "query": "RETURN 1"},
+            {"name": "test2", "query": "RETURN 2"},
+        ],
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(spec_data, f)
+        temp_path = Path(f.name)
+
+    try:
+        spec = load_spec(temp_path)
+        assert spec.parallel_tests is True
+    finally:
+        temp_path.unlink()
+
+
+def test_parallel_tests_default_false() -> None:
+    """Test that parallel_tests defaults to False when not specified."""
+    spec_data = {
+        "name": "default-test",
+        "tests": [{"name": "test1", "args": ["--help"], "expect": {"exit_code": 0}}],
+    }
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(spec_data, f)
+        temp_path = Path(f.name)
+
+    try:
+        spec = load_spec(temp_path)
+        assert spec.parallel_tests is False
+    finally:
+        temp_path.unlink()

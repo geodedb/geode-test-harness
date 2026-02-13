@@ -27,8 +27,8 @@ variables:
 # Lint Stage: Static analysis and quality gates
 # =============================================================================
 
-lint-python:
-  stage: lint
+# Shared setup for Python jobs that need the full dev environment (PERF-006)
+.python-setup:
   tags:
     - company
     - linux
@@ -42,6 +42,10 @@ lint-python:
     - python -m venv .venv
     - . .venv/bin/activate
     - pip install -q -e ".[dev]"
+
+lint-python:
+  extends: .python-setup
+  stage: lint
   script:
     - . .venv/bin/activate
     - ruff check geodetestlab/
@@ -52,23 +56,12 @@ lint-python:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 lint-mypy:
+  extends: .python-setup
   stage: lint
-  tags:
-    - company
-    - linux
-  image: python:3.13-slim
-  cache:
-    key: pip-${CI_COMMIT_REF_SLUG}
-    paths:
-      - geodetestlab-cli/.venv/
-  before_script:
-    - cd geodetestlab-cli
-    - python -m venv .venv
-    - . .venv/bin/activate
-    - pip install -q -e ".[dev]"
   script:
     - . .venv/bin/activate
     - mypy geodetestlab/ --ignore-missing-imports
+  # mypy can legitimately fail on third-party stubs; allow failure but log
   allow_failure: true
   rules:
     - changes:
@@ -76,24 +69,12 @@ lint-mypy:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 test-unit:
+  extends: .python-setup
   stage: lint
-  tags:
-    - company
-    - linux
-  image: python:3.13-slim
-  cache:
-    key: pip-${CI_COMMIT_REF_SLUG}
-    paths:
-      - geodetestlab-cli/.venv/
-  before_script:
-    - cd geodetestlab-cli
-    - python -m venv .venv
-    - . .venv/bin/activate
-    - pip install -q -e ".[dev]"
   script:
     - . .venv/bin/activate
     - python -m pytest geodetestlab/tests/ -v --tb=short
-  allow_failure: true
+  # Unit tests MUST pass — removed allow_failure (was #57)
   rules:
     - changes:
         - "geodetestlab-cli/**/*.py"
@@ -114,7 +95,7 @@ lint-security:
     paths:
       - reports/bandit.json
     when: always
-  allow_failure: true
+  # Security lint MUST pass — removed allow_failure (was #57)
   rules:
     - changes:
         - "geodetestlab-cli/**/*.py"
@@ -160,6 +141,12 @@ build-zig:
     - cd runners
     - zig build -Doptimize=ReleaseFast
     - cp zig-out/bin/zig_runner ./zig_runner
+  # Pass Zig toolchain as artifact so test-all can reuse it (PERF-010)
+  artifacts:
+    paths:
+      - runners/zig_runner
+      - zig-linux-x86_64-${ZIG_VERSION}/
+    expire_in: 1 hour
   rules:
     - exists:
         - runners/build.zig
@@ -242,6 +229,11 @@ test-all:
     - company
     - linux
   image: alpine:3.21
+  # Reuse Zig toolchain from build-zig artifact when available (PERF-010)
+  needs:
+    - job: build-zig
+      artifacts: true
+      optional: true
   cache:
     - key: zig-${ZIG_VERSION}
       paths:
@@ -586,7 +578,8 @@ generate-html-report:
           '''
           for repo, urls in created_issues.items():
               for url in urls:
-                  html_content += f'<li><a href="{url}" class="issue-link">{url}</a></li>'
+                  safe_url = html.escape(str(url), quote=True)
+                  html_content += f'<li><a href="{safe_url}" class="issue-link">{safe_url}</a></li>'
           html_content += '''
                   </ul>
               </div>
@@ -600,10 +593,11 @@ generate-html-report:
           skipped = sum(1 for r in client_results if r.get('status') == 'skipped')
           total = len(client_results)
 
+          safe_client = html.escape(client.upper())
           html_content += f'''
               <div class="client-section">
                   <div class="client-header">
-                      <span class="client-name">{client.upper()}</span>
+                      <span class="client-name">{safe_client}</span>
                       <div class="client-stats">
                           <span class="badge badge-passed">{passed} passed</span>
                           <span class="badge badge-failed">{failed} failed</span>

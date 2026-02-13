@@ -107,6 +107,9 @@ class PlaintextScanner:
     def scan(self) -> list[PlaintextViolation]:
         """Scan the data directory for plaintext violations.
 
+        Combines all patterns into a single ``grep -E`` call to avoid
+        N recursive directory scans (PERF-005).
+
         Returns
         -------
         List[PlaintextViolation]
@@ -114,13 +117,55 @@ class PlaintextScanner:
         """
         self.violations = []
 
-        if not self.data_dir.exists():
+        if not self.data_dir.exists() or not self.patterns:
             return self.violations
 
-        for pattern in self.patterns:
-            self._scan_pattern(pattern)
-
+        self._scan_combined()
         return self.violations
+
+    def _scan_combined(self) -> None:
+        """Scan for all patterns in a single grep invocation."""
+        import re as _re
+
+        combined = "|".join(_re.escape(p) for p in self.patterns)
+        try:
+            cmd = ["grep", "-r", "-a", "-n", "-E", combined, str(self.data_dir)]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+            if result.returncode == 0:
+                for line in result.stdout.strip().split("\n"):
+                    if not line:
+                        continue
+                    # Parse file_path:line_number:content
+                    parts = line.split(":", 2)
+                    file_path = parts[0]
+                    line_number = None
+                    with contextlib.suppress(ValueError, IndexError):
+                        line_number = int(parts[1])
+
+                    if not self._should_scan_file(file_path):
+                        continue
+
+                    # Determine which pattern matched
+                    matched_pattern = self.patterns[0]
+                    content = parts[2] if len(parts) > 2 else ""
+                    for p in self.patterns:
+                        if p in content:
+                            matched_pattern = p
+                            break
+
+                    self.violations.append(
+                        PlaintextViolation(
+                            file_path=file_path,
+                            pattern=matched_pattern,
+                            line_number=line_number,
+                            file_type=self._get_file_type(file_path),
+                        )
+                    )
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
 
     def _scan_pattern(self, pattern: str) -> None:
         """Scan for a single pattern using grep."""

@@ -19,11 +19,21 @@ import shlex
 import signal
 import subprocess
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-from .executor import run_cli_test, run_plaintext_verification, run_single_test
+import httpx
+
+from .executor import (
+    DEFAULT_HTTP_TIMEOUT_S,
+    SSL_VERIFY,
+    run_cli_test,
+    run_plaintext_verification,
+    run_single_test,
+)
 from .runner_types import RunnerError, RunSummary, TestResult
 from .server import (
     ServerError,
@@ -52,7 +62,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DEFAULT_QUIC_PORT = 3141
 DEFAULT_GRPC_PORT = 50051
-DEFAULT_ADMIN_PASSWORD = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
+# DEFAULT_ADMIN_PASSWORD lives in runner_types (centralized)
 
 
 def _kill_stale_servers() -> None:
@@ -137,14 +147,28 @@ def run_tests(
         port = server_port or get_free_port()
 
         # Run pre_server commands (e.g., cleanup of shared state files)
+        # Only allow known-safe commands to mitigate CWE-78.
+        _ALLOWED_PRE_SERVER_CMDS = frozenset({"rm", "mkdir", "cp", "mv", "chmod", "touch", "ln", "sleep"})
         if spec.pre_server and not dry_run:
             if verbose:
                 print(f"Running {len(spec.pre_server)} pre-server commands...")
             for i, cmd in enumerate(spec.pre_server):
                 if verbose:
                     print(f"  pre_server[{i}]: {cmd}")
+                parsed = shlex.split(cmd)
+                if not parsed:
+                    continue
+                base_cmd = Path(parsed[0]).name  # handle /usr/bin/rm → rm
+                if base_cmd not in _ALLOWED_PRE_SERVER_CMDS:
+                    logger.warning(
+                        "pre_server[%d] blocked: '%s' not in allowlist %s",
+                        i,
+                        base_cmd,
+                        sorted(_ALLOWED_PRE_SERVER_CMDS),
+                    )
+                    continue
                 try:
-                    subprocess.run(shlex.split(cmd), shell=False, check=False)
+                    subprocess.run(parsed, shell=False, check=False)
                 except Exception as e:
                     if verbose:
                         print(f"  pre_server[{i}] warning: {e}")
@@ -225,40 +249,41 @@ def run_tests(
                             print(f"    Error: {result.error}")
                         # Continue anyway - some setup failures might be expected
 
-        # Run each test case
-        for test_case in spec.tests:
-            # Check if we were interrupted
-            if interrupted:
-                break
+        # Create a shared httpx client for connection reuse across tests (PERF-007)
+        _shared_http = httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT_S, verify=SSL_VERIFY)
 
-            summary.total += 1
+        # Lock protects summary mutation and server health checks in parallel mode
+        _lock = threading.Lock()
+
+        def _execute_one_test(test_case: TestCase) -> TestResult:
+            """Execute a single test case and handle server crash recovery.
+
+            Returns the TestResult. Server restart is serialized via _lock.
+            """
+            nonlocal server_process
 
             if test_case.skip:
-                result = TestResult(
+                return TestResult(
                     name=test_case.name,
                     passed=True,
                     duration_ms=0,
                     skip_reason=test_case.skip_reason or "Skipped",
                 )
-                summary.skipped += 1
-                summary.results.append(result)
-                continue
 
             if dry_run:
-                result = TestResult(
+                return TestResult(
                     name=test_case.name,
                     passed=True,
                     duration_ms=0,
                     output="[DRY RUN]",
                 )
-                summary.passed += 1
-            else:
-                # Check if server is still alive before running the test
-                # (server may have crashed due to QUIC memory bugs)
+
+            # Check if server is still alive before running the test
+            # (server may have crashed due to QUIC memory bugs)
+            with _lock:
                 if server_process and server_process.poll() is not None:
                     if verbose:
                         print(f"  Server crashed (exit code {server_process.returncode}), restarting...")
-                    # Clean up old server
                     untrack_server(server_process)
                     try:
                         assert data_dir is not None
@@ -275,29 +300,27 @@ def run_tests(
                     except ServerError as e:
                         if verbose:
                             print(f"  Failed to restart server: {e}")
-                        # Mark remaining tests as failed
-                        result = TestResult(
+                        return TestResult(
                             name=test_case.name,
                             passed=False,
                             duration_ms=0,
                             error=f"Server crashed and failed to restart: {e}",
                         )
-                        summary.failed += 1
-                        summary.results.append(result)
-                        continue
 
-                result = run_single_test(
-                    test_case=test_case,
-                    binary=binary,
-                    env=env,
-                    secrets=secrets,
-                    timeout_ms=timeout_ms,
-                    data_dir=data_dir,
-                    verbose=verbose,
-                )
+            result = run_single_test(
+                test_case=test_case,
+                binary=binary,
+                env=env,
+                secrets=secrets,
+                timeout_ms=timeout_ms,
+                data_dir=data_dir,
+                verbose=verbose,
+                http_client=_shared_http,
+            )
 
-                # If test failed with connection timeout and server is dead, restart server
-                if not result.passed and "connection timeout" in (result.error or "") and server_process:
+            # If test failed with connection timeout and server is dead, restart
+            if not result.passed and "connection timeout" in (result.error or "") and server_process:
+                with _lock:
                     if server_process.poll() is not None:
                         if verbose:
                             print("  Server died during test, restarting for next test...")
@@ -315,13 +338,18 @@ def run_tests(
                                 grpc_port=grpc_port,
                             )
                         except ServerError:
-                            pass  # Will be caught at the top of the next iteration
+                            pass  # Will be caught at the top of the next test
 
-                if result.passed:
-                    summary.passed += 1
-                else:
-                    summary.failed += 1
+            return result
 
+        def _record_result(test_case: TestCase, result: TestResult) -> None:
+            """Record a test result into the summary and print status."""
+            if result.skip_reason:
+                summary.skipped += 1
+            elif dry_run or result.passed:
+                summary.passed += 1
+            else:
+                summary.failed += 1
             summary.results.append(result)
 
             if verbose and not ci_mode:
@@ -329,6 +357,27 @@ def run_tests(
                 if result.skip_reason:
                     status = "SKIP"
                 print(f"  [{status}] {test_case.name}")
+
+        # Run each test case — parallel or sequential (PERF-004)
+        if spec.parallel_tests and not dry_run:
+            pool_size = min(os.cpu_count() or 4, len(spec.tests), 8)
+            with ThreadPoolExecutor(max_workers=pool_size) as pool:
+                futures = {}
+                for tc in spec.tests:
+                    summary.total += 1
+                    futures[pool.submit(_execute_one_test, tc)] = tc
+
+                for future in as_completed(futures):
+                    tc = futures[future]
+                    result = future.result()
+                    _record_result(tc, result)
+        else:
+            for test_case in spec.tests:
+                if interrupted:
+                    break
+                summary.total += 1
+                result = _execute_one_test(test_case)
+                _record_result(test_case, result)
 
         # Run spec-level plaintext verification if enabled
         if spec.plaintext_verification.enabled and data_dir and not dry_run:
@@ -351,6 +400,12 @@ def run_tests(
                 summary.results.append(result)
 
     finally:
+        # Close shared HTTP client (PERF-007)
+        try:
+            _shared_http.close()
+        except Exception:
+            pass
+
         # Restore original signal handlers
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)

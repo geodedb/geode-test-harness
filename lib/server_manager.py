@@ -124,14 +124,14 @@ class ServerManager:
             self.binary_path,
             "serve",
             "--listen",
-            f"0.0.0.0:{self.port}",
+            f"127.0.0.1:{self.port}",
             "--data-dir",
             self.data_dir,
         ]
 
         # Add gRPC port if specified
         if self.grpc_port:
-            cmd.extend(["--listen-grpc", f"0.0.0.0:{self.grpc_port}"])
+            cmd.extend(["--listen-grpc", f"127.0.0.1:{self.grpc_port}"])
 
         cmd.extend(self.args)
 
@@ -170,7 +170,9 @@ class ServerManager:
         while time.time() - start_time < timeout_seconds:
             # Check if process is still running
             if self.process.poll() is not None:
-                raise RuntimeError(f"Server process exited with code {self.process.returncode}")
+                raise RuntimeError(
+                    f"Server process exited with code {self.process.returncode}"
+                )
 
             # Try to connect to the server port
             # QUIC servers listen on UDP, so we check if the port is bound
@@ -188,7 +190,9 @@ class ServerManager:
                         time.sleep(0.5)
                         # Verify process is still running after the delay
                         if self.process.poll() is not None:
-                            raise RuntimeError(f"Server process exited with code {self.process.returncode}")
+                            raise RuntimeError(
+                                f"Server process exited with code {self.process.returncode}"
+                            )
                         return server_address
             except (socket.timeout, OSError):
                 pass

@@ -375,6 +375,7 @@ class TestSpec:
     pre_server: list[str] | None = None  # Shell commands to run before server starts
     tde_config: dict[str, Any] | None = None
     plaintext_verification: PlaintextCheck = field(default_factory=PlaintextCheck)
+    parallel_tests: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestSpec:
@@ -424,6 +425,7 @@ class TestSpec:
             pre_server=data.get("pre_server"),
             tde_config=data.get("tde_config"),
             plaintext_verification=PlaintextCheck.from_dict(data.get("plaintext_verification")),
+            parallel_tests=bool(data.get("parallel_tests", False)),
         )
 
 

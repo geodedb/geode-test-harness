@@ -38,28 +38,39 @@ console = Console()
 console_err = Console(stderr=True)
 
 
-def _kill_geode_processes() -> None:
-    """Kill any orphaned geode server processes started by this test run.
+_tracked_pids: set[int] = set()
 
-    This is a cleanup function to ensure geode processes don't linger after
-    the test harness is interrupted or exits.
+
+def track_pid(pid: int) -> None:
+    """Register a PID for cleanup on exit."""
+    _tracked_pids.add(pid)
+
+
+def untrack_pid(pid: int) -> None:
+    """Remove a PID from the cleanup set."""
+    _tracked_pids.discard(pid)
+
+
+def _kill_geode_processes() -> None:
+    """Kill orphaned geode server processes started by this test run.
+
+    Uses tracked PIDs when available, falling back to pattern-based
+    pkill only for processes matching our temp-dir naming convention.
     """
     import subprocess
 
+    # First, kill any PIDs we explicitly tracked
+    for pid in list(_tracked_pids):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        _tracked_pids.discard(pid)
+
+    # Fallback: pattern-based cleanup scoped to our test temp dirs
     try:
-        # Kill geode serve processes (matching temp dir pattern)
         subprocess.run(
             ["pkill", "-9", "-f", "geode serve.*geode-test-"],
-            capture_output=True,
-            timeout=5,
-        )
-    except Exception:
-        pass
-
-    try:
-        # Also kill any geode query processes
-        subprocess.run(
-            ["pkill", "-9", "-f", "geode query"],
             capture_output=True,
             timeout=5,
         )
@@ -298,6 +309,16 @@ def run(
             console.print("[dim]Running with both QUIC and gRPC transports[/dim]")
         elif transport == "grpc":
             console.print("[dim]Running with gRPC transport[/dim]")
+
+    # Resolve geode binary once, before workers start (PERF-013).
+    # This avoids each worker spawning subprocesses to find the binary.
+    if geode_binary is None:
+        from lib.utils import find_geode_binary
+
+        try:
+            geode_binary = find_geode_binary()
+        except FileNotFoundError:
+            pass  # Let workers report the error individually
 
     # Kill stale servers once before running any specs
     # This must happen exactly once, not per-worker, to avoid

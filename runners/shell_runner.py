@@ -11,7 +11,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
@@ -23,11 +22,12 @@ import yaml
 # Import shared utilities
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.server_manager import ServerManager
-from lib.utils import find_geode_binary, get_free_port
+from lib.utils import find_geode_binary
 
 # Try to import pexpect for interactive shell testing
 try:
     import pexpect
+
     PEXPECT_AVAILABLE = True
 except ImportError:
     PEXPECT_AVAILABLE = False
@@ -35,7 +35,7 @@ except ImportError:
 
 # ANSI escape code pattern for stripping terminal control sequences
 # Includes cursor movement, colors, and carriage returns
-ANSI_ESCAPE_PATTERN = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\r')
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\[\?[0-9;]*[a-zA-Z]|\r")
 
 
 class ShellTestRunner:
@@ -96,7 +96,7 @@ class ShellTestRunner:
 
     def strip_ansi(self, text: str) -> str:
         """Strip ANSI escape codes from text."""
-        return ANSI_ESCAPE_PATTERN.sub('', text)
+        return ANSI_ESCAPE_PATTERN.sub("", text)
 
     def start_server(self) -> bool:
         """Start the Geode server for testing using the shared ServerManager."""
@@ -106,7 +106,11 @@ class ShellTestRunner:
             # Create server manager with auto-allocated port if needed
             self.server_manager = ServerManager(
                 binary_path=self.geode_binary,
-                port=None if self._auto_allocate else int(self.server.split(":")[-1]) if self.server else None,
+                port=None
+                if self._auto_allocate
+                else int(self.server.split(":")[-1])
+                if self.server
+                else None,
                 data_dir=self.data_dir,
                 verbose=self.verbose,
             )
@@ -188,7 +192,9 @@ class ShellTestRunner:
                     self.shell_process.terminate(force=True)
                 self.shell_process = None
 
-    def send_command(self, command: str, timeout: Optional[int] = None) -> Tuple[bool, str]:
+    def send_command(
+        self, command: str, timeout: Optional[int] = None
+    ) -> Tuple[bool, str]:
         """
         Send a command to the shell and wait for the response.
 
@@ -202,8 +208,12 @@ class ShellTestRunner:
         self.log(f"Sending command: {command}")
 
         try:
-            # Wait a moment to ensure shell is ready
-            time.sleep(0.3)
+            # Wait for prompt to be ready instead of a fixed 0.3s sleep (PERF-009).
+            # A short expect with the prompt pattern confirms the shell is idle.
+            try:
+                self.shell_process.expect(self.prompt_pattern, timeout=0.5)
+            except pexpect.TIMEOUT:
+                pass  # If no prompt yet, proceed anyway
 
             # Send the command
             self.shell_process.sendline(command)
@@ -227,7 +237,7 @@ class ShellTestRunner:
 
             # The output contains: echoed command + newline + actual output
             # Find and remove the echoed command
-            lines = output.split('\n')
+            lines = output.split("\n")
 
             # Find where the echoed command ends
             cmd_prefix = command.strip()[:20] if len(command) > 20 else command.strip()
@@ -246,8 +256,12 @@ class ShellTestRunner:
             while output_lines and not output_lines[-1].strip():
                 output_lines.pop()
 
-            output = '\n'.join(output_lines)
-            self.log(f"Output: {output[:200]}..." if len(output) > 200 else f"Output: {output}")
+            output = "\n".join(output_lines)
+            self.log(
+                f"Output: {output[:200]}..."
+                if len(output) > 200
+                else f"Output: {output}"
+            )
             return True, output
         except pexpect.TIMEOUT:
             self.log("Timeout waiting for response")
@@ -258,7 +272,9 @@ class ShellTestRunner:
             self.log("Shell process ended")
             return False, "Shell process ended unexpectedly"
 
-    def execute_query(self, query: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+    def execute_query(
+        self, query: str, timeout: Optional[int] = None
+    ) -> Dict[str, Any]:
         """Execute a GQL query and return the result."""
         success, output = self.send_command(query, timeout)
 
@@ -268,7 +284,7 @@ class ShellTestRunner:
         # Check for error in output
         if "Error" in output or "error" in output.lower():
             # Extract error code if present
-            error_match = re.search(r'Error\s*\(([^)]+)\)', output)
+            error_match = re.search(r"Error\s*\(([^)]+)\)", output)
             error_code = error_match.group(1) if error_match else "unknown"
             return {
                 "status": "error",
@@ -290,7 +306,9 @@ class ShellTestRunner:
         # Shell outputs: {"status_class":"00000","result":{"type":"BINDINGS",...,"rows":[...]}}
         try:
             # Find JSON object in output (shell format)
-            json_match = re.search(r'\{[^{}]*"status_class"[^{}]*\{.*\}\}', output, re.DOTALL)
+            json_match = re.search(
+                r'\{[^{}]*"status_class"[^{}]*\{.*\}\}', output, re.DOTALL
+            )
             if json_match:
                 data = json.loads(json_match.group())
                 if "result" in data and "rows" in data["result"]:
@@ -302,7 +320,7 @@ class ShellTestRunner:
 
         # Try simple JSON array format
         try:
-            json_match = re.search(r'\[.*\]', output, re.DOTALL)
+            json_match = re.search(r"\[.*\]", output, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group())
                 result["data"] = data
@@ -321,7 +339,11 @@ class ShellTestRunner:
         lines = output.strip().split("\n")
 
         # Filter to data lines (those starting with |)
-        data_lines = [l for l in lines if l.strip().startswith("|") and not l.strip().startswith("|--")]
+        data_lines = [
+            line
+            for line in lines
+            if line.strip().startswith("|") and not line.strip().startswith("|--")
+        ]
 
         # Subtract 1 for header row if we have any data lines
         if len(data_lines) > 1:
@@ -331,13 +353,21 @@ class ShellTestRunner:
             result["rows"] = 0
         else:
             # Try alternative: count non-border, non-empty lines
-            non_border_lines = [l for l in lines if l.strip() and not l.startswith("+") and not l.startswith("---")]
+            non_border_lines = [
+                line
+                for line in lines
+                if line.strip()
+                and not line.startswith("+")
+                and not line.startswith("---")
+            ]
             if non_border_lines:
                 result["rows"] = max(0, len(non_border_lines) - 1)
 
         return result
 
-    def source_file(self, file_path: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+    def source_file(
+        self, file_path: str, timeout: Optional[int] = None
+    ) -> Dict[str, Any]:
         """Execute /source command with a file."""
         timeout = timeout or 300  # 5 minutes for large files
         success, output = self.send_command(f"/source {file_path}", timeout)
@@ -427,7 +457,9 @@ class ShellTestRunner:
 
         if source_content:
             # Write content to a temporary file
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".gql", delete=False) as f:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".gql", delete=False
+            ) as f:
                 f.write(source_content)
                 source_file = f.name
             result["details"]["temp_file"] = source_file
@@ -438,7 +470,9 @@ class ShellTestRunner:
             return result
 
         # Execute /source
-        source_result = self.source_file(source_file, test.get("timeout_ms", 300000) // 1000)
+        source_result = self.source_file(
+            source_file, test.get("timeout_ms", 300000) // 1000
+        )
         result["details"]["source_result"] = source_result
 
         # Check expectations
@@ -446,7 +480,9 @@ class ShellTestRunner:
 
         if expect.get("success", True) and source_result.get("has_errors"):
             result["status"] = "failed"
-            result["error"] = f"Expected success but got errors: {source_result.get('output', '')[:500]}"
+            result["error"] = (
+                f"Expected success but got errors: {source_result.get('output', '')[:500]}"
+            )
 
         if "statements" in expect:
             actual = source_result.get("statements_executed", 0)
@@ -482,7 +518,9 @@ class ShellTestRunner:
                 # Create data via shell
                 source_content = step.get("content")
                 if source_content:
-                    with tempfile.NamedTemporaryFile(mode="w", suffix=".gql", delete=False) as f:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".gql", delete=False
+                    ) as f:
                         f.write(source_content)
                         temp_file = f.name
 
@@ -493,7 +531,9 @@ class ShellTestRunner:
 
                     if source_result.get("has_errors"):
                         result["status"] = "failed"
-                        result["error"] = f"Step {i} failed: {source_result.get('output', '')[:500]}"
+                        result["error"] = (
+                            f"Step {i} failed: {source_result.get('output', '')[:500]}"
+                        )
                         return result
 
             elif step_type == "check_persistence_file":
@@ -511,7 +551,9 @@ class ShellTestRunner:
                 min_size = step.get("min_size", 0)
                 if file_size < min_size:
                     result["status"] = "failed"
-                    result["error"] = f"Persistence file too small: {file_size} < {min_size}"
+                    result["error"] = (
+                        f"Persistence file too small: {file_size} < {min_size}"
+                    )
                     return result
 
             elif step_type == "restart_server":
@@ -542,7 +584,9 @@ class ShellTestRunner:
                     if "min_rows" in expect:
                         if query_result.get("rows", 0) < expect["min_rows"]:
                             result["status"] = "failed"
-                            result["error"] = f"Expected at least {expect['min_rows']} rows, got {query_result.get('rows', 0)}"
+                            result["error"] = (
+                                f"Expected at least {expect['min_rows']} rows, got {query_result.get('rows', 0)}"
+                            )
                             return result
 
         return result
@@ -597,8 +641,14 @@ class ShellTestRunner:
 
             if step_type == "command":
                 cmd = step.get("text")
-                success, output = self.send_command(cmd, step.get("timeout_ms", 30000) // 1000)
-                result["details"][f"step_{i}"] = {"command": cmd, "success": success, "output": output[:500]}
+                success, output = self.send_command(
+                    cmd, step.get("timeout_ms", 30000) // 1000
+                )
+                result["details"][f"step_{i}"] = {
+                    "command": cmd,
+                    "success": success,
+                    "output": output[:500],
+                }
 
                 if not success:
                     result["status"] = "failed"
@@ -611,7 +661,9 @@ class ShellTestRunner:
                     for expected_text in expect["contains"]:
                         if expected_text not in output:
                             result["status"] = "failed"
-                            result["error"] = f"Step {i}: Expected output to contain '{expected_text}'"
+                            result["error"] = (
+                                f"Step {i}: Expected output to contain '{expected_text}'"
+                            )
                             return result
 
             elif step_type == "query":
@@ -621,7 +673,9 @@ class ShellTestRunner:
 
                 if query_result.get("status") == "error":
                     result["status"] = "failed"
-                    result["error"] = f"Step {i} query failed: {query_result.get('error')}"
+                    result["error"] = (
+                        f"Step {i} query failed: {query_result.get('error')}"
+                    )
                     return result
 
         return result
@@ -686,12 +740,22 @@ def run_spec(
 
     if manage_server:
         if not runner.start_server():
-            return [{"status": "error", "error": f"Failed to start server on {runner.server}"}]
+            return [
+                {
+                    "status": "error",
+                    "error": f"Failed to start server on {runner.server}",
+                }
+            ]
 
     if not runner.start_shell():
         if manage_server:
             runner.stop_server()
-        return [{"status": "error", "error": f"Failed to start shell connecting to {runner.server}"}]
+        return [
+            {
+                "status": "error",
+                "error": f"Failed to start shell connecting to {runner.server}",
+            }
+        ]
 
     try:
         for test in tests:
@@ -707,10 +771,22 @@ def run_spec(
 
 def main():
     parser = argparse.ArgumentParser(description="Geode shell test runner")
-    parser.add_argument("--spec", required=True, help="Path to test specification YAML file")
-    parser.add_argument("--server", default=None, help="Server address (auto-allocated if not specified and manage_server=true)")
-    parser.add_argument("--geode-binary", default=None, help="Path to geode binary (auto-detected if not specified)")
-    parser.add_argument("--data-dir", help="Data directory for server (auto-created if not specified)")
+    parser.add_argument(
+        "--spec", required=True, help="Path to test specification YAML file"
+    )
+    parser.add_argument(
+        "--server",
+        default=None,
+        help="Server address (auto-allocated if not specified and manage_server=true)",
+    )
+    parser.add_argument(
+        "--geode-binary",
+        default=None,
+        help="Path to geode binary (auto-detected if not specified)",
+    )
+    parser.add_argument(
+        "--data-dir", help="Data directory for server (auto-created if not specified)"
+    )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
 

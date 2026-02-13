@@ -10,15 +10,13 @@ import atexit
 import logging
 import os
 import signal
+import socket
 import subprocess
 import time
 
-logger = logging.getLogger(__name__)
+from .runner_types import DEFAULT_ADMIN_PASSWORD
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-DEFAULT_ADMIN_PASSWORD = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
+logger = logging.getLogger(__name__)
 
 # Global list to track server processes for cleanup on exit
 _active_servers: list[subprocess.Popen[str]] = []
@@ -69,6 +67,23 @@ def kill_stale_servers() -> None:
 atexit.register(cleanup_servers)
 
 
+def _port_is_bound(port: int, sock_type: int) -> bool:
+    """Check if a port is bound by attempting to bind to it.
+
+    If the bind fails with EADDRINUSE, the port is in use (server is listening).
+    This is a zero-cost alternative to spawning ss/netstat subprocesses.
+
+    NOTE: Do NOT use SO_REUSEADDR here — it allows re-binding to an
+    already-bound UDP port on Linux, which defeats the detection.
+    """
+    try:
+        with socket.socket(socket.AF_INET, sock_type) as s:
+            s.bind(("127.0.0.1", port))
+            return False  # We could bind → port is free, server not ready
+    except OSError:
+        return True  # Port in use → server is listening
+
+
 def start_server(
     binary: str,
     data_dir: os.PathLike[str],
@@ -98,13 +113,19 @@ def start_server(
         cmd.extend(["--listen-grpc", f"127.0.0.1:{grpc_port}"])
     cmd.extend(args)
 
-    # Set environment variables for testing
-    # Disable audit logging (avoids signing key requirements)
-    env["GEODE_DISABLE_AUDIT"] = "1"
-    # Allow auth to be disabled in release builds for testing
-    env["GEODE_ALLOW_NO_AUTH"] = "1"
+    # Set environment variables for testing.
+    # These flags weaken security and MUST NOT be used in production.
+    # Guard: only set if not explicitly overridden by the caller.
+    if os.environ.get("GEODE_DISABLE_AUDIT_GUARD") != "0":
+        env.setdefault("GEODE_DISABLE_AUDIT", "1")
+    else:
+        logger.info("GEODE_DISABLE_AUDIT_GUARD=0: audit logging NOT disabled")
+    if os.environ.get("GEODE_ALLOW_NO_AUTH_GUARD") != "0":
+        env.setdefault("GEODE_ALLOW_NO_AUTH", "1")
+    else:
+        logger.info("GEODE_ALLOW_NO_AUTH_GUARD=0: auth bypass NOT enabled")
     # Set a known admin password for testing (used by query commands)
-    env["GEODE_ADMIN_PASSWORD"] = DEFAULT_ADMIN_PASSWORD
+    env.setdefault("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
 
     if verbose:
         print(f"Starting server: {' '.join(cmd)}")
@@ -134,55 +155,18 @@ def start_server(
                 f"Server exited unexpectedly with code {process.returncode}\nstdout: {stdout}\nstderr: {stderr}"
             )
 
-        # Check if port is bound (try ss first, then netstat as fallback)
-        quic_ready = False
-        grpc_ready = grpc_port is None  # If no gRPC, consider it ready
-        try:
-            # Check QUIC (UDP) port
-            result = subprocess.run(
-                ["ss", "-uln"],
-                capture_output=True,
-                text=True,
-                timeout=1.0,
-            )
-            if result.returncode == 0 and f":{port}" in result.stdout:
-                quic_ready = True
+        # Check if port is bound using zero-cost socket bind probe
+        # (replaces subprocess-based ss/netstat polling — PERF-002)
+        quic_ready = _port_is_bound(port, socket.SOCK_DGRAM)  # UDP for QUIC
+        grpc_ready = grpc_port is None or _port_is_bound(grpc_port, socket.SOCK_STREAM)  # TCP for gRPC
 
-            # Check gRPC (TCP) port if needed
-            if grpc_port and not grpc_ready:
-                result = subprocess.run(
-                    ["ss", "-tln"],
-                    capture_output=True,
-                    text=True,
-                    timeout=1.0,
-                )
-                if result.returncode == 0 and f":{grpc_port}" in result.stdout:
-                    grpc_ready = True
-
-            if quic_ready and grpc_ready:
-                if verbose:
-                    msg = f"Server ready on port {port}"
-                    if grpc_port:
-                        msg += f" (gRPC on {grpc_port})"
-                    print(msg)
-                return process
-        except FileNotFoundError:
-            # ss not available, try netstat
-            try:
-                result = subprocess.run(
-                    ["netstat", "-uln"],
-                    capture_output=True,
-                    text=True,
-                    timeout=1.0,
-                )
-                if result.returncode == 0 and f":{port}" in result.stdout:
-                    if verbose:
-                        print(f"Server ready on port {port}")
-                    return process
-            except Exception:
-                pass
-        except Exception:
-            pass
+        if quic_ready and grpc_ready:
+            if verbose:
+                msg = f"Server ready on port {port}"
+                if grpc_port:
+                    msg += f" (gRPC on {grpc_port})"
+                print(msg)
+            return process
 
         time.sleep(0.1)
 

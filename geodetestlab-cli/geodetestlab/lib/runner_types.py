@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
+
+# Centralized test credential — every Python module should import this
+# constant instead of defining its own.  The value is read from the
+# environment at import time so it can be overridden externally.
+DEFAULT_ADMIN_PASSWORD: str = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
 
 class RunnerError(Exception):

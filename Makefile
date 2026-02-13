@@ -320,10 +320,15 @@ geodetestlab-setup:
 	@$(GEODETESTLAB_PIP) install -e $(GEODETESTLAB_CLI)
 	@echo "geodetestlab-cli setup complete"
 
-# Number of parallel workers for CLI tests
-# Cap at 4 to prevent QUIC server crashes from too many simultaneous
-# server instances (QUIC memory bugs cause double-free under high load)
-PARALLEL_WORKERS ?= $(shell echo $$(( $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) > 4 ? 4 : $$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )))
+# Number of parallel workers for CLI tests.
+# QUIC transport: cap at 4 (QUIC memory bugs cause double-free under high load).
+# gRPC transport: no cap needed — use full core count (PERF-003).
+NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+ifeq ($(TRANSPORT),grpc)
+  PARALLEL_WORKERS ?= $(NPROC)
+else
+  PARALLEL_WORKERS ?= $(shell echo $$(( $(NPROC) > 4 ? 4 : $(NPROC) )))
+endif
 
 # ==============================================================================
 # Test Commands (all use geodetestlab-cli)

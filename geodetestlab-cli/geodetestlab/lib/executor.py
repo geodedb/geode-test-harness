@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from .checks import check_expectations, check_http_expectations
+from .runner_types import DEFAULT_ADMIN_PASSWORD, TestResult
 from .spec import PlaintextCheck, TestCase
 
 logger = logging.getLogger(__name__)
@@ -25,14 +26,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DEFAULT_QUIC_PORT = 3141
 DEFAULT_GRPC_PORT = 50051
-DEFAULT_ADMIN_PASSWORD = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 DEFAULT_HTTP_TIMEOUT_S = 30.0
 DEFAULT_SHELL_TIMEOUT_S = 30.0
 SSL_VERIFY = os.environ.get("GEODE_VERIFY_SSL", "0").lower() in ("1", "true", "yes")
-
-
-# Re-export TestResult so runner.py doesn't need a separate import
-from .runner_types import TestResult  # noqa: E402
+if not SSL_VERIFY:
+    logging.getLogger(__name__).debug(
+        "SSL verification disabled (GEODE_VERIFY_SSL=%s). "
+        "Set GEODE_VERIFY_SSL=1 to enable certificate verification.",
+        os.environ.get("GEODE_VERIFY_SSL", "0"),
+    )
 
 
 def run_single_test(
@@ -43,12 +45,22 @@ def run_single_test(
     timeout_ms: int,
     data_dir: Path | None,
     verbose: bool,
+    http_client: httpx.Client | None = None,
 ) -> TestResult:
-    """Run a single test case, dispatching by test type."""
+    """Run a single test case, dispatching by test type.
+
+    Parameters
+    ----------
+    http_client : httpx.Client | None
+        Optional shared HTTP client for connection reuse across tests
+        within the same spec (PERF-007).
+    """
     if test_case.test_type == "http":
-        return _run_http_test(test_case, env, verbose)
+        return _run_http_test(test_case, env, verbose, http_client=http_client)
     elif test_case.test_type == "sequential":
-        return _run_sequential_test(test_case, binary, env, secrets, timeout_ms, data_dir, verbose)
+        return _run_sequential_test(
+            test_case, binary, env, secrets, timeout_ms, data_dir, verbose, http_client=http_client
+        )
     elif test_case.test_type == "shell":
         return _run_shell_test(test_case, env, verbose)
 
@@ -69,14 +81,26 @@ def run_cli_test(
     start_time = time.time()
 
     # Create setup files if defined (e.g., for --file flag tests)
+    # Sandbox: only allow writes under /tmp to prevent path traversal (CWE-22)
     if test_case.setup_files:
+        import tempfile as _tempfile
+
+        sandbox_root = Path(_tempfile.gettempdir())
         for file_spec in test_case.setup_files:
             file_path = file_spec.get("path", "")
             file_content = file_spec.get("content", "")
             if file_path and file_content:
+                resolved = Path(file_path).resolve()
+                if not str(resolved).startswith(str(sandbox_root)):
+                    return TestResult(
+                        name=test_case.name,
+                        passed=False,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        error=f"setup_files path must be under {sandbox_root}: {file_path}",
+                    )
                 try:
-                    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-                    with open(file_path, "w") as f:
+                    resolved.parent.mkdir(parents=True, exist_ok=True)
+                    with open(resolved, "w") as f:
                         f.write(file_content)
                 except Exception as e:
                     return TestResult(
@@ -131,13 +155,7 @@ def run_cli_test(
             if geode_path in command_str:
                 command_str = command_str.replace(geode_path, binary, 1)
                 break  # Only replace the first matching pattern once
-        if data_dir:
-            command_str = command_str.replace("${data_dir}", str(data_dir))
-        for key, value in env.items():
-            command_str = command_str.replace(f"${{{key}}}", value)
-            command_str = command_str.replace(f"${{env:{key}}}", value)
-        for key, value in secrets.items():
-            command_str = command_str.replace(f"${{secret:{key}}}", value)
+        command_str = _substitute_one(command_str, env, secrets, data_dir)
 
         # Inject auth credentials if this is a query command without auth flags
         if "query" in command_str and "-U" not in command_str and "-P" not in command_str:
@@ -163,13 +181,27 @@ def run_cli_test(
             )
 
         # Shell command test - detect shell metacharacters
-        shell_metacharacters = ["|", "&&", "||", ";", "$(", "`", ">", "<"]
-        if any(mc in command_str for mc in shell_metacharacters):
-            # Complex shell command - run through bash
+        # Only route through bash when the spec explicitly requests it via
+        # test_type: shell.  For CLI commands containing shell metacharacters,
+        # log a warning and use shlex to avoid CWE-78 injection.
+        _shell_metacharacters = {"|", "&&", "||", ";", "$(", "`", ">", "<"}
+        has_shell_meta = any(mc in command_str for mc in _shell_metacharacters)
+        if has_shell_meta and test_case.test_type == "shell":
+            # Explicit shell test - route through bash (trusted spec author)
             args = substitute_variables(test_case.args, env, secrets, data_dir)
             if args:
                 command_str += " " + " ".join(args)
             cmd = ["bash", "-c", command_str]
+        elif has_shell_meta:
+            # CLI test with metacharacters - log and parse safely
+            logger.warning(
+                "Command contains shell metacharacters but test_type is not 'shell'; "
+                "using shlex (no shell expansion): %s",
+                command_str[:120],
+            )
+            cmd = shlex.split(command_str)
+            args = substitute_variables(test_case.args, env, secrets, data_dir)
+            cmd.extend(args)
         else:
             cmd = shlex.split(command_str)
             args = substitute_variables(test_case.args, env, secrets, data_dir)
@@ -196,13 +228,8 @@ def run_cli_test(
     try:
         # Substitute variables in stdin if present
         stdin_input = test_case.stdin
-        if stdin_input and data_dir:
-            stdin_input = stdin_input.replace("${data_dir}", str(data_dir))
-            for key, value in env.items():
-                stdin_input = stdin_input.replace(f"${{{key}}}", value)
-                stdin_input = stdin_input.replace(f"${{env:{key}}}", value)
-            for key, value in secrets.items():
-                stdin_input = stdin_input.replace(f"${{secret:{key}}}", value)
+        if stdin_input:
+            stdin_input = _substitute_one(stdin_input, env, secrets, data_dir)
 
         result = subprocess.run(
             cmd,
@@ -273,6 +300,8 @@ def _run_http_test(
     test_case: TestCase,
     env: dict[str, str],
     verbose: bool,
+    *,
+    http_client: httpx.Client | None = None,
 ) -> TestResult:
     """Run an HTTP test case."""
     start_time = time.time()
@@ -280,14 +309,13 @@ def _run_http_test(
     errors: list[str] = []
 
     try:
-        # Create an HTTP client with connection reuse
-        with httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT_S, verify=SSL_VERIFY) as client:
+        # Reuse shared client if provided (PERF-007), else create one
+        _owned = http_client is None
+        client = http_client or httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT_S, verify=SSL_VERIFY)
+        try:
             for i, req in enumerate(test_case.http_requests):
                 # Substitute environment variables in URL
-                url = req.url
-                for key, value in env.items():
-                    url = url.replace(f"${{{key}}}", value)
-                    url = url.replace(f"${{env:{key}}}", value)
+                url = _substitute_one(req.url, env, {}, None)
 
                 if verbose:
                     print(f"  HTTP {req.method} {url}")
@@ -329,6 +357,10 @@ def _run_http_test(
                         output="\n".join(outputs),
                         error="\n".join(errors),
                     )
+
+        finally:
+            if _owned:
+                client.close()
 
     except Exception as e:
         return TestResult(
@@ -452,6 +484,8 @@ def _run_sequential_test(
     timeout_ms: int,
     data_dir: Path | None,
     verbose: bool,
+    *,
+    http_client: httpx.Client | None = None,
 ) -> TestResult:
     """Run a sequential test case with multiple steps."""
     start_time = time.time()
@@ -469,8 +503,10 @@ def _run_sequential_test(
         server_addr = env.get("GEODE_SERVER_ADDRESS", f"127.0.0.1:{DEFAULT_QUIC_PORT}")
 
     try:
-        # Create an HTTP client for HTTP steps
-        with httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT_S, verify=SSL_VERIFY) as http_client:
+        # Reuse shared client if provided (PERF-007), else create one
+        _owned_seq = http_client is None
+        _http_client = http_client or httpx.Client(timeout=DEFAULT_HTTP_TIMEOUT_S, verify=SSL_VERIFY)
+        try:
             for i, step in enumerate(test_case.steps):
                 if verbose:
                     print(f"  Step {i + 1}: {step.step_type}")
@@ -481,12 +517,9 @@ def _run_sequential_test(
 
                 elif step.step_type == "http":
                     # Execute HTTP step
-                    url = step.url or ""
-                    for key, value in env.items():
-                        url = url.replace(f"${{{key}}}", value)
-                        url = url.replace(f"${{env:{key}}}", value)
+                    url = _substitute_one(step.url or "", env, {}, None)
 
-                    response = http_client.request(
+                    response = _http_client.request(
                         method=step.method or "GET",
                         url=url,
                         headers=step.headers,
@@ -541,6 +574,10 @@ def _run_sequential_test(
 
                     outputs.append(f"Step {i + 1}: GQL OK")
 
+        finally:
+            if _owned_seq:
+                _http_client.close()
+
     except Exception as e:
         return TestResult(
             name=test_case.name,
@@ -563,24 +600,42 @@ def substitute_variables(
     secrets: dict[str, str],
     data_dir: Path | None,
 ) -> list[str]:
-    """Substitute variables in argument list."""
-    result = []
-    for arg in args:
-        # Substitute ${data_dir}
-        if data_dir:
-            arg = arg.replace("${data_dir}", str(data_dir))
+    """Substitute variables in argument list.
 
-        # Substitute ${env:VAR}
-        for key, value in env.items():
-            arg = arg.replace(f"${{{key}}}", value)
-            arg = arg.replace(f"${{env:{key}}}", value)
+    Uses a single ``re.sub`` pass instead of O(n*m) ``.replace()`` calls
+    (PERF-008).
+    """
+    return [_substitute_one(arg, env, secrets, data_dir) for arg in args]
 
-        # Substitute ${secret:NAME}
-        for key, value in secrets.items():
-            arg = arg.replace(f"${{secret:{key}}}", value)
 
-        result.append(arg)
-    return result
+def _substitute_one(
+    text: str,
+    env: dict[str, str],
+    secrets: dict[str, str],
+    data_dir: Path | None,
+) -> str:
+    """Replace ``${key}``, ``${env:key}``, ``${secret:key}``, ``${data_dir}`` in *text*."""
+    import re as _re
+
+    def _replacer(m: _re.Match[str]) -> str:
+        full = m.group(0)  # e.g. ${env:FOO} or ${FOO} or ${secret:BAR} or ${data_dir}
+        inner = m.group(1)  # e.g. env:FOO or FOO or secret:BAR or data_dir
+
+        if inner == "data_dir":
+            return str(data_dir) if data_dir else full
+
+        if inner.startswith("env:"):
+            key = inner[4:]
+            return env.get(key, full)
+
+        if inner.startswith("secret:"):
+            key = inner[7:]
+            return secrets.get(key, full)
+
+        # Plain ${KEY} — look up in env
+        return env.get(inner, full)
+
+    return _re.sub(r"\$\{([^}]+)\}", _replacer, text)
 
 
 def run_plaintext_verification(
@@ -588,40 +643,54 @@ def run_plaintext_verification(
     config: PlaintextCheck,
     verbose: bool,
 ) -> list[str]:
-    """Run plaintext verification scan on data directory."""
-    violations = []
+    """Run plaintext verification scan on data directory.
 
-    for pattern in config.search_patterns:
-        try:
-            # Use grep to search for plaintext patterns in all files
-            result = subprocess.run(
-                ["grep", "-r", "-a", "-l", pattern, str(data_dir)],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
+    Combines all search patterns into a single ``grep -E`` invocation
+    to avoid N recursive directory scans (PERF-005).
+    """
+    violations: list[str] = []
+    patterns = config.search_patterns
+    if not patterns:
+        return violations
 
-            if result.returncode == 0:
-                # Pattern was found - this is a violation!
-                matching_files = result.stdout.strip().split("\n")
-                for file_path in matching_files:
-                    if file_path:
-                        # Filter out excluded extensions
-                        skip = False
-                        for ext in config.exclude_extensions:
-                            if file_path.endswith(ext):
-                                skip = True
-                                break
-                        if not skip:
-                            violations.append(f"Pattern '{pattern}' found in: {file_path}")
-                            if verbose:
-                                print(f"  VIOLATION: '{pattern}' in {file_path}")
+    # Build a combined extended regex: pat1|pat2|pat3
+    import re as _re
 
-        except subprocess.TimeoutExpired:
-            if verbose:
-                print(f"  WARNING: Grep timeout for pattern '{pattern}'")
-        except Exception as e:
-            if verbose:
-                print(f"  WARNING: Error scanning for '{pattern}': {e}")
+    combined = "|".join(_re.escape(p) for p in patterns)
+
+    try:
+        result = subprocess.run(
+            ["grep", "-r", "-a", "-E", combined, str(data_dir)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                if not line:
+                    continue
+                # line format: filepath:matched_content
+                file_path = line.split(":")[0] if ":" in line else line
+                # Filter out excluded extensions
+                skip = any(file_path.endswith(ext) for ext in config.exclude_extensions)
+                if skip:
+                    continue
+                # Figure out which pattern matched
+                for pattern in patterns:
+                    if pattern in line:
+                        violations.append(f"Pattern '{pattern}' found in: {file_path}")
+                        if verbose:
+                            print(f"  VIOLATION: '{pattern}' in {file_path}")
+                        break
+                else:
+                    violations.append(f"Pattern match found in: {file_path}")
+
+    except subprocess.TimeoutExpired:
+        if verbose:
+            print("  WARNING: Grep timeout for combined pattern scan")
+    except Exception as e:
+        if verbose:
+            print(f"  WARNING: Error scanning: {e}")
 
     return violations

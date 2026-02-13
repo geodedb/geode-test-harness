@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sort"
 	"time"
@@ -109,7 +108,7 @@ func main() {
 	_ = os.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
 
 	// Load spec
-	data, err := ioutil.ReadFile(*specPath)
+	data, err := os.ReadFile(*specPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to read spec: %v\n", err)
 		os.Exit(2)

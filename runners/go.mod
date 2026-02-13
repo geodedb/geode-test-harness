@@ -8,8 +8,8 @@ require (
 )
 
 require (
-	github.com/quic-go/quic-go v0.55.0 // indirect
-	golang.org/x/crypto v0.43.0 // indirect
+	github.com/quic-go/quic-go v0.59.0 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/mod v0.28.0 // indirect
 	golang.org/x/net v0.45.0 // indirect
 	golang.org/x/sync v0.17.0 // indirect
@@ -20,4 +20,3 @@ require (
 	google.golang.org/grpc v1.75.1 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
 )
-
