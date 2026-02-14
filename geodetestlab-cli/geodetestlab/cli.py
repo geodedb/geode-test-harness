@@ -320,10 +320,12 @@ def run(
         except FileNotFoundError:
             pass  # Let workers report the error individually
 
-    # Kill stale servers once before running any specs
-    # This must happen exactly once, not per-worker, to avoid
-    # parallel workers killing each other's servers.
-    _kill_stale_servers()
+    # Kill stale servers ONLY when running a directory of specs (--specs).
+    # When running a single spec (--spec), skip: the caller (e.g., a parallel
+    # runner) is responsible for one-time cleanup before spawning workers.
+    # Calling pkill inside each worker kills other workers' servers (GH-516).
+    if specs is not None:
+        _kill_stale_servers()
 
     # Aggregate results across all spec files
     total_exit_code = 0

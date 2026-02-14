@@ -135,7 +135,7 @@ def run_cli_test(
         if use_grpc:
             cmd.append("--grpc")
         else:
-            cmd.extend(["--insecure"])
+            cmd.extend(["--insecure-tls-skip-verify"])
         cmd.extend(["-U", "geode", "-P", admin_password])
     elif test_case.command and _is_gql_query(test_case.command):
         # Command field contains GQL - route to query handler
@@ -144,7 +144,7 @@ def run_cli_test(
         if use_grpc:
             cmd.append("--grpc")
         else:
-            cmd.extend(["--insecure"])
+            cmd.extend(["--insecure-tls-skip-verify"])
         cmd.extend(["-U", "geode", "-P", admin_password])
     elif test_case.command:
         # Substitute variables in command string
@@ -216,8 +216,8 @@ def run_cli_test(
                 cmd.extend(["--server", server_addr])
             if use_grpc and "--grpc" not in args:
                 cmd.append("--grpc")
-            elif not use_grpc and "--insecure" not in args:
-                cmd.extend(["--insecure"])
+            elif not use_grpc and "--insecure-tls-skip-verify" not in args and "--insecure" not in args:
+                cmd.extend(["--insecure-tls-skip-verify"])
             if "-U" not in args:
                 cmd.extend(["-U", "geode", "-P", admin_password])
 
@@ -551,7 +551,7 @@ def _run_sequential_test(
                     if use_grpc:
                         cmd.append("--grpc")
                     else:
-                        cmd.extend(["--insecure"])
+                        cmd.extend(["--insecure-tls-skip-verify"])
                     cmd.extend(["-U", "geode", "-P", admin_password])
 
                     result = subprocess.run(

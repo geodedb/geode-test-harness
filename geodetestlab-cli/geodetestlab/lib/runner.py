@@ -322,10 +322,14 @@ def run_tests(
                 http_client=_shared_http,
             )
 
-            # If test failed with connection timeout and server is dead, restart
-            if not result.passed and "connection timeout" in (result.error or "") and server_process:
+            # If test failed with a timeout-like error, the server may be hung
+            # (still alive but unresponsive). Force-kill and restart.
+            if not result.passed and server_process:
+                error_text = (result.error or "").lower() + (result.output or "").lower()
+                is_timeout = "timed out" in error_text or "connection timeout" in error_text or "timeout" in error_text
                 with _lock:
                     if server_process.poll() is not None:
+                        # Server crashed - restart
                         if verbose:
                             print("  Server died during test, restarting for next test...")
                         untrack_server(server_process)
@@ -343,6 +347,58 @@ def run_tests(
                             )
                         except ServerError:
                             pass  # Will be caught at the top of the next test
+                    elif is_timeout:
+                        # Server may be hung - health check with a simple query
+                        try:
+                            health_result = subprocess.run(
+                                [
+                                    binary,
+                                    "query",
+                                    "--server",
+                                    f"127.0.0.1:{port}",
+                                    "--insecure-tls-skip-verify",
+                                    "-U",
+                                    "geode",
+                                    "-P",
+                                    env.get("GEODE_ADMIN_PASSWORD", ""),
+                                    "RETURN 1 AS _health",
+                                ],
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                                env=env,
+                            )
+                            if health_result.returncode != 0:
+                                raise subprocess.TimeoutExpired(cmd="health", timeout=5)
+                        except (subprocess.TimeoutExpired, Exception):
+                            # Server is hung - force kill and restart
+                            if verbose:
+                                print("  Server hung (unresponsive), force-killing and restarting...")
+                            try:
+                                pgid = os.getpgid(server_process.pid)
+                                os.killpg(pgid, signal.SIGKILL)
+                            except (OSError, ProcessLookupError):
+                                pass
+                            server_process.kill()
+                            try:
+                                server_process.wait(timeout=2)
+                            except subprocess.TimeoutExpired:
+                                pass
+                            untrack_server(server_process)
+                            try:
+                                assert data_dir is not None
+                                server_process = start_server(
+                                    binary=binary,
+                                    data_dir=data_dir,
+                                    port=port,
+                                    env=env,
+                                    args=spec.server_args,
+                                    timeout_ms=server_timeout_ms,
+                                    verbose=verbose,
+                                    grpc_port=grpc_port,
+                                )
+                            except ServerError:
+                                pass  # Will be caught at the top of the next test
 
             return result
 
