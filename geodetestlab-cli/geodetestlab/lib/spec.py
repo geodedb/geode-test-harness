@@ -218,6 +218,8 @@ class TestCase:
     plaintext_check: PlaintextCheck = field(default_factory=PlaintextCheck)
     # Setup files to create before running the test
     setup_files: list[dict[str, str]] = field(default_factory=list)
+    # Per-test timeout override (if larger than global timeout, this takes precedence)
+    timeout_ms: int = 0
     # HTTP test fields
     http_requests: list[HttpRequest] = field(default_factory=list)
     # Sequential test fields
@@ -332,6 +334,7 @@ class TestCase:
             skip_reason=data.get("skip_reason"),
             plaintext_check=PlaintextCheck.from_dict(plaintext_data),
             setup_files=setup_files,
+            timeout_ms=data.get("timeout_ms", 0),
             http_requests=http_requests,
             steps=steps,
         )
@@ -376,6 +379,7 @@ class TestSpec:
     tde_config: dict[str, Any] | None = None
     plaintext_verification: PlaintextCheck = field(default_factory=PlaintextCheck)
     parallel_tests: bool = False
+    default_timeout_ms: int = 0  # Spec-level default timeout for all tests (0 = use runner default)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestSpec:
@@ -426,6 +430,7 @@ class TestSpec:
             tde_config=data.get("tde_config"),
             plaintext_verification=PlaintextCheck.from_dict(data.get("plaintext_verification")),
             parallel_tests=bool(data.get("parallel_tests", False)),
+            default_timeout_ms=data.get("default_timeout_ms", 0),
         )
 
 

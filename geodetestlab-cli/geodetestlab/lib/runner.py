@@ -127,6 +127,10 @@ def run_tests(
     summary = RunSummary()
     start_time = time.time()
 
+    # Apply spec-level default timeout if set (overrides runner default)
+    if spec.default_timeout_ms > 0:
+        timeout_ms = max(timeout_ms, spec.default_timeout_ms)
+
     # Find geode binary
     try:
         binary = find_geode_binary(geode_binary)

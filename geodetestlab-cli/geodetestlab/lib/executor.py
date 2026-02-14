@@ -225,6 +225,9 @@ def run_cli_test(
     test_env = env.copy()
     test_env.update(test_case.env)
 
+    # Use the larger of the global timeout and per-test timeout
+    effective_timeout_ms = max(timeout_ms, test_case.timeout_ms)
+
     try:
         # Substitute variables in stdin if present
         stdin_input = test_case.stdin
@@ -236,7 +239,7 @@ def run_cli_test(
             env=test_env,
             capture_output=True,
             text=True,
-            timeout=timeout_ms / 1000.0,
+            timeout=effective_timeout_ms / 1000.0,
             input=stdin_input,  # Pass stdin content to the subprocess
         )
 
@@ -249,7 +252,7 @@ def run_cli_test(
             name=test_case.name,
             passed=False,
             duration_ms=(time.time() - start_time) * 1000,
-            error=f"Test timed out after {timeout_ms}ms",
+            error=f"Test timed out after {effective_timeout_ms}ms",
         )
     except Exception as e:
         return TestResult(
