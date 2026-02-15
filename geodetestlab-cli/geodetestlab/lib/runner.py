@@ -322,6 +322,31 @@ def run_tests(
                 http_client=_shared_http,
             )
 
+            # Retry once on transient failures (timeouts, connection errors)
+            # that are likely caused by parallel resource contention rather
+            # than real bugs.  The retry uses the same server instance.
+            if not result.passed and server_process:
+                err = (result.error or "").lower() + (result.output or "").lower()
+                _TRANSIENT = ("timed out", "connection refused", "connection timeout", "timeout", "broken pipe")
+                if any(t in err for t in _TRANSIENT):
+                    # Only retry if the server is still alive
+                    with _lock:
+                        alive = server_process.poll() is None
+                    if alive:
+                        if verbose:
+                            print(f"  Retrying {test_case.name} after transient failure...")
+                        time.sleep(2)
+                        result = run_single_test(
+                            test_case=test_case,
+                            binary=binary,
+                            env=env,
+                            secrets=secrets,
+                            timeout_ms=timeout_ms,
+                            data_dir=data_dir,
+                            verbose=verbose,
+                            http_client=_shared_http,
+                        )
+
             # If test failed with a timeout-like error, the server may be hung
             # (still alive but unresponsive). Force-kill and restart.
             if not result.passed and server_process:
