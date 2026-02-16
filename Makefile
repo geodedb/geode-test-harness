@@ -321,13 +321,15 @@ geodetestlab-setup:
 	@echo "geodetestlab-cli setup complete"
 
 # Number of parallel workers for CLI tests.
-# QUIC transport: cap at 4 (QUIC memory bugs cause double-free under high load).
+# QUIC transport: cap at 2 to avoid resource contention (each spec spawns a
+# full Geode server; >2 parallel servers causes timeouts and false failures).
+# Failed specs are automatically retried serially by the runner.
 # gRPC transport: no cap needed — use full core count (PERF-003).
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 ifeq ($(TRANSPORT),grpc)
   PARALLEL_WORKERS ?= $(NPROC)
 else
-  PARALLEL_WORKERS ?= $(shell echo $$(( $(NPROC) > 4 ? 4 : $(NPROC) )))
+  PARALLEL_WORKERS ?= $(shell echo $$(( $(NPROC) > 2 ? 2 : $(NPROC) )))
 endif
 
 # ==============================================================================

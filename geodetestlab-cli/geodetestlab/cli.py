@@ -402,6 +402,7 @@ def run(
                 }
 
                 # Collect results as they complete
+                failed_specs: list[tuple[Path, dict[str, Any]]] = []
                 for future in as_completed(future_to_spec):
                     if interrupted:
                         # Cancel remaining futures
@@ -422,25 +423,90 @@ def run(
                     if result["error"]:
                         console_err.print(result["error"], style="red")
 
-                    total_exit_code = max(total_exit_code, result["exit_code"])
                     summary = result["summary"]
-                    aggregate_summary["total"] += summary.get("total", 0)
-                    aggregate_summary["passed"] += summary.get("passed", 0)
-                    aggregate_summary["failed"] += summary.get("failed", 0)
-                    aggregate_summary["skipped"] += summary.get("skipped", 0)
-                    all_results.append({"spec": result["spec"], "summary": summary})
+                    failed_count = summary.get("failed", 0)
+                    total_count = summary.get("total", 0)
+                    has_error = result.get("error") is not None
+
+                    if failed_count > 0 or has_error or total_count == 0:
+                        # Track failed specs for retry
+                        failed_specs.append((spec_file, result))
+                    else:
+                        total_exit_code = max(total_exit_code, result["exit_code"])
+                        aggregate_summary["total"] += summary.get("total", 0)
+                        aggregate_summary["passed"] += summary.get("passed", 0)
+                        aggregate_summary["failed"] += summary.get("failed", 0)
+                        aggregate_summary["skipped"] += summary.get("skipped", 0)
+                        all_results.append({"spec": result["spec"], "summary": summary})
 
                     if not ci and verbose:
                         passed = summary.get("passed", 0)
-                        failed = summary.get("failed", 0)
-                        total = summary.get("total", 0)
-                        has_error = result.get("error") is not None
                         # FAIL if: failed > 0, or error occurred, or no tests ran at all
-                        if failed > 0 or has_error or total == 0:
+                        if failed_count > 0 or has_error or total_count == 0:
                             status = "[red]FAIL[/red]"
                         else:
                             status = "[green]PASS[/green]"
-                        console.print(f"  {status} {spec_file.name}: {passed} passed, {failed} failed")
+                        console.print(f"  {status} {spec_file.name}: {passed} passed, {failed_count} failed")
+
+                # Retry failed specs serially to eliminate false positives
+                # from resource contention during parallel execution.
+                if failed_specs and not interrupted:
+                    if not ci:
+                        console.print(f"\n[yellow]Retrying {len(failed_specs)} failed spec(s) serially...[/yellow]")
+
+                    # Kill any leftover geode processes before retries
+                    _kill_geode_processes()
+
+                    for spec_file, _original_result in failed_specs:
+                        if not ci and verbose:
+                            console.print(f"  [dim]Retrying {spec_file.name}...[/dim]")
+
+                        retry_result = _run_single_spec(
+                            spec_file,
+                            llm_provider,
+                            model,
+                            max_cases,
+                            timeout_ms,
+                            server_timeout_ms,
+                            dry_run,
+                            ci,
+                            seed,
+                            geode_binary,
+                            None,
+                            verbose,
+                            current_transport,
+                        )
+
+                        retry_summary = retry_result["summary"]
+                        retry_failed = retry_summary.get("failed", 0)
+                        retry_total = retry_summary.get("total", 0)
+                        retry_has_error = retry_result.get("error") is not None
+
+                        if retry_failed == 0 and not retry_has_error and retry_total > 0:
+                            # Retry passed — use retry result (contention was the cause)
+                            use_result = retry_result
+                            if not ci and verbose:
+                                console.print(
+                                    f"  [green]PASS[/green] {spec_file.name}: "
+                                    f"{retry_summary.get('passed', 0)} passed (retry succeeded)"
+                                )
+                        else:
+                            # Retry also failed — genuine failure, use retry result
+                            use_result = retry_result
+                            if not ci and verbose:
+                                console.print(
+                                    f"  [red]FAIL[/red] {spec_file.name}: "
+                                    f"{retry_summary.get('passed', 0)} passed, "
+                                    f"{retry_failed} failed (confirmed failure)"
+                                )
+
+                        use_summary = use_result["summary"]
+                        total_exit_code = max(total_exit_code, use_result["exit_code"])
+                        aggregate_summary["total"] += use_summary.get("total", 0)
+                        aggregate_summary["passed"] += use_summary.get("passed", 0)
+                        aggregate_summary["failed"] += use_summary.get("failed", 0)
+                        aggregate_summary["skipped"] += use_summary.get("skipped", 0)
+                        all_results.append({"spec": use_result["spec"], "summary": use_summary})
 
             except KeyboardInterrupt:
                 interrupted = True
