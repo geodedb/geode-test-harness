@@ -182,6 +182,14 @@ def run_tests(
         if transport == "grpc":
             grpc_port = get_free_port()
 
+        # Set GEODE_STATE_DIR before starting the server so the server process
+        # inherits the same state directory used by CLI commands. Without this,
+        # the server reads auth state from the default HOME location while the
+        # CLI writes to the test-run-specific data_dir, causing auth failures
+        # (e.g. create-session test: user created via CLI not found by server).
+        if "GEODE_STATE_DIR" not in env:
+            env["GEODE_STATE_DIR"] = str(data_dir)
+
         # Start server
         if not dry_run:
             try:
@@ -201,10 +209,6 @@ def run_tests(
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
         env["PORT"] = str(port)
         env["data_dir"] = str(data_dir)
-        # Isolate CLI state (users, API keys) per test run so state from a
-        # previous run (or a parallel retry) cannot bleed into this run.
-        if "GEODE_STATE_DIR" not in env:
-            env["GEODE_STATE_DIR"] = str(data_dir)
         env["GEODE_TRANSPORT"] = transport
         if grpc_port:
             env["GEODE_GRPC_ADDRESS"] = f"127.0.0.1:{grpc_port}"
