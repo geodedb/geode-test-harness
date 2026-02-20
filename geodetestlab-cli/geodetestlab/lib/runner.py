@@ -201,6 +201,10 @@ def run_tests(
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
         env["PORT"] = str(port)
         env["data_dir"] = str(data_dir)
+        # Isolate CLI state (users, API keys) per test run so state from a
+        # previous run (or a parallel retry) cannot bleed into this run.
+        if "GEODE_STATE_DIR" not in env:
+            env["GEODE_STATE_DIR"] = str(data_dir)
         env["GEODE_TRANSPORT"] = transport
         if grpc_port:
             env["GEODE_GRPC_ADDRESS"] = f"127.0.0.1:{grpc_port}"
