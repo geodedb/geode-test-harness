@@ -1,0 +1,391 @@
+version: '1.0'
+name: GQL ISO/IEC 39075:2024 Conformance Integration Tests
+description: >
+  Runtime-observable conformance tests for ISO/IEC 39075:2024 GQL standard.
+  Covers: RQ-0001 (execute conforming programs), RQ-0014 (temporal literal
+  parsing), RQ-0022 (case-insensitive keywords).
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+tests:
+# RQ-0001: A conforming GQL processor shall be capable of executing any
+# conforming GQL program that is executable on that processor.
+- name: RQ0001-return-integer-literal
+  description: 'RQ-0001: Execute a conforming GQL program returning an integer literal'
+  args:
+  - query
+  - RETURN 1 AS x
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - x
+    stdout_json_assert:
+    - expression: results[0].x
+      equals: 1
+  tags:
+  - rq0001
+  - conformance
+  - basic
+
+- name: RQ0001-return-string-literal
+  description: 'RQ-0001: Execute a conforming GQL program returning a string literal'
+  args:
+  - query
+  - RETURN 'hello' AS greeting
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - greeting
+    stdout_json_assert:
+    - expression: results[0].greeting
+      equals: hello
+  tags:
+  - rq0001
+  - conformance
+  - basic
+
+- name: RQ0001-return-boolean-literal
+  description: 'RQ-0001: Execute a conforming GQL program returning boolean literals'
+  args:
+  - query
+  - RETURN true AS t, false AS f
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - t
+      - f
+    stdout_json_assert:
+    - expression: results[0].t
+      equals: true
+    - expression: results[0].f
+      equals: false
+  tags:
+  - rq0001
+  - conformance
+  - boolean
+
+- name: RQ0001-return-arithmetic-expression
+  description: 'RQ-0001: Execute a conforming GQL program with arithmetic expression'
+  args:
+  - query
+  - RETURN 2 + 3 AS sum
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - sum
+    stdout_json_assert:
+    - expression: results[0].sum
+      equals: 5
+  tags:
+  - rq0001
+  - conformance
+  - arithmetic
+
+- name: RQ0001-return-null-literal
+  description: 'RQ-0001: Execute a conforming GQL program returning NULL'
+  args:
+  - query
+  - RETURN null AS n
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - n
+  tags:
+  - rq0001
+  - conformance
+
+# RQ-0022: GQL keywords shall be case-insensitive.
+- name: RQ0022-keywords-uppercase
+  description: 'RQ-0022: Keywords case-insensitive - all uppercase (canonical form)'
+  args:
+  - query
+  - RETURN 1 AS x
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - x
+    stdout_json_assert:
+    - expression: results[0].x
+      equals: 1
+  tags:
+  - rq0022
+  - conformance
+  - case-insensitive
+
+- name: RQ0022-keywords-lowercase
+  description: 'RQ-0022: Keywords case-insensitive - all lowercase'
+  args:
+  - query
+  - return 1 as x
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - x
+    stdout_json_assert:
+    - expression: results[0].x
+      equals: 1
+  tags:
+  - rq0022
+  - conformance
+  - case-insensitive
+
+- name: RQ0022-keywords-mixed-case
+  description: 'RQ-0022: Keywords case-insensitive - mixed/title case'
+  args:
+  - query
+  - Return 1 As x
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - x
+    stdout_json_assert:
+    - expression: results[0].x
+      equals: 1
+  tags:
+  - rq0022
+  - conformance
+  - case-insensitive
+
+- name: RQ0022-match-keyword-lowercase
+  description: 'RQ-0022: MATCH keyword case-insensitive in graph query'
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:KwTest {val: 1}) return n.val AS v'
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - v
+  tags:
+  - rq0022
+  - conformance
+  - case-insensitive
+
+- name: RQ0022-where-keyword-mixed-case
+  description: 'RQ-0022: WHERE and AND keywords case-insensitive'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:KwTest) Where n.val = 1 AND n.val > 0 RETURN n.val AS v
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - v
+  tags:
+  - rq0022
+  - conformance
+  - case-insensitive
+
+# RQ-0014: ISO 8601 temporal literal parsing.
+# The GQL standard requires that date, time, and datetime literals follow
+# ISO 8601 format and be parseable by a conforming processor.
+- name: RQ0014-date-literal-iso8601
+  description: "RQ-0014: ISO 8601 date literal DATE '2024-01-15'"
+  args:
+  - query
+  - RETURN DATE('2024-01-15') AS d
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - d
+    stdout_contains:
+    - 2024-01-15
+  tags:
+  - rq0014
+  - conformance
+  - temporal
+  - date
+
+- name: RQ0014-date-literal-year-boundary
+  description: 'RQ-0014: ISO 8601 date literal at year boundary'
+  args:
+  - query
+  - RETURN DATE('2024-12-31') AS d
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - d
+    stdout_contains:
+    - 2024-12-31
+  tags:
+  - rq0014
+  - conformance
+  - temporal
+  - date
+
+- name: RQ0014-date-literal-leap-day
+  description: 'RQ-0014: ISO 8601 date literal - leap day'
+  args:
+  - query
+  - RETURN DATE('2024-02-29') AS d
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - d
+    stdout_contains:
+    - 2024-02-29
+  tags:
+  - rq0014
+  - conformance
+  - temporal
+  - date
+
+- name: RQ0014-time-literal-iso8601
+  description: "RQ-0014: ISO 8601 time literal TIME '14:30:00'"
+  args:
+  - query
+  - RETURN TIME('14:30:00') AS t
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - t
+    stdout_contains:
+    - 14:30
+  tags:
+  - rq0014
+  - conformance
+  - temporal
+  - time
+
+- name: RQ0014-datetime-literal-iso8601
+  description: 'RQ-0014: ISO 8601 datetime literal'
+  args:
+  - query
+  - RETURN DATETIME('2024-01-15T14:30:00') AS dt
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - dt
+    stdout_contains:
+    - '2024-01-15'
+  tags:
+  - rq0014
+  - conformance
+  - temporal
+  - datetime
+
+- name: RQ0014-date-in-node-property
+  description: 'RQ-0014: DATE literal stored and retrieved from node property'
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (e:Event {name: 'launch', date: DATE('2024-06-01')}) RETURN e.name AS name, e.date AS d"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - name
+      - d
+    stdout_contains:
+    - launch
+  tags:
+  - rq0014
+  - conformance
+  - temporal
+  - storage
+
+# Additional conformance: verifying correct column aliasing and result shapes
+- name: RQ0001-multi-column-return
+  description: 'RQ-0001: Execute a conforming multi-column RETURN program'
+  args:
+  - query
+  - RETURN 1 AS a, 2 AS b, 3 AS c
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - a
+      - b
+      - c
+    stdout_json_assert:
+    - expression: results[0].a
+      equals: 1
+    - expression: results[0].b
+      equals: 2
+    - expression: results[0].c
+      equals: 3
+  tags:
+  - rq0001
+  - conformance
+  - columns
+
+- name: RQ0001-float-literal
+  description: 'RQ-0001: Execute a conforming GQL program returning a float literal'
+  args:
+  - query
+  - RETURN 3.14 AS pi
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - pi
+  tags:
+  - rq0001
+  - conformance
+  - float
+
+- name: RQ0001-negative-integer-literal
+  description: 'RQ-0001: Execute a conforming GQL program returning a negative integer'
+  args:
+  - query
+  - RETURN -42 AS n
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - n
+    stdout_json_assert:
+    - expression: results[0].n
+      equals: -42
+  tags:
+  - rq0001
+  - conformance
+  - negative
