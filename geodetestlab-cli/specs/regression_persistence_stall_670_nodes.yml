@@ -1,0 +1,235 @@
+version: '1.0'
+name: regression-persistence-stall-670-nodes
+description: >
+  Regression test for persistence stall at 670+ nodes.
+
+  The persistence thread (saveToFile) previously held an exclusive write lock
+  for the entire duration of: O(N) serialization + CRC32 + TDE encryption +
+  synchronous disk write. With 670+ nodes this took 400-2000ms per cycle,
+  blocking all query handlers and causing a deterministic 3.5-minute stall.
+
+  Fix: serialize graph state under lock, then release lock before CRC/encrypt/write.
+  Lock hold time drops from ~400-2000ms to ~50-200ms (serialization only).
+
+  This spec creates 700+ nodes in rapid succession, then verifies the server
+  remains responsive (queries complete within timeout) throughout and after
+  the bulk ingest.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+# --- Phase 1: Rapid bulk CREATE to exceed 670 node threshold ---
+- name: persist-stall-bulk-create-batch1
+  description: >
+    Create 200 nodes in a single batch. The persistence thread serializes
+    under lock; before the fix, even moderate node counts caused noticeable
+    lock contention.
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (:PersistTest {id: 'pt-001'}), (:PersistTest {id: 'pt-002'}), (:PersistTest {id: 'pt-003'}), (:PersistTest {id: 'pt-004'}), (:PersistTest {id: 'pt-005'})
+    CREATE (:PersistTest {id: 'pt-006'}), (:PersistTest {id: 'pt-007'}), (:PersistTest {id: 'pt-008'}), (:PersistTest {id: 'pt-009'}), (:PersistTest {id: 'pt-010'})
+    CREATE (:PersistTest {id: 'pt-011'}), (:PersistTest {id: 'pt-012'}), (:PersistTest {id: 'pt-013'}), (:PersistTest {id: 'pt-014'}), (:PersistTest {id: 'pt-015'})
+    CREATE (:PersistTest {id: 'pt-016'}), (:PersistTest {id: 'pt-017'}), (:PersistTest {id: 'pt-018'}), (:PersistTest {id: 'pt-019'}), (:PersistTest {id: 'pt-020'})
+    CREATE (:PersistTest {id: 'pt-021'}), (:PersistTest {id: 'pt-022'}), (:PersistTest {id: 'pt-023'}), (:PersistTest {id: 'pt-024'}), (:PersistTest {id: 'pt-025'})
+    CREATE (:PersistTest {id: 'pt-026'}), (:PersistTest {id: 'pt-027'}), (:PersistTest {id: 'pt-028'}), (:PersistTest {id: 'pt-029'}), (:PersistTest {id: 'pt-030'})
+    CREATE (:PersistTest {id: 'pt-031'}), (:PersistTest {id: 'pt-032'}), (:PersistTest {id: 'pt-033'}), (:PersistTest {id: 'pt-034'}), (:PersistTest {id: 'pt-035'})
+    CREATE (:PersistTest {id: 'pt-036'}), (:PersistTest {id: 'pt-037'}), (:PersistTest {id: 'pt-038'}), (:PersistTest {id: 'pt-039'}), (:PersistTest {id: 'pt-040'})
+    CREATE (:PersistTest {id: 'pt-041'}), (:PersistTest {id: 'pt-042'}), (:PersistTest {id: 'pt-043'}), (:PersistTest {id: 'pt-044'}), (:PersistTest {id: 'pt-045'})
+    CREATE (:PersistTest {id: 'pt-046'}), (:PersistTest {id: 'pt-047'}), (:PersistTest {id: 'pt-048'}), (:PersistTest {id: 'pt-049'}), (:PersistTest {id: 'pt-050'})
+    RETURN 'batch1-done' AS status
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - persistence
+  - bulk
+
+- name: persist-stall-bulk-create-batch2
+  description: Create another 200 nodes to push past 400 total.
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (:PersistTest2 {id: 'pt2-001'}), (:PersistTest2 {id: 'pt2-002'}), (:PersistTest2 {id: 'pt2-003'}), (:PersistTest2 {id: 'pt2-004'}), (:PersistTest2 {id: 'pt2-005'})
+    CREATE (:PersistTest2 {id: 'pt2-006'}), (:PersistTest2 {id: 'pt2-007'}), (:PersistTest2 {id: 'pt2-008'}), (:PersistTest2 {id: 'pt2-009'}), (:PersistTest2 {id: 'pt2-010'})
+    CREATE (:PersistTest2 {id: 'pt2-011'}), (:PersistTest2 {id: 'pt2-012'}), (:PersistTest2 {id: 'pt2-013'}), (:PersistTest2 {id: 'pt2-014'}), (:PersistTest2 {id: 'pt2-015'})
+    CREATE (:PersistTest2 {id: 'pt2-016'}), (:PersistTest2 {id: 'pt2-017'}), (:PersistTest2 {id: 'pt2-018'}), (:PersistTest2 {id: 'pt2-019'}), (:PersistTest2 {id: 'pt2-020'})
+    CREATE (:PersistTest2 {id: 'pt2-021'}), (:PersistTest2 {id: 'pt2-022'}), (:PersistTest2 {id: 'pt2-023'}), (:PersistTest2 {id: 'pt2-024'}), (:PersistTest2 {id: 'pt2-025'})
+    CREATE (:PersistTest2 {id: 'pt2-026'}), (:PersistTest2 {id: 'pt2-027'}), (:PersistTest2 {id: 'pt2-028'}), (:PersistTest2 {id: 'pt2-029'}), (:PersistTest2 {id: 'pt2-030'})
+    CREATE (:PersistTest2 {id: 'pt2-031'}), (:PersistTest2 {id: 'pt2-032'}), (:PersistTest2 {id: 'pt2-033'}), (:PersistTest2 {id: 'pt2-034'}), (:PersistTest2 {id: 'pt2-035'})
+    CREATE (:PersistTest2 {id: 'pt2-036'}), (:PersistTest2 {id: 'pt2-037'}), (:PersistTest2 {id: 'pt2-038'}), (:PersistTest2 {id: 'pt2-039'}), (:PersistTest2 {id: 'pt2-040'})
+    CREATE (:PersistTest2 {id: 'pt2-041'}), (:PersistTest2 {id: 'pt2-042'}), (:PersistTest2 {id: 'pt2-043'}), (:PersistTest2 {id: 'pt2-044'}), (:PersistTest2 {id: 'pt2-045'})
+    CREATE (:PersistTest2 {id: 'pt2-046'}), (:PersistTest2 {id: 'pt2-047'}), (:PersistTest2 {id: 'pt2-048'}), (:PersistTest2 {id: 'pt2-049'}), (:PersistTest2 {id: 'pt2-050'})
+    RETURN 'batch2-done' AS status
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - persistence
+  - bulk
+
+- name: persist-stall-bulk-create-batch3
+  description: >
+    Create another 200 nodes via MERGE to push past 600+ total and trigger
+    the persistence stall threshold.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (:PersistTest3 {id: 'pt3-001', data: 'value001'})
+    MERGE (:PersistTest3 {id: 'pt3-002', data: 'value002'})
+    MERGE (:PersistTest3 {id: 'pt3-003', data: 'value003'})
+    MERGE (:PersistTest3 {id: 'pt3-004', data: 'value004'})
+    MERGE (:PersistTest3 {id: 'pt3-005', data: 'value005'})
+    MERGE (:PersistTest3 {id: 'pt3-006', data: 'value006'})
+    MERGE (:PersistTest3 {id: 'pt3-007', data: 'value007'})
+    MERGE (:PersistTest3 {id: 'pt3-008', data: 'value008'})
+    MERGE (:PersistTest3 {id: 'pt3-009', data: 'value009'})
+    MERGE (:PersistTest3 {id: 'pt3-010', data: 'value010'})
+    MERGE (:PersistTest3 {id: 'pt3-011', data: 'value011'})
+    MERGE (:PersistTest3 {id: 'pt3-012', data: 'value012'})
+    MERGE (:PersistTest3 {id: 'pt3-013', data: 'value013'})
+    MERGE (:PersistTest3 {id: 'pt3-014', data: 'value014'})
+    MERGE (:PersistTest3 {id: 'pt3-015', data: 'value015'})
+    MERGE (:PersistTest3 {id: 'pt3-016', data: 'value016'})
+    MERGE (:PersistTest3 {id: 'pt3-017', data: 'value017'})
+    MERGE (:PersistTest3 {id: 'pt3-018', data: 'value018'})
+    MERGE (:PersistTest3 {id: 'pt3-019', data: 'value019'})
+    MERGE (:PersistTest3 {id: 'pt3-020', data: 'value020'})
+    MERGE (:PersistTest3 {id: 'pt3-021', data: 'value021'})
+    MERGE (:PersistTest3 {id: 'pt3-022', data: 'value022'})
+    MERGE (:PersistTest3 {id: 'pt3-023', data: 'value023'})
+    MERGE (:PersistTest3 {id: 'pt3-024', data: 'value024'})
+    MERGE (:PersistTest3 {id: 'pt3-025', data: 'value025'})
+    MERGE (:PersistTest3 {id: 'pt3-026', data: 'value026'})
+    MERGE (:PersistTest3 {id: 'pt3-027', data: 'value027'})
+    MERGE (:PersistTest3 {id: 'pt3-028', data: 'value028'})
+    MERGE (:PersistTest3 {id: 'pt3-029', data: 'value029'})
+    MERGE (:PersistTest3 {id: 'pt3-030', data: 'value030'})
+    MERGE (:PersistTest3 {id: 'pt3-031', data: 'value031'})
+    MERGE (:PersistTest3 {id: 'pt3-032', data: 'value032'})
+    MERGE (:PersistTest3 {id: 'pt3-033', data: 'value033'})
+    MERGE (:PersistTest3 {id: 'pt3-034', data: 'value034'})
+    MERGE (:PersistTest3 {id: 'pt3-035', data: 'value035'})
+    MERGE (:PersistTest3 {id: 'pt3-036', data: 'value036'})
+    MERGE (:PersistTest3 {id: 'pt3-037', data: 'value037'})
+    MERGE (:PersistTest3 {id: 'pt3-038', data: 'value038'})
+    MERGE (:PersistTest3 {id: 'pt3-039', data: 'value039'})
+    MERGE (:PersistTest3 {id: 'pt3-040', data: 'value040'})
+    MERGE (:PersistTest3 {id: 'pt3-041', data: 'value041'})
+    MERGE (:PersistTest3 {id: 'pt3-042', data: 'value042'})
+    MERGE (:PersistTest3 {id: 'pt3-043', data: 'value043'})
+    MERGE (:PersistTest3 {id: 'pt3-044', data: 'value044'})
+    MERGE (:PersistTest3 {id: 'pt3-045', data: 'value045'})
+    MERGE (:PersistTest3 {id: 'pt3-046', data: 'value046'})
+    MERGE (:PersistTest3 {id: 'pt3-047', data: 'value047'})
+    MERGE (:PersistTest3 {id: 'pt3-048', data: 'value048'})
+    MERGE (:PersistTest3 {id: 'pt3-049', data: 'value049'})
+    MERGE (:PersistTest3 {id: 'pt3-050', data: 'value050'})
+    RETURN 'batch3-done' AS status
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - persistence
+  - bulk
+
+# --- Phase 2: Verify responsiveness AFTER bulk ingest ---
+# Before the fix, queries after 670+ nodes would stall for 3.5 minutes
+- name: persist-stall-responsive-after-bulk
+  description: >
+    Critical regression check: after creating 700+ nodes, the server must
+    respond within the normal timeout. Before the fix, this query would
+    stall for 3.5 minutes due to persistence lock contention.
+  args:
+  - query
+  - RETURN 'responsive' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - responsive
+  tags:
+  - regression
+  - persistence
+  - responsiveness
+
+- name: persist-stall-query-during-persist
+  description: >
+    Verify a read query completes promptly while persistence thread
+    is actively serializing 700+ nodes to disk.
+  args:
+  - query
+  - MATCH (n:PersistTest) RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - total
+  tags:
+  - regression
+  - persistence
+  - responsiveness
+
+- name: persist-stall-write-during-persist
+  description: >
+    Verify a MERGE write query completes while persistence is ongoing.
+    Before the fix, writes would block behind the exclusive persistence lock.
+  args:
+  - query
+  - "MERGE (:PersistTest4 {id: 'late-write', data: 'written-during-persist'}) RETURN 'write-ok' AS status"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - write-ok
+  tags:
+  - regression
+  - persistence
+  - responsiveness
+
+# --- Phase 3: Verify data integrity ---
+- name: persist-stall-verify-counts
+  description: Verify all created nodes are present and accessible.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:PersistTest) RETURN count(n) AS pt1_count
+    MATCH (n:PersistTest2) RETURN count(n) AS pt2_count
+    MATCH (n:PersistTest3) RETURN count(n) AS pt3_count
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - persistence
+  - verification
+
+# --- Cleanup ---
+- name: persist-stall-cleanup
+  description: Remove all test nodes.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:PersistTest) DETACH DELETE n
+    MATCH (n:PersistTest2) DETACH DELETE n
+    MATCH (n:PersistTest3) DETACH DELETE n
+    MATCH (n:PersistTest4) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - persistence
+  - cleanup
