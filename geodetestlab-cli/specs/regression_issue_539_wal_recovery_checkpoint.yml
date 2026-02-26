@@ -1,0 +1,113 @@
+description: 'Issue #539: End-of-recovery checkpoint after WAL replay to prevent unbounded WAL growth'
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    startup_timeout_ms: 30000
+    args:
+    - --insecure
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+default_timeout_ms: 30000
+cleanup: false
+tests:
+- name: wal-recovery-create-data
+  description: Create some data that will be persisted via WAL
+  args:
+  - query
+  - "CREATE (:WalRecovery539 {id: 1, data: 'first'}), (:WalRecovery539 {id: 2, data: 'second'}), (:WalRecovery539 {id: 3, data: 'third'})"
+  expect:
+    exit_code: 0
+  tags:
+  - wal
+  - recovery
+  - regression
+
+- name: wal-recovery-create-more-data
+  description: Create additional data to ensure WAL has multiple records
+  args:
+  - query
+  - "MERGE (:WalRecovery539Extra {id: 10, info: 'extra-data-for-wal'})"
+  expect:
+    exit_code: 0
+  tags:
+  - wal
+  - recovery
+
+- name: wal-recovery-verify-before-restart
+  description: Verify data exists before server restart
+  args:
+  - query
+  - MATCH (n:WalRecovery539) RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '3'
+  tags:
+  - wal
+  - recovery
+
+- name: wal-recovery-restart-server
+  description: Restart the server to trigger WAL replay and end-of-recovery checkpoint
+  type: shell
+  command: echo 'Server restart triggered by test framework'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags:
+  - wal
+  - recovery
+
+- name: wal-recovery-verify-after-restart
+  description: Verify data survived restart (WAL replay applied mutations)
+  args:
+  - query
+  - MATCH (n:WalRecovery539) RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '3'
+  tags:
+  - wal
+  - recovery
+
+- name: wal-recovery-verify-extra-data
+  description: Verify extra data also survived restart
+  args:
+  - query
+  - MATCH (n:WalRecovery539Extra) RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1'
+  tags:
+  - wal
+  - recovery
+
+- name: wal-recovery-server-responsive
+  description: Verify server is responsive after recovery
+  args:
+  - query
+  - RETURN 'wal-recovery-ok' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - wal-recovery-ok
+  tags:
+  - wal
+  - recovery
+
+- name: wal-recovery-cleanup
+  description: Clean up test data
+  args:
+  - query
+  - MATCH (n:WalRecovery539) DETACH DELETE n; MATCH (n:WalRecovery539Extra) DETACH DELETE n
+  stdin: MATCH (n:WalRecovery539) DETACH DELETE n; MATCH (n:WalRecovery539Extra) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - wal
+  - recovery
+  - cleanup
