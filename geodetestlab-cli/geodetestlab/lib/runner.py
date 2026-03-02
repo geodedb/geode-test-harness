@@ -34,7 +34,7 @@ from .executor import (
     run_plaintext_verification,
     run_single_test,
 )
-from .runner_types import RunnerError, RunSummary, TestResult
+from .runner_types import DEFAULT_ADMIN_PASSWORD, RunnerError, RunSummary, TestResult
 from .server import (
     ServerError,
     kill_stale_servers,
@@ -189,6 +189,13 @@ def run_tests(
         # (e.g. create-session test: user created via CLI not found by server).
         if "GEODE_STATE_DIR" not in env:
             env["GEODE_STATE_DIR"] = str(data_dir)
+
+        # Ensure the server bootstraps its default admin user with the known
+        # test password so the executor's auto-injected ``-U geode -P …``
+        # credentials work.  Without this the server generates a random
+        # password that the executor can't know.
+        if "GEODE_ADMIN_PASSWORD" not in env:
+            env["GEODE_ADMIN_PASSWORD"] = DEFAULT_ADMIN_PASSWORD
 
         # Start server
         if not dry_run:
