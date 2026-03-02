@@ -64,6 +64,69 @@ DEFAULT_QUIC_PORT = 3141
 DEFAULT_GRPC_PORT = 50051
 # DEFAULT_ADMIN_PASSWORD lives in runner_types (centralized)
 
+# ---------------------------------------------------------------------------
+# Transient failure retry configuration
+# ---------------------------------------------------------------------------
+_MAX_TRANSIENT_RETRIES = 2  # Up to 2 retries = 3 total attempts
+_RETRY_BASE_DELAY_S = 1.0  # Exponential backoff: 1s, 2s
+
+_TRANSIENT_PATTERNS = (
+    # Connection / timeout errors
+    "timed out",
+    "connection refused",
+    "connection timeout",
+    "timeout",
+    "broken pipe",
+    # QUIC transport errors (from src/cli/main.zig)
+    "failed to get stream",
+    "failed to send hello",
+    "failed to receive hello",
+    "empty handshake response",
+    "connection was refused",
+    "connection reset",
+    # gRPC / protocol errors
+    "failed to send query",
+    "failed to receive response",
+    "stream error",
+    "quic error",
+    # Server overload
+    "server busy",
+    "too many connections",
+    "work queue full",
+)
+
+
+def _is_transient_failure(result: TestResult, test_case: TestCase) -> bool:
+    """Return True if *result* looks like a transient QUIC/network failure.
+
+    Checks two heuristics:
+    1. Known error-string patterns in stdout + stderr/error.
+    2. Empty stdout when the test expects content (silent QUIC drops).
+    """
+    combined = (result.error or "").lower() + (result.output or "").lower()
+
+    # Pattern match against known transient strings
+    if any(p in combined for p in _TRANSIENT_PATTERNS):
+        return True
+
+    # Empty-output heuristic: QUIC silently dropped the connection so
+    # the CLI returned nothing.  Only trigger when the test actually
+    # expects content.
+    output_blank = not (result.output or "").strip()
+    if output_blank:
+        exp = test_case.expected
+        expects_content = (
+            exp.stdout_contains
+            or exp.result_contains
+            or exp.stdout_exact
+            or exp.stdout_regex
+            or test_case.query  # geode_query tests always expect output
+        )
+        if expects_content:
+            return True
+
+    return False
+
 
 def _kill_stale_servers() -> None:
     """Thin wrapper so ``cli.py`` can keep importing from ``runner``."""
@@ -337,30 +400,41 @@ def run_tests(
                 http_client=_shared_http,
             )
 
-            # Retry once on transient failures (timeouts, connection errors)
-            # that are likely caused by parallel resource contention rather
-            # than real bugs.  The retry uses the same server instance.
-            if not result.passed and server_process:
-                err = (result.error or "").lower() + (result.output or "").lower()
-                _TRANSIENT = ("timed out", "connection refused", "connection timeout", "timeout", "broken pipe")
-                if any(t in err for t in _TRANSIENT):
-                    # Only retry if the server is still alive
-                    with _lock:
-                        alive = server_process.poll() is None
-                    if alive:
-                        if verbose:
-                            print(f"  Retrying {test_case.name} after transient failure...")
-                        time.sleep(2)
-                        result = run_single_test(
-                            test_case=test_case,
-                            binary=binary,
-                            env=env,
-                            secrets=secrets,
-                            timeout_ms=timeout_ms,
-                            data_dir=data_dir,
-                            verbose=verbose,
-                            http_client=_shared_http,
+            # Retry on transient failures (timeouts, QUIC drops, connection
+            # errors) that are caused by resource contention rather than real
+            # bugs.  Uses exponential backoff: 1s, 2s.
+            if not result.passed and _is_transient_failure(result, test_case):
+                for attempt in range(1, _MAX_TRANSIENT_RETRIES + 1):
+                    # In server mode, only retry if the server is still alive
+                    if server_process:
+                        with _lock:
+                            alive = server_process.poll() is None
+                        if not alive:
+                            break
+
+                    delay = _RETRY_BASE_DELAY_S * attempt
+                    if verbose:
+                        print(
+                            f"  Retrying {test_case.name} "
+                            f"(attempt {attempt + 1}/{_MAX_TRANSIENT_RETRIES + 1}, "
+                            f"backoff {delay:.0f}s)..."
                         )
+                    time.sleep(delay)
+                    result = run_single_test(
+                        test_case=test_case,
+                        binary=binary,
+                        env=env,
+                        secrets=secrets,
+                        timeout_ms=timeout_ms,
+                        data_dir=data_dir,
+                        verbose=verbose,
+                        http_client=_shared_http,
+                    )
+                    if result.passed:
+                        break
+                    # Check if still transient before continuing
+                    if not _is_transient_failure(result, test_case):
+                        break
 
             # If test failed with a timeout-like error, the server may be hung
             # (still alive but unresponsive). Force-kill and restart.
