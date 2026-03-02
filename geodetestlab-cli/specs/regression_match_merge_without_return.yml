@@ -1,0 +1,187 @@
+version: '1.0'
+name: regression-match-merge-without-return
+description: >
+  Regression test for SQLSTATE 42000 ("RETURN required") when using
+  MATCH + MATCH + MERGE without a RETURN clause.
+
+  Geode's GQL parser rejects queries of the form:
+    MATCH (a:Label {id: 'x'})
+    MATCH (b:Label {id: 'y'})
+    MERGE (a)-[:EDGE]->(b)
+  with SQLSTATE 42000, because the query has no RETURN clause.
+
+  The fix is to use an inline MERGE path pattern which identifies
+  both endpoints by property without a preceding MATCH:
+    MERGE (:LabelA {id: 'x'})-[:EDGE]->(:LabelB {id: 'y'})
+
+  This spec verifies:
+    1. MATCH + MATCH + MERGE without RETURN fails (SQLSTATE 42000)
+    2. Inline MERGE path pattern succeeds (exit_code: 0)
+    3. The edge created by inline MERGE is queryable
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+# --- Setup: Create source and target nodes used by edge tests ---
+- name: match-merge-setup-nodes
+  description: >
+    Create two nodes that will be linked by edge tests. Uses CREATE (not MERGE)
+    to isolate this spec from other tests.
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (:RegMMSource {id: 'reg-mm-src-1', name: 'Source Node'})
+    CREATE (:RegMMTarget {id: 'reg-mm-tgt-1', name: 'Target Node'})
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - match-merge
+  - setup
+
+# --- Test 1: MATCH + MATCH + MERGE without RETURN must fail ---
+- name: match-merge-without-return-fails
+  description: >
+    Regression guard: MATCH + MATCH + MERGE without RETURN must fail with a
+    non-zero exit code (SQLSTATE 42000). Before the fix this form was used in
+    practiceEdgeStatements() and caused the entire ingest to abort.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:RegMMSource {id: 'reg-mm-src-1'})
+    MATCH (b:RegMMTarget {id: 'reg-mm-tgt-1'})
+    MERGE (a)-[:REG_MM_EDGE]->(b)
+  expect:
+    exit_code: 1
+  tags:
+  - regression
+  - match-merge
+  - negative-test
+  - sqlstate-42000
+
+# --- Test 2: Inline MERGE path pattern must succeed ---
+- name: inline-merge-path-succeeds
+  description: >
+    The corrected form for edge creation: inline MERGE with both endpoints
+    identified by property in a single path pattern. This avoids the RETURN
+    requirement that MATCH + MERGE triggers.
+  args:
+  - query
+  - "MERGE (:RegMMSource {id: 'reg-mm-src-1'})-[:REG_MM_LINK]->(:RegMMTarget {id: 'reg-mm-tgt-1'})"
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - match-merge
+  - positive-test
+
+# --- Test 3: Inline MERGE is idempotent (second call must not duplicate) ---
+- name: inline-merge-path-idempotent
+  description: >
+    Repeating the same inline MERGE must not create a duplicate edge. Verifying
+    idempotency ensures the MERGE semantics are honoured (not CREATE).
+  args:
+  - query
+  - "MERGE (:RegMMSource {id: 'reg-mm-src-1'})-[:REG_MM_LINK]->(:RegMMTarget {id: 'reg-mm-tgt-1'})"
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - match-merge
+  - idempotent
+
+# --- Test 4: The created edge is queryable via MATCH + RETURN ---
+- name: inline-merge-edge-is-queryable
+  description: >
+    Verify that the edge created by the inline MERGE path pattern is visible
+    to a subsequent MATCH query with a proper RETURN clause.
+  args:
+  - query
+  - >-
+    MATCH (a:RegMMSource {id: 'reg-mm-src-1'})-[:REG_MM_LINK]->(b:RegMMTarget {id: 'reg-mm-tgt-1'})
+    RETURN a.name AS source, b.name AS target
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Source Node
+    - Target Node
+  tags:
+  - regression
+  - match-merge
+  - verification
+
+# --- Test 5: Edge count must be exactly 1 (idempotency confirmed by count) ---
+- name: inline-merge-single-edge-count
+  description: >
+    Confirm that exactly one REG_MM_LINK edge exists between the two nodes,
+    proving that the two successive MERGE calls did not create duplicates.
+  args:
+  - query
+  - >-
+    MATCH (:RegMMSource {id: 'reg-mm-src-1'})-[r:REG_MM_LINK]->(:RegMMTarget {id: 'reg-mm-tgt-1'})
+    RETURN count(r) AS edge_count
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - edge_count
+    - '1'
+  tags:
+  - regression
+  - match-merge
+  - verification
+  - idempotent
+
+# --- Test 6: MATCH + RETURN (no MERGE) still works correctly ---
+- name: match-with-return-works
+  description: >
+    Sanity check: MATCH with an explicit RETURN clause must succeed. This
+    confirms that the 42000 error is specific to MATCH+MERGE-without-RETURN,
+    not to MATCH in general.
+  args:
+  - query
+  - >-
+    MATCH (n:RegMMSource {id: 'reg-mm-src-1'}) RETURN n.name AS name
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Source Node
+  tags:
+  - regression
+  - match-merge
+  - sanity
+
+# --- Cleanup: Remove nodes and edges created by this spec ---
+- name: match-merge-cleanup
+  description: Remove RegMM* nodes (edges are removed via DETACH DELETE).
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:RegMMSource) DETACH DELETE n
+    MATCH (n:RegMMTarget) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - match-merge
+  - cleanup
