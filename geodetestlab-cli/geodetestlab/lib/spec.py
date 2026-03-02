@@ -6,11 +6,51 @@ against the expected schema.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
+
+
+# ---------------------------------------------------------------------------
+# Custom YAML loader: disable YAML 1.1 sexagesimal number parsing.
+#
+# PyYAML (YAML 1.1) treats values like 14:30 as sexagesimal integers
+# (14*60 + 30 = 870) and 14:30:00 as 52200.  YAML 1.2 dropped this
+# implicit tag, and our spec files are written by humans who mean "14:30"
+# as a literal string.  We subclass SafeLoader and replace the int/float
+# resolver regexes with versions that omit the sexagesimal alternative.
+# ---------------------------------------------------------------------------
+class _SafeLoaderNoSexagesimal(yaml.SafeLoader):
+    pass
+
+
+# Replacement patterns: same as PyYAML defaults but without sexagesimal.
+_INT_NO_SEXA = re.compile(
+    r"^(?:[-+]?0b[0-1_]+" r"|[-+]?0[0-7_]+" r"|[-+]?(?:0|[1-9][0-9_]*)" r"|[-+]?0x[0-9a-fA-F_]+)$",
+    re.VERBOSE,
+)
+_FLOAT_NO_SEXA = re.compile(
+    r"^(?:[-+]?(?:[0-9][0-9_]*)\.  [0-9_]*(?:[eE][-+][0-9]+)?"
+    r"|\.[0-9][0-9_]*(?:[eE][-+][0-9]+)?"
+    r"|[-+]?\.(?:inf|Inf|INF)"
+    r"|\.(?:nan|NaN|NAN))$",
+    re.VERBOSE,
+)
+_INT_TAG = "tag:yaml.org,2002:int"
+_FLOAT_TAG = "tag:yaml.org,2002:float"
+
+for _key in list(_SafeLoaderNoSexagesimal.yaml_implicit_resolvers):
+    _SafeLoaderNoSexagesimal.yaml_implicit_resolvers[_key] = [
+        (_INT_TAG, _INT_NO_SEXA)
+        if tag == _INT_TAG
+        else (_FLOAT_TAG, _FLOAT_NO_SEXA)
+        if tag == _FLOAT_TAG
+        else (tag, regexp)
+        for tag, regexp in _SafeLoaderNoSexagesimal.yaml_implicit_resolvers[_key]
+    ]
 
 
 class SpecValidationError(Exception):
@@ -464,7 +504,7 @@ def load_spec(path: str | Path) -> TestSpec:
 
     try:
         with open(path, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f, Loader=_SafeLoaderNoSexagesimal)  # noqa: S506
     except yaml.YAMLError as e:
         raise SpecValidationError(f"Invalid YAML syntax: {e}") from e
 
