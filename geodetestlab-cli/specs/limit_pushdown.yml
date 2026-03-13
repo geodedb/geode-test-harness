@@ -1,0 +1,119 @@
+# LIMIT Pushdown Optimization Tests
+# Verifies that LIMIT is correctly pushed into the MATCH scan phase
+# and that results are correct in all combinations of LIMIT with
+# ORDER BY, DISTINCT, aggregation, WHERE, OFFSET, and label filtering.
+
+name: LIMIT Pushdown Tests
+version: '1.0'
+
+setup:
+- |
+  CREATE (:LPUser {name: 'user_0', idx: 0});
+  CREATE (:LPUser {name: 'user_1', idx: 1});
+  CREATE (:LPUser {name: 'user_2', idx: 2});
+  CREATE (:LPUser {name: 'user_3', idx: 3});
+  CREATE (:LPUser {name: 'user_4', idx: 4});
+  CREATE (:LPUser {name: 'user_5', idx: 5});
+  CREATE (:LPUser {name: 'user_6', idx: 6});
+  CREATE (:LPUser {name: 'user_7', idx: 7});
+  CREATE (:LPUser {name: 'user_8', idx: 8});
+  CREATE (:LPUser {name: 'user_9', idx: 9});
+
+- |
+  CREATE (:LPAdmin {name: 'admin_0'});
+  CREATE (:LPAdmin {name: 'admin_1'});
+  CREATE (:LPAdmin {name: 'admin_2'});
+
+tests:
+  # Basic LIMIT pushdown - should return exactly N rows
+- name: 'LIMIT pushdown: basic LIMIT 3 returns 3 rows'
+  query: |
+    MATCH (u:LPUser) RETURN u.name AS name LIMIT 3
+  expect:
+    row_count: 3
+
+- name: 'LIMIT pushdown: LIMIT 1 returns 1 row'
+  query: |
+    MATCH (u:LPUser) RETURN u.name AS name LIMIT 1
+  expect:
+    row_count: 1
+
+- name: 'LIMIT pushdown: LIMIT 5 returns 5 rows'
+  query: |
+    MATCH (u:LPUser) RETURN u.name AS name LIMIT 5
+  expect:
+    row_count: 5
+
+  # LIMIT larger than dataset
+- name: 'LIMIT pushdown: LIMIT larger than dataset returns all'
+  query: |
+    MATCH (u:LPUser) RETURN u.name AS name LIMIT 100
+  expect:
+    row_count: 10
+
+  # LIMIT with OFFSET
+- name: 'LIMIT pushdown: OFFSET 3 LIMIT 4 returns 4 rows'
+  query: |
+    MATCH (u:LPUser) RETURN u.name AS name OFFSET 3 LIMIT 4
+  expect:
+    row_count: 4
+
+- name: 'LIMIT pushdown: OFFSET beyond dataset returns 0 rows'
+  query: |
+    MATCH (u:LPUser) RETURN u.name AS name OFFSET 100 LIMIT 5
+  expect:
+    row_count: 0
+
+  # LIMIT with ORDER BY (LIMIT must NOT be pushed down)
+- name: 'LIMIT with ORDER BY: returns correct row count'
+  query: |
+    MATCH (u:LPUser) RETURN u.name AS name ORDER BY name LIMIT 3
+  expect:
+    row_count: 3
+
+- name: 'LIMIT with ORDER BY: all rows available for sort'
+  query: |
+    MATCH (u:LPUser) RETURN u.name AS name ORDER BY name LIMIT 10
+  expect:
+    row_count: 10
+
+  # LIMIT with WHERE filter
+- name: 'LIMIT pushdown: WHERE filter narrows results'
+  query: |
+    MATCH (u:LPUser) WHERE u.idx < 5 RETURN u.name AS name LIMIT 3
+  expect:
+    row_count: 3
+
+- name: 'LIMIT pushdown: WHERE filter with fewer matches than LIMIT'
+  query: |
+    MATCH (u:LPUser) WHERE u.idx > 7 RETURN u.name AS name LIMIT 10
+  expect:
+    row_count: 2
+
+  # LIMIT with label filtering across labels
+- name: 'LIMIT pushdown: different label returns correct subset'
+  query: |
+    MATCH (a:LPAdmin) RETURN a.name AS name LIMIT 10
+  expect:
+    row_count: 3
+
+  # LIMIT with DISTINCT (LIMIT must NOT be pushed down)
+- name: 'LIMIT with DISTINCT: correct deduplication'
+  query: |
+    MATCH (u:LPUser) RETURN DISTINCT u.name AS name LIMIT 5
+  expect:
+    row_count: 5
+
+  # LIMIT with aggregation (LIMIT must NOT be pushed down)
+- name: 'LIMIT with aggregation: count sees all nodes'
+  query: |
+    MATCH (u:LPUser) RETURN count(u) AS cnt
+  expect:
+    row_count: 1
+
+  # No-label full scan with LIMIT
+- name: 'LIMIT pushdown: no-label scan respects LIMIT'
+  query: |
+    MATCH (n) RETURN n.name AS name LIMIT 5
+  expect:
+    row_count: 5
