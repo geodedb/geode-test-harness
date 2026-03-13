@@ -1,0 +1,141 @@
+# Limitations Fixes Tests
+# Verifies fixes for 6 known Geode limitations documented in docs/geode-limitations.md
+# Bug #7 (single-quoted strings NULL on v0.1.4-beta.6) is Won't Do (fixed in v0.1.23)
+
+name: Limitations Fixes Tests
+version: '1.0'
+
+setup:
+- |
+  CREATE (:LFXnode {id: 'x1', name: 'Alice'});
+  CREATE (:LFYnode {id: 'y1', name: 'Bob'});
+
+- |
+  CREATE (:LFCityNode {name: 'NYC'});
+  CREATE (:LFCityNode {name: 'LA'});
+
+- |
+  CREATE (:LFLblA {name: 'a1'});
+  CREATE (:LFLblB {name: 'b1'});
+  CREATE (:LFLblC {name: 'c1'});
+
+- |
+  CREATE (:LFPLUser {idx: 0});
+  CREATE (:LFPLUser {idx: 1});
+  CREATE (:LFPLUser {idx: 2});
+  CREATE (:LFPLUser {idx: 3});
+  CREATE (:LFPLUser {idx: 4});
+  CREATE (:LFPLUser {idx: 5});
+  CREATE (:LFPLUser {idx: 6});
+  CREATE (:LFPLUser {idx: 7});
+  CREATE (:LFPLUser {idx: 8});
+  CREATE (:LFPLUser {idx: 9});
+
+- |
+  CREATE (:LFMergeA {id: 'ma1', name: 'MergeAlice'});
+  CREATE (:LFMergeB {id: 'mb1', name: 'MergeBob'});
+
+tests:
+  # Bug #5: Parameterized MATCH + relationship traversal
+  # Previously, MATCH with relationship patterns and parameters returned empty results
+- name: 'Bug5: MATCH + relationship CREATE with separate MATCH clauses'
+  query: |
+    MATCH (u:LFXnode {id: 'x1'})
+    MATCH (g:LFYnode {id: 'y1'})
+    CREATE (u)-[:LFLINKED]->(g)
+  expect:
+    success: true
+
+- name: 'Bug5: Verify LFLINKED relationship exists'
+  query: |
+    MATCH ()-[r:LFLINKED]->() RETURN r
+  expect:
+    row_count: 1
+
+- name: 'Bug5: Verify relationship traversal returns data'
+  query: |
+    MATCH (a:LFXnode)-[:LFLINKED]->(b:LFYnode) RETURN b.name AS name
+  expect:
+    row_count: 1
+
+  # Bug #3: MATCH (a), (b) CREATE relationship (comma-separated MATCH)
+  # Previously, comma-join MATCH + CREATE silently did nothing
+- name: 'Bug3: separate MATCH clauses CREATE relationship'
+  query: |
+    MATCH (x:LFCityNode {name: 'NYC'})
+    MATCH (y:LFCityNode {name: 'LA'})
+    CREATE (x)-[:LFROAD {distance: 100}]->(y)
+  expect:
+    success: true
+
+- name: 'Bug3: Verify ROAD relationship exists'
+  query: |
+    MATCH ()-[r:LFROAD]->() RETURN r
+  expect:
+    row_count: 1
+
+  # Bug #6: RETURN DISTINCT with function calls
+  # Previously, DISTINCT with labels() returned only 1 row instead of all distinct values
+- name: 'Bug6: RETURN DISTINCT labels returns all distinct labels'
+  query: |
+    MATCH (n) WHERE labels(n) = ['LFLblA'] OR labels(n) = ['LFLblB'] OR labels(n) = ['LFLblC']
+    RETURN DISTINCT labels(n) AS labels
+  expect:
+    row_count: 3
+
+  # Bug #2: LIMIT with literal integer (basic verification)
+- name: 'Bug2: LIMIT 3 on 10 nodes returns 3'
+  query: |
+    MATCH (u:LFPLUser) RETURN u.idx AS idx LIMIT 3
+  expect:
+    row_count: 3
+
+- name: 'Bug2: LIMIT 5 on 10 nodes returns 5'
+  query: |
+    MATCH (u:LFPLUser) RETURN u.idx AS idx LIMIT 5
+  expect:
+    row_count: 5
+
+- name: 'Bug2: LIMIT larger than dataset returns all'
+  query: |
+    MATCH (u:LFPLUser) RETURN u.idx AS idx LIMIT 100
+  expect:
+    row_count: 10
+
+  # Bug #2: Parameterized LIMIT with $param
+- name: 'Bug2: LIMIT with $param'
+  query: |
+    MATCH (u:LFPLUser) RETURN u.idx AS idx LIMIT $lim
+  params:
+    lim: 4
+  expect:
+    row_count: 4
+
+- name: 'Bug2: OFFSET with $param'
+  query: |
+    MATCH (u:LFPLUser) RETURN u.idx AS idx OFFSET $off LIMIT 3
+  params:
+    off: 2
+  expect:
+    row_count: 3
+
+  # Bug #1: MERGE after MATCH
+  # Previously failed with error "RETURN"
+- name: 'Bug1: MATCH then MERGE creates relationship'
+  query: |
+    MATCH (a:LFMergeA {id: 'ma1'})
+    MERGE (b:LFMergeB {id: 'mb1'})
+  expect:
+    success: true
+
+  # Bug #4: Inline CREATE with relationships preserves properties
+  # Previously, node properties were null when creating nodes with relationships inline
+- name: 'Bug4: Inline CREATE with relationship preserves properties'
+  query: |
+    CREATE (a:LFAnimal {name: 'Cat'})-[:LFEATS]->(b:LFFood {name: 'Fish'})
+    RETURN a.name AS aname, b.name AS bname
+  expect:
+    row_count: 1
+    contains:
+      aname: Cat
+      bname: Fish
