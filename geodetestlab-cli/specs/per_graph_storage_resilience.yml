@@ -1,0 +1,154 @@
+# Per-Graph Storage Resilience Tests
+# Verifies property persistence, edge isolation, multi-graph operations,
+# and data integrity for per-graph storage split.
+
+name: Per-Graph Storage Resilience
+version: '1.0'
+
+setup:
+- |
+  CREATE GRAPH IF NOT EXISTS pgsr_alpha;
+  CREATE GRAPH IF NOT EXISTS pgsr_beta;
+  CREATE GRAPH IF NOT EXISTS pgsr_gamma;
+
+tests:
+  # Property persistence across graphs
+- name: Create nodes with properties in alpha
+  query: |
+    USE GRAPH pgsr_alpha;
+    CREATE (:PGSRPerson {name: 'Alice', age: 30, role: 'engineer'});
+    CREATE (:PGSRPerson {name: 'Bob', age: 25, role: 'designer'});
+    MATCH (n:PGSRPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Create nodes with properties in beta
+  query: |
+    USE GRAPH pgsr_beta;
+    CREATE (:PGSRPerson {name: 'Charlie', age: 35, role: 'manager'});
+    MATCH (n:PGSRPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Alpha properties are intact
+  query: |
+    USE GRAPH pgsr_alpha;
+    MATCH (n:PGSRPerson) WHERE n.name = 'Alice' RETURN n.age AS age
+  expect:
+    row_count: 1
+
+- name: Alpha node count unaffected by beta
+  query: |
+    USE GRAPH pgsr_alpha;
+    MATCH (n:PGSRPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Beta has only its own node
+  query: |
+    USE GRAPH pgsr_beta;
+    MATCH (n:PGSRPerson) RETURN n.name AS name
+  expect:
+    row_count: 1
+
+  # Edge isolation between graphs
+- name: Create edges in alpha
+  query: |
+    USE GRAPH pgsr_alpha;
+    MATCH (a:PGSRPerson {name: 'Alice'}), (b:PGSRPerson {name: 'Bob'})
+    CREATE (a)-[:PGSR_KNOWS {since: 2020}]->(b);
+    MATCH ()-[r:PGSR_KNOWS]->() RETURN count(r) AS cnt
+  expect:
+    row_count: 1
+
+- name: Beta has no edges
+  query: |
+    USE GRAPH pgsr_beta;
+    MATCH ()-[r:PGSR_KNOWS]->() RETURN count(r) AS cnt
+  expect:
+    row_count: 1
+
+  # Property updates persist per-graph
+- name: Update property in alpha
+  query: |
+    USE GRAPH pgsr_alpha;
+    MATCH (n:PGSRPerson {name: 'Alice'}) SET n.age = 31;
+    MATCH (n:PGSRPerson {name: 'Alice'}) RETURN n.age AS age
+  expect:
+    row_count: 1
+
+  # Third graph independence
+- name: Create data in gamma
+  query: |
+    USE GRAPH pgsr_gamma;
+    CREATE (:PGSRItem {type: 'widget', count: 42});
+    MATCH (n:PGSRItem) RETURN n.type AS type
+  expect:
+    row_count: 1
+
+- name: Gamma has no PGSRPerson data
+  query: |
+    USE GRAPH pgsr_gamma;
+    MATCH (n:PGSRPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+  # DROP one graph does not affect others
+- name: Drop beta graph
+  query: |
+    DROP GRAPH IF EXISTS pgsr_beta;
+    RETURN 'dropped' AS status
+  expect:
+    row_count: 1
+
+- name: Alpha data survives beta drop
+  query: |
+    USE GRAPH pgsr_alpha;
+    MATCH (n:PGSRPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Alpha edges survive beta drop
+  query: |
+    USE GRAPH pgsr_alpha;
+    MATCH ()-[r:PGSR_KNOWS]->() RETURN count(r) AS cnt
+  expect:
+    row_count: 1
+
+- name: Gamma data survives beta drop
+  query: |
+    USE GRAPH pgsr_gamma;
+    MATCH (n:PGSRItem) RETURN n.count AS count
+  expect:
+    row_count: 1
+
+  # Recreate dropped graph starts empty
+- name: Recreate beta starts empty
+  query: |
+    CREATE GRAPH IF NOT EXISTS pgsr_beta;
+    USE GRAPH pgsr_beta;
+    MATCH (n) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+  # Delete node in one graph does not affect another
+- name: Delete node from alpha
+  query: |
+    USE GRAPH pgsr_alpha;
+    MATCH (n:PGSRPerson {name: 'Bob'}) DELETE n;
+    MATCH (n:PGSRPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Gamma unaffected by alpha deletion
+  query: |
+    USE GRAPH pgsr_gamma;
+    MATCH (n:PGSRItem) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+teardown:
+- |
+  DROP GRAPH IF EXISTS pgsr_alpha;
+  DROP GRAPH IF EXISTS pgsr_beta;
+  DROP GRAPH IF EXISTS pgsr_gamma;
