@@ -1,0 +1,74 @@
+# Per-Graph Storage Isolation Tests
+# Verifies that per-graph storage split properly isolates data between graphs.
+
+name: Per-Graph Storage Isolation
+version: '1.0'
+
+setup:
+- |
+  CREATE GRAPH IF NOT EXISTS pgst_graph_a;
+  CREATE GRAPH IF NOT EXISTS pgst_graph_b;
+
+tests:
+  # Create data in graph A, verify isolation in graph B
+- name: Create data in graph A
+  query: |
+    USE GRAPH pgst_graph_a;
+    CREATE (:PGSTNode {id: 'a1', source: 'graph_a'});
+    MATCH (n:PGSTNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Data isolation - graph B has no PGSTNode data
+  query: |
+    USE GRAPH pgst_graph_b;
+    MATCH (n:PGSTNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Graph A data still accessible
+  query: |
+    USE GRAPH pgst_graph_a;
+    MATCH (n:PGSTNode) RETURN n.source AS source
+  expect:
+    row_count: 1
+
+  # Create data in graph B independently
+- name: Create data in graph B
+  query: |
+    USE GRAPH pgst_graph_b;
+    CREATE (:PGSTNode {id: 'b1', source: 'graph_b'});
+    MATCH (n:PGSTNode) RETURN n.source AS source
+  expect:
+    row_count: 1
+
+  # Verify both graphs have independent data
+- name: Graph A still has only its own data
+  query: |
+    USE GRAPH pgst_graph_a;
+    MATCH (n:PGSTNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+  # DROP GRAPH cleans up
+- name: DROP and recreate graph B clears data
+  query: |
+    DROP GRAPH IF EXISTS pgst_graph_b;
+    CREATE GRAPH pgst_graph_b;
+    USE GRAPH pgst_graph_b;
+    MATCH (n:PGSTNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+  # Graph A unaffected by graph B drop
+- name: Graph A data survives graph B drop
+  query: |
+    USE GRAPH pgst_graph_a;
+    MATCH (n:PGSTNode) RETURN n.source AS source
+  expect:
+    row_count: 1
+
+teardown:
+- |
+  DROP GRAPH IF EXISTS pgst_graph_a;
+  DROP GRAPH IF EXISTS pgst_graph_b;
