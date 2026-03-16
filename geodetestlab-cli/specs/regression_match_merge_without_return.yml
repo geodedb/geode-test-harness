@@ -1,14 +1,11 @@
 version: '1.0'
 name: regression-match-merge-without-return
 description: >
-  Regression test for SQLSTATE 42000 ("RETURN required") when using
-  MATCH + MATCH + MERGE without a RETURN clause.
+  Regression test for MATCH + MERGE behavior with and without RETURN.
 
-  Geode's GQL parser rejects queries of the form:
-    MATCH (a:Label {id: 'x'})
-    MATCH (b:Label {id: 'y'})
-    MERGE (a)-[:EDGE]->(b)
-  with SQLSTATE 42000, because the query has no RETURN clause.
+  GAP #57 updated the parser to accept MERGE without RETURN (matching
+  CREATE/SET/REMOVE behavior). MATCH + MATCH + MERGE without RETURN
+  now succeeds with status 00000.
 
   The inline MERGE path pattern form:
     MERGE (:LabelA {id: 'x'})-[:EDGE]->(:LabelB {id: 'y'})
@@ -16,7 +13,7 @@ description: >
   create edges in the graph store — this is a known Geode limitation.
 
   This spec verifies:
-    1. MATCH + MATCH + MERGE without RETURN returns SQLSTATE 42000
+    1. MATCH + MATCH + MERGE without RETURN succeeds (GAP #57)
     2. Inline MERGE path pattern succeeds (status 00000)
     3. MATCH + RETURN (no MERGE) still works correctly
 cli:
@@ -53,12 +50,12 @@ tests:
   - match-merge
   - setup
 
-# --- Test 1: MATCH + MATCH + MERGE without RETURN must return 42000 ---
-- name: match-merge-without-return-fails
+# --- Test 1: MATCH + MATCH + MERGE without RETURN succeeds (GAP #57) ---
+- name: match-merge-without-return-succeeds
   description: >
-    Regression guard: MATCH + MATCH + MERGE without RETURN must return
-    SQLSTATE 42000. The CLI returns exit_code 0 with the error reported
-    in the JSON response body (status_class 42000).
+    GAP #57: MATCH + MATCH + MERGE without RETURN now succeeds, matching
+    the behavior of CREATE/SET/REMOVE without RETURN. The parser wraps
+    MERGE in a query with an empty return clause. Status must be 00000.
   args:
   - query
   - '-'
@@ -69,13 +66,11 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
-    - '42000'
-    - RETURN
+    - '00000'
   tags:
   - regression
   - match-merge
-  - negative-test
-  - sqlstate-42000
+  - gap-57
 
 # --- Test 2: Inline MERGE path pattern must succeed ---
 - name: inline-merge-path-succeeds
