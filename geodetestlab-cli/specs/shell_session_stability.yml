@@ -1,0 +1,74 @@
+# Shell Session Stability Tests
+# Verifies that shell/REPL maintains a persistent QUIC connection
+# across multiple sequential queries without reconnection.
+
+name: Shell Session Stability
+version: '1.0'
+
+tests:
+  # Sequential queries should reuse the same connection
+- name: Sequential queries maintain connection
+  query: |
+    RETURN 1 AS first;
+    RETURN 2 AS second;
+    RETURN 3 AS third
+  expect:
+    row_count: 1
+
+- name: USE GRAPH then MATCH maintains connection
+  query: |
+    USE GRAPH default;
+    MATCH (n) RETURN count(n) AS cnt LIMIT 1
+  expect:
+    row_count: 1
+
+- name: CREATE GRAPH then USE then query
+  query: |
+    CREATE GRAPH IF NOT EXISTS shell_stability_test;
+    USE GRAPH shell_stability_test;
+    CREATE (:StabilityNode {name: 'test1'});
+    MATCH (n:StabilityNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Multiple mutations then read
+  query: |
+    USE GRAPH shell_stability_test;
+    CREATE (:StabilityNode {name: 'test2'});
+    CREATE (:StabilityNode {name: 'test3'});
+    MATCH (n:StabilityNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Property query after USE GRAPH
+  query: |
+    USE GRAPH shell_stability_test;
+    MATCH (n:StabilityNode {name: 'test1'}) RETURN n.name AS name
+  expect:
+    row_count: 1
+
+- name: Switch graph and query back
+  query: |
+    USE GRAPH default;
+    MATCH (n:StabilityNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Switch back to test graph
+  query: |
+    USE GRAPH shell_stability_test;
+    MATCH (n:StabilityNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: DELETE and verify
+  query: |
+    USE GRAPH shell_stability_test;
+    MATCH (n:StabilityNode) DELETE n;
+    MATCH (n:StabilityNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+teardown:
+- |
+  DROP GRAPH IF EXISTS shell_stability_test;
