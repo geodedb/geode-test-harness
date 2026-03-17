@@ -1,0 +1,84 @@
+# Regression: Relative data directory HMAC key panic
+# Verifies that geode serve works with relative --data-dir paths.
+# Previously, resolveHmacKey used openFileAbsolute which panics
+# on relative paths (e.g. --data-dir ./data or --data-dir reldata).
+
+name: Regression - Relative Data Directory
+version: '1.0'
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+tests:
+- name: Server started with managed data dir accepts queries
+  description: >
+    The managed test server uses a temporary data directory (relative path).
+    If resolveHmacKey panics on relative paths, this test will fail because
+    the server will not start.
+  args:
+  - query
+  - RETURN 'hmac_key_ok' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hmac_key_ok
+    - '00000'
+  tags:
+  - regression
+  - hmac
+  - relative-path
+
+- name: Auth works after HMAC key auto-generation
+  description: >
+    Verifies the HMAC key file was successfully auto-generated in the
+    (potentially relative) data directory and auth handshake succeeded.
+  args:
+  - query
+  - RETURN 1 + 1 AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '00000'
+  tags:
+  - regression
+  - hmac
+  - auth
+
+- name: Multiple queries maintain auth session
+  description: >
+    Multiple sequential queries should work with the auto-generated
+    HMAC key without re-authentication failures.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN 'first' AS q;
+    RETURN 'second' AS q;
+    RETURN 'third' AS q
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '00000'
+  tags:
+  - regression
+  - hmac
+  - session
+
+tags:
+- regression
+- hmac
+- relative-path
+- critical
