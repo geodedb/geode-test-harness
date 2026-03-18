@@ -16,6 +16,7 @@
 .PHONY: test-unit test-unit-verbose
 .PHONY: test-quic test-grpc test-all-transports
 .PHONY: lint format type-check security-check quality
+.PHONY: loadtest loadtest-go loadtest-python loadtest-cli loadtest-build
 
 # Default target: run full test suite with Docker
 all: clean docker-start test-all docker-stop
@@ -102,6 +103,13 @@ help:
 	@echo "  geodetestlab-setup   - Install geodetestlab in venv (CI)"
 	@echo "  setup                - Full setup (venv + all runners)"
 	@echo "  build-all            - Build multi-language runners"
+	@echo ""
+	@echo "Load Testing:"
+	@echo "  loadtest             - Run all load tests (Go + CLI)"
+	@echo "  loadtest-go          - Go client concurrent connections (1-64)"
+	@echo "  loadtest-python      - Python CLI concurrent processes"
+	@echo "  loadtest-cli         - Geodetestlab sequential stress spec"
+	@echo "  loadtest-build       - Build Go load test binary"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  lint / format / type-check / security-check / quality"
@@ -448,6 +456,55 @@ test-all-transports: .check-geodetestlab
 	-$(GEODETESTLAB) run --specs $(SPECS_DIR) --output reports/results_grpc.json -v -j $(PARALLEL_WORKERS) --transport grpc
 	@echo ""
 	@echo "Results: reports/results_quic.json, reports/results_grpc.json"
+
+# ==============================================================================
+# Load Testing — Concurrent Connection Stress
+# ==============================================================================
+
+# Geode connection DSN for load tests (override as needed)
+LOADTEST_DSN ?= localhost:3141?insecure=true&user=$(GEODE_USERNAME)&pass=$(GEODE_ADMIN_PASSWORD)
+LOADTEST_LEVELS ?= 1,2,4,8,16,32
+LOADTEST_DURATION ?= 5s
+
+# Build Go load test binary
+loadtest-build:
+	@echo "Building Go load test..."
+	cd loadtest/go && go build -o geode-loadtest .
+	@echo "Built: loadtest/go/geode-loadtest"
+
+# Run Go client load test (native QUIC via quic-go, connection pooling)
+loadtest-go: loadtest-build
+	@mkdir -p reports
+	@echo "Running Go concurrent load test..."
+	cd loadtest/go && ./geode-loadtest \
+		-dsn "$(LOADTEST_DSN)" \
+		-levels "$(LOADTEST_LEVELS)" \
+		-duration $(LOADTEST_DURATION) \
+		-output ../../reports/loadtest_go.json
+	@echo ""
+	@cat reports/loadtest_go.json | python3 -c "import json,sys; r=json.load(sys.stdin); print(r.get('summary',''))"
+
+# Run Python CLI-based load test (subprocess per query)
+loadtest-python:
+	@mkdir -p reports
+	@echo "Running Python CLI load test..."
+	python3 loadtest/python/loadtest.py \
+		--host $(GEODE_HOST) --port $(GEODE_PORT) \
+		-U $(GEODE_USERNAME) -P $(GEODE_ADMIN_PASSWORD) \
+		--levels "$(LOADTEST_LEVELS)" \
+		--duration 5 \
+		--output reports/loadtest_python.json
+
+# Run geodetestlab load stress specs
+loadtest-cli: .check-geodetestlab
+	@echo "Running CLI load stress specs..."
+	$(GEODETESTLAB) run --spec $(SPECS_DIR)/load_stress_sequential.yml -v
+
+# Run all load tests
+loadtest: loadtest-go loadtest-cli
+	@echo ""
+	@echo "Load test reports:"
+	@ls -la reports/loadtest_*.json 2>/dev/null
 
 # ==============================================================================
 # Unit Tests (test harness internals)

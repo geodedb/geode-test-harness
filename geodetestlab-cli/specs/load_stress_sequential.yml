@@ -1,0 +1,84 @@
+name: Load Stress - Sequential Query Throughput
+version: '1.0'
+description: >
+  Stress test sequential query throughput on a single managed server.
+  Tests rapid-fire queries, large result sets, and batch writes.
+
+setup:
+- |
+  CREATE GRAPH IF NOT EXISTS load_test;
+  USE GRAPH load_test;
+  CREATE (:LoadNode {idx: 1, name: 'node_001', value: 'abcdefghij'});
+  CREATE (:LoadNode {idx: 2, name: 'node_002', value: 'klmnopqrst'});
+  CREATE (:LoadNode {idx: 3, name: 'node_003', value: 'uvwxyz1234'});
+  CREATE (:LoadNode {idx: 4, name: 'node_004', value: '5678901234'});
+  CREATE (:LoadNode {idx: 5, name: 'node_005', value: 'abcdefghij'})
+
+tests:
+- name: Rapid sequential count queries
+  repeat: 10
+  query: |
+    USE GRAPH load_test;
+    MATCH (n:LoadNode) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+  tags:
+  - load
+  - sequential
+
+- name: Property-heavy read
+  query: |
+    USE GRAPH load_test;
+    MATCH (n:LoadNode) RETURN n.idx, n.name, n.value LIMIT 5
+  expect:
+    row_count: 5
+  tags:
+  - load
+
+- name: Write then read cycle
+  repeat: 5
+  query: |
+    USE GRAPH load_test;
+    CREATE (:LoadTemp {ts: 'now'});
+    MATCH (n:LoadTemp) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+  tags:
+  - load
+  - write-read
+
+- name: Batch create 10 nodes
+  query: |
+    USE GRAPH load_test;
+    CREATE (:LoadBatch {i: 1}); CREATE (:LoadBatch {i: 2}); CREATE (:LoadBatch {i: 3});
+    CREATE (:LoadBatch {i: 4}); CREATE (:LoadBatch {i: 5}); CREATE (:LoadBatch {i: 6});
+    CREATE (:LoadBatch {i: 7}); CREATE (:LoadBatch {i: 8}); CREATE (:LoadBatch {i: 9});
+    CREATE (:LoadBatch {i: 10});
+    MATCH (n:LoadBatch) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+  tags:
+  - load
+  - batch
+
+- name: Repeated single-row queries
+  repeat: 20
+  query: RETURN 1 AS x
+  expect:
+    row_count: 1
+  tags:
+  - load
+  - rapid-fire
+
+teardown:
+- |
+  USE GRAPH load_test;
+  MATCH (n:LoadTemp) DELETE n;
+  MATCH (n:LoadBatch) DELETE n;
+  MATCH (n:LoadNode) DELETE n
+- DROP GRAPH IF EXISTS load_test
+
+tags:
+- load
+- stress
+- performance
