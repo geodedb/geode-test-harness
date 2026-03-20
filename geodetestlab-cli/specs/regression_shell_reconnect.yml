@@ -1,0 +1,94 @@
+name: Regression - Shell Session Reconnection
+version: '1.0'
+description: >
+  Regression test for shell QUIC connection dropping between commands.
+  The shell keepalive thread must not race with query I/O, which
+  corrupts the QUIC stream receive buffer and causes reconnection.
+
+setup:
+- CREATE GRAPH IF NOT EXISTS reconnect_regression
+- |
+  USE GRAPH reconnect_regression;
+  CREATE (:ReconnNode {idx: 1, name: 'node_1', type: 'test'});
+  CREATE (:ReconnNode {idx: 2, name: 'node_2', type: 'test'});
+  CREATE (:ReconnNode {idx: 3, name: 'node_3', type: 'test'});
+  CREATE (:ReconnNode {idx: 4, name: 'node_4', type: 'test'});
+  CREATE (:ReconnNode {idx: 5, name: 'node_5', type: 'test'})
+
+tests:
+- name: USE GRAPH then COUNT query
+  query: |
+    USE GRAPH reconnect_regression;
+    MATCH (n:ReconnNode) RETURN COUNT(n) AS cnt
+  expect:
+    row_count: 1
+  tags:
+  - regression
+  - shell-reconnect
+
+- name: Repeated COUNT queries (10x)
+  repeat: 10
+  query: |
+    USE GRAPH reconnect_regression;
+    MATCH (n:ReconnNode) RETURN COUNT(n) AS cnt
+  expect:
+    row_count: 1
+  tags:
+  - regression
+  - shell-reconnect
+  - rapid-fire
+
+- name: Property query after COUNT
+  query: |
+    USE GRAPH reconnect_regression;
+    MATCH (n:ReconnNode) RETURN n.idx, n.name LIMIT 5
+  expect:
+    row_count: 5
+  tags:
+  - regression
+  - shell-reconnect
+
+- name: Zero-result query after data query
+  query: |
+    USE GRAPH reconnect_regression;
+    MATCH (n:ReconnNode {type: 'nonexistent'}) RETURN COUNT(n) AS cnt
+  expect:
+    row_count: 1
+  tags:
+  - regression
+  - shell-reconnect
+
+- name: Alternating zero and non-zero results
+  repeat: 5
+  query: |
+    USE GRAPH reconnect_regression;
+    MATCH (n:ReconnNode) RETURN COUNT(n) AS cnt
+  expect:
+    row_count: 1
+  tags:
+  - regression
+  - shell-reconnect
+  - alternating
+
+- name: Graph switch mid-session
+  query: |
+    USE GRAPH default;
+    RETURN 1 AS x;
+    USE GRAPH reconnect_regression;
+    MATCH (n:ReconnNode) RETURN COUNT(n) AS cnt
+  expect:
+    row_count: 1
+  tags:
+  - regression
+  - shell-reconnect
+
+teardown:
+- |
+  USE GRAPH reconnect_regression;
+  MATCH (n:ReconnNode) DELETE n
+- DROP GRAPH IF EXISTS reconnect_regression
+
+tags:
+- regression
+- shell-reconnect
+- critical
