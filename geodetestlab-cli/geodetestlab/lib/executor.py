@@ -166,6 +166,15 @@ def run_cli_test(
             else:
                 command_str += f" -U geode -P {admin_password}"
 
+        # Inject --timeout flag to prevent premature client disconnection under load
+        if "query" in command_str and "--timeout" not in command_str:
+            cli_timeout = max(timeout_ms // 1000, 30)
+            command_str = command_str.strip()
+            if command_str.endswith(" -"):
+                command_str = command_str[:-2] + f" --timeout {cli_timeout} -"
+            else:
+                command_str += f" --timeout {cli_timeout}"
+
         # Inject gRPC transport flag for query commands
         if use_grpc and "query" in command_str and "--grpc" not in command_str:
             command_str += " --grpc"
@@ -212,14 +221,16 @@ def run_cli_test(
         cmd.extend(args)
         # If this is a query command via args, add server, insecure, and auth flags
         if args and args[0] == "query" and len(args) > 1:
-            if "--server" not in args:
-                cmd.extend(["--server", server_addr])
             if use_grpc and "--grpc" not in args:
                 cmd.append("--grpc")
             elif not use_grpc and "--insecure-tls-skip-verify" not in args and "--insecure" not in args:
                 cmd.extend(["--insecure-tls-skip-verify"])
-            if "-U" not in args:
+            # Add auth credentials unless intentionally unauthenticated
+            if "-U" not in args and "--no-saved-session" not in args:
                 cmd.extend(["-U", "geode", "-P", admin_password])
+            # Pass CLI-level timeout matching the test harness timeout
+            if "--timeout" not in args:
+                cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])
 
     # Merge test-specific environment
     test_env = env.copy()
