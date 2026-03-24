@@ -260,21 +260,38 @@ def run_tests(
         if "GEODE_ADMIN_PASSWORD" not in env:
             env["GEODE_ADMIN_PASSWORD"] = DEFAULT_ADMIN_PASSWORD
 
-        # Start server
+        # Start server with retry logic to handle port collisions in parallel mode.
+        # get_free_port() has a TOCTOU race: between releasing the probe socket
+        # and the server binding, another worker can grab the same port.
+        MAX_PORT_RETRIES = 3
         if not dry_run:
-            try:
-                server_process = start_server(
-                    binary=binary,
-                    data_dir=data_dir,
-                    port=port,
-                    env=env,
-                    args=spec.server_args,
-                    timeout_ms=server_timeout_ms,
-                    verbose=verbose,
-                    grpc_port=grpc_port,
-                )
-            except ServerError as e:
-                raise RunnerError(str(e)) from e
+            last_error: Exception | None = None
+            for attempt in range(MAX_PORT_RETRIES):
+                try:
+                    server_process = start_server(
+                        binary=binary,
+                        data_dir=data_dir,
+                        port=port,
+                        env=env,
+                        args=spec.server_args,
+                        timeout_ms=server_timeout_ms,
+                        verbose=verbose,
+                        grpc_port=grpc_port,
+                    )
+                    break  # Success
+                except ServerError as e:
+                    last_error = e
+                    if attempt < MAX_PORT_RETRIES - 1 and server_port is None:
+                        # Port collision likely — retry with fresh ports
+                        port = get_free_port()
+                        if grpc_port is not None:
+                            grpc_port = get_free_port()
+                        if verbose:
+                            print(f"  Server start failed (attempt {attempt + 1}), retrying on port {port}...")
+                        continue
+                    raise RunnerError(str(e)) from e
+            else:
+                raise RunnerError(str(last_error)) from last_error
 
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
         env["PORT"] = str(port)
@@ -296,6 +313,31 @@ def run_tests(
     original_sigterm = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGINT, _worker_signal_handler)
     signal.signal(signal.SIGTERM, _worker_signal_handler)
+
+    def _replay_setup() -> None:
+        """Re-run setup queries after server crash/restart."""
+        if not spec.setup or dry_run:
+            return
+        if verbose:
+            print(f"  Re-running {len(spec.setup)} setup queries after restart...")
+        for i, setup_item in enumerate(spec.setup):
+            if isinstance(setup_item, dict):
+                setup_case = TestCase.from_dict(
+                    {
+                        "name": f"setup-{i}",
+                        "description": "Setup query (replay)",
+                        **setup_item,
+                    }
+                )
+                run_cli_test(
+                    test_case=setup_case,
+                    binary=binary,
+                    env=env,
+                    secrets=secrets,
+                    timeout_ms=timeout_ms,
+                    data_dir=data_dir,
+                    verbose=verbose,
+                )
 
     try:
         # Run setup queries if defined
@@ -367,26 +409,44 @@ def run_tests(
                     if verbose:
                         print(f"  Server crashed (exit code {server_process.returncode}), restarting...")
                     untrack_server(server_process)
-                    try:
-                        assert data_dir is not None
-                        server_process = start_server(
-                            binary=binary,
-                            data_dir=data_dir,
-                            port=port,
-                            env=env,
-                            args=spec.server_args,
-                            timeout_ms=server_timeout_ms,
-                            verbose=verbose,
-                            grpc_port=grpc_port,
-                        )
-                    except ServerError as e:
-                        if verbose:
-                            print(f"  Failed to restart server: {e}")
+                    restarted = False
+                    for restart_attempt in range(MAX_PORT_RETRIES):
+                        try:
+                            assert data_dir is not None
+                            server_process = start_server(
+                                binary=binary,
+                                data_dir=data_dir,
+                                port=port,
+                                env=env,
+                                args=spec.server_args,
+                                timeout_ms=server_timeout_ms,
+                                verbose=verbose,
+                                grpc_port=grpc_port,
+                            )
+                            restarted = True
+                            break
+                        except ServerError as e:
+                            if restart_attempt < MAX_PORT_RETRIES - 1 and server_port is None:
+                                port = get_free_port()
+                                if grpc_port is not None:
+                                    grpc_port = get_free_port()
+                                if verbose:
+                                    print(f"  Restart failed (attempt {restart_attempt + 1}), retrying on port {port}...")
+                                env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
+                                env["PORT"] = str(port)
+                                continue
+                            if verbose:
+                                print(f"  Failed to restart server: {e}")
+                    if restarted:
+                        # Re-run setup queries so remaining tests have their data
+                        _replay_setup()
+                    if not restarted:
+                        # Mark remaining tests as failed
                         return TestResult(
                             name=test_case.name,
                             passed=False,
                             duration_ms=0,
-                            error=f"Server crashed and failed to restart: {e}",
+                            error="Server crashed and failed to restart after retries",
                         )
 
             result = run_single_test(
@@ -447,20 +507,32 @@ def run_tests(
                         if verbose:
                             print("  Server died during test, restarting for next test...")
                         untrack_server(server_process)
-                        try:
-                            assert data_dir is not None
-                            server_process = start_server(
-                                binary=binary,
-                                data_dir=data_dir,
-                                port=port,
-                                env=env,
-                                args=spec.server_args,
-                                timeout_ms=server_timeout_ms,
-                                verbose=verbose,
-                                grpc_port=grpc_port,
-                            )
-                        except ServerError:
-                            pass  # Will be caught at the top of the next test
+                        for restart_attempt in range(MAX_PORT_RETRIES):
+                            try:
+                                assert data_dir is not None
+                                server_process = start_server(
+                                    binary=binary,
+                                    data_dir=data_dir,
+                                    port=port,
+                                    env=env,
+                                    args=spec.server_args,
+                                    timeout_ms=server_timeout_ms,
+                                    verbose=verbose,
+                                    grpc_port=grpc_port,
+                                )
+                                break
+                            except ServerError:
+                                if restart_attempt < MAX_PORT_RETRIES - 1 and server_port is None:
+                                    port = get_free_port()
+                                    if grpc_port is not None:
+                                        grpc_port = get_free_port()
+                                    env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
+                                    env["PORT"] = str(port)
+                                    continue
+                                break  # Will be caught at the top of the next iteration
+                        else:
+                            # Restart succeeded -- replay setup for remaining tests
+                            _replay_setup()
                     elif is_timeout:
                         # Server may be hung - health check with a simple query
                         try:
@@ -499,20 +571,32 @@ def run_tests(
                             except subprocess.TimeoutExpired:
                                 pass
                             untrack_server(server_process)
-                            try:
-                                assert data_dir is not None
-                                server_process = start_server(
-                                    binary=binary,
-                                    data_dir=data_dir,
-                                    port=port,
-                                    env=env,
-                                    args=spec.server_args,
-                                    timeout_ms=server_timeout_ms,
-                                    verbose=verbose,
-                                    grpc_port=grpc_port,
-                                )
-                            except ServerError:
-                                pass  # Will be caught at the top of the next test
+                            for restart_attempt in range(MAX_PORT_RETRIES):
+                                try:
+                                    assert data_dir is not None
+                                    server_process = start_server(
+                                        binary=binary,
+                                        data_dir=data_dir,
+                                        port=port,
+                                        env=env,
+                                        args=spec.server_args,
+                                        timeout_ms=server_timeout_ms,
+                                        verbose=verbose,
+                                        grpc_port=grpc_port,
+                                    )
+                                    break
+                                except ServerError:
+                                    if restart_attempt < MAX_PORT_RETRIES - 1 and server_port is None:
+                                        port = get_free_port()
+                                        if grpc_port is not None:
+                                            grpc_port = get_free_port()
+                                        env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
+                                        env["PORT"] = str(port)
+                                        continue
+                                    break  # Will be caught at the top of the next iteration
+                            else:
+                                # Restart succeeded -- replay setup for remaining tests
+                                _replay_setup()
 
             return result
 

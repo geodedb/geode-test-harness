@@ -17,18 +17,32 @@ from typing import Optional
 def get_free_port() -> int:
     """Get a free port number for server binding.
 
-    This function finds an available port by binding to port 0 and letting
-    the OS assign a free port. Uses UDP since QUIC runs over UDP.
-    This enables parallel test execution without port conflicts.
+    Probes both UDP and TCP to find a port that is free on both protocols
+    (Geode binds QUIC on UDP and optionally gRPC on TCP).  Uses
+    ``SO_REUSEADDR`` so the kernel allows fast re-binding after the probe
+    sockets are closed.
 
     Returns
     -------
     int
         An available port number.
     """
+    # Bind UDP first (QUIC uses UDP)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("", 0))
         port = s.getsockname()[1]
+    # Verify the same port is also free on TCP
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
+            t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            t.bind(("", port))
+    except OSError:
+        # TCP port in use — try again with a fresh allocation
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", 0))
+            port = s.getsockname()[1]
     return port
 
 

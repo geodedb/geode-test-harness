@@ -221,6 +221,8 @@ def run_cli_test(
         cmd.extend(args)
         # If this is a query command via args, add server, insecure, and auth flags
         if args and args[0] == "query" and len(args) > 1:
+            if "--server" not in args:
+                cmd.extend(["--server", server_addr])
             if use_grpc and "--grpc" not in args:
                 cmd.append("--grpc")
             elif not use_grpc and "--insecure-tls-skip-verify" not in args and "--insecure" not in args:
