@@ -129,7 +129,18 @@ def run_cli_test(
         gql_keywords = ["CREATE", "MATCH", "RETURN", "MERGE", "DELETE", "SET", "UNWIND", "WITH", "CALL", "OPTIONAL"]
         return any(text_upper.startswith(kw) for kw in gql_keywords)
 
-    if test_case.query:
+    # Resolve DSN with variable substitution if present
+    resolved_dsn = None
+    if test_case.dsn:
+        resolved_dsn = _substitute_one(test_case.dsn, env, secrets, data_dir)
+
+    if test_case.query and resolved_dsn:
+        # DSN mode: use --dsn instead of --server, credentials are in the DSN
+        cmd = [binary, "query", test_case.query]
+        cmd.extend(["--dsn", resolved_dsn])
+        cmd.extend(["--insecure-tls-skip-verify"])
+        # No -U/-P injection: credentials are embedded in DSN
+    elif test_case.query:
         cmd = [binary, "query", test_case.query]
         cmd.extend(["--server", server_addr])
         if use_grpc:
@@ -137,6 +148,11 @@ def run_cli_test(
         else:
             cmd.extend(["--insecure-tls-skip-verify"])
         cmd.extend(["-U", "geode", "-P", admin_password])
+    elif test_case.command and _is_gql_query(test_case.command) and resolved_dsn:
+        # GQL command with DSN: use --dsn instead of --server
+        cmd = [binary, "query", test_case.command]
+        cmd.extend(["--dsn", resolved_dsn])
+        cmd.extend(["--insecure-tls-skip-verify"])
     elif test_case.command and _is_gql_query(test_case.command):
         # Command field contains GQL - route to query handler
         cmd = [binary, "query", test_case.command]

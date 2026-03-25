@@ -264,6 +264,8 @@ class TestCase:
     http_requests: list[HttpRequest] = field(default_factory=list)
     # Sequential test fields
     steps: list[TestStep] = field(default_factory=list)
+    # DSN connection string — when set, uses --dsn instead of --server and skips -U/-P injection
+    dsn: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestCase:
@@ -377,6 +379,7 @@ class TestCase:
             timeout_ms=data.get("timeout_ms", 0),
             http_requests=http_requests,
             steps=steps,
+            dsn=data.get("dsn"),
         )
 
 
