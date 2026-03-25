@@ -1,0 +1,193 @@
+# DSN Graph Binding Tests
+# Verifies that connecting with a graph in the DSN binds the session to that graph,
+# auto-creates graphs when the user has permission, and rejects USE GRAPH on bound sessions.
+
+name: DSN Graph Binding
+version: '1.0'
+
+setup:
+- |
+  CREATE GRAPH IF NOT EXISTS dsn_existing;
+
+tests:
+
+  # ============================================================================
+  # 1. Basic graph binding via DSN — connect to existing graph
+  # ============================================================================
+
+- name: DSN binds session to existing graph
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_existing
+  query: |
+    CREATE (:DSNNode {name: 'Alice'});
+    MATCH (n:DSNNode) RETURN n.name AS name
+  expect:
+    status: success
+    result_contains: Alice
+
+- name: Data created via DSN is in the bound graph
+  query: |
+    USE GRAPH dsn_existing;
+    MATCH (n:DSNNode) RETURN n.name AS name
+  expect:
+    status: success
+    result_contains: Alice
+
+  # ============================================================================
+  # 2. Auto-create graph via DSN
+  # ============================================================================
+
+- name: DSN auto-creates graph that does not exist
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_autocreated
+  query: |
+    CREATE (:DSNAutoNode {val: 42});
+    MATCH (n:DSNAutoNode) RETURN n.val AS val
+  expect:
+    status: success
+    result_contains: '42'
+
+- name: Auto-created graph is visible via normal connection
+  query: |
+    USE GRAPH dsn_autocreated;
+    MATCH (n:DSNAutoNode) RETURN n.val AS val
+  expect:
+    status: success
+    result_contains: '42'
+
+  # ============================================================================
+  # 3. USE GRAPH rejected on bound session
+  # ============================================================================
+
+- name: USE GRAPH rejected when session is graph-bound via DSN
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_existing
+  query: |
+    USE GRAPH dsn_autocreated
+  expect:
+    status: error
+    result_contains: USE GRAPH not allowed
+
+  # ============================================================================
+  # 4. Graph isolation — data stays in bound graph
+  # ============================================================================
+
+- name: Create data in graph A via DSN
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_iso_a
+  query: |
+    CREATE (:IsoNode {side: 'A'});
+    MATCH (n:IsoNode) RETURN count(n) AS cnt
+  expect:
+    status: success
+    result_contains: '1'
+
+- name: Create data in graph B via DSN
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_iso_b
+  query: |
+    CREATE (:IsoNode {side: 'B'});
+    MATCH (n:IsoNode) RETURN count(n) AS cnt
+  expect:
+    status: success
+    result_contains: '1'
+
+- name: Graph A only sees its own data
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_iso_a
+  query: |
+    MATCH (n:IsoNode) RETURN n.side AS side
+  expect:
+    status: success
+    result_contains: A
+    result_not_contains: B
+
+- name: Graph B only sees its own data
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_iso_b
+  query: |
+    MATCH (n:IsoNode) RETURN n.side AS side
+  expect:
+    status: success
+    result_contains: B
+    result_not_contains: A
+
+  # ============================================================================
+  # 5. DSN without graph — normal behavior, USE GRAPH allowed
+  # ============================================================================
+
+- name: DSN without graph path allows USE GRAPH
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}
+  query: |
+    USE GRAPH dsn_existing;
+    MATCH (n:DSNNode) RETURN n.name AS name
+  expect:
+    status: success
+    result_contains: Alice
+
+  # ============================================================================
+  # 6. Multiple operations on bound graph
+  # ============================================================================
+
+- name: CRUD operations on DSN-bound graph
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_crud
+  query: |
+    CREATE (:CrudNode {name: 'test', val: 1});
+    MATCH (n:CrudNode {name: 'test'}) SET n.val = 2;
+    MATCH (n:CrudNode {name: 'test'}) RETURN n.val AS val
+  expect:
+    status: success
+    result_contains: '2'
+
+- name: Edge creation on DSN-bound graph
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_crud
+  query: |
+    CREATE (:CrudA {id: 1}), (:CrudB {id: 2});
+    MATCH (a:CrudA), (b:CrudB)
+    CREATE (a)-[:LINKED]->(b);
+    MATCH ()-[r:LINKED]->() RETURN count(r) AS cnt
+  expect:
+    status: success
+    result_contains: '1'
+
+  # ============================================================================
+  # 7. Graph name validation
+  # ============================================================================
+
+- name: Invalid graph name with slash rejected
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/bad/name
+  query: RETURN 1 AS x
+  expect:
+    status: error
+
+- name: Graph name with special chars rejected
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/bad-name
+  query: RETURN 1 AS x
+  expect:
+    status: error
+    result_contains: Invalid graph name
+
+  # ============================================================================
+  # 8. DDL operations still work on bound session
+  # ============================================================================
+
+- name: CREATE GRAPH allowed on bound session
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/dsn_existing
+  query: |
+    CREATE GRAPH IF NOT EXISTS dsn_other_graph
+  expect:
+    status: success
+
+- name: Verify other graph was created
+  query: |
+    USE GRAPH dsn_other_graph;
+    RETURN 1 AS x
+  expect:
+    status: success
+    result_contains: '1'
+
+  # ============================================================================
+  # 9. Underscore in graph names works
+  # ============================================================================
+
+- name: Graph name with underscores is valid
+  dsn: quic://geode:${env:GEODE_ADMIN_PASSWORD}@127.0.0.1:${PORT}/my_test_graph_123
+  query: |
+    CREATE (:UnderscoreNode {ok: true});
+    MATCH (n:UnderscoreNode) RETURN count(n) AS cnt
+  expect:
+    status: success
+    result_contains: '1'
