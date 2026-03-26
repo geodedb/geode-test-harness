@@ -384,7 +384,7 @@ def run_tests(
 
             Returns the TestResult. Server restart is serialized via _lock.
             """
-            nonlocal server_process
+            nonlocal server_process, port, grpc_port
 
             if test_case.skip:
                 return TestResult(
@@ -431,7 +431,9 @@ def run_tests(
                                 if grpc_port is not None:
                                     grpc_port = get_free_port()
                                 if verbose:
-                                    print(f"  Restart failed (attempt {restart_attempt + 1}), retrying on port {port}...")
+                                    print(
+                                        f"  Restart failed (attempt {restart_attempt + 1}), retrying on port {port}..."
+                                    )
                                 env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
                                 env["PORT"] = str(port)
                                 continue
