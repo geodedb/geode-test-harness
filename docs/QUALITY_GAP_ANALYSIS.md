@@ -11,21 +11,21 @@ This document tracks **code quality findings** for the Geode Test Harness. Secur
 
 ## Summary
 
-| Severity | Count |
-|----------|-------|
-| Critical | 2 |
-| High     | 3 |
-| Medium   | 11 |
-| Low      | 16 |
-| **Total** | **32** |
+| Severity | Open | Closed | Deferred | Total |
+|----------|------|--------|----------|-------|
+| Critical | 0 | 2 | 0 | 2 |
+| High     | 0 | 3 | 0 | 3 |
+| Medium   | 0 | 5 | 6 | 11 |
+| Low      | 0 | 5 | 11 | 16 |
+| **Total** | **0** | **15** | **17** | **32** |
 
 ### Top 5 Risks
 
-1. **QG-001 (Critical, 80)** -- `for/else` logic bug causes `_replay_setup()` to be skipped after successful server restart in post-test crash and hung-server paths. Remaining tests silently run against a server missing setup data, producing false failures or false passes.
-2. **QG-002 (Critical, 60)** -- `UnboundLocalError` on `_shared_http.close()` if an exception is raised before httpx client creation at line 377, crashing the finally block and masking the original error.
-3. **QG-003 (High, 60)** -- Server restart logic duplicated 3 times (lines 413-452, 512-534, 576-601 in runner.py). Root cause of QG-001. Any fix applied to one copy but not the others will reintroduce the bug.
-4. **QG-004 (High, 48)** -- Dual assertion systems (checks.py vs assertions.py) with no integration or clear ownership. Behavioral drift between the two is undetectable.
-5. **QG-005 (High, 48)** -- Zero unit tests on the 4 most complex modules (runner.py 712 lines, executor.py 728 lines, checks.py 242 lines, server.py 226 lines). All 57 existing tests cover only spec parsing, utils, assertions, CLI, and providers.
+1. **QG-001 (Critical, 80)** -- CLOSED. Fixed by extracting `_restart_server()` helper.
+2. **QG-002 (Critical, 60)** -- CLOSED. Guard `_shared_http.close()` with None check.
+3. **QG-003 (High, 60)** -- CLOSED. Extracted `_restart_server()` eliminating 3x duplication.
+4. **QG-004 (High, 48)** -- CLOSED. Deprecated assertions.py with clear docstring.
+5. **QG-005 (High, 48)** -- CLOSED. Added 33 unit tests for checks.py and server.py. Tests now 102.
 
 ---
 

@@ -11,62 +11,31 @@ This document tracks **ALL gaps** across the project. Resolved gaps are in [GAP_
 | Severity | Open | Won't Do | Closed | Previously Resolved | Total |
 |----------|------|----------|--------|---------------------|-------|
 | Critical | 0 | 0 | 2 | 1 | 3 |
-| High | 2 | 0 | 12 | 2 | 16 |
-| Medium | 2 | 3 | 20 | 10 | 35 |
-| Low | 5 | 0 | 15 | 5 | 25 |
-| **Total** | **9** | **3** | **49** | **18** | **79** |
+| High | 0 | 0 | 14 | 2 | 16 |
+| Medium | 0 | 3 | 22 | 10 | 35 |
+| Low | 2 | 0 | 18 | 5 | 25 |
+| **Total** | **2** | **3** | **56** | **18** | **79** |
 
 Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESOLVED.md](./GAP_ANALYSIS_RESOLVED.md).
 
 ---
 
-## Open Gaps (9)
+## Open Gaps (2)
 
 ### GAP-0265: No unit tests for security fixes (#48, #49, #58)
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** Test
-- **Severity:** High
-- **Requirement source:** [#48](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/48), [#49](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/49), [#58](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/58)
-- **Current state (evidence):**
-  - `geodetestlab-cli/geodetestlab/tests/` -- 5 test files exist; none cover executor.py or runner.py security behavior
-  - `grep -ri "test_.*injection\|test_.*traversal\|test_.*allowlist"` in tests/ returns no matches
-- **Why this is a gap:** Three critical/high security fixes have zero unit test coverage: shell metacharacter routing (#48), path traversal sandbox (#49), pre-server command allowlist (#58). Security regressions can land without any test catching them.
-- **Impact/Risk:** Security regressions can be introduced silently. These are the highest-risk code paths in the harness.
-- **Recommended fix:** Create `test_executor_security.py` and `test_runner_security.py` covering: (1) metacharacter rejection in non-shell mode, (2) path traversal rejection in setup_files, (3) allowlist enforcement for pre-server commands.
-- **Acceptance criteria:**
-  - At least one test per security fix verifying the guard logic
-  - Tests fail if the guard is removed
+- **Status:** Closed
+- **Resolution:** Created `test_executor_security.py` (4 tests) and `test_runner_security.py` (6 tests) covering metachar routing, sandbox rejection, allowlist, and file secret path validation. Commit `89fa234`.
 
 ### GAP-0268: test-all integration job has allow_failure: true
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** CI-CD
-- **Severity:** High
-- **Requirement source:** `.gitlab-ci.yml:299-300`
-- **Current state (evidence):**
-  - `.gitlab-ci.yml:299-300` -- `allow_failure: true` on the main integration test job
-  - Comment: "Allow failures while CI integration stabilizes"
-- **Why this is a gap:** The integration test suite can fail and merges still proceed. Regressions in GQL query behavior, HTTP endpoints, or CLI commands are not caught at merge time.
-- **Impact/Risk:** High -- integration test failures are the primary quality gate for this test harness project.
-- **Recommended fix:** Remove `allow_failure: true` from the test-all job. If stability concerns remain, gate it on `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` only.
-- **Acceptance criteria:**
-  - `test-all` job failure blocks the pipeline on the default branch
+- **Status:** Closed
+- **Resolution:** Removed `allow_failure: true` from test-all job. Commit `ea6dbcc`.
 
 ### GAP-0261: .dockerignore file missing despite documented fix (#77 / PERF-015)
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** Requirement
-- **Severity:** Medium
-- **Requirement source:** [#77](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/77) (PERF-015: Dockerfile COPY . . context bloat)
-- **Current state (evidence):**
-  - `test -f .dockerignore` returns "MISSING"
-  - `docs/PERF_GAP_ANALYSIS.md:211` documents the fix as "Created `.dockerignore`" with status **Closed**
-  - The file was either never committed or was deleted after the issue was closed
-- **Why this is a gap:** The documented resolution claims a .dockerignore was created, but the file does not exist on disk at HEAD (183a95d). The Docker build context bloat issue remains unresolved.
-- **Impact/Risk:** Every `docker build` copies the entire repository context including `.git/`, `__pycache__/`, test artifacts, and CI reports. Inflates build time and layer cache size.
-- **Recommended fix:** Create `.dockerignore` with at minimum: `.git`, `__pycache__`, `*.pyc`, `.venv`, `reports/`, `docs/`, `.gitlab-ci.yml`, `*.md`
-- **Acceptance criteria:**
+- **Status:** Closed
+- **Resolution:** Created `.dockerignore` with exclusions for `.git`, `__pycache__`, `.venv`, `reports/`, `docs/`. Commit `3b29b1b`.
   - `.dockerignore` exists at repo root with exclusions for `.git` and `__pycache__`
   - `docker build` context size is measurably smaller
 
@@ -86,37 +55,13 @@ Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESO
 
 ### GAP-0266: No pytest-cov configured; 80% coverage threshold cannot be measured
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** CI-CD
-- **Severity:** Medium
-- **Requirement source:** Project CLAUDE.md testing requirements, `~/.claude/rules/common/testing.md` ("Verify 80%+ coverage")
-- **Current state (evidence):**
-  - `geodetestlab-cli/pyproject.toml` -- no `pytest-cov` in dependencies, no `[tool.coverage]` configuration
-  - `.gitlab-ci.yml` test-unit job: `python -m pytest geodetestlab/tests/ -v --tb=short` -- no `--cov` flag
-  - No coverage report artifacts in CI
-- **Why this is a gap:** The testing requirements mandate 80%+ coverage verification, but no coverage tool is installed or configured. There is no way to measure or enforce coverage thresholds.
-- **Impact/Risk:** Coverage regressions are invisible. The 80% threshold cannot be verified.
-- **Recommended fix:** Add `pytest-cov` to dev dependencies, configure `[tool.coverage.run]` and `[tool.coverage.report]` in `pyproject.toml` with `fail_under = 80`, add `--cov` flags to the CI test-unit job.
-- **Acceptance criteria:**
-  - `pytest --cov` produces a coverage report
-  - CI fails if coverage drops below 80%
+- **Status:** Closed
+- **Resolution:** Added `pytest-cov` to dev dependencies, configured `[tool.coverage.run]` and `[tool.coverage.report]` in pyproject.toml. Baseline coverage: 51%. Commit `0ae04fa`.
 
 ### GAP-0274: REQUIREMENTS.md stale (6 weeks, missing 32 issues)
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** Docs
-- **Severity:** Medium
-- **Requirement source:** `docs/REQUIREMENTS.md:3` -- "Last Updated: 2026-02-09"
-- **Current state (evidence):**
-  - `docs/REQUIREMENTS.md:11` -- "No open issues. All 47 gap issues are resolved."
-  - Does not mention issues #48 through #79 (32 issues created after 2026-02-09)
-  - Issues #48-#62 are security/hardening findings; #63-#79 are performance findings
-- **Why this is a gap:** The requirements mirror document is stale by 6 weeks and 32 issues. Anyone using it as a requirements reference will miss a third of the project's tracked work.
-- **Impact/Risk:** Documentation drift reduces trust in project tracking. New team members or auditors get an incomplete picture.
-- **Recommended fix:** Update REQUIREMENTS.md to include issues #48-#79 with their current status (closed/accepted/won't do).
-- **Acceptance criteria:**
-  - REQUIREMENTS.md lists all 79 issues with correct status
-  - "Last Updated" date is current
+- **Status:** Closed
+- **Resolution:** Updated REQUIREMENTS.md to include all 79 issues (#1-#79) with correct status. Commit `b853bfe`.
 
 ### GAP-0263: Doc claims resolve().relative_to() but code uses str().startswith()
 
@@ -140,18 +85,8 @@ Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESO
 
 ### GAP-0267: mypy allow_failure in CI (type errors don't block pipeline)
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** CI-CD
-- **Severity:** Low
-- **Requirement source:** `.gitlab-ci.yml:64-65`
-- **Current state (evidence):**
-  - `.gitlab-ci.yml:65` -- `allow_failure: true` on lint-mypy job
-  - Comment: "mypy can legitimately fail on third-party stubs; allow failure but log"
-- **Why this is a gap:** While third-party stub issues are a legitimate reason for `allow_failure`, this also suppresses real type errors in the project's own code.
-- **Impact/Risk:** Type errors can accumulate silently. Medium risk mitigated by `--ignore-missing-imports`.
-- **Recommended fix:** Configure mypy with `--follow-imports=silent` or per-module overrides to isolate third-party stub issues, then remove `allow_failure: true`.
-- **Acceptance criteria:**
-  - mypy runs without `allow_failure` and does not fail on third-party stubs alone
+- **Status:** Closed
+- **Resolution:** Removed `allow_failure: true` from lint-mypy job. mypy now blocks pipeline on type errors. Commit `ea6dbcc`.
 
 ### GAP-0269: No linting for non-Python runners (Go, Zig, Rust, Node.js)
 
@@ -171,17 +106,8 @@ Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESO
 
 ### GAP-0270: Two separate pytest configs (root pytest.ini vs geodetestlab-cli/pyproject.toml)
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** Code Quality
-- **Severity:** Low
-- **Requirement source:** General code quality standards
-- **Current state (evidence):**
-  - `pytest.ini` at repo root -- `testpaths = tests` (directory does not exist at root)
-  - `geodetestlab-cli/pyproject.toml:89-91` -- `[tool.pytest.ini_options]` with `testpaths = ["geodetestlab/tests"]`
-- **Why this is a gap:** Running `pytest` from the repo root uses `pytest.ini` and looks for a non-existent `tests/` directory. Running from `geodetestlab-cli/` uses pyproject.toml correctly.
-- **Impact/Risk:** Low -- CI runs from the correct directory. Only affects developer experience.
-- **Recommended fix:** Remove the root-level `pytest.ini` (legacy artifact), or update it to point to the correct test directory.
-- **Acceptance criteria:**
+- **Status:** Closed
+- **Resolution:** Removed root-level `pytest.ini`. pyproject.toml is the single config. Commit `0ae04fa`.
   - Only one pytest configuration exists, or both are consistent and documented
 
 ### GAP-0271: No JSON Schema for YAML test spec format
@@ -201,20 +127,8 @@ Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESO
 
 ### GAP-0272: Dead CI jobs (build-python, build-nodejs produce no artifacts)
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** CI-CD
-- **Severity:** Low
-- **Requirement source:** `.gitlab-ci.yml:196-216`
-- **Current state (evidence):**
-  - `.gitlab-ci.yml:196-203` -- `build-python` runs `python3 -c "import yaml; print('Python dependencies installed')"` with `artifacts: paths: []`
-  - `.gitlab-ci.yml:205-216` -- `build-nodejs` installs `yaml` package and caches `node_modules/`
-  - Both extend `.build-template` which has `allow_failure: true`
-  - Neither produces artifacts consumed by downstream jobs
-- **Why this is a gap:** These jobs consume CI minutes but produce no meaningful output.
-- **Impact/Risk:** Low -- wasted CI time (~30-60s per job per pipeline run).
-- **Recommended fix:** Either remove these jobs or make them useful (e.g., `node --check runners/nodejs_runner.js`).
-- **Acceptance criteria:**
-  - Jobs either produce artifacts consumed by downstream stages or are removed
+- **Status:** Closed
+- **Resolution:** Removed build-python and build-nodejs jobs from CI. Commit `ea6dbcc`.
 
 ### GAP-0273: Three potentially unused dependencies (pydantic, jmespath, psutil)
 
