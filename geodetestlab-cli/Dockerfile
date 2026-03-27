@@ -4,7 +4,7 @@ FROM python:3.11-slim AS builder
 WORKDIR /app
 
 # Install system dependencies for building
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     make \
@@ -21,7 +21,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*
@@ -36,6 +36,10 @@ COPY . .
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash geodetest
 USER geodetest
+
+# Verify the geodetestlab package is importable
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import geodetestlab" || exit 1
 
 # Default command
 ENTRYPOINT ["geodetestlab"]
