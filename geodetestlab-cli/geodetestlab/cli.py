@@ -23,10 +23,20 @@ from rich.table import Table
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from lib.runner import RunnerError, _kill_stale_servers, run_tests
-from lib.spec import SpecValidationError, load_spec
-from lib.utils import SecretResolutionError, resolve_secrets
-from server.simple_manager import ServerManager
+from lib.runner import RunnerError, _kill_stale_servers, run_tests  # noqa: E402
+from lib.spec import SpecValidationError, load_spec  # noqa: E402
+from lib.utils import SecretResolutionError, resolve_secrets  # noqa: E402
+from server.simple_manager import ServerManager  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Exit codes returned by the ``run`` command.
+# ---------------------------------------------------------------------------
+EXIT_SUCCESS = 0  # All tests passed
+EXIT_TEST_FAILURE = 1  # One or more tests failed
+EXIT_SPEC_ERROR = 2  # Spec loading / validation error
+EXIT_RUNNER_ERROR = 3  # Runner or server lifecycle error
+EXIT_SECRET_ERROR = 4  # Secret resolution failed
+EXIT_INTERRUPTED = 130  # Ctrl-C (SIGINT)
 
 app = typer.Typer(
     name="geodetestlab",

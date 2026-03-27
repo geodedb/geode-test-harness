@@ -1,7 +1,19 @@
-"""Assertion evaluation for test expectations.
+"""Structured assertion evaluation for test expectations.
 
-This module provides structured assertion evaluation that returns detailed
-results for each individual check, enabling rich test reporting.
+.. deprecated::
+    This module is **not used by the test runner**.  The runner uses
+    ``checks.py`` for pass/fail determination.  This module exists as a
+    candidate for future structured reporting (per-assertion detail) but
+    has **diverged** from ``checks.py`` and is missing several assertion
+    types (``result_contains``, ``result_not_contains``, ``result_matches``,
+    ``error_contains``, ``stdout_not_contains``, ``stderr_not_contains``,
+    ``stderr_exact``).
+
+    **Do not add new assertion logic here** without also wiring it into the
+    runner.  If you need to add a new expectation check, add it to
+    ``checks.py`` (the authoritative implementation).
+
+See also: QG-004 in ``docs/QUALITY_GAP_ANALYSIS.md``.
 """
 
 from __future__ import annotations
