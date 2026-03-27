@@ -55,9 +55,17 @@ def cleanup_servers() -> None:
 
 
 def kill_stale_servers() -> None:
-    """Kill any stale Geode servers from previous runs."""
+    """Kill any stale Geode servers from previous test runs.
+
+    Uses a scoped pattern that only matches servers started with a
+    ``geode-test-`` temp directory to avoid killing unrelated processes.
+    """
     try:
-        subprocess.run(["pkill", "-f", "geode serve"], capture_output=True, timeout=5)
+        subprocess.run(
+            ["pkill", "-f", "geode serve.*geode-test-"],
+            capture_output=True,
+            timeout=5,
+        )
         time.sleep(0.5)  # Give processes time to terminate
     except Exception:
         pass

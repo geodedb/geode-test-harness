@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 from geodetestlab.lib.spec import SpecValidationError, load_spec
 

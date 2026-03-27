@@ -4,7 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 from typer.testing import CliRunner
 
 from geodetestlab.cli import app

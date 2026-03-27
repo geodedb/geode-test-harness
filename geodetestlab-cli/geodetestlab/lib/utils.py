@@ -323,10 +323,24 @@ def _resolve_secret(name: str, config: SecretConfig) -> str | None:
             pass
 
     elif config.source == "file":
-        # Read from file
+        # Read from file — restrict to safe directories to prevent
+        # arbitrary file reads via crafted YAML specs (CWE-22 / SEC-002).
         if config.key:
-            path = Path(config.key).expanduser()
-            if path.exists():
+            path = Path(config.key).expanduser().resolve()
+            # Allow files under the user's home, /tmp, or working directory.
+            _allowed_roots = [
+                Path.home(),
+                Path("/tmp"),
+                Path.cwd(),
+            ]
+            if not any(path.is_relative_to(root) for root in _allowed_roots):
+                import logging as _log
+
+                _log.getLogger(__name__).warning(
+                    "Secret file path rejected (outside allowed directories): %s",
+                    path,
+                )
+            elif path.exists():
                 value = path.read_text().strip()
 
     # Use default if no value found

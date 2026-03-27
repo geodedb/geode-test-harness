@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -16,16 +17,15 @@ from pathlib import Path
 import httpx
 
 from .checks import check_expectations, check_http_expectations
-from .runner_types import DEFAULT_ADMIN_PASSWORD, TestResult
+from .runner_types import DEFAULT_ADMIN_PASSWORD, DEFAULT_GRPC_PORT, DEFAULT_QUIC_PORT, TestResult
 from .spec import PlaintextCheck, TestCase
+from .utils import is_valid_gql
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (DEFAULT_QUIC_PORT, DEFAULT_GRPC_PORT from runner_types)
 # ---------------------------------------------------------------------------
-DEFAULT_QUIC_PORT = 3141
-DEFAULT_GRPC_PORT = 50051
 DEFAULT_HTTP_TIMEOUT_S = 30.0
 DEFAULT_SHELL_TIMEOUT_S = 30.0
 SSL_VERIFY = os.environ.get("GEODE_VERIFY_SSL", "0").lower() in ("1", "true", "yes")
@@ -68,6 +68,19 @@ def run_single_test(
     return run_cli_test(test_case, binary, env, secrets, timeout_ms, data_dir, verbose)
 
 
+def _resolve_server_address(env: dict[str, str]) -> tuple[str, bool]:
+    """Return ``(server_addr, use_grpc)`` based on transport env vars."""
+    use_grpc = env.get("GEODE_TRANSPORT") == "grpc"
+    if use_grpc:
+        server_addr = env.get(
+            "GEODE_GRPC_ADDRESS",
+            env.get("GEODE_SERVER_ADDRESS", f"127.0.0.1:{DEFAULT_GRPC_PORT}"),
+        )
+    else:
+        server_addr = env.get("GEODE_SERVER_ADDRESS", f"127.0.0.1:{DEFAULT_QUIC_PORT}")
+    return server_addr, use_grpc
+
+
 def run_cli_test(
     test_case: TestCase,
     binary: str,
@@ -91,7 +104,7 @@ def run_cli_test(
             file_content = file_spec.get("content", "")
             if file_path and file_content:
                 resolved = Path(file_path).resolve()
-                if not str(resolved).startswith(str(sandbox_root)):
+                if not resolved.is_relative_to(sandbox_root):
                     return TestResult(
                         name=test_case.name,
                         passed=False,
@@ -114,20 +127,7 @@ def run_cli_test(
     admin_password = env.get("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
 
     # Transport-aware server address and flags
-    use_grpc = env.get("GEODE_TRANSPORT") == "grpc"
-    if use_grpc:
-        server_addr = env.get("GEODE_GRPC_ADDRESS", env.get("GEODE_SERVER_ADDRESS", f"127.0.0.1:{DEFAULT_GRPC_PORT}"))
-    else:
-        server_addr = env.get("GEODE_SERVER_ADDRESS", f"127.0.0.1:{DEFAULT_QUIC_PORT}")
-
-    # Determine if this is a query test or command test
-    # Helper to detect if a string looks like a GQL query
-    def _is_gql_query(text: str) -> bool:
-        if not text:
-            return False
-        text_upper = text.strip().upper()
-        gql_keywords = ["CREATE", "MATCH", "RETURN", "MERGE", "DELETE", "SET", "UNWIND", "WITH", "CALL", "OPTIONAL"]
-        return any(text_upper.startswith(kw) for kw in gql_keywords)
+    server_addr, use_grpc = _resolve_server_address(env)
 
     # Resolve DSN with variable substitution if present
     resolved_dsn = None
@@ -148,12 +148,12 @@ def run_cli_test(
         else:
             cmd.extend(["--insecure-tls-skip-verify"])
         cmd.extend(["-U", "geode", "-P", admin_password])
-    elif test_case.command and _is_gql_query(test_case.command) and resolved_dsn:
+    elif test_case.command and is_valid_gql(test_case.command) and resolved_dsn:
         # GQL command with DSN: use --dsn instead of --server
         cmd = [binary, "query", test_case.command]
         cmd.extend(["--dsn", resolved_dsn])
         cmd.extend(["--insecure-tls-skip-verify"])
-    elif test_case.command and _is_gql_query(test_case.command):
+    elif test_case.command and is_valid_gql(test_case.command):
         # Command field contains GQL - route to query handler
         cmd = [binary, "query", test_case.command]
         cmd.extend(["--server", server_addr])
@@ -433,14 +433,13 @@ def _run_shell_test(
         )
 
     # Determine the working directory - shell tests typically need to run from Geode source
-    # The test harness is in geode-test-harness, and geode source is in ../geode
-    harness_dir = Path(__file__).parent.parent.parent.parent.parent
-    geode_source = harness_dir / "geode"
-
-    # If geode source doesn't exist, try the parent directory structure
-    if not geode_source.exists():
-        # Try /home/benji/src/gl/devnw/codepros/geode/geode
-        geode_source = Path("/home/benji/src/gl/devnw/codepros/geode/geode")
+    # Prefer GEODE_SOURCE_DIR env var, then fall back to sibling directory detection.
+    geode_source_env = os.environ.get("GEODE_SOURCE_DIR")
+    if geode_source_env:
+        geode_source = Path(geode_source_env)
+    else:
+        harness_dir = Path(__file__).resolve().parent.parent.parent.parent.parent
+        geode_source = harness_dir / "geode"
 
     if not geode_source.exists():
         return TestResult(
@@ -528,11 +527,7 @@ def _run_sequential_test(
     admin_password = env.get("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
 
     # Transport-aware server address and flags
-    use_grpc = env.get("GEODE_TRANSPORT") == "grpc"
-    if use_grpc:
-        server_addr = env.get("GEODE_GRPC_ADDRESS", env.get("GEODE_SERVER_ADDRESS", f"127.0.0.1:{DEFAULT_GRPC_PORT}"))
-    else:
-        server_addr = env.get("GEODE_SERVER_ADDRESS", f"127.0.0.1:{DEFAULT_QUIC_PORT}")
+    server_addr, use_grpc = _resolve_server_address(env)
 
     try:
         # Reuse shared client if provided (PERF-007), else create one
@@ -647,9 +642,8 @@ def _substitute_one(
     data_dir: Path | None,
 ) -> str:
     """Replace ``${key}``, ``${env:key}``, ``${secret:key}``, ``${data_dir}`` in *text*."""
-    import re as _re
 
-    def _replacer(m: _re.Match[str]) -> str:
+    def _replacer(m: re.Match[str]) -> str:
         full = m.group(0)  # e.g. ${env:FOO} or ${FOO} or ${secret:BAR} or ${data_dir}
         inner = m.group(1)  # e.g. env:FOO or FOO or secret:BAR or data_dir
 
@@ -667,7 +661,7 @@ def _substitute_one(
         # Plain ${KEY} — look up in env
         return env.get(inner, full)
 
-    return _re.sub(r"\$\{([^}]+)\}", _replacer, text)
+    return re.sub(r"\$\{([^}]+)\}", _replacer, text)
 
 
 def run_plaintext_verification(
@@ -686,9 +680,7 @@ def run_plaintext_verification(
         return violations
 
     # Build a combined extended regex: pat1|pat2|pat3
-    import re as _re
-
-    combined = "|".join(_re.escape(p) for p in patterns)
+    combined = "|".join(re.escape(p) for p in patterns)
 
     try:
         result = subprocess.run(

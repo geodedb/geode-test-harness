@@ -7,9 +7,12 @@ that should have been encrypted by TDE.
 from __future__ import annotations
 
 import contextlib
+import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -163,57 +166,9 @@ class PlaintextScanner:
                         )
                     )
         except subprocess.TimeoutExpired:
-            pass
+            logger.warning("Grep timed out during combined pattern scan on %s", self.data_dir)
         except Exception:
-            pass
-
-    def _scan_pattern(self, pattern: str) -> None:
-        """Scan for a single pattern using grep."""
-        try:
-            # Use grep -r for recursive search, -a for binary files
-            cmd = ["grep", "-r", "-a", "-l", "-n", pattern, str(self.data_dir)]
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-
-            if result.returncode == 0:
-                # Pattern was found
-                for line in result.stdout.strip().split("\n"):
-                    if not line:
-                        continue
-
-                    file_path = line
-                    line_number = None
-
-                    # Parse line number if present
-                    if ":" in line:
-                        parts = line.split(":", 1)
-                        file_path = parts[0]
-                        with contextlib.suppress(ValueError, IndexError):
-                            line_number = int(parts[1].split(":")[0])
-
-                    # Check if file should be scanned
-                    if not self._should_scan_file(file_path):
-                        continue
-
-                    # Determine file type
-                    file_type = self._get_file_type(file_path)
-
-                    violation = PlaintextViolation(
-                        file_path=file_path,
-                        pattern=pattern,
-                        line_number=line_number,
-                        file_type=file_type,
-                    )
-                    self.violations.append(violation)
-
-        except subprocess.TimeoutExpired:
-            pass
-        except Exception:
-            pass
+            logger.warning("Error during combined pattern scan on %s", self.data_dir, exc_info=True)
 
     def _should_scan_file(self, file_path: str) -> bool:
         """Check if a file should be included in the scan."""

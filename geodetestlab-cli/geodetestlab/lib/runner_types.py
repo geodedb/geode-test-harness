@@ -11,6 +11,10 @@ from typing import Any
 # environment at import time so it can be overridden externally.
 DEFAULT_ADMIN_PASSWORD: str = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
 
+# Network port defaults — centralised so every module imports from here.
+DEFAULT_QUIC_PORT: int = 3141
+DEFAULT_GRPC_PORT: int = 50051
+
 
 class RunnerError(Exception):
     """Raised when the test runner encounters an error."""
