@@ -18,7 +18,7 @@ from geodetestlab.lib.spec import TestCase
 
 def _make_case(**overrides: object) -> TestCase:
     """Helper to build a minimal TestCase with overrides."""
-    defaults: dict = {
+    defaults: dict[str, object] = {
         "name": "security-test",
         "description": "test",
         "test_type": "cli",
