@@ -1,6 +1,6 @@
 # Gap Analysis
 
-> **Last Updated:** 2026-02-13
+> **Last Updated:** 2026-03-27
 > **GitLab Project:** [devnw/codepros/geode/geode-test-harness](https://gitlab.com/devnw/codepros/geode/geode-test-harness)
 > **Analysis Method:** Requirements-to-code comparison, automated SAST/SCA (semgrep, bandit, gitleaks, trufflehog, shellcheck, hadolint, trivy, grype, syft, osv-scanner, cargo-audit), manual adversarial review, and code quality analysis (ruff, mypy, pytest)
 
@@ -11,12 +11,250 @@ This document tracks **ALL gaps** across the project. Resolved gaps are in [GAP_
 | Severity | Open | Won't Do | Closed | Previously Resolved | Total |
 |----------|------|----------|--------|---------------------|-------|
 | Critical | 0 | 0 | 2 | 1 | 3 |
-| High | 0 | 0 | 12 | 2 | 14 |
-| Medium | 0 | 2 | 19 | 10 | 31 |
-| Low | 0 | 0 | 12 | 5 | 17 |
-| **Total** | **0** | **2** | **45** | **18** | **65** |
+| High | 2 | 0 | 12 | 2 | 16 |
+| Medium | 4 | 2 | 19 | 10 | 35 |
+| Low | 8 | 0 | 12 | 5 | 25 |
+| **Total** | **14** | **2** | **45** | **18** | **79** |
 
 Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESOLVED.md](./GAP_ANALYSIS_RESOLVED.md).
+
+---
+
+## Open Gaps (14)
+
+### GAP-0265: No unit tests for security fixes (#48, #49, #58)
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Test
+- **Severity:** High
+- **Requirement source:** [#48](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/48), [#49](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/49), [#58](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/58)
+- **Current state (evidence):**
+  - `geodetestlab-cli/geodetestlab/tests/` -- 5 test files exist; none cover executor.py or runner.py security behavior
+  - `grep -ri "test_.*injection\|test_.*traversal\|test_.*allowlist"` in tests/ returns no matches
+- **Why this is a gap:** Three critical/high security fixes have zero unit test coverage: shell metacharacter routing (#48), path traversal sandbox (#49), pre-server command allowlist (#58). Security regressions can land without any test catching them.
+- **Impact/Risk:** Security regressions can be introduced silently. These are the highest-risk code paths in the harness.
+- **Recommended fix:** Create `test_executor_security.py` and `test_runner_security.py` covering: (1) metacharacter rejection in non-shell mode, (2) path traversal rejection in setup_files, (3) allowlist enforcement for pre-server commands.
+- **Acceptance criteria:**
+  - At least one test per security fix verifying the guard logic
+  - Tests fail if the guard is removed
+
+### GAP-0268: test-all integration job has allow_failure: true
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** CI-CD
+- **Severity:** High
+- **Requirement source:** `.gitlab-ci.yml:299-300`
+- **Current state (evidence):**
+  - `.gitlab-ci.yml:299-300` -- `allow_failure: true` on the main integration test job
+  - Comment: "Allow failures while CI integration stabilizes"
+- **Why this is a gap:** The integration test suite can fail and merges still proceed. Regressions in GQL query behavior, HTTP endpoints, or CLI commands are not caught at merge time.
+- **Impact/Risk:** High -- integration test failures are the primary quality gate for this test harness project.
+- **Recommended fix:** Remove `allow_failure: true` from the test-all job. If stability concerns remain, gate it on `$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH` only.
+- **Acceptance criteria:**
+  - `test-all` job failure blocks the pipeline on the default branch
+
+### GAP-0261: .dockerignore file missing despite documented fix (#77 / PERF-015)
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Requirement
+- **Severity:** Medium
+- **Requirement source:** [#77](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/77) (PERF-015: Dockerfile COPY . . context bloat)
+- **Current state (evidence):**
+  - `test -f .dockerignore` returns "MISSING"
+  - `docs/PERF_GAP_ANALYSIS.md:211` documents the fix as "Created `.dockerignore`" with status **Closed**
+  - The file was either never committed or was deleted after the issue was closed
+- **Why this is a gap:** The documented resolution claims a .dockerignore was created, but the file does not exist on disk at HEAD (183a95d). The Docker build context bloat issue remains unresolved.
+- **Impact/Risk:** Every `docker build` copies the entire repository context including `.git/`, `__pycache__/`, test artifacts, and CI reports. Inflates build time and layer cache size.
+- **Recommended fix:** Create `.dockerignore` with at minimum: `.git`, `__pycache__`, `*.pyc`, `.venv`, `reports/`, `docs/`, `.gitlab-ci.yml`, `*.md`
+- **Acceptance criteria:**
+  - `.dockerignore` exists at repo root with exclusions for `.git` and `__pycache__`
+  - `docker build` context size is measurably smaller
+
+### GAP-0262: Makefile Docker commands still bind to 0.0.0.0 despite #54 being closed
+
+- **Status: Won't Do**
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Bug
+- **Severity:** Medium
+- **Requirement source:** [#54](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/54) (Server binds 0.0.0.0 in ServerManager)
+- **Current state (evidence):**
+  - `Makefile:143` -- `serve --listen 0.0.0.0:3141 --listen-grpc 0.0.0.0:50051 --log-level info`
+  - `lib/server_manager.py` fix confirmed (binds 127.0.0.1), but the Makefile `docker-start` target was not updated
+- **Why this is a gap:** The Makefile Docker target uses 0.0.0.0 inside the container.
+- **Why Won't Do:** Inside a Docker container, the process must bind to 0.0.0.0 for the `-p` port mapping to work. Docker's `-p host:container` maps the host port to the container's listening address. If the container process binds to 127.0.0.1, Docker's port mapping cannot reach it from outside the container's network namespace. The host-side exposure is already limited by the `-p` flag which binds to all host interfaces by default; to restrict host-side exposure, use `-p 127.0.0.1:3141:3141/udp` in the Docker run command (which is a separate concern from the in-container bind address). The `server_manager.py` fix correctly binds to 127.0.0.1 for the non-Docker (bare metal) path.
+- **Impact/Risk:** Low. Docker port mapping controls host-side exposure independently of in-container bind address.
+
+### GAP-0266: No pytest-cov configured; 80% coverage threshold cannot be measured
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** CI-CD
+- **Severity:** Medium
+- **Requirement source:** Project CLAUDE.md testing requirements, `~/.claude/rules/common/testing.md` ("Verify 80%+ coverage")
+- **Current state (evidence):**
+  - `geodetestlab-cli/pyproject.toml` -- no `pytest-cov` in dependencies, no `[tool.coverage]` configuration
+  - `.gitlab-ci.yml` test-unit job: `python -m pytest geodetestlab/tests/ -v --tb=short` -- no `--cov` flag
+  - No coverage report artifacts in CI
+- **Why this is a gap:** The testing requirements mandate 80%+ coverage verification, but no coverage tool is installed or configured. There is no way to measure or enforce coverage thresholds.
+- **Impact/Risk:** Coverage regressions are invisible. The 80% threshold cannot be verified.
+- **Recommended fix:** Add `pytest-cov` to dev dependencies, configure `[tool.coverage.run]` and `[tool.coverage.report]` in `pyproject.toml` with `fail_under = 80`, add `--cov` flags to the CI test-unit job.
+- **Acceptance criteria:**
+  - `pytest --cov` produces a coverage report
+  - CI fails if coverage drops below 80%
+
+### GAP-0274: REQUIREMENTS.md stale (6 weeks, missing 32 issues)
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Docs
+- **Severity:** Medium
+- **Requirement source:** `docs/REQUIREMENTS.md:3` -- "Last Updated: 2026-02-09"
+- **Current state (evidence):**
+  - `docs/REQUIREMENTS.md:11` -- "No open issues. All 47 gap issues are resolved."
+  - Does not mention issues #48 through #79 (32 issues created after 2026-02-09)
+  - Issues #48-#62 are security/hardening findings; #63-#79 are performance findings
+- **Why this is a gap:** The requirements mirror document is stale by 6 weeks and 32 issues. Anyone using it as a requirements reference will miss a third of the project's tracked work.
+- **Impact/Risk:** Documentation drift reduces trust in project tracking. New team members or auditors get an incomplete picture.
+- **Recommended fix:** Update REQUIREMENTS.md to include issues #48-#79 with their current status (closed/accepted/won't do).
+- **Acceptance criteria:**
+  - REQUIREMENTS.md lists all 79 issues with correct status
+  - "Last Updated" date is current
+
+### GAP-0263: Doc claims resolve().relative_to() but code uses str().startswith()
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Bug
+- **Severity:** Low
+- **Requirement source:** [#49](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/49) (Arbitrary file write via setup_files path traversal)
+- **Current state (evidence):**
+  - `geodetestlab-cli/geodetestlab/lib/executor.py:94` -- `if not str(resolved).startswith(str(sandbox_root)):`
+  - `docs/GAP_ANALYSIS.md:29` documents the fix as "Path traversal sandbox via `resolve().relative_to()` check against temp dir"
+- **Why this is a gap:** The documentation says `relative_to()` is used, but the actual implementation uses `str().startswith()`. The `startswith()` approach has a known bypass: a sandbox root of `/tmp/test` would allow writes to `/tmp/test-evil/`. Practical risk is very low due to unique temp dir names.
+- **Impact/Risk:** Theoretical path traversal bypass if the temp directory name is a prefix of another directory. Very low practical risk.
+- **Recommended fix:** Either update the code to use `resolved.relative_to(sandbox_root)` inside a try/except ValueError (as documented), OR update the documentation to accurately describe the `startswith()` approach.
+- **Acceptance criteria:**
+  - Code and documentation agree on the mechanism
+  - If `startswith()` is kept, ensure `sandbox_root` always ends with `/` before comparison
+
+### GAP-0264: Doc claims _tracked_pids/track_pid()/untrack_pid() but actual mechanism uses _active_servers
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Docs
+- **Severity:** Low
+- **Requirement source:** [#62](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/62) (Insecure temp file/process cleanup patterns)
+- **Current state (evidence):**
+  - `geodetestlab-cli/geodetestlab/cli.py:41-68` -- `_tracked_pids` set, `track_pid()`, `untrack_pid()` defined
+  - Functions exist but their actual usage within server lifecycle paths needs verification
+- **Why this is a gap:** The functions exist but may not be wired into all server lifecycle paths. The existing `_kill_geode_processes()` function has fallback logic, so orphaned processes are still cleaned up.
+- **Impact/Risk:** Low -- fallback cleanup logic covers the gap in practice.
+- **Recommended fix:** Verify that `track_pid()` is called wherever server processes are spawned (in `server.py` and `runner.py`). Update docs if wiring is incomplete.
+- **Acceptance criteria:**
+  - `track_pid()` is called for every `subprocess.Popen` of the geode binary, or documentation is updated to reflect partial coverage
+
+### GAP-0267: mypy allow_failure in CI (type errors don't block pipeline)
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** CI-CD
+- **Severity:** Low
+- **Requirement source:** `.gitlab-ci.yml:64-65`
+- **Current state (evidence):**
+  - `.gitlab-ci.yml:65` -- `allow_failure: true` on lint-mypy job
+  - Comment: "mypy can legitimately fail on third-party stubs; allow failure but log"
+- **Why this is a gap:** While third-party stub issues are a legitimate reason for `allow_failure`, this also suppresses real type errors in the project's own code.
+- **Impact/Risk:** Type errors can accumulate silently. Medium risk mitigated by `--ignore-missing-imports`.
+- **Recommended fix:** Configure mypy with `--follow-imports=silent` or per-module overrides to isolate third-party stub issues, then remove `allow_failure: true`.
+- **Acceptance criteria:**
+  - mypy runs without `allow_failure` and does not fail on third-party stubs alone
+
+### GAP-0269: No linting for non-Python runners (Go, Zig, Rust, Node.js)
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Code Quality
+- **Severity:** Low
+- **Requirement source:** General code quality standards
+- **Current state (evidence):**
+  - `.gitlab-ci.yml` -- lint-python and lint-mypy cover Python code only
+  - No `go vet`, `golangci-lint`, `clippy`, `eslint`, or Zig compiler warnings in CI
+  - Runners in `runners/` directory have no lint jobs
+- **Why this is a gap:** Non-Python runners have no automated quality checks in CI. Issues like deprecated `ioutil.ReadFile` (PERF-014) were only caught during manual review.
+- **Impact/Risk:** Low -- runners are supplementary components. Quality issues can accumulate.
+- **Recommended fix:** Add `go vet ./...` to build-go, `cargo clippy` to build-rust, `npx eslint` to build-nodejs. Zig warnings are surfaced during build.
+- **Acceptance criteria:**
+  - Each runner language has at least basic lint/vet checks in its CI build job
+
+### GAP-0270: Two separate pytest configs (root pytest.ini vs geodetestlab-cli/pyproject.toml)
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Code Quality
+- **Severity:** Low
+- **Requirement source:** General code quality standards
+- **Current state (evidence):**
+  - `pytest.ini` at repo root -- `testpaths = tests` (directory does not exist at root)
+  - `geodetestlab-cli/pyproject.toml:89-91` -- `[tool.pytest.ini_options]` with `testpaths = ["geodetestlab/tests"]`
+- **Why this is a gap:** Running `pytest` from the repo root uses `pytest.ini` and looks for a non-existent `tests/` directory. Running from `geodetestlab-cli/` uses pyproject.toml correctly.
+- **Impact/Risk:** Low -- CI runs from the correct directory. Only affects developer experience.
+- **Recommended fix:** Remove the root-level `pytest.ini` (legacy artifact), or update it to point to the correct test directory.
+- **Acceptance criteria:**
+  - Only one pytest configuration exists, or both are consistent and documented
+
+### GAP-0271: No JSON Schema for YAML test spec format
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Docs
+- **Severity:** Low
+- **Requirement source:** General documentation standards
+- **Current state (evidence):**
+  - `geodetestlab-cli/geodetestlab/lib/spec.py` -- validates specs programmatically but no formal schema file
+  - 243 YAML spec files in `specs/` with no schema reference
+- **Why this is a gap:** No machine-readable schema for the YAML test spec format. Contributors must read `spec.py` source code to understand valid fields. IDE autocompletion/validation is not available.
+- **Impact/Risk:** Low -- programmatic validation in `spec.py` catches invalid specs at runtime. Developer experience improvement.
+- **Recommended fix:** Create a JSON Schema file (`specs/schema.json` or `docs/spec-schema.json`) and reference it from CLAUDE.md.
+- **Acceptance criteria:**
+  - A JSON Schema file exists that validates the YAML spec format
+
+### GAP-0272: Dead CI jobs (build-python, build-nodejs produce no artifacts)
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** CI-CD
+- **Severity:** Low
+- **Requirement source:** `.gitlab-ci.yml:196-216`
+- **Current state (evidence):**
+  - `.gitlab-ci.yml:196-203` -- `build-python` runs `python3 -c "import yaml; print('Python dependencies installed')"` with `artifacts: paths: []`
+  - `.gitlab-ci.yml:205-216` -- `build-nodejs` installs `yaml` package and caches `node_modules/`
+  - Both extend `.build-template` which has `allow_failure: true`
+  - Neither produces artifacts consumed by downstream jobs
+- **Why this is a gap:** These jobs consume CI minutes but produce no meaningful output.
+- **Impact/Risk:** Low -- wasted CI time (~30-60s per job per pipeline run).
+- **Recommended fix:** Either remove these jobs or make them useful (e.g., `node --check runners/nodejs_runner.js`).
+- **Acceptance criteria:**
+  - Jobs either produce artifacts consumed by downstream stages or are removed
+
+### GAP-0273: Three potentially unused dependencies (pydantic, jmespath, psutil)
+
+- **Issue:** Not yet created (--skip-issues)
+- **Category:** Code Quality
+- **Severity:** Low
+- **Requirement source:** `geodetestlab-cli/pyproject.toml:31,34,36`
+- **Current state (evidence):**
+  - `pyproject.toml:31` -- `pydantic>=2.5.0`
+  - `pyproject.toml:34` -- `jmespath>=1.0.1`
+  - `pyproject.toml:36` -- `psutil>=5.9.0`
+  - `grep -r "import pydantic\|from pydantic\|import jmespath\|import psutil"` in `geodetestlab-cli/**/*.py` returns no matches
+- **Why this is a gap:** Three dependencies are declared but never imported in application code. They inflate the install footprint and attack surface.
+- **Impact/Risk:** Low -- unnecessary dependencies, minor supply chain risk.
+- **Recommended fix:** Verify these are truly unused (check dynamic imports, CLI plugins, test-only usage), then remove if confirmed unused.
+- **Acceptance criteria:**
+  - All declared dependencies are imported somewhere in the codebase, or unused ones are removed
+
+---
+
+## Process Finding: GitLab Issue Status Discrepancy
+
+**Observation:** 32 GitLab issues (#48-#79) remain OPEN on the platform despite code fixes being documented as implemented. Code verification confirms the fixes ARE in the codebase.
+
+**Root cause:** Issues were resolved in code and documented in gap analysis files, but were never formally closed on GitLab.
+
+**Recommendation:** Close all 32 issues on GitLab with references to the implementing commits. This is a process hygiene issue, not a code gap, so no Gap-ID is assigned.
+
+**Note:** Items #55 and #59 remain permanently "Won't Do" per project policy (see MEMORY.md).
 
 ---
 
@@ -190,12 +428,13 @@ See previous GAP_ANALYSIS.md version for full resolution details.
 
 ## Analysis Metadata
 
-**Analysis Date:** 2026-02-13
-**Analyzed By:** Claude Code (adversarial security review + automated scanning)
-**Repository State:** 65 gaps tracked. 0 open, 2 won't do, 45 closed in this project, 18 previously resolved.
+**Analysis Date:** 2026-03-27
+**Analyzed By:** Claude Code (Opus 4.6, requirements-to-code gap analysis + automated scanning)
+**Repository State:** 79 gaps tracked. 14 open, 2 won't do, 45 closed in this project, 18 previously resolved.
 **Issue Series:**
 
 - GAP-0001 through GAP-0018: Resolved (see [GAP_ANALYSIS_RESOLVED.md](./GAP_ANALYSIS_RESOLVED.md))
 - GAP-0019 through GAP-0037: All 19 closed
 - QG-001 through QG-010: All 10 closed
 - Issues #48 through #62: 13 closed, 2 won't do (all resolved)
+- GAP-0261 through GAP-0274: 14 open (added 2026-03-27)
