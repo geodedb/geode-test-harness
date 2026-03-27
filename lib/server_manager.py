@@ -186,8 +186,8 @@ class ServerManager:
                         s.close()
                     except OSError:
                         # Port is in use - server is listening
-                        # Give server a moment to fully initialize
-                        time.sleep(0.5)
+                        # Brief pause for server to complete initialization
+                        time.sleep(0.1)
                         # Verify process is still running after the delay
                         if self.process.poll() is not None:
                             raise RuntimeError(
