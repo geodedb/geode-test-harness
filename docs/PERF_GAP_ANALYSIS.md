@@ -14,9 +14,9 @@ This document tracks all performance and scalability findings for the Geode Test
 |----------|--------|----------|------|-------|
 | P0 (Critical) | 0 | 1 | 0 | 1 |
 | P1 (High) | 5 | 0 | 0 | 5 |
-| P2 (Medium) | 4 | 0 | 3 | 7 |
+| P2 (Medium) | 5 | 0 | 2 | 7 |
 | P3 (Low/Info) | 3 | 4 | 3 | 10 |
-| **Total** | **12** | **5** | **6** | **23** |
+| **Total** | **13** | **5** | **5** | **23** |
 
 ### Top 5 Performance Bottlenecks
 
@@ -24,7 +24,7 @@ This document tracks all performance and scalability findings for the Geode Test
 2. **No performance regression tests in CI** (PerfScore: 36) - Regressions go undetected -- **Open**
 3. **Parallel worker cap at 4** (PerfScore: 28) - Underutilizes multi-core machines -- **Closed** (transport-aware cap)
 4. **Server readiness polling via subprocess** (PerfScore: 28) - 100 ss spawns per server start -- **Closed** (socket bind probe)
-5. **Server restart logic duplicated 3x with for...else bug** (PerfScore: 24) - Dead `_replay_setup()` in 2 of 3 copies -- **Open**
+5. **Server restart logic duplicated 3x with for...else bug** (PerfScore: 24) - Dead `_replay_setup()` in 2 of 3 copies -- **Closed** (extracted `_restart_server()` helper)
 
 ---
 
@@ -208,19 +208,9 @@ build-zig and test-all both download/extract Zig (~200MB) independently.
 
 ### PERF-018: Server restart logic duplicated 3x with for...else bug {#perf-018}
 
-**PerfScore:** 24 | **Severity:** P2 | **Area:** app | **Confidence:** confirmed | **Status: Open**
+**PerfScore:** 24 | **Severity:** P2 | **Area:** app | **Confidence:** confirmed | **Status: Closed**
 
-The server restart loop is copy-pasted three times in `runner.py`:
-
-1. **Copy 1** (lines 413-452): Crash-during-iteration handler. Uses a `restarted` flag. Correctly calls `_replay_setup()` when restart succeeds.
-2. **Copy 2** (lines 512-534): Post-test "server died" handler. Uses Python `for...else` pattern, but `break` is called on BOTH success (line 525) AND final failure (line 534). The `else` block (line 535-537 calling `_replay_setup()`) only executes when the loop completes without `break` -- which never happens. `_replay_setup()` is dead code here.
-3. **Copy 3** (lines 576-601): Post-test "server hung" handler. Same `for...else` bug as Copy 2. `_replay_setup()` on line 600-601 is dead code.
-
-**Perf Impact:** The runtime cost of the duplication itself is negligible. The real impact is correctness: after a successful restart in copies 2 and 3, setup queries are never replayed, so subsequent tests may fail due to missing data (graphs, users, schemas created in setup). This can cause cascading false failures in CI.
-
-**Root Cause:** Copy-paste of restart logic without extracting a shared helper. The `for...else` semantics were misunderstood -- `else` runs only when the loop exits without `break`, but both exit paths use `break`.
-
-**Fix Guidance:** Extract a `_restart_server()` helper that returns the new process (or raises). Call `_replay_setup()` unconditionally after a successful restart in all three sites. Alternatively, refactor into a single restart-with-replay function.
+**Resolution:** Extracted `_restart_server()` helper in `runner.py:137`. All three restart sites now call the shared helper, eliminating the for/else bug. `_replay_setup()` is correctly called after every successful restart. Commit `8043c5c`.
 
 **Validation Plan:**
 

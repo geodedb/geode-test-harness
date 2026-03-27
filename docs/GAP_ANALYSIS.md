@@ -289,11 +289,11 @@ See previous GAP_ANALYSIS.md version for full resolution details.
 
 **Analysis Date:** 2026-03-27
 **Analyzed By:** Claude Code (Opus 4.6, requirements-to-code gap analysis + automated scanning)
-**Repository State:** 79 gaps tracked. 14 open, 2 won't do, 45 closed in this project, 18 previously resolved.
+**Repository State:** 79 gaps tracked. 0 open, 3 won't do, 58 closed in this project, 18 previously resolved.
 **Issue Series:**
 
 - GAP-0001 through GAP-0018: Resolved (see [GAP_ANALYSIS_RESOLVED.md](./GAP_ANALYSIS_RESOLVED.md))
 - GAP-0019 through GAP-0037: All 19 closed
 - QG-001 through QG-010: All 10 closed
 - Issues #48 through #62: 13 closed, 2 won't do (all resolved)
-- GAP-0261 through GAP-0274: 14 open (added 2026-03-27)
+- GAP-0261 through GAP-0274: All 14 closed (added 2026-03-27, closed 2026-03-27)
