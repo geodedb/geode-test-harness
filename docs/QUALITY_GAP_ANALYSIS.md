@@ -11,13 +11,13 @@ This document tracks **code quality findings** for the Geode Test Harness. Secur
 
 ## Summary
 
-| Severity | Deferred | Closed | Deferred | Total |
-|----------|------|--------|----------|-------|
-| Critical | 0 | 2 | 0 | 2 |
-| High     | 0 | 3 | 0 | 3 |
-| Medium   | 0 | 5 | 6 | 11 |
-| Low      | 0 | 5 | 11 | 16 |
-| **Total** | **0** | **15** | **17** | **32** |
+| Severity | Closed | Deferred | Total |
+|----------|--------|----------|-------|
+| Critical | 2 | 0 | 2 |
+| High     | 3 | 0 | 3 |
+| Medium   | 7 | 4 | 11 |
+| Low      | 8 | 8 | 16 |
+| **Total** | **20** | **12** | **32** |
 
 ### Top 5 Risks
 
@@ -42,7 +42,7 @@ This document tracks **code quality findings** for the Geode Test Harness. Secur
 | 7 | Medium | 36 | readability | QG-007: Duplicated GQL keyword lists | `executor.py` | Fixed: uses `is_valid_gql()` from utils.py | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 8 | Medium | 36 | readability | QG-008: Duplicated transport-aware address resolution | `executor.py` | Fixed: extracted `_resolve_server_address()` helper | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 9 | Medium | 36 | readability | QG-009: Duplicated port constants | `runner_types.py` | Fixed: centralized in runner_types.py | -- | Commit `8043c5c` | -- | -- | **Closed** |
-| 10 | Medium | 32 | api-contract | QG-010: `stdout_contains` silently falls back to stderr | `checks.py:107-111` | `combined = output + error` concatenates stdout and stderr, then checks `stdout_contains` against the combined string. A test asserting `stdout_contains: ["error"]` would pass if the string appears only in stderr. This masks bugs where output goes to the wrong stream. | -- | Check stdout only; add separate `stderr_contains` or `output_contains` field if needed | git blame checks.py | S (< 1 day) | Deferred |
+| 10 | Medium | 32 | api-contract | QG-010: `stdout_contains` silently falls back to stderr | `checks.py:107-111` | Added `output_contains` field for explicit combined stdout+stderr checking. `stdout_contains` retained combined behavior for backward compat (961 usages across 88 specs). | -- | Commit `979f487` | -- | -- | **Closed** |
 | 11 | Medium | 32 | api-contract | QG-011: Exit codes are undocumented magic numbers | `cli.py` | Fixed: EXIT_SUCCESS/TEST_FAILURE/SPEC_ERROR/RUNNER_ERROR/SECRET_ERROR/INTERRUPTED constants | -- | Commit `0ae04fa` | -- | -- | **Closed** |
 | 12 | Medium | 32 | api-contract | QG-012: JSON report schema differs between single-spec and multi-spec modes | `runner.py` / `cli.py` | Single-spec returns a flat `RunSummary` dict. Multi-spec wraps results in an outer envelope. Consumers must handle both shapes. | -- | Unify report schema: always use envelope format, single-spec wraps one entry | git blame cli.py | M (1-2 days) | Deferred |
 | 13 | Medium | 28 | reliability | QG-013: `kill_stale_servers()` overly broad pkill pattern | `server.py` | Fixed: scoped to "geode serve.*geode-test-" | -- | Commit `8043c5c` | -- | -- | **Closed** |
@@ -59,10 +59,10 @@ This document tracks **code quality findings** for the Geode Test Harness. Secur
 | 24 | Low | 16 | reliability | QG-024: Fragile cwd discovery in shell test | `executor.py` | Fixed: uses GEODE_SOURCE_DIR env var with .resolve() | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 25 | Low | 16 | deps | QG-025: Three unused declared dependencies | `pyproject.toml` | Fixed: pydantic, jmespath, psutil removed | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 26 | Low | 12 | tests | QG-026: No pytest coverage configuration | `pyproject.toml` | Fixed: pytest-cov added with coverage config | -- | Commit `0ae04fa` | -- | -- | **Closed** |
-| 27 | Low | 12 | docs | QG-027: No exit code documentation | `cli.py` | Related to QG-011. No `--help` text, docstring, or external doc explaining what exit codes 0, 1, 2, etc. mean. | -- | Document in CLI help text and CLAUDE.md | git blame cli.py | S (< 1 day) | Deferred |
+| 27 | Low | 12 | docs | QG-027: No exit code documentation | `cli.py` | Added exit code table to Typer app help text (codes 0-4 and 130). | -- | Commit `979f487` | -- | -- | **Closed** |
 | 28 | Low | 12 | cleanup | QG-028: Dead code `_scan_pattern()` method | `plaintext_scanner.py` | Fixed: method deleted | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 29 | Low | 12 | docs | QG-029: `assertions.py` module purpose unclear | `assertions.py` | Fixed: deprecation docstring added explaining relationship to checks.py | -- | Commit `0ae04fa` | -- | -- | **Closed** |
-| 30 | Low | 12 | docs | QG-030: No ADR for dual plaintext verification | `plaintext_scanner.py` | Two scan methods exist (`_scan_file` and `_scan_pattern`) with no documented rationale for why both exist or which should be used. | -- | Write ADR or inline doc explaining the design; delete dead code per QG-028 | git blame plaintext_scanner.py | S (< 1 day) | Deferred |
+| 30 | Low | 12 | docs | QG-030: No ADR for dual plaintext verification | `plaintext_scanner.py` | Added design rationale docstring documenting _scan_combined vs removed _scan_pattern, PERF-005, and public API. | -- | Commit `979f487` | -- | -- | **Closed** |
 | 31 | Low | 8 | readability | QG-031: Files exceeding 800-line guideline | `cli.py` (803), `shell_runner.py` (833), `main.rs` (883), `zig_runner_new.zig` (1386) | Four files exceed the 800-line soft limit. `cli.py` and `shell_runner.py` are Python and decomposable. The Rust and Zig runners are self-contained binaries where this is less impactful. | -- | Decompose `cli.py` (QG-018) and `shell_runner.py`; runners are lower priority | git blame respective files | M-L | Deferred |
 | 32 | Low | 8 | architecture | QG-032: Cross-runner code duplication (~3,850 lines across 5 languages) | `runners/` (Go, Python, Rust, Zig, Node.js) | Each runner independently implements: YAML parsing, CLI arg handling, server connection, query execution, result formatting. Shared logic is re-implemented per language. | -- | Long-term: define a runner protocol/spec and generate boilerplate; short-term: document the contract in a shared `runners/PROTOCOL.md` | git blame runners/ | L (strategic) | Deferred |
 

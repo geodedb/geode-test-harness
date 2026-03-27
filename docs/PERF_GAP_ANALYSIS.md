@@ -2,7 +2,7 @@
 
 > **Last Updated:** 2026-03-27
 > **GitLab Project:** [devnw/codepros/geode/geode-test-harness](https://gitlab.com/devnw/codepros/geode/geode-test-harness)
-> **Commit:** 183a95d (main)
+> **Commit:** 979f487 (main)
 > **Analysis Method:** Full codebase read (all Python, Go, Rust runners, CI/CD, Dockerfile, Makefile), automated pattern scanning (subprocess spawn sites, sleep calls, env copies, string allocation patterns, regex compilation, connection reuse), manual adversarial performance review, Phase 3 deep review (restart logic, CI job analysis, dependency audit)
 > **Scoring:** PerfScore = Impact (1-5) x Likelihood (1-5) x 4
 
@@ -10,13 +10,13 @@ This document tracks all performance and scalability findings for the Geode Test
 
 ## Summary
 
-| Severity | Closed | Accepted | Open | Total |
-|----------|--------|----------|------|-------|
+| Severity | Closed | Accepted | Deferred | Total |
+|----------|--------|----------|----------|-------|
 | P0 (Critical) | 0 | 1 | 0 | 1 |
 | P1 (High) | 5 | 0 | 0 | 5 |
-| P2 (Medium) | 5 | 0 | 2 | 7 |
-| P3 (Low/Info) | 3 | 4 | 3 | 10 |
-| **Total** | **13** | **5** | **5** | **23** |
+| P2 (Medium) | 6 | 0 | 1 | 7 |
+| P3 (Low/Info) | 6 | 4 | 0 | 10 |
+| **Total** | **17** | **5** | **1** | **23** |
 
 ### Top 5 Performance Bottlenecks
 
@@ -33,22 +33,22 @@ This document tracks all performance and scalability findings for the Geode Test
 | # | Issue | PerfScore | Severity | Area | File:Line | Status |
 |---|-------|-----------|----------|------|-----------|--------|
 | 1 | [subprocess per CLI test](#perf-001) | 40 | P0 | app | executor.py:207 | **Accepted** |
-| 2 | [No perf regression tests in CI](#perf-023) | 36 | P2 | ci | .gitlab-ci.yml | **Open** |
+| 2 | [No perf regression tests in CI](#perf-023) | 36 | P2 | ci | .gitlab-ci.yml | **Deferred** |
 | 3 | [Server readiness polling via subprocess](#perf-002) | 28 | P1 | app | server.py:142 | **Closed** |
 | 4 | [Parallel worker cap at 4](#perf-003) | 28 | P1 | app | Makefile:326 | **Closed** |
-| 5 | [Server restart logic 3x duplication + for...else bug](#perf-018) | 24 | P2 | app | runner.py:413-601 | **Open** |
-| 6 | [Unconditional 0.5s sleep in server_manager](#perf-019) | 24 | P2 | app | server_manager.py:190 | **Open** |
+| 5 | [Server restart logic 3x duplication + for...else bug](#perf-018) | 24 | P2 | app | runner.py:413-601 | **Closed** |
+| 6 | [Unconditional 0.5s sleep in server_manager](#perf-019) | 24 | P2 | app | server_manager.py:190 | **Closed** |
 | 7 | [Sequential tests within spec](#perf-004) | 24 | P1 | app | runner.py:229 | **Closed** |
 | 8 | [Plaintext grep per pattern](#perf-005) | 24 | P1 | app | executor.py:594 | **Closed** |
 | 9 | [CI pip install in 4+ jobs](#perf-006) | 20 | P1 | ci | .gitlab-ci.yml | **Closed** |
 | 10 | [httpx.Client per test case](#perf-007) | 16 | P2 | app | executor.py:284 | **Closed** |
-| 11 | [Redundant pip install pyyaml in 2 CI jobs](#perf-020) | 16 | P3 | ci | .gitlab-ci.yml:399,465 | **Open** |
-| 12 | [build-python CI job is a no-op](#perf-021) | 16 | P3 | ci | .gitlab-ci.yml:196-203 | **Open** |
+| 11 | [Redundant pip install pyyaml in 2 CI jobs](#perf-020) | 16 | P3 | ci | .gitlab-ci.yml:399,465 | **Closed** |
+| 12 | [build-python CI job is a no-op](#perf-021) | 16 | P3 | ci | .gitlab-ci.yml:196-203 | **Closed** |
 | 13 | [O(n*m) variable substitution](#perf-008) | 12 | P2 | app | executor.py:136 | **Closed** |
 | 14 | [Shell runner 0.3s sleep per command](#perf-009) | 12 | P2 | app | shell_runner.py:206 | **Closed** |
 | 15 | [CI Zig download duplication](#perf-010) | 12 | P2 | ci | .gitlab-ci.yml:260 | **Closed** |
 | 16 | [YAML re-parsed in workers](#perf-low) | 8 | P3 | app | cli.py:117 | **Accepted** |
-| 17 | [Rust runner serde_yaml 0.9 deprecated](#perf-022) | 8 | P3 | app | Cargo.toml:16 | **Open** |
+| 17 | [Rust runner serde_yaml 0.9 deprecated](#perf-022) | 8 | P3 | app | Cargo.toml:16 | **Closed** |
 | 18 | [os.environ.copy per test](#perf-low) | 4 | P3 | app | runner.py:127 | **Accepted** |
 | 19 | [find_geode_binary per worker](#perf-low) | 4 | P3 | app | lib/utils.py:82 | **Closed** |
 | 20 | [Go runner deprecated ioutil + code dup](#perf-low) | 4 | P3 | app | go_runner.go:112 | **Closed** |
@@ -238,9 +238,11 @@ python -m geodetestlab run --spec specs/server-crash-recovery.yml -v
 
 ### PERF-019: Unconditional 0.5s sleep in server_manager.py {#perf-019}
 
-**PerfScore:** 24 | **Severity:** P2 | **Area:** app | **Confidence:** confirmed | **Status: Open**
+**PerfScore:** 24 | **Severity:** P2 | **Area:** app | **Confidence:** confirmed | **Status: Closed**
 
-After the socket bind probe detects the server port is bound, `lib/server_manager.py:190` unconditionally sleeps 500ms "to let the server fully initialize."
+**Resolution:** Removed the unconditional `time.sleep(0.1)` after bind probe. The process liveness check (poll) is sufficient. Commit `979f487`.
+
+Previously: After the socket bind probe detects the server port is bound, `lib/server_manager.py:190` unconditionally slept after detection.
 
 ```python
 # lib/server_manager.py:190
@@ -271,9 +273,11 @@ time python -m geodetestlab run --spec specs/shell-basic.yml -v 2>&1 | grep "Ser
 
 ### PERF-020: Redundant pip install pyyaml in 2 CI jobs {#perf-020}
 
-**PerfScore:** 16 | **Severity:** P3 | **Area:** ci | **Confidence:** confirmed | **Status: Open**
+**PerfScore:** 16 | **Severity:** P3 | **Area:** ci | **Confidence:** confirmed | **Status: Closed**
 
-Two CI jobs install `pyyaml` but never use it:
+**Resolution:** Both pyyaml installs were already removed in a prior commit (CI refactoring). Verified: zero `pyyaml` references in `.gitlab-ci.yml`.
+
+Previously, two CI jobs installed `pyyaml` but never used it:
 
 1. `analyze-coverage` (`.gitlab-ci.yml:399`): Script uses only `json` and `os` modules.
 2. `generate-html-report` (`.gitlab-ci.yml:465`): Script uses only `json`, `os`, and `html` string operations.
@@ -303,9 +307,11 @@ grep -A 50 'generate-html-report:' .gitlab-ci.yml | grep -i yaml
 
 ### PERF-021: build-python CI job is a no-op {#perf-021}
 
-**PerfScore:** 16 | **Severity:** P3 | **Area:** ci | **Confidence:** confirmed | **Status: Open**
+**PerfScore:** 16 | **Severity:** P3 | **Area:** ci | **Confidence:** confirmed | **Status: Closed**
 
-The `build-python` job (`.gitlab-ci.yml:196-203`) installs `pyyaml`, prints a confirmation message, and produces empty artifacts (`paths: []`). It does not build, compile, or validate anything meaningful.
+**Resolution:** `build-python` job was already removed in a prior commit (GAP-0272/QG-023). Comment at `.gitlab-ci.yml:197` documents the removal.
+
+Previously, the `build-python` job installed `pyyaml`, printed a confirmation message, and produced empty artifacts.
 
 ```yaml
 build-python:
@@ -340,9 +346,11 @@ grep -n 'build-python' .gitlab-ci.yml
 
 ### PERF-022: Rust runner serde_yaml 0.9 deprecated {#perf-022}
 
-**PerfScore:** 8 | **Severity:** P3 | **Area:** app | **Confidence:** confirmed | **Status: Open**
+**PerfScore:** 8 | **Severity:** P3 | **Area:** app | **Confidence:** confirmed | **Status: Closed**
 
-`runners/rust_runner/Cargo.toml:16` depends on `serde_yaml = "0.9"`, which is officially deprecated and unmaintained. The crate's README states: "This crate is no longer maintained. Please use a maintained YAML library such as `serde_yml`."
+**Resolution:** Replaced `serde_yaml = "0.9"` with `serde_yml = "0.0.12"` in `Cargo.toml`. Updated `serde_yaml::` → `serde_yml::` in `main.rs`. Removed stale `Cargo.lock` for regeneration. Commit `979f487`.
+
+Previously, `runners/rust_runner/Cargo.toml:16` depended on `serde_yaml = "0.9"`, which is officially deprecated and unmaintained. The crate's README states: "This crate is no longer maintained. Please use a maintained YAML library such as `serde_yml`."
 
 ```toml
 serde_yaml = "0.9"
@@ -371,7 +379,9 @@ cargo test
 
 ### PERF-023: No performance regression tests in CI {#perf-023}
 
-**PerfScore:** 36 | **Severity:** P2 | **Area:** ci | **Confidence:** suspected | **Status: Open**
+**PerfScore:** 36 | **Severity:** P2 | **Area:** ci | **Confidence:** suspected | **Status: Deferred**
+
+**Deferral rationale:** Requires a running Geode server for baseline collection, plus 2-3 days of benchmark design and CI integration. Not achievable without server access in a single session.
 
 The CI pipeline has no benchmark or performance regression detection. Changes that degrade test harness throughput (e.g., adding sleeps, removing parallelism, breaking connection reuse) will not be caught until a human notices slower CI runs.
 
@@ -448,33 +458,21 @@ assert ratio < 1.2, f'Performance regression detected: {ratio:.2f}x slower'
 
 ## Remediation Roadmap
 
-### Open (6) -- Prioritized
+### Deferred (1)
 
-#### Quick Wins (< 1 day)
+| Finding | Effort | Expected Impact | Reason |
+|---------|--------|-----------------|--------|
+| PERF-023: Add performance regression CI job | 2-3 days | Prevents silent regressions | Requires running server for baseline collection |
 
-| Finding | Effort | Expected Impact |
-|---------|--------|-----------------|
-| PERF-020: Remove redundant `pip install pyyaml` | 5 min | ~5s CI savings/pipeline |
-| PERF-021: Remove no-op `build-python` job | 10 min | ~30s CI savings/pipeline |
-| PERF-022: Replace deprecated `serde_yaml` | 30 min | Supply-chain hygiene |
-
-#### Medium (1-5 days)
-
-| Finding | Effort | Expected Impact |
-|---------|--------|-----------------|
-| PERF-018: Extract `_restart_server()` helper, fix `for...else` | 2 hours | Correctness fix: `_replay_setup()` runs after restart |
-| PERF-019: Replace 0.5s sleep with health check | 1 hour | 500ms savings per shell_runner spec |
-
-#### Strategic (> 5 days)
-
-| Finding | Effort | Expected Impact |
-|---------|--------|-----------------|
-| PERF-023: Add performance regression CI job | 2-3 days | Prevents silent regressions |
-
-### Closed (12)
+### Closed (17)
 
 | Issue | Resolution |
 |-------|-----------|
+| PERF-018 Server restart duplication | Extracted `_restart_server()` helper (commit `8043c5c`) |
+| PERF-019 Post-bind sleep | Removed unconditional sleep after bind probe (commit `979f487`) |
+| PERF-020 Redundant pyyaml | Already removed in prior CI refactoring |
+| PERF-021 No-op build-python | Already removed (GAP-0272/QG-023) |
+| PERF-022 Deprecated serde_yaml | Replaced with serde_yml 0.0.12 (commit `979f487`) |
 | [#64](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/64) Server polling | Replaced `ss` with socket bind probe |
 | [#65](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/65) Grep per pattern | Combined into single `grep -E` |
 | [#67](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/67) Worker cap | Transport-aware parallelism |
