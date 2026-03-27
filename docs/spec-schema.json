@@ -1,0 +1,437 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/raw/main/docs/spec-schema.json",
+  "title": "Geode Test Specification",
+  "description": "Schema for YAML test specifications used by geodetestlab-cli. Authoritative source: geodetestlab-cli/geodetestlab/lib/spec.py",
+  "type": "object",
+  "required": ["name", "tests"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Human-readable name for the test suite"
+    },
+    "description": {
+      "type": "string",
+      "description": "Description of what this test suite validates"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["server", "cli"],
+      "default": "server",
+      "description": "server: auto-manages a Geode server per spec. cli: no server management"
+    },
+    "skip_server": {
+      "type": "boolean",
+      "default": false,
+      "description": "Legacy alias for mode: cli"
+    },
+    "server_args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Extra CLI arguments passed to 'geode serve'"
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Environment variables set for all tests in this spec"
+    },
+    "secrets": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/SecretConfig"
+      },
+      "description": "Named secrets resolved before test execution"
+    },
+    "setup": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          { "type": "object" }
+        ]
+      },
+      "description": "Setup queries executed after server starts, before tests"
+    },
+    "teardown": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Teardown commands executed after all tests"
+    },
+    "pre_server": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Shell commands run before server starts (allowlisted: rm, mkdir, cp, mv, chmod, touch, ln, sleep)"
+    },
+    "parallel_tests": {
+      "type": "boolean",
+      "default": false,
+      "description": "Run tests within this spec in parallel using ThreadPoolExecutor"
+    },
+    "default_timeout_ms": {
+      "type": "integer",
+      "default": 0,
+      "description": "Default per-test timeout in milliseconds (0 = use runner default of 30000)"
+    },
+    "plaintext_verification": {
+      "$ref": "#/$defs/PlaintextCheck",
+      "description": "Spec-level plaintext verification (TDE check) after all tests"
+    },
+    "cli": {
+      "type": "object",
+      "properties": {
+        "server": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "args": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "env": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            }
+          }
+        }
+      },
+      "description": "New-format configuration block (alternative to top-level mode/server_args)"
+    },
+    "tests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/TestCase" },
+      "description": "List of test cases to execute"
+    }
+  },
+  "$defs": {
+    "SecretConfig": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["env", "keyring", "file"],
+          "description": "Where to resolve the secret from"
+        },
+        "key": {
+          "type": "string",
+          "description": "Key name (env var name, keyring key, or file path)"
+        },
+        "service": {
+          "type": "string",
+          "description": "Keyring service name (only for source: keyring)"
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        },
+        "default": {
+          "type": "string",
+          "description": "Fallback value if secret cannot be resolved"
+        }
+      }
+    },
+    "TestCase": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Unique test case name within the spec"
+        },
+        "description": {
+          "type": "string"
+        },
+        "test_type": {
+          "type": "string",
+          "enum": ["cli", "http", "shell", "sequential"],
+          "default": "cli"
+        },
+        "query": {
+          "type": "string",
+          "description": "GQL query to execute (routed through 'geode query')"
+        },
+        "command": {
+          "type": "string",
+          "description": "CLI command string (variable substitution applied)"
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "CLI arguments (variable substitution applied)"
+        },
+        "stdin": {
+          "type": "string",
+          "description": "Text piped to the command's stdin"
+        },
+        "dsn": {
+          "type": "string",
+          "description": "DSN connection string — uses --dsn instead of --server, skips -U/-P injection"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Per-test environment variable overrides"
+        },
+        "skip": {
+          "type": "boolean",
+          "default": false
+        },
+        "skip_reason": {
+          "type": "string"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "default": 0,
+          "description": "Per-test timeout override (uses max of this and global timeout)"
+        },
+        "setup": {
+          "type": "object",
+          "properties": {
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["path", "content"],
+                "properties": {
+                  "path": {
+                    "type": "string",
+                    "description": "File path (must be under /tmp for sandbox safety)"
+                  },
+                  "content": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "description": "Files to create before running this test"
+        },
+        "expected": {
+          "$ref": "#/$defs/ExpectedResult"
+        },
+        "http_requests": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/HttpRequest" },
+          "description": "HTTP requests for test_type: http"
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TestStep" },
+          "description": "Steps for test_type: sequential"
+        },
+        "plaintext_check": {
+          "$ref": "#/$defs/PlaintextCheck"
+        }
+      }
+    },
+    "ExpectedResult": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["success", "error"],
+          "default": "success"
+        },
+        "exit_code": {
+          "oneOf": [
+            { "type": "integer" },
+            { "type": "array", "items": { "type": "integer" } }
+          ],
+          "description": "Expected exit code (single int or list of acceptable codes)"
+        },
+        "stdout_contains": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "object" }
+            ]
+          },
+          "description": "Substrings that must appear in stdout (falls back to stderr)"
+        },
+        "contains": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Shorthand for stdout_contains"
+        },
+        "stdout_not_contains": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "object" }
+            ]
+          }
+        },
+        "not_contains": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Shorthand for stdout_not_contains"
+        },
+        "stdout_regex": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Regex patterns that must match stdout (falls back to stderr)"
+        },
+        "regex": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Shorthand for stdout_regex"
+        },
+        "matches": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Shorthand for stdout_regex"
+        },
+        "stdout_exact": {
+          "type": "string",
+          "description": "Exact stdout match (whitespace-trimmed)"
+        },
+        "stderr_contains": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "stderr_not_contains": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "stderr_regex": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "stderr_exact": {
+          "type": "string"
+        },
+        "result_contains": {
+          "description": "Legacy: substring/list/dict that must appear in output",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array" },
+            { "type": "object" }
+          ]
+        },
+        "result_not_contains": {
+          "description": "Legacy: substring/list/dict that must NOT appear in output",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array" },
+            { "type": "object" }
+          ]
+        },
+        "result_matches": {
+          "description": "Legacy: regex that must match output",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "error_contains": {
+          "description": "Substring(s) that must appear in stderr",
+          "oneOf": [
+            { "type": "string" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        }
+      }
+    },
+    "HttpRequest": {
+      "type": "object",
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+          "default": "GET"
+        },
+        "url": {
+          "type": "string",
+          "description": "URL with ${VAR} substitution support"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "body": {
+          "type": "string"
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "default": 5000
+        },
+        "expect": {
+          "$ref": "#/$defs/HttpExpected"
+        }
+      }
+    },
+    "HttpExpected": {
+      "type": "object",
+      "properties": {
+        "status_code": { "type": "integer" },
+        "content_type": { "type": "string" },
+        "body_contains": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "body_not_contains": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "body_regex": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "TestStep": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["gql", "http", "wait"],
+          "default": "gql"
+        },
+        "query": { "type": "string" },
+        "method": { "type": "string" },
+        "url": { "type": "string" },
+        "headers": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "body": { "type": "string" },
+        "timeout_ms": { "type": "integer", "default": 5000 },
+        "wait_ms": { "type": "integer", "default": 0 },
+        "expect": {
+          "oneOf": [
+            { "$ref": "#/$defs/HttpExpected" },
+            { "type": "object" }
+          ]
+        }
+      }
+    },
+    "PlaintextCheck": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "search_patterns": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "scan_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "exclude_extensions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [".log", ".txt", ".md", ".yml", ".yaml", ".json"]
+        },
+        "fail_on_violation": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    }
+  }
+}
