@@ -1,18 +1,20 @@
 # Requirements Mirror
 
-> **Last Updated:** 2026-02-09
+> **Last Updated:** 2026-03-27
 > **GitLab Project:** [devnw/codepros/geode/geode-test-harness](https://gitlab.com/devnw/codepros/geode/geode-test-harness)
 > **Source of Truth:** GitLab Issues
 
 This document is a **flatfile mirror** of requirements tracked in GitLab. GitLab is the authoritative source of truth.
 
-## Open Issues by Priority
+## Summary
 
-**No open issues.** All 47 gap issues are resolved.
+79 total issues tracked. 47 original gap issues (all resolved). 15 security/hardening issues (#48-#62, all resolved). 17 performance issues (#63-#79, 12 resolved, 5 accepted by design).
 
-## Resolved Issues
+See [GAP_ANALYSIS.md](./GAP_ANALYSIS.md), [QUALITY_GAP_ANALYSIS.md](./QUALITY_GAP_ANALYSIS.md), [PERF_GAP_ANALYSIS.md](./PERF_GAP_ANALYSIS.md), and [SECURITY_GAP_ANALYSIS.md](./SECURITY_GAP_ANALYSIS.md) for detailed tracking.
 
-All 47 gap issues are closed. See [GAP_ANALYSIS.md](./GAP_ANALYSIS.md) for the findings table and [GAP_ANALYSIS_RESOLVED.md](./GAP_ANALYSIS_RESOLVED.md) for detailed resolution evidence.
+## Resolved Issues (Issues #1-#47)
+
+All 47 original gap issues are closed. See [GAP_ANALYSIS_RESOLVED.md](./GAP_ANALYSIS_RESOLVED.md) for detailed resolution evidence.
 
 ### Critical / High Priority (Resolved)
 
@@ -63,7 +65,7 @@ All 47 gap issues are closed. See [GAP_ANALYSIS.md](./GAP_ANALYSIS.md) for the f
 | Issue | Type | Title | Status |
 |-------|------|-------|--------|
 | [#41](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/41) | Cleanup | QG-004: 488-line dead ServerManagerDisabled class | **Closed** |
-| [#47](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/47) | Bug | QG-010: Pre-commit TODO hook always exits 0 | **Closed** |
+| [#47](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/47) | Bug | QG-010: Pre-commit check-todos hook always exits 0 | **Closed** |
 | [#37](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/37) | Enhancement | GAP-0037: Gitleaks false positives from test encryption keys | **Closed** |
 | [#24](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/24) | Bug | GAP-0024: Duplicate sys.path.insert in manager.py | **Closed** |
 | [#25](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/25) | Enhancement | GAP-0025: Temp directory accumulation from disabled cleanup | **Closed** |
@@ -108,12 +110,47 @@ All 47 gap issues are closed. See [GAP_ANALYSIS.md](./GAP_ANALYSIS.md) for the f
 - SSL certificate validation ([#31](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/31) - RESOLVED)
 - Dynamic code execution ([#23](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/23) - RESOLVED)
 - Secret scanning false positives ([#37](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/37) - RESOLVED)
+- Shell metacharacter routing ([#48](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/48) - RESOLVED)
+- Path traversal in setup_files ([#49](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/49) - RESOLVED)
+- Pre-server command allowlist ([#58](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/58) - RESOLVED)
+- Server bind address ([#54](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/54) - RESOLVED)
+- Audit/auth guards ([#61](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/61) - RESOLVED)
+- Temp file cleanup ([#62](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/62) - RESOLVED)
+- CI HTML report XSS ([#60](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/60) - RESOLVED)
+- Centralized test credentials ([#56](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/56) - RESOLVED)
+- SSL verification logging ([#53](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/53) - RESOLVED)
+- CI security job allow_failure ([#57](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/57) - RESOLVED)
+- Dockerfile hardening ([#55](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/55) - WON'T DO, org controls)
+- Python lockfile ([#59](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/59) - WON'T DO, org controls)
 
 ### Supply Chain
 
 - CI download integrity ([#32](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/32) - RESOLVED)
 - Dependency pinning ([#33](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/33) - RESOLVED)
 - Docker image pinning ([#35](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/35) - RESOLVED)
+- Go deps CVE-2024-45337 ([#50](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/50) - RESOLVED)
+- Python protobuf pin ([#51](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/51) - RESOLVED)
+- Rust bytes vulnerability ([#52](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/52) - RESOLVED)
+
+### Performance (Issues #63-#79)
+
+- Subprocess per CLI test ([#63](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/63) - ACCEPTED, by design)
+- Server readiness polling ([#64](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/64) - RESOLVED)
+- Plaintext grep optimization ([#65](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/65) - RESOLVED)
+- Variable substitution O(n*m) ([#66](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/66) - RESOLVED)
+- Parallel worker cap ([#67](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/67) - RESOLVED)
+- Sequential tests within spec ([#68](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/68) - RESOLVED)
+- httpx.Client per test ([#69](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/69) - RESOLVED)
+- YAML re-parsed in workers ([#70](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/70) - ACCEPTED)
+- os.environ.copy per spec ([#71](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/71) - ACCEPTED)
+- find_geode_binary per worker ([#72](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/72) - RESOLVED)
+- CI pip install duplication ([#73](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/73) - RESOLVED)
+- Shell runner sleep ([#74](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/74) - RESOLVED)
+- CI Zig toolchain duplication ([#75](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/75) - RESOLVED)
+- Go runner deprecated ioutil ([#76](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/76) - RESOLVED)
+- Dockerfile COPY context ([#77](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/77) - RESOLVED)
+- HTML report string concat ([#78](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/78) - ACCEPTED)
+- Docker readiness polling ([#79](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/79) - ACCEPTED)
 
 ### CI/CD
 
