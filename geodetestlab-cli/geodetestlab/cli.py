@@ -40,7 +40,16 @@ EXIT_INTERRUPTED = 130  # Ctrl-C (SIGINT)
 
 app = typer.Typer(
     name="geodetestlab",
-    help="Interactive CLI testing system for Geode graph database with LLM fuzzing",
+    help=(
+        "Interactive CLI testing system for Geode graph database with LLM fuzzing.\n\n"
+        "Exit codes:\n\n"
+        "  0  All tests passed\n\n"
+        "  1  One or more tests failed\n\n"
+        "  2  Spec loading / validation error\n\n"
+        "  3  Runner or server lifecycle error\n\n"
+        "  4  Secret resolution failed\n\n"
+        "  130  Interrupted (SIGINT)\n"
+    ),
     rich_markup_mode="rich",
 )
 

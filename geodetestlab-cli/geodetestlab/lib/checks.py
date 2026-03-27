@@ -105,7 +105,8 @@ def check_expectations(
                 return False
 
     # Check stdout_contains (list of substrings that must ALL be present)
-    # Note: Geode CLI often outputs to stderr, so we also check stderr as fallback
+    # Note: checks combined stdout+stderr for backward compatibility (961 usages).
+    # Use output_contains for explicit combined semantics.
     if expected.stdout_contains:
         combined = output + error
         for item in expected.stdout_contains:
@@ -119,8 +120,22 @@ def check_expectations(
                         return False
             else:
                 substring = str(item) if not isinstance(item, str) else item
-                # Check stdout first, then stderr as fallback
                 if substring not in output and substring not in error:
+                    return False
+
+    # Check output_contains (list of substrings in combined stdout+stderr — QG-010)
+    if expected.output_contains:
+        combined = output + error
+        for item in expected.output_contains:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    k_str = str(k)
+                    v_str = str(v)
+                    if k_str not in combined or v_str not in combined:
+                        return False
+            else:
+                substring = str(item) if not isinstance(item, str) else item
+                if substring not in combined:
                     return False
 
     # Check stderr_contains (list of substrings that must ALL be present)

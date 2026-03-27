@@ -185,10 +185,8 @@ class ServerManager:
                         # If we could bind, server hasn't started listening yet
                         s.close()
                     except OSError:
-                        # Port is in use - server is listening
-                        # Brief pause for server to complete initialization
-                        time.sleep(0.1)
-                        # Verify process is still running after the delay
+                        # Port is in use — server is listening.
+                        # Verify process is still alive (no blind sleep — PERF-019).
                         if self.process.poll() is not None:
                             raise RuntimeError(
                                 f"Server process exited with code {self.process.returncode}"

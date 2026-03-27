@@ -161,6 +161,7 @@ class ExpectedResult:
     error_contains: str | list[str] | None = None
     exit_code: int | list[int] | None = None
     stdout_contains: list[str | dict[str, Any]] | None = None
+    output_contains: list[str | dict[str, Any]] | None = None  # combined stdout+stderr
     stderr_contains: list[str] | None = None
     stdout_not_contains: list[str | dict[str, Any]] | None = None
     stderr_not_contains: list[str] | None = None
@@ -206,6 +207,7 @@ class ExpectedResult:
             error_contains=data.get("error_contains"),
             exit_code=data.get("exit_code"),
             stdout_contains=stdout_contains,
+            output_contains=normalize_list(data.get("output_contains")),
             stderr_contains=normalize_list(data.get("stderr_contains")),
             stdout_not_contains=stdout_not_contains,
             stderr_not_contains=normalize_list(data.get("stderr_not_contains")),

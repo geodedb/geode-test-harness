@@ -805,7 +805,7 @@ async fn main() -> Result<()> {
     let spec_content = std::fs::read_to_string(&args.spec)
         .with_context(|| format!("Failed to read spec file: {:?}", args.spec))?;
 
-    let spec: TestSpec = serde_yaml::from_str(&spec_content)
+    let spec: TestSpec = serde_yml::from_str(&spec_content)
         .with_context(|| "Failed to parse YAML specification")?;
 
     // Create runner

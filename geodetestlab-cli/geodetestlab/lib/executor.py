@@ -19,7 +19,7 @@ import httpx
 from .checks import check_expectations, check_http_expectations
 from .runner_types import DEFAULT_ADMIN_PASSWORD, DEFAULT_GRPC_PORT, DEFAULT_QUIC_PORT, TestResult
 from .spec import PlaintextCheck, TestCase
-from .utils import is_valid_gql
+from .utils import is_valid_gql, sanitize_args
 
 logger = logging.getLogger(__name__)
 
@@ -94,23 +94,27 @@ def run_cli_test(
     start_time = time.time()
 
     # Create setup files if defined (e.g., for --file flag tests)
-    # Sandbox: only allow writes under /tmp to prevent path traversal (CWE-22)
+    # Sandbox: per-test temp directory with 0o700 to prevent path traversal (CWE-22, SEC-015)
     if test_case.setup_files:
         import tempfile as _tempfile
 
-        sandbox_root = Path(_tempfile.gettempdir())
+        sandbox_root = Path(_tempfile.mkdtemp(prefix="geodetestlab_"))
+        os.chmod(sandbox_root, 0o700)
         for file_spec in test_case.setup_files:
             file_path = file_spec.get("path", "")
             file_content = file_spec.get("content", "")
             if file_path and file_content:
                 resolved = Path(file_path).resolve()
                 if not resolved.is_relative_to(sandbox_root):
-                    return TestResult(
-                        name=test_case.name,
-                        passed=False,
-                        duration_ms=(time.time() - start_time) * 1000,
-                        error=f"setup_files path must be under {sandbox_root}: {file_path}",
-                    )
+                    # Allow absolute paths only if they're under the system tmpdir
+                    sys_tmp = Path(_tempfile.gettempdir())
+                    if not resolved.is_relative_to(sys_tmp):
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            error=f"setup_files path must be under {sys_tmp}: {file_path}",
+                        )
                 try:
                     resolved.parent.mkdir(parents=True, exist_ok=True)
                     with open(resolved, "w") as f:
@@ -249,6 +253,19 @@ def run_cli_test(
             # Pass CLI-level timeout matching the test harness timeout
             if "--timeout" not in args:
                 cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])
+
+    # Validate user-supplied args for shell metacharacters (SEC-003).
+    # Shell tests are excluded — they intentionally use shell features.
+    if test_case.test_type != "shell" and test_case.args:
+        try:
+            sanitize_args(test_case.args)
+        except ValueError as e:
+            return TestResult(
+                name=test_case.name,
+                passed=False,
+                duration_ms=(time.time() - start_time) * 1000,
+                error=f"Unsafe argument rejected: {e}",
+            )
 
     # Merge test-specific environment
     test_env = env.copy()

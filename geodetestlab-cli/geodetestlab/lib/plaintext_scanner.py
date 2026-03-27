@@ -1,7 +1,20 @@
 """Plaintext scanner for TDE verification.
 
 This module provides tools for scanning data files to detect plaintext
-that should have been encrypted by TDE.
+that should have been encrypted by TDE (Transparent Data Encryption).
+
+Design rationale (QG-030):
+    The scanner uses a single ``grep -rE`` invocation via ``_scan_combined()``
+    to check all patterns in one pass.  An earlier design spawned one grep
+    per pattern (``_scan_pattern``), which was removed in PERF-005 because
+    the per-pattern approach scaled as O(patterns * files).  The combined
+    approach is O(files) regardless of pattern count.
+
+    The public entry points are:
+    - ``PlaintextScanner.scan()`` — class-based, returns ``PlaintextViolation`` objects.
+    - ``scan_for_plaintext()`` — standalone function used by ``executor.py``.
+
+    Both delegate to ``_scan_combined()`` internally.
 """
 
 from __future__ import annotations
