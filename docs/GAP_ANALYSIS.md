@@ -12,15 +12,15 @@ This document tracks **ALL gaps** across the project. Resolved gaps are in [GAP_
 |----------|------|----------|--------|---------------------|-------|
 | Critical | 0 | 0 | 2 | 1 | 3 |
 | High | 2 | 0 | 12 | 2 | 16 |
-| Medium | 4 | 2 | 19 | 10 | 35 |
-| Low | 8 | 0 | 12 | 5 | 25 |
-| **Total** | **14** | **2** | **45** | **18** | **79** |
+| Medium | 2 | 3 | 20 | 10 | 35 |
+| Low | 5 | 0 | 15 | 5 | 25 |
+| **Total** | **9** | **3** | **49** | **18** | **79** |
 
 Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESOLVED.md](./GAP_ANALYSIS_RESOLVED.md).
 
 ---
 
-## Open Gaps (14)
+## Open Gaps (9)
 
 ### GAP-0265: No unit tests for security fixes (#48, #49, #58)
 
@@ -120,19 +120,8 @@ Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESO
 
 ### GAP-0263: Doc claims resolve().relative_to() but code uses str().startswith()
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** Bug
-- **Severity:** Low
-- **Requirement source:** [#49](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/49) (Arbitrary file write via setup_files path traversal)
-- **Current state (evidence):**
-  - `geodetestlab-cli/geodetestlab/lib/executor.py:94` -- `if not str(resolved).startswith(str(sandbox_root)):`
-  - `docs/GAP_ANALYSIS.md:29` documents the fix as "Path traversal sandbox via `resolve().relative_to()` check against temp dir"
-- **Why this is a gap:** The documentation says `relative_to()` is used, but the actual implementation uses `str().startswith()`. The `startswith()` approach has a known bypass: a sandbox root of `/tmp/test` would allow writes to `/tmp/test-evil/`. Practical risk is very low due to unique temp dir names.
-- **Impact/Risk:** Theoretical path traversal bypass if the temp directory name is a prefix of another directory. Very low practical risk.
-- **Recommended fix:** Either update the code to use `resolved.relative_to(sandbox_root)` inside a try/except ValueError (as documented), OR update the documentation to accurately describe the `startswith()` approach.
-- **Acceptance criteria:**
-  - Code and documentation agree on the mechanism
-  - If `startswith()` is kept, ensure `sandbox_root` always ends with `/` before comparison
+- **Status:** Closed
+- **Resolution:** Updated `executor.py:94` to use `resolved.is_relative_to(sandbox_root)` (Python 3.9+), matching the documented approach. Commit `8043c5c`.
 
 ### GAP-0264: Doc claims _tracked_pids/track_pid()/untrack_pid() but actual mechanism uses _active_servers
 
@@ -229,20 +218,8 @@ Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESO
 
 ### GAP-0273: Three potentially unused dependencies (pydantic, jmespath, psutil)
 
-- **Issue:** Not yet created (--skip-issues)
-- **Category:** Code Quality
-- **Severity:** Low
-- **Requirement source:** `geodetestlab-cli/pyproject.toml:31,34,36`
-- **Current state (evidence):**
-  - `pyproject.toml:31` -- `pydantic>=2.5.0`
-  - `pyproject.toml:34` -- `jmespath>=1.0.1`
-  - `pyproject.toml:36` -- `psutil>=5.9.0`
-  - `grep -r "import pydantic\|from pydantic\|import jmespath\|import psutil"` in `geodetestlab-cli/**/*.py` returns no matches
-- **Why this is a gap:** Three dependencies are declared but never imported in application code. They inflate the install footprint and attack surface.
-- **Impact/Risk:** Low -- unnecessary dependencies, minor supply chain risk.
-- **Recommended fix:** Verify these are truly unused (check dynamic imports, CLI plugins, test-only usage), then remove if confirmed unused.
-- **Acceptance criteria:**
-  - All declared dependencies are imported somewhere in the codebase, or unused ones are removed
+- **Status:** Closed
+- **Resolution:** Confirmed unused via grep; removed `pydantic`, `jmespath`, and `psutil` from `pyproject.toml` dependencies. Commit `8043c5c`.
 
 ---
 
