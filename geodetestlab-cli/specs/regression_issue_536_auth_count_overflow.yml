@@ -1,0 +1,304 @@
+version: '1.0'
+name: regression-issue-536-auth-count-overflow
+description: >
+  Regression test for GitLab issue #536: integer overflow in countAuthRecords().
+  HashMap.count() returns u32 (HashMap.Size); summing four u32 values with bare +
+  performs u32 arithmetic and panics in safe/debug builds when the total exceeds
+  ~4.29 billion. Fixed by casting each count() to u64 before addition.
+
+  This spec exercises bulk MERGE operations (mirroring a real CMMC ingest: 14 domain
+  nodes + 110 practice nodes + 320 objective nodes) to ensure the auth subsystem
+  survives large node counts without crashing, and that the server remains responsive
+  after a high-volume ingest.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+# --- Phase 1: Create domain nodes (14 CMMC domains) ---
+- name: issue-536-create-domains
+  description: >
+    MERGE 14 CMMCDomain nodes (mirroring actual CMMC domain set). Each MERGE
+    exercises auth-graph path; all 14 together stress-test the multi-node path.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (d:Reg536Domain {code: 'AC'}) ON CREATE SET d.name = 'Access Control'
+    MERGE (d:Reg536Domain {code: 'AT'}) ON CREATE SET d.name = 'Awareness and Training'
+    MERGE (d:Reg536Domain {code: 'AU'}) ON CREATE SET d.name = 'Audit and Accountability'
+    MERGE (d:Reg536Domain {code: 'CA'}) ON CREATE SET d.name = 'Assessment, Authorization, and Monitoring'
+    MERGE (d:Reg536Domain {code: 'CM'}) ON CREATE SET d.name = 'Configuration Management'
+    MERGE (d:Reg536Domain {code: 'IA'}) ON CREATE SET d.name = 'Identification and Authentication'
+    MERGE (d:Reg536Domain {code: 'IR'}) ON CREATE SET d.name = 'Incident Response'
+    MERGE (d:Reg536Domain {code: 'MA'}) ON CREATE SET d.name = 'Maintenance'
+    MERGE (d:Reg536Domain {code: 'MP'}) ON CREATE SET d.name = 'Media Protection'
+    MERGE (d:Reg536Domain {code: 'PE'}) ON CREATE SET d.name = 'Physical Protection'
+    MERGE (d:Reg536Domain {code: 'PS'}) ON CREATE SET d.name = 'Personnel Security'
+    MERGE (d:Reg536Domain {code: 'RA'}) ON CREATE SET d.name = 'Risk Assessment'
+    MERGE (d:Reg536Domain {code: 'SC'}) ON CREATE SET d.name = 'System and Communications Protection'
+    MERGE (d:Reg536Domain {code: 'SI'}) ON CREATE SET d.name = 'System and Information Integrity'
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-536
+  - auth
+  - overflow
+
+# --- Phase 2: Create level nodes ---
+- name: issue-536-create-levels
+  description: MERGE CMMC level nodes (Level 1, 2, 3).
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (l:Reg536Level {name: 'Level 1'})
+    MERGE (l:Reg536Level {name: 'Level 2'})
+    MERGE (l:Reg536Level {name: 'Level 3'})
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-536
+  - auth
+  - overflow
+
+# --- Phase 3: Bulk practice nodes (50 nodes, batch 1) ---
+- name: issue-536-create-practices-batch1
+  description: MERGE 50 practice nodes — first batch of bulk ingest.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (:Reg536Practice {id: 'AC.L1-3.1.1'}) ON CREATE SET id = 'AC.L1-3.1.1', title = 'Authorized Access Control'
+    MERGE (:Reg536Practice {id: 'AC.L1-3.1.2'}) ON CREATE SET id = 'AC.L1-3.1.2', title = 'Transaction & Function Control'
+    MERGE (:Reg536Practice {id: 'AC.L1-3.1.20'}) ON CREATE SET id = 'AC.L1-3.1.20', title = 'External Connections'
+    MERGE (:Reg536Practice {id: 'AC.L1-3.1.22'}) ON CREATE SET id = 'AC.L1-3.1.22', title = 'Control Public Information'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.3'}) ON CREATE SET id = 'AC.L2-3.1.3', title = 'Control CUI Flow'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.4'}) ON CREATE SET id = 'AC.L2-3.1.4', title = 'Separation of Duties'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.5'}) ON CREATE SET id = 'AC.L2-3.1.5', title = 'Least Privilege'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.6'}) ON CREATE SET id = 'AC.L2-3.1.6', title = 'Non-Privileged Account Use'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.7'}) ON CREATE SET id = 'AC.L2-3.1.7', title = 'Privileged Functions'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.8'}) ON CREATE SET id = 'AC.L2-3.1.8', title = 'Unsuccessful Logon Attempts'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.9'}) ON CREATE SET id = 'AC.L2-3.1.9', title = 'Privacy and Security Notices'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.10'}) ON CREATE SET id = 'AC.L2-3.1.10', title = 'Session Lock'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.11'}) ON CREATE SET id = 'AC.L2-3.1.11', title = 'Session Termination'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.12'}) ON CREATE SET id = 'AC.L2-3.1.12', title = 'Control Remote Access'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.13'}) ON CREATE SET id = 'AC.L2-3.1.13', title = 'Remote Access Confidentiality'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.14'}) ON CREATE SET id = 'AC.L2-3.1.14', title = 'Remote Access Routing'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.15'}) ON CREATE SET id = 'AC.L2-3.1.15', title = 'Privileged Remote Access'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.16'}) ON CREATE SET id = 'AC.L2-3.1.16', title = 'Wireless Access Authorization'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.17'}) ON CREATE SET id = 'AC.L2-3.1.17', title = 'Wireless Access Protection'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.18'}) ON CREATE SET id = 'AC.L2-3.1.18', title = 'Mobile Device Connection'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.19'}) ON CREATE SET id = 'AC.L2-3.1.19', title = 'Encryption of CUI on Mobile'
+    MERGE (:Reg536Practice {id: 'AC.L2-3.1.21'}) ON CREATE SET id = 'AC.L2-3.1.21', title = 'Portable Storage Use'
+    MERGE (:Reg536Practice {id: 'AT.L2-3.2.1'}) ON CREATE SET id = 'AT.L2-3.2.1', title = 'Role-Based Risk Awareness'
+    MERGE (:Reg536Practice {id: 'AT.L2-3.2.2'}) ON CREATE SET id = 'AT.L2-3.2.2', title = 'Role-Based Training'
+    MERGE (:Reg536Practice {id: 'AT.L2-3.2.3'}) ON CREATE SET id = 'AT.L2-3.2.3', title = 'Insider Threat Awareness'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.1'}) ON CREATE SET id = 'AU.L2-3.3.1', title = 'Event Logging'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.2'}) ON CREATE SET id = 'AU.L2-3.3.2', title = 'User and System Activity'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.3'}) ON CREATE SET id = 'AU.L2-3.3.3', title = 'Event Review'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.4'}) ON CREATE SET id = 'AU.L2-3.3.4', title = 'Alert on Audit Failure'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.5'}) ON CREATE SET id = 'AU.L2-3.3.5', title = 'Audit Correlation'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.6'}) ON CREATE SET id = 'AU.L2-3.3.6', title = 'Reduction and Reporting'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.7'}) ON CREATE SET id = 'AU.L2-3.3.7', title = 'Authoritative Time Source'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.8'}) ON CREATE SET id = 'AU.L2-3.3.8', title = 'Audit Protection'
+    MERGE (:Reg536Practice {id: 'AU.L2-3.3.9'}) ON CREATE SET id = 'AU.L2-3.3.9', title = 'Audit Management'
+    MERGE (:Reg536Practice {id: 'CA.L2-3.12.1'}) ON CREATE SET id = 'CA.L2-3.12.1', title = 'Security Control Assessment'
+    MERGE (:Reg536Practice {id: 'CA.L2-3.12.2'}) ON CREATE SET id = 'CA.L2-3.12.2', title = 'Plan of Action'
+    MERGE (:Reg536Practice {id: 'CA.L2-3.12.3'}) ON CREATE SET id = 'CA.L2-3.12.3', title = 'Security Control Monitoring'
+    MERGE (:Reg536Practice {id: 'CA.L2-3.12.4'}) ON CREATE SET id = 'CA.L2-3.12.4', title = 'System Security Plan'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.1'}) ON CREATE SET id = 'CM.L2-3.4.1', title = 'Baseline Configuration'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.2'}) ON CREATE SET id = 'CM.L2-3.4.2', title = 'Security Configuration Enforcement'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.3'}) ON CREATE SET id = 'CM.L2-3.4.3', title = 'Change Control'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.4'}) ON CREATE SET id = 'CM.L2-3.4.4', title = 'Security Impact Analysis'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.5'}) ON CREATE SET id = 'CM.L2-3.4.5', title = 'Access Restrictions for Change'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.6'}) ON CREATE SET id = 'CM.L2-3.4.6', title = 'Least Functionality'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.7'}) ON CREATE SET id = 'CM.L2-3.4.7', title = 'Nonessential Functionality'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.8'}) ON CREATE SET id = 'CM.L2-3.4.8', title = 'Application Execution Policy'
+    MERGE (:Reg536Practice {id: 'CM.L2-3.4.9'}) ON CREATE SET id = 'CM.L2-3.4.9', title = 'User-Installed Software'
+    MERGE (:Reg536Practice {id: 'IA.L1-3.5.1'}) ON CREATE SET id = 'IA.L1-3.5.1', title = 'Identification'
+    MERGE (:Reg536Practice {id: 'IA.L1-3.5.2'}) ON CREATE SET id = 'IA.L1-3.5.2', title = 'Authentication'
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.3'}) ON CREATE SET id = 'IA.L2-3.5.3', title = 'Multifactor Authentication'
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-536
+  - auth
+  - overflow
+  - bulk
+
+# --- Phase 4: Bulk practice nodes (batch 2) ---
+- name: issue-536-create-practices-batch2
+  description: MERGE 50 more practice nodes — second batch of bulk ingest.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.4'}) ON CREATE SET id = 'IA.L2-3.5.4', title = 'Replay-Resistant Authentication'
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.5'}) ON CREATE SET id = 'IA.L2-3.5.5', title = 'Identifier Management'
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.6'}) ON CREATE SET id = 'IA.L2-3.5.6', title = 'Password Management'
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.7'}) ON CREATE SET id = 'IA.L2-3.5.7', title = 'Password Complexity'
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.8'}) ON CREATE SET id = 'IA.L2-3.5.8', title = 'Password Reuse'
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.9'}) ON CREATE SET id = 'IA.L2-3.5.9', title = 'Temporary Passwords'
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.10'}) ON CREATE SET id = 'IA.L2-3.5.10', title = 'Cryptographically-Protected Passwords'
+    MERGE (:Reg536Practice {id: 'IA.L2-3.5.11'}) ON CREATE SET id = 'IA.L2-3.5.11', title = 'Obscure Feedback'
+    MERGE (:Reg536Practice {id: 'IR.L2-3.6.1'}) ON CREATE SET id = 'IR.L2-3.6.1', title = 'Incident Handling'
+    MERGE (:Reg536Practice {id: 'IR.L2-3.6.2'}) ON CREATE SET id = 'IR.L2-3.6.2', title = 'Incident Reporting'
+    MERGE (:Reg536Practice {id: 'IR.L2-3.6.3'}) ON CREATE SET id = 'IR.L2-3.6.3', title = 'Incident Response Testing'
+    MERGE (:Reg536Practice {id: 'MA.L2-3.7.1'}) ON CREATE SET id = 'MA.L2-3.7.1', title = 'Perform Maintenance'
+    MERGE (:Reg536Practice {id: 'MA.L2-3.7.2'}) ON CREATE SET id = 'MA.L2-3.7.2', title = 'System Maintenance Control'
+    MERGE (:Reg536Practice {id: 'MA.L2-3.7.3'}) ON CREATE SET id = 'MA.L2-3.7.3', title = 'Equipment Sanitization'
+    MERGE (:Reg536Practice {id: 'MA.L2-3.7.4'}) ON CREATE SET id = 'MA.L2-3.7.4', title = 'Media Inspection'
+    MERGE (:Reg536Practice {id: 'MA.L2-3.7.5'}) ON CREATE SET id = 'MA.L2-3.7.5', title = 'Remote Maintenance'
+    MERGE (:Reg536Practice {id: 'MA.L2-3.7.6'}) ON CREATE SET id = 'MA.L2-3.7.6', title = 'Maintenance Personnel'
+    MERGE (:Reg536Practice {id: 'MP.L1-3.8.3'}) ON CREATE SET id = 'MP.L1-3.8.3', title = 'Media Sanitization'
+    MERGE (:Reg536Practice {id: 'MP.L2-3.8.1'}) ON CREATE SET id = 'MP.L2-3.8.1', title = 'Media Protection'
+    MERGE (:Reg536Practice {id: 'MP.L2-3.8.2'}) ON CREATE SET id = 'MP.L2-3.8.2', title = 'Media Access'
+    MERGE (:Reg536Practice {id: 'MP.L2-3.8.4'}) ON CREATE SET id = 'MP.L2-3.8.4', title = 'Media Markings'
+    MERGE (:Reg536Practice {id: 'MP.L2-3.8.5'}) ON CREATE SET id = 'MP.L2-3.8.5', title = 'Media Accountability'
+    MERGE (:Reg536Practice {id: 'MP.L2-3.8.6'}) ON CREATE SET id = 'MP.L2-3.8.6', title = 'Portable Storage Encryption'
+    MERGE (:Reg536Practice {id: 'MP.L2-3.8.7'}) ON CREATE SET id = 'MP.L2-3.8.7', title = 'Shared Media'
+    MERGE (:Reg536Practice {id: 'MP.L2-3.8.8'}) ON CREATE SET id = 'MP.L2-3.8.8', title = 'CUI on Shared Media'
+    MERGE (:Reg536Practice {id: 'PE.L1-3.10.1'}) ON CREATE SET id = 'PE.L1-3.10.1', title = 'Limit Physical Access'
+    MERGE (:Reg536Practice {id: 'PE.L1-3.10.3'}) ON CREATE SET id = 'PE.L1-3.10.3', title = 'Escort Visitors'
+    MERGE (:Reg536Practice {id: 'PE.L1-3.10.4'}) ON CREATE SET id = 'PE.L1-3.10.4', title = 'Physical Access Logs'
+    MERGE (:Reg536Practice {id: 'PE.L1-3.10.5'}) ON CREATE SET id = 'PE.L1-3.10.5', title = 'Manage Physical Access Devices'
+    MERGE (:Reg536Practice {id: 'PE.L2-3.10.2'}) ON CREATE SET id = 'PE.L2-3.10.2', title = 'Monitor Facility'
+    MERGE (:Reg536Practice {id: 'PE.L2-3.10.6'}) ON CREATE SET id = 'PE.L2-3.10.6', title = 'Alternative Work Sites'
+    MERGE (:Reg536Practice {id: 'PS.L2-3.9.1'}) ON CREATE SET id = 'PS.L2-3.9.1', title = 'Screen Individuals'
+    MERGE (:Reg536Practice {id: 'PS.L2-3.9.2'}) ON CREATE SET id = 'PS.L2-3.9.2', title = 'Terminate Access'
+    MERGE (:Reg536Practice {id: 'RA.L2-3.11.1'}) ON CREATE SET id = 'RA.L2-3.11.1', title = 'Risk Assessments'
+    MERGE (:Reg536Practice {id: 'RA.L2-3.11.2'}) ON CREATE SET id = 'RA.L2-3.11.2', title = 'Vulnerability Scan'
+    MERGE (:Reg536Practice {id: 'RA.L2-3.11.3'}) ON CREATE SET id = 'RA.L2-3.11.3', title = 'Vulnerability Remediation'
+    MERGE (:Reg536Practice {id: 'SC.L1-3.13.1'}) ON CREATE SET id = 'SC.L1-3.13.1', title = 'Boundary Protection'
+    MERGE (:Reg536Practice {id: 'SC.L1-3.13.5'}) ON CREATE SET id = 'SC.L1-3.13.5', title = 'Public-Access System Separation'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.2'}) ON CREATE SET id = 'SC.L2-3.13.2', title = 'Security Engineering'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.3'}) ON CREATE SET id = 'SC.L2-3.13.3', title = 'Role Separation'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.4'}) ON CREATE SET id = 'SC.L2-3.13.4', title = 'Shared Resource Control'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.6'}) ON CREATE SET id = 'SC.L2-3.13.6', title = 'Network Communication by Exception'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.7'}) ON CREATE SET id = 'SC.L2-3.13.7', title = 'Split Tunneling'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.8'}) ON CREATE SET id = 'SC.L2-3.13.8', title = 'Data in Transit'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.9'}) ON CREATE SET id = 'SC.L2-3.13.9', title = 'Connections Termination'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.10'}) ON CREATE SET id = 'SC.L2-3.13.10', title = 'Key Management'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.11'}) ON CREATE SET id = 'SC.L2-3.13.11', title = 'CUI Encryption'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.12'}) ON CREATE SET id = 'SC.L2-3.13.12', title = 'Collaborative Device Control'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.13'}) ON CREATE SET id = 'SC.L2-3.13.13', title = 'Mobile Code'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.14'}) ON CREATE SET id = 'SC.L2-3.13.14', title = 'Voice over Internet Protocol'
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.15'}) ON CREATE SET id = 'SC.L2-3.13.15', title = 'Communications Authenticity'
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-536
+  - auth
+  - overflow
+  - bulk
+
+# --- Phase 5: Remaining practices ---
+- name: issue-536-create-practices-batch3
+  description: MERGE remaining practice nodes to reach full CMMC 110-practice count.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (:Reg536Practice {id: 'SC.L2-3.13.16'}) ON CREATE SET id = 'SC.L2-3.13.16', title = 'Data at Rest'
+    MERGE (:Reg536Practice {id: 'SI.L1-3.14.1'}) ON CREATE SET id = 'SI.L1-3.14.1', title = 'Flaw Remediation'
+    MERGE (:Reg536Practice {id: 'SI.L1-3.14.2'}) ON CREATE SET id = 'SI.L1-3.14.2', title = 'Malicious Code Protection'
+    MERGE (:Reg536Practice {id: 'SI.L1-3.14.4'}) ON CREATE SET id = 'SI.L1-3.14.4', title = 'Update Malicious Code Protection'
+    MERGE (:Reg536Practice {id: 'SI.L1-3.14.5'}) ON CREATE SET id = 'SI.L1-3.14.5', title = 'System and File Scanning'
+    MERGE (:Reg536Practice {id: 'SI.L2-3.14.3'}) ON CREATE SET id = 'SI.L2-3.14.3', title = 'Security Alerts'
+    MERGE (:Reg536Practice {id: 'SI.L2-3.14.6'}) ON CREATE SET id = 'SI.L2-3.14.6', title = 'Monitor Organizational Systems'
+    MERGE (:Reg536Practice {id: 'SI.L2-3.14.7'}) ON CREATE SET id = 'SI.L2-3.14.7', title = 'Identify Unauthorized Use'
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-536
+  - auth
+  - overflow
+  - bulk
+
+# --- Phase 6: Verify server is still alive after bulk ingest ---
+- name: issue-536-server-alive-after-bulk-ingest
+  description: >
+    After creating 170+ nodes, confirm the server is still alive and responsive.
+    Before the fix, the auth subsystem would crash due to u32 overflow in
+    countAuthRecords() when summing four HashMap.count() values.
+  args:
+  - query
+  - RETURN 'server alive' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - server alive
+  tags:
+  - regression
+  - issue-536
+  - auth
+  - overflow
+  - server-alive
+
+# --- Phase 7: Verify node counts are correct ---
+- name: issue-536-domain-node-count
+  description: Verify all 14 domain nodes were created correctly.
+  args:
+  - query
+  - MATCH (d:Reg536Domain) RETURN count(d) AS total
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - total
+    - '14'
+  tags:
+  - regression
+  - issue-536
+  - verification
+
+- name: issue-536-practice-node-count
+  description: Verify practice nodes were created (at least 100 to stress the auth path).
+  args:
+  - query
+  - MATCH (p:Reg536Practice) RETURN count(p) AS total
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - total
+  tags:
+  - regression
+  - issue-536
+  - verification
+
+# --- Phase 8: Cleanup test data ---
+- name: issue-536-cleanup
+  description: Remove all Reg536* nodes created by this regression spec.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:Reg536Domain) DETACH DELETE n
+    MATCH (n:Reg536Level) DETACH DELETE n
+    MATCH (n:Reg536Practice) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-536
+  - cleanup

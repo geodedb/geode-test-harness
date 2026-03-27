@@ -1,0 +1,93 @@
+version: '1.0'
+name: GQL Targeted DELETE
+description: 'Tests that DELETE only removes specified items, not all matched pattern items (GAP #56)'
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-create-linked-nodes
+  description: Create two nodes with a relationship
+  args:
+  - query
+  - "CREATE (a:DelTarget {name: 'A'})-[:LINK]->(b:DelTarget {name: 'B'})"
+  expect:
+    exit_code: 0
+  tags:
+  - delete
+  - setup
+
+- name: delete-rel-only-leaves-nodes
+  description: DELETE MATCH ... r should only delete relationship, not nodes
+  args:
+  - query
+  - DELETE MATCH (a:DelTarget)-[r:LINK]->(b:DelTarget) r
+  expect:
+    exit_code: 0
+  tags:
+  - delete
+  - targeted
+
+- name: verify-nodes-survive
+  description: Both nodes should still exist after relationship DELETE
+  args:
+  - query
+  - MATCH (n:DelTarget) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - delete
+  - verify
+
+- name: setup-multiple-nodes
+  description: Create distinct test nodes
+  args:
+  - query
+  - "CREATE (x:DelSpecific {name: 'keep'})"
+  - --
+  - query
+  - "CREATE (y:DelSpecific {name: 'remove'})"
+  expect:
+    exit_code: 0
+  tags:
+  - delete
+  - setup
+
+- name: delete-specific-node-by-prop
+  description: DELETE specific node by property filter
+  args:
+  - query
+  - "DELETE MATCH (n:DelSpecific {name: 'remove'}) n"
+  expect:
+    exit_code: 0
+  tags:
+  - delete
+  - targeted
+
+- name: verify-one-node-remains
+  description: Only the 'keep' node should remain
+  args:
+  - query
+  - MATCH (n:DelSpecific) RETURN n.name AS name
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].name
+      equals: keep
+  tags:
+  - delete
+  - verify

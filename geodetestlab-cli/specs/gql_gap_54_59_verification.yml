@@ -1,0 +1,170 @@
+version: '1.0'
+name: GAP 54-59 Verification
+description: 'Exact reproduction of GAP #54-#59 failure scenarios'
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+tests:
+# GAP #54: Parameter binding in property maps
+- name: gap54-param-in-create-property-map
+  description: 'GAP #54: --param should resolve inside CREATE property map'
+  args:
+  - query
+  - --param
+  - id
+  - '"test54"'
+  - 'CREATE (n:Gap54 {id: $id}) RETURN n.id AS id'
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].id
+      equals: test54
+  tags:
+  - gap-54
+
+# GAP #55: MERGE pattern properties not persisted
+- name: gap55-merge-then-return-id
+  description: 'GAP #55: MERGE pattern props must be stored - query n.id after MERGE'
+  args:
+  - query
+  - "MERGE (n:Gap55 {id: 'x'})"
+  - --
+  - query
+  - MATCH (n:Gap55) RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].id
+      equals: x
+  tags:
+  - gap-55
+
+# GAP #56: DELETE r only deletes relationship, not nodes
+# NOTE: This uses MATCH...DELETE form (Query with delete_items)
+- name: gap56-setup
+  description: 'GAP #56 setup: create nodes and edge'
+  args:
+  - query
+  - "CREATE (a:Gap56 {id: 'a1'})-[:LINK]->(b:Gap56 {id: 'b1'})"
+  expect:
+    exit_code: 0
+  tags:
+  - gap-56
+  - setup
+
+- name: gap56-delete-rel-only
+  description: 'GAP #56: DELETE r should only delete relationship, not nodes'
+  args:
+  - query
+  - DELETE MATCH (a:Gap56)-[r:LINK]->(b:Gap56) r
+  expect:
+    exit_code: 0
+  tags:
+  - gap-56
+
+- name: gap56-verify-nodes-survive
+  description: 'GAP #56: Both nodes should survive after DELETE r'
+  args:
+  - query
+  - MATCH (n:Gap56) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - gap-56
+  - verify
+
+- name: gap56-verify-edge-gone
+  description: 'GAP #56: The LINK edge should be gone'
+  args:
+  - query
+  - MATCH (a:Gap56)-[r:LINK]->(b:Gap56) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 0
+  tags:
+  - gap-56
+  - verify
+
+# GAP #57: WITH after MERGE
+- name: gap57-merge-with-merge
+  description: 'GAP #57: MERGE (a) WITH a MERGE (b) should not parse error'
+  args:
+  - query
+  - "MERGE (a:Gap57 {id: '1'}) WITH a MERGE (b:Gap57 {id: '2'}) RETURN a.id AS a_id, b.id AS b_id"
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].a_id
+      equals: '1'
+  tags:
+  - gap-57
+
+# GAP #58: Edge MERGE
+- name: gap58-setup
+  description: 'GAP #58 setup: create nodes for edge MERGE'
+  args:
+  - query
+  - "CREATE (a:Gap58A {id: 'a'})"
+  - --
+  - query
+  - "CREATE (b:Gap58B {id: 'b'})"
+  expect:
+    exit_code: 0
+  tags:
+  - gap-58
+  - setup
+
+- name: gap58-merge-edge
+  description: 'GAP #58: MATCH (a), (b) MERGE (a)-[:REL]->(b) should not parse error'
+  args:
+  - query
+  - MATCH (a:Gap58A), (b:Gap58B) MERGE (a)-[:REL]->(b)
+  expect:
+    exit_code: 0
+  tags:
+  - gap-58
+
+- name: gap58-verify-edge
+  description: 'GAP #58: Verify edge was created'
+  args:
+  - query
+  - MATCH (a:Gap58A)-[r:REL]->(b:Gap58B) RETURN a.id AS a_id, b.id AS b_id
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].a_id
+      equals: a
+  tags:
+  - gap-58
+  - verify
+
+# GAP #59: Bare SET after MERGE
+- name: gap59-bare-set
+  description: 'GAP #59: MERGE ... SET should not return parse error'
+  args:
+  - query
+  - "MERGE (n:Gap59 {id: '1'}) SET n.status = 'active' RETURN n.status AS s"
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].s
+      equals: active
+  tags:
+  - gap-59

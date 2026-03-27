@@ -759,7 +759,7 @@ const ClientContext = struct {
     }
 
     fn poolAcquire(self: *ClientContext, conn_id: []const u8, verbose: bool) !void {
-        var cli = GeodeClient.init(self.allocator, self.host, self.port, true, "", "");
+        var cli = try GeodeClient.init(self.allocator, self.host, self.port, true, "", "");
         if (verbose) {
             std.debug.print("  Acquiring pool connection: {s}\n", .{conn_id});
         }
@@ -781,20 +781,14 @@ const ClientContext = struct {
     fn ensureConnected(self: *ClientContext, verbose: bool) !void {
         if (self.client != null) return;
         // Pass username and password for authentication
-        var cli = GeodeClient.init(self.allocator, self.host, self.port, true, self.username, self.password);
+        var cli = try GeodeClient.init(self.allocator, self.host, self.port, true, self.username, self.password);
         if (verbose) {
             const transport_str = if (self.transport == .grpc) "gRPC" else "QUIC";
             std.debug.print("  Connecting to {s}:{d} via {s}\n", .{ self.host, self.port, transport_str });
         }
-        cli.connect() catch |err| {
-            return err;
-        };
-        cli.openStream() catch |err| {
-            return err;
-        };
-        cli.sendHello() catch |err| {
-            return err;
-        };
+        try cli.connect();
+        try cli.openStream();
+        try cli.sendHello();
         self.client = cli;
     }
 

@@ -1,0 +1,110 @@
+version: '1.0'
+name: GQL MERGE Property Persistence
+description: 'Tests that MERGE persists pattern properties on CREATE path (GAP #55)'
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+tests:
+- name: merge-persists-string-property
+  description: MERGE should persist string property from pattern on CREATE
+  args:
+  - query
+  - "MERGE (n:MergePersist {id: 'x1'})"
+  - --
+  - query
+  - "MATCH (n:MergePersist {id: 'x1'}) RETURN n.id AS id"
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].id
+      equals: x1
+  tags:
+  - merge
+  - property-persistence
+
+- name: merge-persists-int-property
+  description: MERGE should persist integer property from pattern on CREATE
+  args:
+  - query
+  - 'MERGE (n:MergePersistInt {val: 42})'
+  - --
+  - query
+  - MATCH (n:MergePersistInt) RETURN n.val AS val
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].val
+      equals: 42
+  tags:
+  - merge
+  - property-persistence
+
+- name: merge-idempotent-string
+  description: MERGE with same string property should not create duplicates
+  args:
+  - query
+  - "MERGE (n:MergeIdem {name: 'Alice'})"
+  - --
+  - query
+  - "MERGE (n:MergeIdem {name: 'Alice'})"
+  - --
+  - query
+  - MATCH (n:MergeIdem) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 1
+  tags:
+  - merge
+  - idempotent
+
+- name: merge-different-props-creates-new
+  description: MERGE with different property values should create separate nodes
+  args:
+  - query
+  - "MERGE (n:MergeDiff {id: 'd1'})"
+  - --
+  - query
+  - "MERGE (n:MergeDiff {id: 'd2'})"
+  - --
+  - query
+  - MATCH (n:MergeDiff) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - merge
+  - different-props
+
+- name: merge-with-param-persist
+  description: MERGE with --param should persist the property
+  args:
+  - query
+  - --param
+  - key
+  - '"paramval"'
+  - 'MERGE (n:MergeParamPersist {key: $key}) RETURN n.key AS k'
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].k
+      equals: paramval
+  tags:
+  - merge
+  - parameter-binding
+  - property-persistence

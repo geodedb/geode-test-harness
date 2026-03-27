@@ -1,0 +1,253 @@
+version: '1.0'
+name: regression-issue-537-periodic-verify-data-race
+description: >
+  Regression test for GitLab issue #537: data race in periodicVerifyLoop.
+
+  periodicVerifyLoop called verifyChain() — which reads label_index via
+  getNodesByLabel() and reads node properties via getNodeProperty() — without
+  holding any lock. QUIC query handlers hold g_store_rwlock.lockShared()
+  while executing MERGE statements that call addNodeLabel() → label_index.getOrPut().
+  When a MERGE triggers a HashMap rehash (reallocating its internal backing
+  array), the verify thread's concurrent lock-free read accesses freed memory,
+  causing a General Protection Fault (SIGILL/IOT instruction).
+
+  Fix: acquire acquireStoreLock() around the verifyChain() call in
+  periodicVerifyLoop so it participates in the same shared-lock protocol
+  used by query handlers.
+
+  This spec verifies that the server survives rapid bulk MERGE ingestion
+  (170+ nodes in rapid batches, mirroring the CMMC ingest that triggered
+  the crash) and remains responsive immediately after — which it did NOT
+  before the fix.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+# --- Rapid bulk MERGE: 60 nodes in one batch ---
+# The key trigger is fast successive MERGE batches that force HashMap
+# rehashes while the periodic verify thread is concurrently reading.
+- name: issue-537-bulk-merge-batch1
+  description: >
+    MERGE 60 nodes rapidly to stress the label_index and trigger rehash.
+    Before the fix, the periodic verify thread racing on this rehash
+    would GPF and crash the server.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (:Reg537Node {id: 'r537-001', val: 'a'})
+    MERGE (:Reg537Node {id: 'r537-002', val: 'b'})
+    MERGE (:Reg537Node {id: 'r537-003', val: 'c'})
+    MERGE (:Reg537Node {id: 'r537-004', val: 'd'})
+    MERGE (:Reg537Node {id: 'r537-005', val: 'e'})
+    MERGE (:Reg537Node {id: 'r537-006', val: 'f'})
+    MERGE (:Reg537Node {id: 'r537-007', val: 'g'})
+    MERGE (:Reg537Node {id: 'r537-008', val: 'h'})
+    MERGE (:Reg537Node {id: 'r537-009', val: 'i'})
+    MERGE (:Reg537Node {id: 'r537-010', val: 'j'})
+    MERGE (:Reg537Node {id: 'r537-011', val: 'k'})
+    MERGE (:Reg537Node {id: 'r537-012', val: 'l'})
+    MERGE (:Reg537Node {id: 'r537-013', val: 'm'})
+    MERGE (:Reg537Node {id: 'r537-014', val: 'n'})
+    MERGE (:Reg537Node {id: 'r537-015', val: 'o'})
+    MERGE (:Reg537Node {id: 'r537-016', val: 'p'})
+    MERGE (:Reg537Node {id: 'r537-017', val: 'q'})
+    MERGE (:Reg537Node {id: 'r537-018', val: 'r'})
+    MERGE (:Reg537Node {id: 'r537-019', val: 's'})
+    MERGE (:Reg537Node {id: 'r537-020', val: 't'})
+    MERGE (:Reg537Node {id: 'r537-021', val: 'u'})
+    MERGE (:Reg537Node {id: 'r537-022', val: 'v'})
+    MERGE (:Reg537Node {id: 'r537-023', val: 'w'})
+    MERGE (:Reg537Node {id: 'r537-024', val: 'x'})
+    MERGE (:Reg537Node {id: 'r537-025', val: 'y'})
+    MERGE (:Reg537Node {id: 'r537-026', val: 'z'})
+    MERGE (:Reg537Node {id: 'r537-027', val: 'aa'})
+    MERGE (:Reg537Node {id: 'r537-028', val: 'ab'})
+    MERGE (:Reg537Node {id: 'r537-029', val: 'ac'})
+    MERGE (:Reg537Node {id: 'r537-030', val: 'ad'})
+    MERGE (:Reg537Node {id: 'r537-031', val: 'ae'})
+    MERGE (:Reg537Node {id: 'r537-032', val: 'af'})
+    MERGE (:Reg537Node {id: 'r537-033', val: 'ag'})
+    MERGE (:Reg537Node {id: 'r537-034', val: 'ah'})
+    MERGE (:Reg537Node {id: 'r537-035', val: 'ai'})
+    MERGE (:Reg537Node {id: 'r537-036', val: 'aj'})
+    MERGE (:Reg537Node {id: 'r537-037', val: 'ak'})
+    MERGE (:Reg537Node {id: 'r537-038', val: 'al'})
+    MERGE (:Reg537Node {id: 'r537-039', val: 'am'})
+    MERGE (:Reg537Node {id: 'r537-040', val: 'an'})
+    MERGE (:Reg537Node {id: 'r537-041', val: 'ao'})
+    MERGE (:Reg537Node {id: 'r537-042', val: 'ap'})
+    MERGE (:Reg537Node {id: 'r537-043', val: 'aq'})
+    MERGE (:Reg537Node {id: 'r537-044', val: 'ar'})
+    MERGE (:Reg537Node {id: 'r537-045', val: 'as'})
+    MERGE (:Reg537Node {id: 'r537-046', val: 'at'})
+    MERGE (:Reg537Node {id: 'r537-047', val: 'au'})
+    MERGE (:Reg537Node {id: 'r537-048', val: 'av'})
+    MERGE (:Reg537Node {id: 'r537-049', val: 'aw'})
+    MERGE (:Reg537Node {id: 'r537-050', val: 'ax'})
+    MERGE (:Reg537Node {id: 'r537-051', val: 'ay'})
+    MERGE (:Reg537Node {id: 'r537-052', val: 'az'})
+    MERGE (:Reg537Node {id: 'r537-053', val: 'ba'})
+    MERGE (:Reg537Node {id: 'r537-054', val: 'bb'})
+    MERGE (:Reg537Node {id: 'r537-055', val: 'bc'})
+    MERGE (:Reg537Node {id: 'r537-056', val: 'bd'})
+    MERGE (:Reg537Node {id: 'r537-057', val: 'be'})
+    MERGE (:Reg537Node {id: 'r537-058', val: 'bf'})
+    MERGE (:Reg537Node {id: 'r537-059', val: 'bg'})
+    MERGE (:Reg537Node {id: 'r537-060', val: 'bh'})
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-537
+  - data-race
+  - bulk
+
+# --- Immediately issue a second batch (maximises race window) ---
+- name: issue-537-bulk-merge-batch2
+  description: >
+    Second rapid MERGE batch. Issuing batches back-to-back maximises the
+    window during which label_index is being grown, making the race more
+    likely to trigger if the lock is missing.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (:Reg537Node2 {id: 'r537b-001', val: 'a'})
+    MERGE (:Reg537Node2 {id: 'r537b-002', val: 'b'})
+    MERGE (:Reg537Node2 {id: 'r537b-003', val: 'c'})
+    MERGE (:Reg537Node2 {id: 'r537b-004', val: 'd'})
+    MERGE (:Reg537Node2 {id: 'r537b-005', val: 'e'})
+    MERGE (:Reg537Node2 {id: 'r537b-006', val: 'f'})
+    MERGE (:Reg537Node2 {id: 'r537b-007', val: 'g'})
+    MERGE (:Reg537Node2 {id: 'r537b-008', val: 'h'})
+    MERGE (:Reg537Node2 {id: 'r537b-009', val: 'i'})
+    MERGE (:Reg537Node2 {id: 'r537b-010', val: 'j'})
+    MERGE (:Reg537Node2 {id: 'r537b-011', val: 'k'})
+    MERGE (:Reg537Node2 {id: 'r537b-012', val: 'l'})
+    MERGE (:Reg537Node2 {id: 'r537b-013', val: 'm'})
+    MERGE (:Reg537Node2 {id: 'r537b-014', val: 'n'})
+    MERGE (:Reg537Node2 {id: 'r537b-015', val: 'o'})
+    MERGE (:Reg537Node2 {id: 'r537b-016', val: 'p'})
+    MERGE (:Reg537Node2 {id: 'r537b-017', val: 'q'})
+    MERGE (:Reg537Node2 {id: 'r537b-018', val: 'r'})
+    MERGE (:Reg537Node2 {id: 'r537b-019', val: 's'})
+    MERGE (:Reg537Node2 {id: 'r537b-020', val: 't'})
+    MERGE (:Reg537Node2 {id: 'r537b-021', val: 'u'})
+    MERGE (:Reg537Node2 {id: 'r537b-022', val: 'v'})
+    MERGE (:Reg537Node2 {id: 'r537b-023', val: 'w'})
+    MERGE (:Reg537Node2 {id: 'r537b-024', val: 'x'})
+    MERGE (:Reg537Node2 {id: 'r537b-025', val: 'y'})
+    MERGE (:Reg537Node2 {id: 'r537b-026', val: 'z'})
+    MERGE (:Reg537Node2 {id: 'r537b-027', val: 'aa'})
+    MERGE (:Reg537Node2 {id: 'r537b-028', val: 'ab'})
+    MERGE (:Reg537Node2 {id: 'r537b-029', val: 'ac'})
+    MERGE (:Reg537Node2 {id: 'r537b-030', val: 'ad'})
+    MERGE (:Reg537Node2 {id: 'r537b-031', val: 'ae'})
+    MERGE (:Reg537Node2 {id: 'r537b-032', val: 'af'})
+    MERGE (:Reg537Node2 {id: 'r537b-033', val: 'ag'})
+    MERGE (:Reg537Node2 {id: 'r537b-034', val: 'ah'})
+    MERGE (:Reg537Node2 {id: 'r537b-035', val: 'ai'})
+    MERGE (:Reg537Node2 {id: 'r537b-036', val: 'aj'})
+    MERGE (:Reg537Node2 {id: 'r537b-037', val: 'ak'})
+    MERGE (:Reg537Node2 {id: 'r537b-038', val: 'al'})
+    MERGE (:Reg537Node2 {id: 'r537b-039', val: 'am'})
+    MERGE (:Reg537Node2 {id: 'r537b-040', val: 'an'})
+    MERGE (:Reg537Node2 {id: 'r537b-041', val: 'ao'})
+    MERGE (:Reg537Node2 {id: 'r537b-042', val: 'ap'})
+    MERGE (:Reg537Node2 {id: 'r537b-043', val: 'aq'})
+    MERGE (:Reg537Node2 {id: 'r537b-044', val: 'ar'})
+    MERGE (:Reg537Node2 {id: 'r537b-045', val: 'as'})
+    MERGE (:Reg537Node2 {id: 'r537b-046', val: 'at'})
+    MERGE (:Reg537Node2 {id: 'r537b-047', val: 'au'})
+    MERGE (:Reg537Node2 {id: 'r537b-048', val: 'av'})
+    MERGE (:Reg537Node2 {id: 'r537b-049', val: 'aw'})
+    MERGE (:Reg537Node2 {id: 'r537b-050', val: 'ax'})
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-537
+  - data-race
+  - bulk
+
+# --- Server must be alive after the bulk ingest ---
+- name: issue-537-server-alive-after-bulk
+  description: >
+    Critical regression guard: after the back-to-back bulk MERGE batches,
+    the server must still respond. Before the fix this query would time out
+    because the server had crashed with a GPF in periodicVerifyLoop.
+  args:
+  - query
+  - RETURN 'server alive' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - server alive
+  tags:
+  - regression
+  - issue-537
+  - server-alive
+
+# --- Verify node counts are correct (data integrity after concurrent access) ---
+- name: issue-537-node-count-batch1
+  description: All 60 nodes from batch 1 must be present.
+  args:
+  - query
+  - MATCH (n:Reg537Node) RETURN count(n) AS total
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - total
+    - '60'
+  tags:
+  - regression
+  - issue-537
+  - verification
+
+- name: issue-537-node-count-batch2
+  description: All 50 nodes from batch 2 must be present.
+  args:
+  - query
+  - MATCH (n:Reg537Node2) RETURN count(n) AS total
+  - --format
+  - json
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - total
+    - '50'
+  tags:
+  - regression
+  - issue-537
+  - verification
+
+# --- Cleanup ---
+- name: issue-537-cleanup
+  description: Remove all Reg537* nodes created by this regression spec.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:Reg537Node) DETACH DELETE n
+    MATCH (n:Reg537Node2) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - regression
+  - issue-537
+  - cleanup
