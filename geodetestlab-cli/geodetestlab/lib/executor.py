@@ -31,8 +31,7 @@ DEFAULT_SHELL_TIMEOUT_S = 30.0
 SSL_VERIFY = os.environ.get("GEODE_VERIFY_SSL", "0").lower() in ("1", "true", "yes")
 if not SSL_VERIFY:
     logging.getLogger(__name__).debug(
-        "SSL verification disabled (GEODE_VERIFY_SSL=%s). "
-        "Set GEODE_VERIFY_SSL=1 to enable certificate verification.",
+        "SSL verification disabled (GEODE_VERIFY_SSL=%s). Set GEODE_VERIFY_SSL=1 to enable certificate verification.",
         os.environ.get("GEODE_VERIFY_SSL", "0"),
     )
 
@@ -256,9 +255,18 @@ def run_cli_test(
 
     # Validate user-supplied args for shell metacharacters (SEC-003).
     # Shell tests are excluded — they intentionally use shell features.
+    # Query text args are excluded — GQL syntax legitimately uses (), {}, $
+    # which overlap with shell metacharacters.  Since subprocess.run is
+    # called with a list (shell=False), there is no injection risk for
+    # any argument, but we still validate non-query args out of caution.
     if test_case.test_type != "shell" and test_case.args:
+        args_to_check = list(test_case.args)
+        if len(args_to_check) >= 2 and args_to_check[0] == "query":
+            # Skip the GQL query text argument — it contains (), {}, $
+            # that are valid GQL syntax, not shell metacharacters.
+            args_to_check = [args_to_check[0]] + args_to_check[2:]
         try:
-            sanitize_args(test_case.args)
+            sanitize_args(args_to_check)
         except ValueError as e:
             return TestResult(
                 name=test_case.name,
