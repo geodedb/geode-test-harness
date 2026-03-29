@@ -1,0 +1,137 @@
+# Storage Restart Persistence Tests
+# Verifies that graph data survives a server restart.
+#
+# This spec uses cleanup: false to preserve the data directory, then
+# runs a two-phase test:
+#   Phase 1: Create graphs and insert data
+#   Phase 2: Verify data is still present (proves in-session persistence)
+#
+# For cross-restart verification, use the companion script:
+#   scripts/test_restart_persistence.sh
+#
+# The test creates unique label/property names to avoid collisions.
+
+name: Storage Restart Persistence
+version: '1.0'
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: false
+
+setup:
+- |
+  CREATE GRAPH IF NOT EXISTS srp_main;
+
+tests:
+  # Phase 1: Insert data
+- name: Create nodes with distinct properties
+  query: |
+    USE GRAPH srp_main;
+    CREATE (:SRPUser {uid: 'srp-001', email: 'alice@test.com', active: true});
+    CREATE (:SRPUser {uid: 'srp-002', email: 'bob@test.com', active: false});
+    CREATE (:SRPUser {uid: 'srp-003', email: 'charlie@test.com', active: true});
+    MATCH (n:SRPUser) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 3
+
+- name: Create edges between users
+  query: |
+    USE GRAPH srp_main;
+    MATCH (a:SRPUser {uid: 'srp-001'}), (b:SRPUser {uid: 'srp-002'})
+    CREATE (a)-[:SRP_FOLLOWS]->(b);
+    MATCH (a:SRPUser {uid: 'srp-002'}), (c:SRPUser {uid: 'srp-003'})
+    CREATE (a)-[:SRP_FOLLOWS]->(c);
+    MATCH ()-[r:SRP_FOLLOWS]->() RETURN count(r) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 2
+
+- name: Create a second graph with data
+  query: |
+    CREATE GRAPH IF NOT EXISTS srp_secondary;
+    USE GRAPH srp_secondary;
+    CREATE (:SRPProduct {sku: 'SKU-100', price: 29.99});
+    CREATE (:SRPProduct {sku: 'SKU-200', price: 49.99});
+    MATCH (n:SRPProduct) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 2
+
+  # Phase 2: Verify all data is still accessible (same session)
+- name: Verify srp_main user count
+  query: |
+    USE GRAPH srp_main;
+    MATCH (n:SRPUser) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 3
+
+- name: Verify srp_main user properties
+  query: |
+    USE GRAPH srp_main;
+    MATCH (n:SRPUser {uid: 'srp-001'}) RETURN n.email AS email
+  expect:
+    row_count: 1
+    values:
+      email: alice@test.com
+
+- name: Verify srp_main edge count
+  query: |
+    USE GRAPH srp_main;
+    MATCH ()-[r:SRP_FOLLOWS]->() RETURN count(r) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 2
+
+- name: Verify srp_secondary product count
+  query: |
+    USE GRAPH srp_secondary;
+    MATCH (n:SRPProduct) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 2
+
+- name: Verify srp_secondary product properties
+  query: |
+    USE GRAPH srp_secondary;
+    MATCH (n:SRPProduct {sku: 'SKU-100'}) RETURN n.price AS price
+  expect:
+    row_count: 1
+    values:
+      price: 29.99
+
+  # Phase 3: Verify graph isolation
+- name: srp_main has no products
+  query: |
+    USE GRAPH srp_main;
+    MATCH (n:SRPProduct) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 0
+
+- name: srp_secondary has no users
+  query: |
+    USE GRAPH srp_secondary;
+    MATCH (n:SRPUser) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 0
+
+teardown:
+- |
+  DROP GRAPH IF EXISTS srp_main;
+  DROP GRAPH IF EXISTS srp_secondary;

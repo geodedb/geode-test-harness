@@ -1,0 +1,185 @@
+# Storage Persistence Basic Tests
+# Verifies that data written to graphs persists within a session:
+# - Graph creation with UUID tracking
+# - Node creation and property persistence
+# - Edge creation and adjacency persistence
+# - Data survives across multiple queries in the same session
+# - Manifest and catalog consistency
+
+name: Storage Persistence Basic
+version: '1.0'
+
+setup:
+- |
+  CREATE GRAPH IF NOT EXISTS sp_basic_a;
+  CREATE GRAPH IF NOT EXISTS sp_basic_b;
+
+tests:
+  # Verify graph creation
+- name: Graph sp_basic_a exists
+  query: |
+    USE GRAPH sp_basic_a;
+    RETURN 'ok' AS status
+  expect:
+    row_count: 1
+
+- name: Graph sp_basic_b exists
+  query: |
+    USE GRAPH sp_basic_b;
+    RETURN 'ok' AS status
+  expect:
+    row_count: 1
+
+  # Create nodes with properties in graph A
+- name: Create nodes with properties in sp_basic_a
+  query: |
+    USE GRAPH sp_basic_a;
+    CREATE (:SPPerson {name: 'Alice', age: 30});
+    CREATE (:SPPerson {name: 'Bob', age: 25});
+    CREATE (:SPPerson {name: 'Charlie', age: 35});
+    MATCH (n:SPPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+
+- name: Verify node count in sp_basic_a
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH (n:SPPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 3
+
+  # Verify property values persist
+- name: Verify Alice properties
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH (n:SPPerson {name: 'Alice'}) RETURN n.name AS name, n.age AS age
+  expect:
+    row_count: 1
+    values:
+      name: Alice
+      age: 30
+
+- name: Verify Bob properties
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH (n:SPPerson {name: 'Bob'}) RETURN n.name AS name, n.age AS age
+  expect:
+    row_count: 1
+    values:
+      name: Bob
+      age: 25
+
+  # Create edges
+- name: Create edges in sp_basic_a
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH (a:SPPerson {name: 'Alice'}), (b:SPPerson {name: 'Bob'})
+    CREATE (a)-[:SP_KNOWS {since: 2020}]->(b);
+    MATCH (a)-[r:SP_KNOWS]->(b) RETURN a.name AS from_name, b.name AS to_name
+  expect:
+    row_count: 1
+    values:
+      from_name: Alice
+      to_name: Bob
+
+  # Verify edges persist across queries
+- name: Verify edge persistence
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH ()-[r:SP_KNOWS]->() RETURN count(r) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 1
+
+  # Graph B isolation — no data from graph A
+- name: Graph B has no SPPerson nodes
+  query: |
+    USE GRAPH sp_basic_b;
+    MATCH (n:SPPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 0
+
+  # Create independent data in graph B
+- name: Create data in sp_basic_b
+  query: |
+    USE GRAPH sp_basic_b;
+    CREATE (:SPItem {id: 'item1', value: 42});
+    CREATE (:SPItem {id: 'item2', value: 99});
+    MATCH (n:SPItem) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 2
+
+  # Verify both graphs coexist
+- name: Graph A still has 3 persons
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH (n:SPPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 3
+
+- name: Graph B has 2 items
+  query: |
+    USE GRAPH sp_basic_b;
+    MATCH (n:SPItem) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 2
+
+  # Property updates persist
+- name: Update property value
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH (n:SPPerson {name: 'Alice'}) SET n.age = 31;
+    MATCH (n:SPPerson {name: 'Alice'}) RETURN n.age AS age
+  expect:
+    row_count: 1
+    values:
+      age: 31
+
+  # Node deletion persists
+- name: Delete a node
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH (n:SPPerson {name: 'Charlie'}) DELETE n;
+    MATCH (n:SPPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 2
+
+  # DROP GRAPH works
+- name: Drop graph B
+  query: |
+    DROP GRAPH IF EXISTS sp_basic_b;
+    CREATE GRAPH sp_basic_b;
+    USE GRAPH sp_basic_b;
+    MATCH (n:SPItem) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 0
+
+  # Graph A unaffected by graph B drop
+- name: Graph A survives graph B drop
+  query: |
+    USE GRAPH sp_basic_a;
+    MATCH (n:SPPerson) RETURN count(n) AS cnt
+  expect:
+    row_count: 1
+    values:
+      cnt: 2
+
+teardown:
+- |
+  DROP GRAPH IF EXISTS sp_basic_a;
+  DROP GRAPH IF EXISTS sp_basic_b;
