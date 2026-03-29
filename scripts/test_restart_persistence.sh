@@ -45,13 +45,19 @@ pass() {
 
 query() {
     local q="$1"
-    timeout 30 "$GEODE_BINARY" query \
-        --server "127.0.0.1:${PORT}" \
-        --insecure-tls-skip-verify \
-        --timeout 15 \
-        --retry 2 \
-        -U geode -P "$ADMIN_PASS" \
-        "$q" 2>/dev/null
+    local attempt
+    for attempt in 1 2 3; do
+        local result
+        result=$(timeout 20 "$GEODE_BINARY" query \
+            --server "127.0.0.1:${PORT}" \
+            --insecure-tls-skip-verify \
+            --timeout 15 \
+            --retry 1 \
+            -U geode -P "$ADMIN_PASS" \
+            "$q" 2>/dev/null) && { echo "$result"; return 0; }
+        sleep 2
+    done
+    return 1
 }
 
 start_server() {
