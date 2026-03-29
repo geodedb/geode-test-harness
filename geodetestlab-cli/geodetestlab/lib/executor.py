@@ -238,8 +238,11 @@ def run_cli_test(
         cmd = [binary]
         args = substitute_variables(test_case.args, env, secrets, data_dir)
         cmd.extend(args)
-        # If this is a query command via args, add server, insecure, and auth flags
-        if args and args[0] == "query" and len(args) > 1:
+        # Commands that talk to the server via QUIC/gRPC
+        _QUERY_COMMANDS = {"query", "shell"}
+        # Commands that operate on the local data directory
+        _LOCAL_COMMANDS = {"user", "apikey", "authn", "session", "auth-init"}
+        if args and args[0] in _QUERY_COMMANDS and len(args) > 1:
             if "--server" not in args:
                 cmd.extend(["--server", server_addr])
             if use_grpc and "--grpc" not in args:
@@ -252,6 +255,10 @@ def run_cli_test(
             # Pass CLI-level timeout matching the test harness timeout
             if "--timeout" not in args:
                 cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])
+        elif args and args[0] in _LOCAL_COMMANDS and len(args) > 1:
+            # Local commands need --data-dir to find the test server's data
+            if "--data-dir" not in args and data_dir:
+                cmd.extend(["--data-dir", data_dir])
 
     # Validate user-supplied args for shell metacharacters (SEC-003).
     # Shell tests are excluded — they intentionally use shell features.

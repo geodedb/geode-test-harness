@@ -56,8 +56,13 @@ class GeodeBinaryNotFoundError(FileNotFoundError):
     pass
 
 
-# Shell metacharacters that should not appear in CLI arguments
-_SHELL_METACHARACTERS = frozenset(";|&`$(){}!")
+# Shell metacharacters that indicate likely test misconfiguration.
+# Note: subprocess.run is always called with a list (shell=False), so
+# no character is actually dangerous.  This check only catches obvious
+# mistakes like embedded pipes or command substitutions.
+# Characters like (), {}, !, $ are intentionally excluded because they
+# appear in GQL queries, passwords, and JSON arguments.
+_SHELL_METACHARACTERS = frozenset(";|&`")
 
 
 def sanitize_args(args: list[str]) -> list[str]:
