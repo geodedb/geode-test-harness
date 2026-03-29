@@ -264,7 +264,21 @@ def run_cli_test(
         if len(args_to_check) >= 2 and args_to_check[0] == "query":
             # Skip the GQL query text argument — it contains (), {}, $
             # that are valid GQL syntax, not shell metacharacters.
-            args_to_check = [args_to_check[0]] + args_to_check[2:]
+            # The query text is the first positional arg after "query"
+            # that doesn't start with "--" (flags may appear before it).
+            query_text_idx = None
+            for idx in range(1, len(args_to_check)):
+                if not args_to_check[idx].startswith("--"):
+                    # Skip flag values (e.g., "dot" after "--format")
+                    if idx > 1 and args_to_check[idx - 1].startswith("--"):
+                        continue
+                    query_text_idx = idx
+                    break
+            if query_text_idx is not None:
+                args_to_check = args_to_check[:query_text_idx] + args_to_check[query_text_idx + 1 :]
+            else:
+                # Fallback: skip args[1] as before
+                args_to_check = [args_to_check[0]] + args_to_check[2:]
         try:
             sanitize_args(args_to_check)
         except ValueError as e:
