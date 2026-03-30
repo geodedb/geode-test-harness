@@ -49,6 +49,10 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
     if len(args) < 2:
         return None
 
+    # Don't convert help requests — let the CLI show its own help text
+    if "--help" in args or "-h" in args:
+        return None
+
     subcmd = args[0]  # user, role, apikey, mfa, etc.
     action = args[1]  # create, list, delete, enable, disable, etc.
 
