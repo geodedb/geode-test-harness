@@ -87,21 +87,32 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
     elif subcmd == "user" and action == "delete":
         username = positionals[0] if positionals else ""
         return f"CALL geode.auth.user_delete('{esc(username)}')"
+    elif subcmd == "role" and action == "create":
+        role_name = positionals[0] if positionals else ""
+        desc = positionals[1] if len(positionals) > 1 else ""
+        return f"CALL geode.auth.role_create('{esc(role_name)}', '{esc(desc)}')"
     elif subcmd == "role" and action == "list":
         return "CALL geode.auth.role_list()"
+    elif subcmd == "role" and action == "delete":
+        role_name = positionals[0] if positionals else ""
+        return f"CALL geode.auth.role_delete('{esc(role_name)}')"
     elif subcmd == "mfa" and action in ("enable", "disable"):
         username = positionals[0] if positionals else flags.get("-U", flags.get("--user", ""))
         return f"CALL geode.auth.mfa_{action}('{esc(username)}')"
     elif subcmd == "apikey" and action == "create":
         username = positionals[0] if positionals else flags.get("--user", "")
-        return "CALL geode.auth.user_list()"  # stub: list users as proxy
+        return f"CALL geode.auth.apikey_create('{esc(username)}')"
     elif subcmd == "apikey" and action in ("list", "revoke-all", "revoke"):
-        return "CALL geode.auth.user_list()"  # stub: list users as proxy
+        return f"CALL geode.auth.apikey_{action.replace('-', '_')}()"
     elif subcmd == "policy" and action == "create":
-        return "CALL geode.auth.role_list()"  # stub: list roles as proxy
+        name = positionals[0] if positionals else ""
+        desc = positionals[1] if len(positionals) > 1 else ""
+        return f"CALL geode.auth.policy_create('{esc(name)}', '{esc(desc)}')"
     elif subcmd in ("grant", "revoke"):
         # grant SELECT TO <role> / revoke SELECT FROM <role>
-        return "CALL geode.auth.role_list()"  # stub: acknowledge via role list
+        perm = positionals[0] if positionals else action
+        target = flags.get("--to", flags.get("--from", positionals[-1] if positionals else ""))
+        return f"CALL geode.auth.grant('{esc(perm)}', '{esc(target)}')"
 
     return None  # Unknown command — fall back to local mode
 
