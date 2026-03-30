@@ -286,6 +286,20 @@ def run_cli_test(
             else:
                 # Fallback: skip args[1] as before
                 args_to_check = [args_to_check[0]] + args_to_check[2:]
+            # GAP-0271: Skip --role flag values from sanitization — the server
+            # validates role strings for injection chars; the test harness must
+            # allow intentionally-malicious role values through for security tests.
+            filtered = []
+            skip_next = False
+            for arg in args_to_check:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg == "--role":
+                    skip_next = True
+                    continue
+                filtered.append(arg)
+            args_to_check = filtered
         try:
             sanitize_args(args_to_check)
         except ValueError as e:
