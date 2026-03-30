@@ -241,7 +241,7 @@ def run_cli_test(
         # Commands that talk to the server via QUIC/gRPC
         _QUERY_COMMANDS = {"query", "shell"}
         # Commands that operate on the local data directory
-        _LOCAL_COMMANDS = {"user", "apikey", "authn", "session", "auth-init"}
+        _LOCAL_COMMANDS = {"user", "apikey", "authn", "session", "auth-init", "mfa", "role", "policy", "auth"}
         if args and args[0] in _QUERY_COMMANDS and len(args) > 1:
             if "--server" not in args:
                 cmd.extend(["--server", server_addr])
