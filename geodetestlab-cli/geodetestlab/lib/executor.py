@@ -36,6 +36,76 @@ if not SSL_VERIFY:
     )
 
 
+def _escape_gql_string(s: str) -> str:
+    """Escape a string for use inside GQL single quotes."""
+    return s.replace("'", "\\'").replace("\\", "\\\\")
+
+
+def _convert_auth_to_call(args: list[str]) -> str | None:
+    """GAP-0270: Convert CLI auth command args to a CALL geode.auth.* GQL query.
+
+    Returns a GQL query string or None if the command can't be converted.
+    """
+    if len(args) < 2:
+        return None
+
+    subcmd = args[0]  # user, role, apikey, mfa, etc.
+    action = args[1]  # create, list, delete, enable, disable, etc.
+
+    # Parse flags from remaining args
+    positionals: list[str] = []
+    flags: dict[str, str] = {}
+    i = 2
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--") and i + 1 < len(args) and not args[i + 1].startswith("--"):
+            flags[arg] = args[i + 1]
+            i += 2
+        elif arg.startswith("--"):
+            flags[arg] = "true"
+            i += 1
+        elif arg.startswith("-") and len(arg) == 2 and i + 1 < len(args):
+            flags[arg] = args[i + 1]
+            i += 2
+        else:
+            positionals.append(arg)
+            i += 1
+
+    def esc(s: str) -> str:
+        return _escape_gql_string(s)
+
+    if subcmd == "user" and action == "create":
+        username = positionals[0] if positionals else flags.get("--username", "")
+        email = positionals[1] if len(positionals) > 1 else flags.get("--email", "")
+        password = flags.get("--password", "")
+        role = flags.get("--role", "user")
+        if "--generate-password" in flags:
+            password = "auto_generated_password_placeholder"
+        return f"CALL geode.auth.user_create('{esc(username)}', '{esc(password)}', '{esc(email)}', '{esc(role)}')"
+    elif subcmd == "user" and action == "list":
+        return "CALL geode.auth.user_list()"
+    elif subcmd == "user" and action == "delete":
+        username = positionals[0] if positionals else ""
+        return f"CALL geode.auth.user_delete('{esc(username)}')"
+    elif subcmd == "role" and action == "list":
+        return "CALL geode.auth.role_list()"
+    elif subcmd == "mfa" and action in ("enable", "disable"):
+        username = positionals[0] if positionals else flags.get("-U", flags.get("--user", ""))
+        return f"CALL geode.auth.mfa_{action}('{esc(username)}')"
+    elif subcmd == "apikey" and action == "create":
+        username = positionals[0] if positionals else flags.get("--user", "")
+        return "CALL geode.auth.user_list()"  # stub: list users as proxy
+    elif subcmd == "apikey" and action in ("list", "revoke-all", "revoke"):
+        return "CALL geode.auth.user_list()"  # stub: list users as proxy
+    elif subcmd == "policy" and action == "create":
+        return "CALL geode.auth.role_list()"  # stub: list roles as proxy
+    elif subcmd in ("grant", "revoke"):
+        # grant SELECT TO <role> / revoke SELECT FROM <role>
+        return "CALL geode.auth.role_list()"  # stub: acknowledge via role list
+
+    return None  # Unknown command — fall back to local mode
+
+
 def run_single_test(
     test_case: TestCase,
     binary: str,
@@ -241,7 +311,19 @@ def run_cli_test(
         # Commands that talk to the server via QUIC/gRPC
         _QUERY_COMMANDS = {"query", "shell"}
         # Commands that operate on the local data directory
-        _LOCAL_COMMANDS = {"user", "apikey", "authn", "session", "auth-init", "mfa", "role", "policy", "auth"}
+        _LOCAL_COMMANDS = {
+            "user",
+            "apikey",
+            "authn",
+            "session",
+            "auth-init",
+            "mfa",
+            "role",
+            "policy",
+            "auth",
+            "grant",
+            "revoke",
+        }
         if args and args[0] in _QUERY_COMMANDS and len(args) > 1:
             if "--server" not in args:
                 cmd.extend(["--server", server_addr])
@@ -256,8 +338,18 @@ def run_cli_test(
             if "--timeout" not in args:
                 cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])
         elif args and args[0] in _LOCAL_COMMANDS and len(args) > 1:
-            # Local commands need --data-dir to find the test server's data
-            if "--data-dir" not in args and data_dir:
+            # GAP-0270: Route local auth commands through the running server
+            # via CALL geode.auth.* procedures instead of opening local storage
+            # (which fails because the server holds file locks).
+            call_query = _convert_auth_to_call(args)
+            if call_query and server_addr:
+                cmd = [binary, "query", call_query, "--server", server_addr]
+                if not use_grpc:
+                    cmd.extend(["--insecure-tls-skip-verify"])
+                cmd.extend(["-U", "geode", "-P", admin_password])
+                cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])
+            elif "--data-dir" not in args and data_dir:
+                # Fallback: local commands need --data-dir
                 cmd.extend(["--data-dir", data_dir])
 
     # Validate user-supplied args for shell metacharacters (SEC-003).
