@@ -241,9 +241,9 @@ class ShellTestRunner:
 
             # Strip ANSI escape codes
             output = self.strip_ansi(raw_output).strip()
-            
+
             # Since we switched to JSON output parsing, we no longer need to fragilely
-            # match the echoed command line by line. The JSON parser will naturally 
+            # match the echoed command line by line. The JSON parser will naturally
             # ignore the echoed command which precedes the JSON block.
 
             self.log(
@@ -279,18 +279,18 @@ class ShellTestRunner:
         }
 
         # Try to parse JSON output. We look for the JSON object in the output.
-        # Since we use --format json, the valid response should be a JSON object 
+        # Since we use --format json, the valid response should be a JSON object
         # containing "status_class" or "result".
         try:
             # Find the JSON block by looking for the first '{' and last '}'
             # This avoids issues with echoed commands or minor warnings before the JSON
             start_idx = output.find('{')
             end_idx = output.rfind('}')
-            
+
             if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
                 json_str = output[start_idx:end_idx + 1]
                 data = json.loads(json_str)
-                
+
                 # Check for error status class (anything not starting with 00)
                 status_class = data.get("status_class", "")
                 if status_class and not status_class.startswith("00"):
@@ -302,7 +302,7 @@ class ShellTestRunner:
                         error_msg = data["message"]
                     elif "error" in data:
                         error_msg = data["error"]
-                        
+
                     return {
                         "status": "error",
                         "output": output,
@@ -310,7 +310,7 @@ class ShellTestRunner:
                         "rows": 0,
                         "data": [],
                     }
-                
+
                 # Success path
                 if "result" in data and isinstance(data["result"], dict) and "rows" in data["result"]:
                     result["data"] = data["result"]["rows"]
@@ -318,9 +318,9 @@ class ShellTestRunner:
                 elif isinstance(data.get("result"), list):
                     result["data"] = data["result"]
                     result["rows"] = len(data["result"])
-                    
+
                 return result
-                
+
         except (json.JSONDecodeError, AttributeError):
             pass
 
@@ -334,7 +334,7 @@ class ShellTestRunner:
             else:
                 error_code = "unknown"
                 error_msg = "Unknown error"
-                
+
             return {
                 "status": "error",
                 "output": output,
@@ -472,7 +472,7 @@ class ShellTestRunner:
                 # Check that the persistence file exists and has data
                 persistence_files = step.get("files", ["graph_store.dat"])
                 total_size = 0
-                
+
                 for filename in persistence_files:
                     persistence_file = os.path.join(self.data_dir, filename)
 
