@@ -13,13 +13,12 @@ import os
 import re
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from shell_test_methods import (
+from runners.shell_test_methods import (
     run_source_test,
     run_persistence_test,
     run_query_test,
@@ -147,9 +146,8 @@ class ShellTestRunner:
             self.log("pexpect not available - cannot run interactive shell tests")
             return False
 
-        # Use --plain mode for automated testing - disables terminal control sequences
-        # that interfere with output capture. Also use json format for reliable parsing.
-        cmd = f"{self.geode_binary} shell --server {self.server} --insecure --format json --no-history --plain"
+        # Use json format for reliable parsing.
+        cmd = f"{self.geode_binary} shell --server {self.server} --insecure-tls-skip-verify --format json --no-history -U geode -P GeodeTestPassword123!"
         self.log(f"Starting shell: {cmd}")
 
         # Environment to disable colors and spinners
@@ -284,11 +282,11 @@ class ShellTestRunner:
         try:
             # Find the JSON block by looking for the first '{' and last '}'
             # This avoids issues with echoed commands or minor warnings before the JSON
-            start_idx = output.find('{')
-            end_idx = output.rfind('}')
+            start_idx = output.find("{")
+            end_idx = output.rfind("}")
 
             if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
-                json_str = output[start_idx:end_idx + 1]
+                json_str = output[start_idx : end_idx + 1]
                 data = json.loads(json_str)
 
                 # Check for error status class (anything not starting with 00)
@@ -296,7 +294,10 @@ class ShellTestRunner:
                 if status_class and not status_class.startswith("00"):
                     # Extract error message
                     error_msg = "Unknown error"
-                    if isinstance(data.get("result"), dict) and "message" in data["result"]:
+                    if (
+                        isinstance(data.get("result"), dict)
+                        and "message" in data["result"]
+                    ):
                         error_msg = data["result"]["message"]
                     elif "message" in data:
                         error_msg = data["message"]
@@ -312,7 +313,11 @@ class ShellTestRunner:
                     }
 
                 # Success path
-                if "result" in data and isinstance(data["result"], dict) and "rows" in data["result"]:
+                if (
+                    "result" in data
+                    and isinstance(data["result"], dict)
+                    and "rows" in data["result"]
+                ):
                     result["data"] = data["result"]["rows"]
                     result["rows"] = len(data["result"]["rows"])
                 elif isinstance(data.get("result"), list):
@@ -345,10 +350,10 @@ class ShellTestRunner:
 
         # Sometimes a simple array is returned
         try:
-            start_idx = output.find('[')
-            end_idx = output.rfind(']')
+            start_idx = output.find("[")
+            end_idx = output.rfind("]")
             if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
-                json_str = output[start_idx:end_idx + 1]
+                json_str = output[start_idx : end_idx + 1]
                 data = json.loads(json_str)
                 result["data"] = data
                 result["rows"] = len(data)
@@ -414,16 +419,16 @@ class ShellTestRunner:
         }
 
         try:
-            if test_type == "shell_source":
+            if test_type in ("shell_source", "source"):
                 # Test /source command with a file
                 result = run_source_test(self, test)
-            elif test_type == "shell_persistence":
+            elif test_type in ("shell_persistence", "persistence"):
                 # Test that data persists across server restarts
                 result = run_persistence_test(self, test)
-            elif test_type == "shell_query":
+            elif test_type in ("shell_query", "query"):
                 # Run a query through the shell
                 result = run_query_test(self, test)
-            elif test_type == "shell_steps":
+            elif test_type in ("shell_steps", "steps"):
                 # Run a sequence of shell commands
                 result = run_steps_test(self, test)
             else:
@@ -432,145 +437,6 @@ class ShellTestRunner:
         except Exception as e:
             result["status"] = "error"
             result["error"] = str(e)
-
-        return result
-
-
-        # Execute /source
-        source_result = self.source_file(
-            source_file, test.get("timeout_ms", 300000) // 1000
-        )
-        result["details"]["source_result"] = source_result
-
-        # Check expectations
-        expect = test.get("expect", {})
-
-        if expect.get("success", True) and source_result.get("has_errors"):
-            result["status"] = "failed"
-            result["error"] = (
-                f"Expected success but got errors: {source_result.get('output', '')[:500]}"
-            )
-
-        if "statements" in expect:
-            actual = source_result.get("statements_executed", 0)
-            expected = expect["statements"]
-            if actual != expected:
-                result["status"] = "failed"
-                result["error"] = f"Expected {expected} statements, got {actual}"
-
-        # Clean up temp file if created
-        if source_content and source_file:
-            try:
-                os.unlink(source_file)
-            except OSError:
-                pass
-
-        return result
-
-
-            elif step_type == "check_persistence_file":
-                # Check that the persistence file exists and has data
-                persistence_files = step.get("files", ["graph_store.dat"])
-                total_size = 0
-
-                for filename in persistence_files:
-                    persistence_file = os.path.join(self.data_dir, filename)
-
-                    if not self.check_file_exists(persistence_file):
-                        result["status"] = "failed"
-                        result["error"] = f"Persistence file not found: {persistence_file}"
-                        return result
-
-                    file_size = self.get_file_size(persistence_file)
-                    result["details"][f"persistence_file_size_{filename}"] = file_size
-                    total_size += file_size
-
-                min_size = step.get("min_size", 0)
-                if total_size < min_size:
-                    result["status"] = "failed"
-                    result["error"] = (
-                        f"Persistence files total size too small: {total_size} < {min_size}"
-                    )
-                    return result
-
-            elif step_type == "restart_server":
-                # Restart the server to test persistence
-                self.stop_shell()
-                self.stop_server()
-
-                time.sleep(1)
-
-                if not self.start_server():
-                    result["status"] = "failed"
-                    result["error"] = "Failed to restart server"
-                    return result
-
-                if not self.start_shell():
-                    result["status"] = "failed"
-                    result["error"] = "Failed to reconnect shell after restart"
-                    return result
-
-            elif step_type == "verify_data":
-                # Verify data exists after restart
-                query = step.get("query")
-                if query:
-                    query_result = self.execute_query(query)
-                    result["details"][f"step_{i}_verify"] = query_result
-
-                    expect = step.get("expect", {})
-                    if "min_rows" in expect:
-                        if query_result.get("rows", 0) < expect["min_rows"]:
-                            result["status"] = "failed"
-                            result["error"] = (
-                                f"Expected at least {expect['min_rows']} rows, got {query_result.get('rows', 0)}"
-                            )
-                            return result
-
-        return result
-
-
-        query_result = self.execute_query(query)
-        result["details"]["query_result"] = query_result
-
-        expect = test.get("expect", {})
-
-        if query_result.get("status") == "error":
-            if not expect.get("error"):
-                result["status"] = "failed"
-                result["error"] = f"Query failed: {query_result.get('error')}"
-
-        if "rows" in expect:
-            actual = query_result.get("rows", 0)
-            expected = expect["rows"]
-            if actual != expected:
-                result["status"] = "failed"
-                result["error"] = f"Expected {expected} rows, got {actual}"
-
-        return result
-
-
-                # Check expectations
-                expect = step.get("expect", {})
-                if "contains" in expect:
-                    for expected_text in expect["contains"]:
-                        if expected_text not in output:
-                            result["status"] = "failed"
-                            result["error"] = (
-                                f"Step {i}: Expected output to contain '{expected_text}'"
-                            )
-                            return result
-
-            elif step_type == "query":
-                query = step.get("text")
-                query_result = self.execute_query(query)
-                result["details"][f"step_{i}"] = query_result
-
-                if query_result.get("status") == "error":
-                    result["status"] = "failed"
-                    result["error"] = (
-                        f"Step {i} query failed: {query_result.get('error')}"
-                    )
-                    return result
 
         return result
 
@@ -616,7 +482,7 @@ def run_spec(
     tests = spec.get("tests", [])
 
     # Check if this spec requires server management
-    manage_server = spec.get("manage_server", False)
+    manage_server = spec.get("manage_server", spec.get("mode", "server") == "server")
 
     # Create runner with automatic port allocation if managing server
     runner = ShellTestRunner(

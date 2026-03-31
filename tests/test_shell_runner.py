@@ -1,17 +1,15 @@
 """Unit tests for runners/shell_runner.py."""
 
-import os
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 # Add paths
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from runners.shell_runner import ShellTestRunner, run_spec, get_free_port
+from lib.utils import get_free_port
+from runners.shell_runner import ShellTestRunner, run_spec
 
 
 class TestShellTestRunnerInit:
@@ -307,10 +305,13 @@ tests:
         with patch("runners.shell_runner.ShellTestRunner") as MockRunner:
             mock_instance = MagicMock()
             mock_instance.start_shell.return_value = True
-            mock_instance.run_test.return_value = {"status": "passed", "test_name": "test"}
+            mock_instance.run_test.return_value = {
+                "status": "passed",
+                "test_name": "test",
+            }
             MockRunner.return_value = mock_instance
 
-            results = run_spec(str(spec_file))
+            run_spec(str(spec_file))
 
             assert mock_instance.run_test.call_count == 2
 
@@ -350,18 +351,22 @@ class TestShellTestRunnerTestExecution:
 
     def test_run_query_test_no_query(self):
         """Query test without query should return error."""
+        from runners.shell_test_methods import run_query_test
+
         runner = ShellTestRunner()
 
-        result = runner._run_query_test({"name": "test"})
+        result = run_query_test(runner, {"name": "test"})
 
         assert result["status"] == "error"
         assert "query" in result["error"].lower()
 
     def test_run_source_test_no_content(self):
         """Source test without content should return error."""
+        from runners.shell_test_methods import run_source_test
+
         runner = ShellTestRunner()
 
-        result = runner._run_source_test({"name": "test"})
+        result = run_source_test(runner, {"name": "test"})
 
         assert result["status"] == "error"
 
@@ -370,8 +375,7 @@ class TestGetFreePort:
     """Tests for get_free_port in shell_runner module."""
 
     def test_imported_correctly(self):
-        """get_free_port should be importable from shell_runner."""
-        from runners.shell_runner import get_free_port
+        """get_free_port should be importable from lib.utils."""
 
         port = get_free_port()
         assert isinstance(port, int)
