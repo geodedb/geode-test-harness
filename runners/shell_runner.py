@@ -19,6 +19,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from shell_test_methods import (
+    run_source_test,
+    run_persistence_test,
+    run_query_test,
+    run_steps_test,
+)
+
 # Import shared utilities
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from lib.server_manager import ServerManager
@@ -141,8 +148,8 @@ class ShellTestRunner:
             return False
 
         # Use --plain mode for automated testing - disables terminal control sequences
-        # that interfere with output capture. Also use table format for easier parsing.
-        cmd = f"{self.geode_binary} shell --server {self.server} --insecure --format table --no-history --plain"
+        # that interfere with output capture. Also use json format for reliable parsing.
+        cmd = f"{self.geode_binary} shell --server {self.server} --insecure --format json --no-history --plain"
         self.log(f"Starting shell: {cmd}")
 
         # Environment to disable colors and spinners
@@ -233,30 +240,12 @@ class ShellTestRunner:
                 pass  # No more prompts, that's fine
 
             # Strip ANSI escape codes
-            output = self.strip_ansi(raw_output)
+            output = self.strip_ansi(raw_output).strip()
+            
+            # Since we switched to JSON output parsing, we no longer need to fragilely
+            # match the echoed command line by line. The JSON parser will naturally 
+            # ignore the echoed command which precedes the JSON block.
 
-            # The output contains: echoed command + newline + actual output
-            # Find and remove the echoed command
-            lines = output.split("\n")
-
-            # Find where the echoed command ends
-            cmd_prefix = command.strip()[:20] if len(command) > 20 else command.strip()
-            output_start = 0
-            for i, line in enumerate(lines):
-                if cmd_prefix in line:
-                    output_start = i + 1
-                    break
-
-            # Get the actual output (everything after the echoed command)
-            output_lines = lines[output_start:]
-
-            # Clean up: remove empty lines at start/end
-            while output_lines and not output_lines[0].strip():
-                output_lines.pop(0)
-            while output_lines and not output_lines[-1].strip():
-                output_lines.pop()
-
-            output = "\n".join(output_lines)
             self.log(
                 f"Output: {output[:200]}..."
                 if len(output) > 200
@@ -281,19 +270,6 @@ class ShellTestRunner:
         if not success:
             return {"status": "error", "error": output}
 
-        # Check for error in output
-        if "Error" in output or "error" in output.lower():
-            # Extract error code if present
-            error_match = re.search(r"Error\s*\(([^)]+)\)", output)
-            error_code = error_match.group(1) if error_match else "unknown"
-            return {
-                "status": "error",
-                "output": output,
-                "error": f"Query error: {error_code}",
-                "rows": 0,
-                "data": [],
-            }
-
         # Parse output to extract result
         result = {
             "status": "success",
@@ -302,66 +278,83 @@ class ShellTestRunner:
             "data": [],
         }
 
-        # Try to parse JSON output (when shell is started with --format json)
-        # Shell outputs: {"status_class":"00000","result":{"type":"BINDINGS",...,"rows":[...]}}
+        # Try to parse JSON output. We look for the JSON object in the output.
+        # Since we use --format json, the valid response should be a JSON object 
+        # containing "status_class" or "result".
         try:
-            # Find JSON object in output (shell format)
-            json_match = re.search(
-                r'\{[^{}]*"status_class"[^{}]*\{.*\}\}', output, re.DOTALL
-            )
-            if json_match:
-                data = json.loads(json_match.group())
-                if "result" in data and "rows" in data["result"]:
+            # Find the JSON block by looking for the first '{' and last '}'
+            # This avoids issues with echoed commands or minor warnings before the JSON
+            start_idx = output.find('{')
+            end_idx = output.rfind('}')
+            
+            if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+                json_str = output[start_idx:end_idx + 1]
+                data = json.loads(json_str)
+                
+                # Check for error status class (anything not starting with 00)
+                status_class = data.get("status_class", "")
+                if status_class and not status_class.startswith("00"):
+                    # Extract error message
+                    error_msg = "Unknown error"
+                    if isinstance(data.get("result"), dict) and "message" in data["result"]:
+                        error_msg = data["result"]["message"]
+                    elif "message" in data:
+                        error_msg = data["message"]
+                    elif "error" in data:
+                        error_msg = data["error"]
+                        
+                    return {
+                        "status": "error",
+                        "output": output,
+                        "error": f"Query error ({status_class}): {error_msg}",
+                        "rows": 0,
+                        "data": [],
+                    }
+                
+                # Success path
+                if "result" in data and isinstance(data["result"], dict) and "rows" in data["result"]:
                     result["data"] = data["result"]["rows"]
                     result["rows"] = len(data["result"]["rows"])
-                    return result
+                elif isinstance(data.get("result"), list):
+                    result["data"] = data["result"]
+                    result["rows"] = len(data["result"])
+                    
+                return result
+                
         except (json.JSONDecodeError, AttributeError):
             pass
 
-        # Try simple JSON array format
+        # If it wasn't valid JSON, check for explicit shell errors.
+        # Avoid falsely matching "error" in normal query output by checking for shell error prefixes
+        if "Error (" in output or "\nError: " in output or output.startswith("Error:"):
+            error_match = re.search(r"Error\s*\(([^)]+)\):\s*(.*)", output)
+            if error_match:
+                error_code = error_match.group(1)
+                error_msg = error_match.group(2)
+            else:
+                error_code = "unknown"
+                error_msg = "Unknown error"
+                
+            return {
+                "status": "error",
+                "output": output,
+                "error": f"Query error ({error_code}): {error_msg}",
+                "rows": 0,
+                "data": [],
+            }
+
+        # Sometimes a simple array is returned
         try:
-            json_match = re.search(r"\[.*\]", output, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
+            start_idx = output.find('[')
+            end_idx = output.rfind(']')
+            if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+                json_str = output[start_idx:end_idx + 1]
+                data = json.loads(json_str)
                 result["data"] = data
                 result["rows"] = len(data)
                 return result
         except (json.JSONDecodeError, AttributeError):
             pass
-
-        # Fallback: Try to parse table output
-        # Tables look like:
-        # +-------+-------+
-        # | col1  | col2  |
-        # +-------+-------+
-        # | val1  | val2  |
-        # +-------+-------+
-        lines = output.strip().split("\n")
-
-        # Filter to data lines (those starting with |)
-        data_lines = [
-            line
-            for line in lines
-            if line.strip().startswith("|") and not line.strip().startswith("|--")
-        ]
-
-        # Subtract 1 for header row if we have any data lines
-        if len(data_lines) > 1:
-            result["rows"] = len(data_lines) - 1
-        elif len(data_lines) == 1:
-            # Just header, no data
-            result["rows"] = 0
-        else:
-            # Try alternative: count non-border, non-empty lines
-            non_border_lines = [
-                line
-                for line in lines
-                if line.strip()
-                and not line.startswith("+")
-                and not line.startswith("---")
-            ]
-            if non_border_lines:
-                result["rows"] = max(0, len(non_border_lines) - 1)
 
         return result
 
@@ -423,16 +416,16 @@ class ShellTestRunner:
         try:
             if test_type == "shell_source":
                 # Test /source command with a file
-                result = self._run_source_test(test)
+                result = run_source_test(self, test)
             elif test_type == "shell_persistence":
                 # Test that data persists across server restarts
-                result = self._run_persistence_test(test)
+                result = run_persistence_test(self, test)
             elif test_type == "shell_query":
                 # Run a query through the shell
-                result = self._run_query_test(test)
+                result = run_query_test(self, test)
             elif test_type == "shell_steps":
                 # Run a sequence of shell commands
-                result = self._run_steps_test(test)
+                result = run_steps_test(self, test)
             else:
                 result["status"] = "error"
                 result["error"] = f"Unknown test type: {test_type}"
@@ -442,32 +435,6 @@ class ShellTestRunner:
 
         return result
 
-    def _run_source_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
-        """Run a /source file test."""
-        result = {
-            "test_name": test.get("name", "unnamed"),
-            "status": "passed",
-            "error": None,
-            "details": {},
-        }
-
-        # Create the source file if content is provided
-        source_content = test.get("source_content")
-        source_file = test.get("source_file")
-
-        if source_content:
-            # Write content to a temporary file
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".gql", delete=False
-            ) as f:
-                f.write(source_content)
-                source_file = f.name
-            result["details"]["temp_file"] = source_file
-
-        if not source_file:
-            result["status"] = "error"
-            result["error"] = "No source_file or source_content provided"
-            return result
 
         # Execute /source
         source_result = self.source_file(
@@ -500,59 +467,29 @@ class ShellTestRunner:
 
         return result
 
-    def _run_persistence_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
-        """Run a persistence test - verifies data survives server restart."""
-        result = {
-            "test_name": test.get("name", "unnamed"),
-            "status": "passed",
-            "error": None,
-            "details": {},
-        }
-
-        steps = test.get("steps", [])
-
-        for i, step in enumerate(steps):
-            step_type = step.get("type")
-
-            if step_type == "create_data":
-                # Create data via shell
-                source_content = step.get("content")
-                if source_content:
-                    with tempfile.NamedTemporaryFile(
-                        mode="w", suffix=".gql", delete=False
-                    ) as f:
-                        f.write(source_content)
-                        temp_file = f.name
-
-                    source_result = self.source_file(temp_file)
-                    result["details"][f"step_{i}_source"] = source_result
-
-                    os.unlink(temp_file)
-
-                    if source_result.get("has_errors"):
-                        result["status"] = "failed"
-                        result["error"] = (
-                            f"Step {i} failed: {source_result.get('output', '')[:500]}"
-                        )
-                        return result
 
             elif step_type == "check_persistence_file":
                 # Check that the persistence file exists and has data
-                persistence_file = os.path.join(self.data_dir, "graph_store.dat")
+                persistence_files = step.get("files", ["graph_store.dat"])
+                total_size = 0
+                
+                for filename in persistence_files:
+                    persistence_file = os.path.join(self.data_dir, filename)
 
-                if not self.check_file_exists(persistence_file):
-                    result["status"] = "failed"
-                    result["error"] = f"Persistence file not found: {persistence_file}"
-                    return result
+                    if not self.check_file_exists(persistence_file):
+                        result["status"] = "failed"
+                        result["error"] = f"Persistence file not found: {persistence_file}"
+                        return result
 
-                file_size = self.get_file_size(persistence_file)
-                result["details"]["persistence_file_size"] = file_size
+                    file_size = self.get_file_size(persistence_file)
+                    result["details"][f"persistence_file_size_{filename}"] = file_size
+                    total_size += file_size
 
                 min_size = step.get("min_size", 0)
-                if file_size < min_size:
+                if total_size < min_size:
                     result["status"] = "failed"
                     result["error"] = (
-                        f"Persistence file too small: {file_size} < {min_size}"
+                        f"Persistence files total size too small: {total_size} < {min_size}"
                     )
                     return result
 
@@ -591,20 +528,6 @@ class ShellTestRunner:
 
         return result
 
-    def _run_query_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
-        """Run a simple query test through the shell."""
-        result = {
-            "test_name": test.get("name", "unnamed"),
-            "status": "passed",
-            "error": None,
-            "details": {},
-        }
-
-        query = test.get("query")
-        if not query:
-            result["status"] = "error"
-            result["error"] = "No query provided"
-            return result
 
         query_result = self.execute_query(query)
         result["details"]["query_result"] = query_result
@@ -625,35 +548,6 @@ class ShellTestRunner:
 
         return result
 
-    def _run_steps_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
-        """Run a multi-step shell test."""
-        result = {
-            "test_name": test.get("name", "unnamed"),
-            "status": "passed",
-            "error": None,
-            "details": {},
-        }
-
-        steps = test.get("steps", [])
-
-        for i, step in enumerate(steps):
-            step_type = step.get("type")
-
-            if step_type == "command":
-                cmd = step.get("text")
-                success, output = self.send_command(
-                    cmd, step.get("timeout_ms", 30000) // 1000
-                )
-                result["details"][f"step_{i}"] = {
-                    "command": cmd,
-                    "success": success,
-                    "output": output[:500],
-                }
-
-                if not success:
-                    result["status"] = "failed"
-                    result["error"] = f"Step {i} failed: {output}"
-                    return result
 
                 # Check expectations
                 expect = step.get("expect", {})

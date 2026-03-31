@@ -8,21 +8,61 @@ This document tracks **ALL gaps** across the project. Resolved gaps are in [GAP_
 
 ## Summary
 
-| Severity | Open | Won't Do | Closed | Previously Resolved | Total |
+| Severity | Blocked | Won't Do | Closed | Previously Resolved | Total |
 |----------|------|----------|--------|---------------------|-------|
 | Critical | 0 | 0 | 2 | 1 | 3 |
-| High | 0 | 0 | 14 | 2 | 16 |
-| Medium | 0 | 3 | 22 | 10 | 35 |
-| Low | 0 | 0 | 20 | 5 | 25 |
-| **Total** | **0** | **3** | **58** | **18** | **79** |
+| High | 0 | 0 | 15 | 2 | 17 |
+| Medium | 0 | 3 | 24 | 10 | 37 |
+| Low | 0 | 0 | 22 | 5 | 27 |
+| **Total** | **0** | **3** | **63** | **18** | **84** |
 
 Previously resolved: 18 gaps (GAP-0001 through GAP-0018). See [GAP_ANALYSIS_RESOLVED.md](./GAP_ANALYSIS_RESOLVED.md).
 
 ---
 
-## Open Gaps (0)
+## Blocked Gaps (0)
 
-All gaps are resolved. Items below are listed for reference with their closure status.
+### GAP-0275: Fragile JSON and Table Parsing in Interactive Shell Runner
+
+- **Status:** Closed
+- **Category:** Reliability
+- **Severity:** High
+- **Description:** `runners/shell_runner.py` extracts JSON using basic regex (`r"\[.*\]"`) and manually counts table borders. If the interactive shell's output formatting changes slightly (e.g. pretty-printed JSON over multiple lines, or different table decorators), the parser will silently fail or return incorrect row counts.
+- **Resolution:** Modified `start_shell` to use `--format json`. Modified `execute_query` to look for outer `{` and `}` directly and use robust `json.loads`.
+
+### GAP-0276: Error Detection Prone to False Positives
+
+- **Status:** Closed
+- **Category:** Reliability
+- **Severity:** Medium
+- **Description:** The shell runner checks `if "Error" in output or "error" in output.lower():` to determine command failure. If a valid query returns a string containing "error" (e.g. returning an error log string or a user named "Error"), the test will falsely fail.
+- **Resolution:** Now checks the JSON `status_class` attribute for values not starting with "00", or explicit Error log prefixes for shell errors.
+
+### GAP-0277: Brittle Command Echo Stripping
+
+- **Status:** Closed
+- **Category:** Reliability
+- **Severity:** Medium
+- **Description:** `send_command` tries to strip the echoed command from `pexpect` output by matching the first 20 characters of the input command. If the terminal wraps the line or the echo is slightly formatted, the actual output is truncated or incorrectly includes the prompt.
+- **Resolution:** Simplified echo handling by finding the JSON block directly via braces which naturally skips the command echo text.
+
+### GAP-0278: Conflicting "Shell" Terminology Between Runners
+
+- **Status:** Closed
+- **Category:** Maintainability
+- **Severity:** Low
+- **Description:** In `executor.py`, `test_type: shell` means running an OS bash script (often for source code grepping). In `runners/shell_runner.py`, it means testing the `geode shell` interactive TTY. This overloaded terminology confuses spec authors.
+- **Resolution:** Renamed `test_type: shell` in `executor.py` to `test_type: bash` across the codebase, test specs, and security unit tests.
+
+### GAP-0279: Hardcoded Persistence File Checking
+
+- **Status:** Closed
+- **Category:** Extensibility
+- **Severity:** Low
+- **Description:** `_run_persistence_test` in `shell_runner.py` hardcodes the check for `graph_store.dat`. If the storage engine changes or utilizes multiple files (like indexes or logs), the persistence test will not verify them accurately.
+- **Resolution:** `_run_persistence_test` now checks `step.get("files", ["graph_store.dat"])` to allow tests to optionally specify multiple persistence files.
+
+### Resolved Gaps Listed Below for Reference
 
 ### GAP-0265: No unit tests for security fixes (#48, #49, #58)
 

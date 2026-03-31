@@ -13,35 +13,28 @@ import httpx
 from .spec import HttpExpected, TestCase
 
 
-def check_expectations(
-    test_case: TestCase,
-    output: str,
-    error: str,
-    exit_code: int,
-) -> bool:
-    """Check if test output matches expectations."""
-    expected = test_case.expected
-
-    # Check exit code (supports single int or list of ints)
+def _check_exit_code(expected, exit_code: int) -> bool:
     if expected.exit_code is not None:
         if isinstance(expected.exit_code, list):
             if exit_code not in expected.exit_code:
                 return False
         elif exit_code != expected.exit_code:
             return False
+    return True
 
-    # Check status (success vs error) - only if exit_code not explicitly specified
-    # This allows tests to specify exit_code without also needing to set status
+
+def _check_status(expected, exit_code: int) -> bool:
     if expected.exit_code is None:
         if expected.status == "success" and exit_code != 0:
             return False
         if expected.status == "error" and exit_code == 0:
             return False
+    return True
 
-    # Check result contains (legacy format - single string or list)
+
+def _check_result_contains(expected, output: str) -> bool:
     if expected.result_contains:
         if isinstance(expected.result_contains, dict):
-            # Dict: check each key-value pair appears in output
             for k, v in expected.result_contains.items():
                 if str(k) not in output or str(v) not in output:
                     return False
@@ -57,8 +50,10 @@ def check_expectations(
         else:
             if str(expected.result_contains) not in output:
                 return False
+    return True
 
-    # Check result not contains (legacy format - single string or list)
+
+def _check_result_not_contains(expected, output: str) -> bool:
     if expected.result_not_contains:
         if isinstance(expected.result_not_contains, dict):
             all_found = True
@@ -84,8 +79,10 @@ def check_expectations(
         else:
             if str(expected.result_not_contains) in output:
                 return False
+    return True
 
-    # Check result matches (legacy format - single regex or list)
+
+def _check_result_matches(expected, output: str) -> bool:
     if expected.result_matches:
         if isinstance(expected.result_matches, list):
             for pattern in expected.result_matches:
@@ -93,8 +90,10 @@ def check_expectations(
                     return False
         elif not re.search(expected.result_matches, output):
             return False
+    return True
 
-    # Check error contains (legacy format - single string or list)
+
+def _check_error_contains(expected, error: str) -> bool:
     if expected.error_contains:
         if isinstance(expected.error_contains, list):
             for item in expected.error_contains:
@@ -103,16 +102,14 @@ def check_expectations(
         else:
             if str(expected.error_contains) not in error:
                 return False
+    return True
 
-    # Check stdout_contains (list of substrings that must ALL be present)
-    # Note: checks combined stdout+stderr for backward compatibility (961 usages).
-    # Use output_contains for explicit combined semantics.
+
+def _check_stdout_contains(expected, output: str, error: str) -> bool:
     if expected.stdout_contains:
         combined = output + error
         for item in expected.stdout_contains:
             if isinstance(item, dict):
-                # Dict items represent expected key-value pairs in result rows.
-                # Check that each key and its stringified value appear in the output.
                 for k, v in item.items():
                     k_str = str(k)
                     v_str = str(v)
@@ -122,8 +119,10 @@ def check_expectations(
                 substring = str(item) if not isinstance(item, str) else item
                 if substring not in output and substring not in error:
                     return False
+    return True
 
-    # Check output_contains (list of substrings in combined stdout+stderr — QG-010)
+
+def _check_output_contains(expected, output: str, error: str) -> bool:
     if expected.output_contains:
         combined = output + error
         for item in expected.output_contains:
@@ -137,19 +136,22 @@ def check_expectations(
                 substring = str(item) if not isinstance(item, str) else item
                 if substring not in combined:
                     return False
+    return True
 
-    # Check stderr_contains (list of substrings that must ALL be present)
+
+def _check_stderr_contains(expected, error: str) -> bool:
     if expected.stderr_contains:
         for item in expected.stderr_contains:
             substring = str(item) if not isinstance(item, str) else item
             if substring not in error:
                 return False
+    return True
 
-    # Check stdout_not_contains (list of substrings that must NOT be present)
+
+def _check_stdout_not_contains(expected, output: str) -> bool:
     if expected.stdout_not_contains:
         for item in expected.stdout_not_contains:
             if isinstance(item, dict):
-                # For not_contains with dicts, fail if ALL key-value pairs are found
                 all_found = True
                 for k, v in item.items():
                     if str(k) not in output or str(v) not in output:
@@ -161,43 +163,89 @@ def check_expectations(
                 substring = str(item) if not isinstance(item, str) else item
                 if substring in output:
                     return False
+    return True
 
-    # Check stderr_not_contains (list of substrings that must NOT be present)
+
+def _check_stderr_not_contains(expected, error: str) -> bool:
     if expected.stderr_not_contains:
         for item in expected.stderr_not_contains:
             substring = str(item) if not isinstance(item, str) else item
             if substring in error:
                 return False
+    return True
 
-    # Check stdout_regex (list of regex patterns that must ALL match)
-    # Note: Geode CLI often outputs to stderr, so we also check stderr as fallback
+
+def _check_stdout_regex(expected, output: str, error: str) -> bool:
     if expected.stdout_regex:
         for pattern in expected.stdout_regex:
-            # Check stdout first, then stderr as fallback
             if not re.search(pattern, output) and not re.search(pattern, error):
                 return False
+    return True
 
-    # Check stderr_regex (list of regex patterns that must ALL match)
+
+def _check_stderr_regex(expected, error: str) -> bool:
     if expected.stderr_regex:
         for pattern in expected.stderr_regex:
             if not re.search(pattern, error):
                 return False
+    return True
 
-    # Check stdout_exact (exact match after stripping whitespace)
-    # Note: Also checks stderr as fallback since Geode CLI often outputs to stderr
+
+def _check_stdout_exact(expected, output: str, error: str) -> bool:
     if expected.stdout_exact is not None:
         expected_stripped = expected.stdout_exact.strip()
         output_stripped = output.strip()
         error_stripped = error.strip()
         if output_stripped != expected_stripped and error_stripped != expected_stripped:
             return False
+    return True
 
-    # Check stderr_exact (exact match after stripping whitespace)
+
+def _check_stderr_exact(expected, error: str) -> bool:
     if expected.stderr_exact is not None:
         if error.strip() != expected.stderr_exact.strip():
             return False
-
     return True
+
+
+def check_expectations(
+    test_case: TestCase,
+    output: str,
+    error: str,
+    exit_code: int,
+) -> bool:
+    """Check if test output matches expectations."""
+    expected = test_case.expected
+
+    if not _check_exit_code(expected, exit_code):
+        return False
+    if not _check_status(expected, exit_code):
+        return False
+    if not _check_result_contains(expected, output):
+        return False
+    if not _check_result_not_contains(expected, output):
+        return False
+    if not _check_result_matches(expected, output):
+        return False
+    if not _check_error_contains(expected, error):
+        return False
+    if not _check_stdout_contains(expected, output, error):
+        return False
+    if not _check_output_contains(expected, output, error):
+        return False
+    if not _check_stderr_contains(expected, error):
+        return False
+    if not _check_stdout_not_contains(expected, output):
+        return False
+    if not _check_stderr_not_contains(expected, error):
+        return False
+    if not _check_stdout_regex(expected, output, error):
+        return False
+    if not _check_stderr_regex(expected, error):
+        return False
+    if not _check_stdout_exact(expected, output, error):
+        return False
+    return _check_stderr_exact(expected, error)
 
 
 def check_http_expectations(

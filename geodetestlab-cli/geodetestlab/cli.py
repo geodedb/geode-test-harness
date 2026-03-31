@@ -23,6 +23,8 @@ from rich.table import Table
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from lib.cli_formatters import _show_rich_summary  # noqa: E402
+from lib.cli_workers import _run_single_spec  # noqa: E402
 from lib.runner import RunnerError, _kill_stale_servers, run_tests  # noqa: E402
 from lib.spec import SpecValidationError, load_spec  # noqa: E402
 from lib.utils import SecretResolutionError, resolve_secrets  # noqa: E402
@@ -114,80 +116,6 @@ def _kill_child_processes() -> None:
 
 # Register cleanup on exit
 atexit.register(_kill_geode_processes)
-
-
-def _run_single_spec(
-    spec_file: Path,
-    llm_provider: str,
-    model: str | None,
-    max_cases: int | None,
-    timeout_ms: int,
-    server_timeout_ms: int,
-    dry_run: bool,
-    ci_mode: bool,
-    seed: int | None,
-    geode_binary: str | None,
-    server_port: int | None,
-    verbose: bool,
-    transport: str = "quic",
-) -> dict[str, Any]:
-    """Run tests for a single spec file.
-
-    This function is designed to be called from a ProcessPoolExecutor.
-    It returns a dict with the results instead of raising exceptions.
-    """
-    result: dict[str, Any] = {
-        "spec": str(spec_file),
-        "exit_code": 0,
-        "summary": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
-        "error": None,
-    }
-
-    try:
-        spec_obj = load_spec(spec_file)
-    except SpecValidationError as exc:
-        result["exit_code"] = 2
-        result["error"] = f"SCHEMA_ERROR in {spec_file}: {exc}"
-        return result
-    except Exception as exc:
-        result["exit_code"] = 2
-        result["error"] = f"SCHEMA_ERROR in {spec_file}: {exc}"
-        return result
-
-    try:
-        secrets, env_vars = resolve_secrets(spec_obj)
-    except SecretResolutionError as exc:
-        result["exit_code"] = 4
-        result["error"] = str(exc)
-        return result
-
-    try:
-        exit_code, summary = run_tests(
-            spec=spec_obj,
-            secrets=secrets,
-            env_overrides=env_vars,
-            llm_provider=llm_provider,
-            model=model,
-            max_cases=max_cases,
-            timeout_ms=timeout_ms,
-            server_timeout_ms=server_timeout_ms,
-            report_json=None,
-            dry_run=dry_run,
-            ci_mode=ci_mode,
-            seed=seed,
-            spec_path=str(spec_file),
-            geode_binary=geode_binary,
-            server_port=server_port,
-            verbose=verbose,
-            transport=transport,
-        )
-        result["exit_code"] = exit_code
-        result["summary"] = summary
-    except RunnerError as exc:
-        result["exit_code"] = 3
-        result["error"] = str(exc)
-
-    return result
 
 
 @app.command("run")
@@ -456,7 +384,10 @@ def run(
                         aggregate_summary["passed"] += summary.get("passed", 0)
                         aggregate_summary["failed"] += summary.get("failed", 0)
                         aggregate_summary["skipped"] += summary.get("skipped", 0)
-                        all_results.append({"spec": result["spec"], "summary": summary})
+                        spec_entry = {"spec": result["spec"], "summary": summary}
+                        if "results" in result:
+                            spec_entry["results"] = result["results"]
+                        all_results.append(spec_entry)
 
                     if not ci and verbose:
                         passed = summary.get("passed", 0)
@@ -525,7 +456,10 @@ def run(
                         aggregate_summary["passed"] += use_summary.get("passed", 0)
                         aggregate_summary["failed"] += use_summary.get("failed", 0)
                         aggregate_summary["skipped"] += use_summary.get("skipped", 0)
-                        all_results.append({"spec": use_result["spec"], "summary": use_summary})
+                        spec_entry = {"spec": use_result["spec"], "summary": use_summary}
+                        if "results" in use_result:
+                            spec_entry["results"] = use_result["results"]
+                        all_results.append(spec_entry)
 
             except KeyboardInterrupt:
                 interrupted = True
@@ -598,7 +532,10 @@ def run(
                     aggregate_summary["passed"] += summary.get("passed", 0)
                     aggregate_summary["failed"] += summary.get("failed", 0)
                     aggregate_summary["skipped"] += summary.get("skipped", 0)
-                    all_results.append({"spec": str(spec_file), "summary": summary})
+                    spec_entry = {"spec": str(spec_file), "summary": summary}
+                    if "results" in summary:
+                        spec_entry["results"] = summary.pop("results")
+                    all_results.append(spec_entry)
                 except RunnerError as exc:
                     console_err.print(str(exc), style="red")
                     total_exit_code = max(total_exit_code, 3)
@@ -618,7 +555,7 @@ def run(
 
     # Show rich summary if not in CI mode
     if not ci:
-        _show_rich_summary(aggregate_summary)
+        _show_rich_summary(aggregate_summary, console)
 
     # Exit with determined exit code (0 for success, 1 if any test failed)
     raise typer.Exit(code=total_exit_code)
@@ -781,31 +718,6 @@ def server_status(
         table.add_row(str(server["pid"]), str(server["port"]), server["status"], server.get("data_dir", "unknown"))
 
     console.print(table)
-
-
-def _show_rich_summary(summary: dict[str, int]) -> None:
-    """Display a rich formatted summary of test results."""
-    table = Table(title="Test Results Summary")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Count", style="bold")
-
-    total = summary.get("total", 0)
-    passed = summary.get("passed", 0)
-    failed = summary.get("failed", 0)
-    skipped = summary.get("skipped", 0)
-
-    table.add_row("Total", str(total))
-    table.add_row("Passed", f"[green]{passed}[/green]")
-    table.add_row("Failed", f"[red]{failed}[/red]" if failed > 0 else str(failed))
-    table.add_row("Skipped", f"[yellow]{skipped}[/yellow]" if skipped > 0 else str(skipped))
-
-    console.print()
-    console.print(table)
-
-    if failed == 0:
-        console.print("\n[green]✓ All tests passed![/green]")
-    else:
-        console.print(f"\n[red]✗ {failed} test(s) failed[/red]")
 
 
 # Add subcommands to the main app

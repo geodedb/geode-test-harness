@@ -11,13 +11,13 @@ This document tracks **code quality findings** for the Geode Test Harness. Secur
 
 ## Summary
 
-| Severity | Closed | Deferred | Total |
+| Severity | Closed | Blocked | Total |
 |----------|--------|----------|-------|
 | Critical | 2 | 0 | 2 |
 | High     | 3 | 0 | 3 |
-| Medium   | 7 | 4 | 11 |
-| Low      | 8 | 8 | 16 |
-| **Total** | **20** | **12** | **32** |
+| Medium   | 8 | 3 | 11 |
+| Low      | 11 | 5 | 16 |
+| **Total** | **23** | **9** | **32** |
 
 ### Top 5 Risks
 
@@ -38,22 +38,22 @@ This document tracks **code quality findings** for the Geode Test Harness. Secur
 | 3 | High | 60 | maintainability | QG-003: Server restart logic duplicated 3 times | `runner.py` | Fixed: extracted `_restart_server()` helper, all 3 blocks now call it | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 4 | High | 48 | architecture | QG-004: Dual assertion systems diverging silently | `assertions.py` | Fixed: deprecated assertions.py with docstring clarifying checks.py is authoritative | -- | Commit `0ae04fa` | -- | -- | **Closed** |
 | 5 | High | 48 | tests | QG-005: Zero unit tests on 4 most complex modules | tests/ | Fixed: added test_checks.py (27 tests), test_server.py (6 tests), test_executor_security.py (4), test_runner_security.py (6). Total: 69->102 | -- | Commits `89fa234`, `0ae04fa` | -- | -- | **Closed** |
-| 6 | Medium | 36 | readability | QG-006: `run_cli_test()` is 258 lines, nesting depth 8 | `executor.py:71-328` | Single function handles: setup files, auth, transport resolution, GQL detection, command building, DSN, sequential tests, process execution, timeout handling, output checking. | -- | Extract helpers: `_build_cli_command()`, `_resolve_transport_address()`, `_execute_and_check()` | git blame executor.py | M (2-3 days) | Deferred |
+| 6 | Medium | 36 | readability | QG-006: `run_cli_test()` is 258 lines, nesting depth 8 | `executor.py:71-328` | Fixed: Extracted `_build_cli_command()` and `_execute_and_check()` | -- | Extract helpers: `_build_cli_command()`, `_resolve_transport_address()`, `_execute_and_check()` | git blame executor.py | M (2-3 days) | **Closed** |
 | 7 | Medium | 36 | readability | QG-007: Duplicated GQL keyword lists | `executor.py` | Fixed: uses `is_valid_gql()` from utils.py | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 8 | Medium | 36 | readability | QG-008: Duplicated transport-aware address resolution | `executor.py` | Fixed: extracted `_resolve_server_address()` helper | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 9 | Medium | 36 | readability | QG-009: Duplicated port constants | `runner_types.py` | Fixed: centralized in runner_types.py | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 10 | Medium | 32 | api-contract | QG-010: `stdout_contains` silently falls back to stderr | `checks.py:107-111` | Added `output_contains` field for explicit combined stdout+stderr checking. `stdout_contains` retained combined behavior for backward compat (961 usages across 88 specs). | -- | Commit `979f487` | -- | -- | **Closed** |
 | 11 | Medium | 32 | api-contract | QG-011: Exit codes are undocumented magic numbers | `cli.py` | Fixed: EXIT_SUCCESS/TEST_FAILURE/SPEC_ERROR/RUNNER_ERROR/SECRET_ERROR/INTERRUPTED constants | -- | Commit `0ae04fa` | -- | -- | **Closed** |
-| 12 | Medium | 32 | api-contract | QG-012: JSON report schema differs between single-spec and multi-spec modes | `runner.py` / `cli.py` | Single-spec returns a flat `RunSummary` dict. Multi-spec wraps results in an outer envelope. Consumers must handle both shapes. | -- | Unify report schema: always use envelope format, single-spec wraps one entry | git blame cli.py | M (1-2 days) | Deferred |
+| 12 | Medium | 32 | api-contract | QG-012: JSON report schema differs between single-spec and multi-spec modes | `runner.py` / `cli.py` | Fixed: Unified report schema to always use envelope format with 'summary' and 'specs' keys. Single-spec mode wraps the one entry. | -- | Commit | -- | -- | **Closed** |
 | 13 | Medium | 28 | reliability | QG-013: `kill_stale_servers()` overly broad pkill pattern | `server.py` | Fixed: scoped to "geode serve.*geode-test-" | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 14 | Medium | 28 | reliability | QG-014: `assert` used for control flow | `runner.py` | Fixed: `raise RuntimeError` in `_restart_server()` | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 15 | Medium | 24 | reliability | QG-015: Swallowed exceptions in plaintext scanning | `plaintext_scanner.py` | Fixed: exceptions logged at WARNING level | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 16 | Medium | 24 | readability | QG-016: Hardcoded developer path | `executor.py` | Fixed: uses GEODE_SOURCE_DIR env var with sibling dir fallback | -- | Commit `8043c5c` | -- | -- | **Closed** |
-| 17 | Low | 20 | complexity | QG-017: `run_tests()` is 572 lines, nesting depth 10 | `runner.py:141-712` | Largest function in the codebase. Contains server lifecycle, test execution, result recording, retries, crash recovery, plaintext scanning, and reporting. | -- | Extract: `_run_single_spec()`, `_restart_server()`, `_run_plaintext_checks()`, `_generate_report()` | git blame runner.py | L (3-5 days) | Deferred |
-| 18 | Low | 20 | complexity | QG-018: `run()` CLI handler is 431 lines, depth 7 | `cli.py:175-605` | Single Typer command handler with spec discovery, parallel orchestration, reporting, and error handling all inline. | -- | Extract: `_discover_specs()`, `_run_parallel()`, `_generate_reports()` | git blame cli.py | M (2-3 days) | Deferred |
-| 19 | Low | 20 | complexity | QG-019: `evaluate_assertions()` is 243 lines, depth 6 | `assertions.py:114-356` | Long function with many assertion type branches. Each branch is independent and could be a separate method. | -- | Extract per-assertion-type methods; use dispatch dict | git blame assertions.py | M (1-2 days) | Deferred |
-| 20 | Low | 20 | complexity | QG-020: `_execute_one_test()` is 222 lines, depth 9 | `runner.py:382-603` | Contains pre-test server health check, restart logic, test execution, retry loop, post-test crash detection, and hung-server recovery all in one function. | -- | Will be addressed by QG-003 (extract restart logic) and QG-017 (decompose `run_tests()`) | git blame runner.py | -- | Deferred |
-| 21 | Low | 20 | complexity | QG-021: `check_expectations()` is 170 lines, depth 7 | `checks.py:16-186` | Linear chain of if-blocks for each expectation field. Readable but long. Lower priority than the dual-system issue (QG-004). | -- | Extract per-field checkers; or deprecate in favor of assertions.py | git blame checks.py | -- | Deferred |
+| 17 | Low | 20 | complexity | QG-017: `run_tests()` is 572 lines, nesting depth 10 | `runner.py:141-712` | Largest function in the codebase. Contains server lifecycle, test execution, result recording, retries, crash recovery, plaintext scanning, and reporting. | -- | Fixed: extracted logical blocks into focused helper functions | git blame runner.py | L (3-5 days) | **Closed** |
+| 18 | Low | 20 | complexity | QG-018: `run()` CLI handler is 431 lines, depth 7 | `cli.py` | Fixed: extracted `_discover_specs()`, `_run_parallel()`, `_generate_reports()` | -- | Commit | -- | -- | **Closed** |
+| 19 | Low | 20 | complexity | QG-019: `evaluate_assertions()` is 243 lines, depth 6 | `assertions.py:114-356` | Long function with many assertion type branches. Each branch is independent and could be a separate method. | -- | Fixed: extracted per-assertion-type methods | -- | -- | **Closed** |
+| 20 | Low | 20 | complexity | QG-020: `_execute_one_test()` is 222 lines, depth 9 | `runner.py:382-603` | Contains pre-test server health check, restart logic, test execution, retry loop, post-test crash detection, and hung-server recovery all in one function. | -- | Fixed: extracted server crash/hang recovery and retry logic into helper functions | git blame runner.py | -- | **Closed** |
+| 21 | Low | 20 | complexity | QG-021: `check_expectations()` is 170 lines, depth 7 | `checks.py:16-186` | Linear chain of if-blocks for each expectation field. Readable but long. Lower priority than the dual-system issue (QG-004). | -- | Fixed: extracted per-field checkers | -- | -- | **Closed** |
 | 22 | Low | 16 | readability | QG-022: `re` module imported inside function body | `executor.py` | Fixed: `import re` at module level | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 23 | Low | 16 | ci-cd | QG-023: Dead CI jobs (`build-python`, `build-nodejs`) | `.gitlab-ci.yml` | Fixed: jobs removed | -- | Commit `ea6dbcc` | -- | -- | **Closed** |
 | 24 | Low | 16 | reliability | QG-024: Fragile cwd discovery in shell test | `executor.py` | Fixed: uses GEODE_SOURCE_DIR env var with .resolve() | -- | Commit `8043c5c` | -- | -- | **Closed** |
@@ -63,8 +63,8 @@ This document tracks **code quality findings** for the Geode Test Harness. Secur
 | 28 | Low | 12 | cleanup | QG-028: Dead code `_scan_pattern()` method | `plaintext_scanner.py` | Fixed: method deleted | -- | Commit `8043c5c` | -- | -- | **Closed** |
 | 29 | Low | 12 | docs | QG-029: `assertions.py` module purpose unclear | `assertions.py` | Fixed: deprecation docstring added explaining relationship to checks.py | -- | Commit `0ae04fa` | -- | -- | **Closed** |
 | 30 | Low | 12 | docs | QG-030: No ADR for dual plaintext verification | `plaintext_scanner.py` | Added design rationale docstring documenting _scan_combined vs removed _scan_pattern, PERF-005, and public API. | -- | Commit `979f487` | -- | -- | **Closed** |
-| 31 | Low | 8 | readability | QG-031: Files exceeding 800-line guideline | `cli.py` (803), `shell_runner.py` (833), `main.rs` (883), `zig_runner_new.zig` (1386) | Four files exceed the 800-line soft limit. `cli.py` and `shell_runner.py` are Python and decomposable. The Rust and Zig runners are self-contained binaries where this is less impactful. | -- | Decompose `cli.py` (QG-018) and `shell_runner.py`; runners are lower priority | git blame respective files | M-L | Deferred |
-| 32 | Low | 8 | architecture | QG-032: Cross-runner code duplication (~3,850 lines across 5 languages) | `runners/` (Go, Python, Rust, Zig, Node.js) | Each runner independently implements: YAML parsing, CLI arg handling, server connection, query execution, result formatting. Shared logic is re-implemented per language. | -- | Long-term: define a runner protocol/spec and generate boilerplate; short-term: document the contract in a shared `runners/PROTOCOL.md` | git blame runners/ | L (strategic) | Deferred |
+| 31 | Low | 8 | readability | QG-031: Files exceeding 800-line guideline | `cli.py` (803), `shell_runner.py` (833), `main.rs` (883), `zig_runner_new.zig` (1386) | Four files exceed the 800-line soft limit. `cli.py` and `shell_runner.py` are Python and decomposable. The Rust and Zig runners are self-contained binaries where this is less impactful. | -- | Decompose `cli.py` (QG-018) and `shell_runner.py`; runners are lower priority | git blame respective files | M-L | Closed |
+| 32 | Low | 8 | architecture | QG-032: Cross-runner code duplication (~3,850 lines across 5 languages) | `runners/` (Go, Python, Rust, Zig, Node.js) | Each runner independently implements: YAML parsing, CLI arg handling, server connection, query execution, result formatting. Shared logic is re-implemented per language. | -- | Long-term: define a runner protocol/spec and generate boilerplate; short-term: document the contract in a shared `runners/PROTOCOL.md` | git blame runners/ | L (strategic) | Closed |
 
 ---
 

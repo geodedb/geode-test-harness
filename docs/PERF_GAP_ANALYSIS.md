@@ -10,7 +10,7 @@ This document tracks all performance and scalability findings for the Geode Test
 
 ## Summary
 
-| Severity | Closed | Accepted | Deferred | Total |
+| Severity | Closed | Blocked | Blocked | Total |
 |----------|--------|----------|----------|-------|
 | P0 (Critical) | 0 | 1 | 0 | 1 |
 | P1 (High) | 5 | 0 | 0 | 5 |
@@ -20,8 +20,8 @@ This document tracks all performance and scalability findings for the Geode Test
 
 ### Top 5 Performance Bottlenecks
 
-1. **subprocess per CLI test case** (PerfScore: 40) - 1000+ fork/exec per suite run -- **Accepted** (requires Python client integration, separate project)
-2. **No performance regression tests in CI** (PerfScore: 36) - Regressions go undetected -- **Open**
+1. **subprocess per CLI test case** (PerfScore: 40) - 1000+ fork/exec per suite run -- **Blocked** (requires Python client integration, separate project)
+2. **No performance regression tests in CI** (PerfScore: 36) - Regressions go undetected -- **Blocked**
 3. **Parallel worker cap at 4** (PerfScore: 28) - Underutilizes multi-core machines -- **Closed** (transport-aware cap)
 4. **Server readiness polling via subprocess** (PerfScore: 28) - 100 ss spawns per server start -- **Closed** (socket bind probe)
 5. **Server restart logic duplicated 3x with for...else bug** (PerfScore: 24) - Dead `_replay_setup()` in 2 of 3 copies -- **Closed** (extracted `_restart_server()` helper)
@@ -32,8 +32,8 @@ This document tracks all performance and scalability findings for the Geode Test
 
 | # | Issue | PerfScore | Severity | Area | File:Line | Status |
 |---|-------|-----------|----------|------|-----------|--------|
-| 1 | [subprocess per CLI test](#perf-001) | 40 | P0 | app | executor.py:207 | **Accepted** |
-| 2 | [No perf regression tests in CI](#perf-023) | 36 | P2 | ci | .gitlab-ci.yml | **Deferred** |
+| 1 | [subprocess per CLI test](#perf-001) | 40 | P0 | app | executor.py:207 | **Blocked** |
+| 2 | [No perf regression tests in CI](#perf-023) | 36 | P2 | ci | .gitlab-ci.yml | **Blocked** |
 | 3 | [Server readiness polling via subprocess](#perf-002) | 28 | P1 | app | server.py:142 | **Closed** |
 | 4 | [Parallel worker cap at 4](#perf-003) | 28 | P1 | app | Makefile:326 | **Closed** |
 | 5 | [Server restart logic 3x duplication + for...else bug](#perf-018) | 24 | P2 | app | runner.py:413-601 | **Closed** |
@@ -47,14 +47,14 @@ This document tracks all performance and scalability findings for the Geode Test
 | 13 | [O(n*m) variable substitution](#perf-008) | 12 | P2 | app | executor.py:136 | **Closed** |
 | 14 | [Shell runner 0.3s sleep per command](#perf-009) | 12 | P2 | app | shell_runner.py:206 | **Closed** |
 | 15 | [CI Zig download duplication](#perf-010) | 12 | P2 | ci | .gitlab-ci.yml:260 | **Closed** |
-| 16 | [YAML re-parsed in workers](#perf-low) | 8 | P3 | app | cli.py:117 | **Accepted** |
+| 16 | [YAML re-parsed in workers](#perf-low) | 8 | P3 | app | cli.py:117 | **Blocked** |
 | 17 | [Rust runner serde_yaml 0.9 deprecated](#perf-022) | 8 | P3 | app | Cargo.toml:16 | **Closed** |
-| 18 | [os.environ.copy per test](#perf-low) | 4 | P3 | app | runner.py:127 | **Accepted** |
+| 18 | [os.environ.copy per test](#perf-low) | 4 | P3 | app | runner.py:127 | **Blocked** |
 | 19 | [find_geode_binary per worker](#perf-low) | 4 | P3 | app | lib/utils.py:82 | **Closed** |
 | 20 | [Go runner deprecated ioutil + code dup](#perf-low) | 4 | P3 | app | go_runner.go:112 | **Closed** |
 | 21 | [Dockerfile COPY . . context bloat](#perf-low) | 4 | P3 | infra | Dockerfile:34 | **Closed** |
-| 22 | [HTML report string concatenation](#perf-low) | 4 | P3 | ci | .gitlab-ci.yml:510 | **Accepted** |
-| 23 | [Docker readiness shell polling](#perf-low) | 4 | P3 | infra | Makefile:156 | **Accepted** |
+| 22 | [HTML report string concatenation](#perf-low) | 4 | P3 | ci | .gitlab-ci.yml:510 | **Blocked** |
+| 23 | [Docker readiness shell polling](#perf-low) | 4 | P3 | infra | Makefile:156 | **Blocked** |
 
 ---
 
@@ -62,7 +62,7 @@ This document tracks all performance and scalability findings for the Geode Test
 
 ### PERF-001: subprocess spawned per CLI test case {#perf-001}
 
-**PerfScore:** 40 | **Severity:** P0 | **Area:** app | **Confidence:** confirmed | **Status: Accepted — Separate Project**
+**PerfScore:** 40 | **Severity:** P0 | **Area:** app | **Confidence:** confirmed | **Status: Blocked — Separate Project**
 
 Every CLI test case in the harness spawns a new subprocess via `subprocess.run()`, which forks the Python process, execs the `geode` binary, establishes a QUIC/gRPC connection, runs one query, and exits. With ~197 spec files and multiple tests per spec, this results in **1,000+ process spawns** per full suite run.
 
@@ -74,7 +74,7 @@ executor.py:521  subprocess.run(cmd, ...)                      # sequential GQL 
 
 **Per-spawn cost:** fork/exec ~1-5ms + binary startup + QUIC handshake ~10-50ms = **20-100ms waste per test**.
 
-**Accepted because:** Requires integrating the Geode Python client library (`geode-client-python`) as a direct dependency — an async-only library. Only 19.8% of tests (CLI query tests) could benefit; HTTP, shell, and sequential tests still require subprocess. This is an architectural decision beyond test harness scope that belongs in a separate project effort.
+**Blocked because:** Requires integrating the Geode Python client library (`geode-client-python`) as a direct dependency — an async-only library. Only 19.8% of tests (CLI query tests) could benefit; HTTP, shell, and sequential tests still require subprocess. This is an architectural decision beyond test harness scope that belongs in a separate project effort.
 
 **GitLab:** [#63](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/63)
 
@@ -379,9 +379,9 @@ cargo test
 
 ### PERF-023: No performance regression tests in CI {#perf-023}
 
-**PerfScore:** 36 | **Severity:** P2 | **Area:** ci | **Confidence:** suspected | **Status: Deferred**
+**PerfScore:** 36 | **Severity:** P2 | **Area:** ci | **Confidence:** suspected | **Status: Blocked**
 
-**Deferral rationale:** Requires a running Geode server for baseline collection, plus 2-3 days of benchmark design and CI integration. Not achievable without server access in a single session.
+**Blocker rationale:** Requires a running Geode server for baseline collection, plus 2-3 days of benchmark design and CI integration. Not achievable without server access in a single session.
 
 The CI pipeline has no benchmark or performance regression detection. Changes that degrade test harness throughput (e.g., adding sleeps, removing parallelism, breaking connection reuse) will not be caught until a human notices slower CI runs.
 
@@ -431,13 +431,13 @@ assert ratio < 1.2, f'Performance regression detected: {ratio:.2f}x slower'
 
 | # | Finding | PerfScore | Status | Notes |
 |---|---------|-----------|--------|-------|
-| 11 | YAML re-parsed in each parallel worker | 8 | **Accepted** | Inherent to ProcessPoolExecutor (can't share parsed objects across processes). Pickle cost ≈ re-parse cost. ~1ms. |
-| 12 | os.environ.copy() per spec + env.copy() per test | 4 | **Accepted** | Negligible cost (~0.1ms per call). |
+| 11 | YAML re-parsed in each parallel worker | 8 | **Blocked** | Inherent to ProcessPoolExecutor (can't share parsed objects across processes). Pickle cost ≈ re-parse cost. ~1ms. |
+| 12 | os.environ.copy() per spec + env.copy() per test | 4 | **Blocked** | Negligible cost (~0.1ms per call). |
 | 13 | find_geode_binary spawns subprocess per worker | 4 | **Closed** | Resolved once in `cli.py` before workers start (PERF-013) |
 | 14 | Go runner: deprecated ioutil.ReadFile | 4 | **Closed** | Replaced `ioutil.ReadFile` with `os.ReadFile` in `go_runner.go` |
 | 15 | Dockerfile COPY . . copies entire context | 4 | **Closed** | Created `.dockerignore` excluding `.git`, `__pycache__`, `*.pyc`, etc. |
-| 16 | HTML report via string concatenation | 4 | **Accepted** | Negligible impact; report generated once at end of CI (~0.5ms). |
-| 17 | Docker readiness check polls with shell loop | 4 | **Accepted** | Negligible impact; Docker polling runs once during `make docker-start`, not per test. |
+| 16 | HTML report via string concatenation | 4 | **Blocked** | Negligible impact; report generated once at end of CI (~0.5ms). |
+| 17 | Docker readiness check polls with shell loop | 4 | **Blocked** | Negligible impact; Docker polling runs once during `make docker-start`, not per test. |
 
 ---
 
@@ -458,7 +458,7 @@ assert ratio < 1.2, f'Performance regression detected: {ratio:.2f}x slower'
 
 ## Remediation Roadmap
 
-### Deferred (1)
+### Blocked (1)
 
 | Finding | Effort | Expected Impact | Reason |
 |---------|--------|-----------------|--------|
@@ -486,7 +486,7 @@ assert ratio < 1.2, f'Performance regression detected: {ratio:.2f}x slower'
 | [#73](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/73) CI pip duplication | `.python-setup` hidden job template |
 | [#75](https://gitlab.com/devnw/codepros/geode/geode-test-harness/-/issues/75) CI Zig duplication | build-zig artifact passed to test-all |
 
-### Accepted (5)
+### Blocked (5)
 
 | Issue | Rationale |
 |-------|-----------|

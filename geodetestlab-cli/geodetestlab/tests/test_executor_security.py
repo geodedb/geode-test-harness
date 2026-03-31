@@ -29,7 +29,7 @@ def _make_case(**overrides: object) -> TestCase:
 
 class TestShellMetacharacterRouting:
     """Verify that shell metacharacters are NOT routed through bash
-    unless test_type is explicitly 'shell'."""
+    unless test_type is explicitly 'bash'."""
 
     def test_metachar_in_cli_test_uses_shlex(self) -> None:
         """CLI test with metacharacters should use shlex, not bash -c."""
@@ -54,10 +54,10 @@ class TestShellMetacharacterRouting:
             assert cmd[0] != "bash", f"CLI test should not use bash: {cmd}"
 
     def test_shell_test_type_uses_bash(self) -> None:
-        """Shell test type should explicitly use bash -c."""
+        """Bash test type should explicitly use bash -c."""
         tc = _make_case(
             command="echo hello",
-            test_type="shell",
+            test_type="bash",
             expected={"exit_code": 0},
         )
         with patch("geodetestlab.lib.executor.subprocess.run") as mock_run:
