@@ -12,7 +12,7 @@
 .PHONY: migrate migrate-status migrate-create test-graph
 .PHONY: route-failures route-failures-dry-run
 .PHONY: test-cli test-cli-comprehensive geodetestlab-setup geodetestlab-run
-.PHONY: test-full test-full-parallel
+.PHONY: test-full test-full-parallel test-everything
 .PHONY: test-unit test-unit-verbose
 .PHONY: test-quic test-grpc test-all-transports
 .PHONY: lint format type-check security-check quality
@@ -432,6 +432,11 @@ test-cli-comprehensive: test
 test-full: test
 test-full-parallel: test
 geodetestlab-run: test-spec
+
+# Unified target for running all tests with a specific binary
+test-everything: .check-geode-binary
+	@echo "Running all tests with geode binary: $(GEODE_BINARY)"
+	@bash scripts/run_all_tests.sh --geode-binary "$(GEODE_BINARY)"
 
 # ==============================================================================
 # Transport-Specific Tests

@@ -72,9 +72,10 @@ def run_query_cli(host: str, port: int, user: str, password: str, query: str) ->
     """Execute a query via the geode CLI binary and return (latency, error)."""
     start = time.monotonic()
     try:
+        geode_bin = os.environ.get("GEODE_BINARY", "geode")
         result = subprocess.run(
             [
-                "geode",
+                geode_bin,
                 "query",
                 query,
                 "--server",
