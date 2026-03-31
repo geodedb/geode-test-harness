@@ -9,6 +9,7 @@ This is the **Geode Test Harness** (`geodetestlab-cli`) — a CLI-based integrat
 ## External Dependencies
 
 Client libraries are located in sibling directories:
+
 - `../geode-client-go/` - Go client (module: geodedb.com/geode)
 - `../geode-client-python/` - Python client (package: geode_client)
 - `../geode-client-rust/` - Rust client (crate: geode-client)
@@ -33,10 +34,12 @@ make setup             # Install dependencies and build runners
 make geodetestlab-setup # Setup geodetestlab-cli venv
 
 # Run tests (all use geodetestlab-cli)
-make test              # Run all tests (parallel)
+make test-everything   # Run ALL tests with a unified script (unit, integration, shell, load)
+make test              # Run client/integration tests
 make test-all          # Run all tests with JSON report
 make test-docker       # Start Docker, run tests, stop Docker
 make test-unit         # Run unit tests (57 tests)
+make test-shell        # Run interactive shell session stability tests
 
 # Transport-specific tests
 make test-quic         # Run tests using QUIC transport (default)
@@ -70,7 +73,7 @@ python -m geodetestlab run --specs specs --transport grpc -v
 
 ### Key Files
 
-```
+```text
 geodetestlab-cli/
 ├── geodetestlab/
 │   ├── cli.py                 # Typer CLI (run, secrets, server commands)
@@ -122,6 +125,7 @@ tests:
 ### Cross-Language Runners
 
 The `runners/` directory contains language-specific test runners for cross-client validation:
+
 - `runners/zig_runner` / `zig_runner_new.zig` - Zig client runner
 - `runners/go_runner` / `go_runner.go` - Go client runner
 - `runners/python_runner.py` - Python client runner
@@ -157,10 +161,12 @@ GEODE_PORT=8443 make docker-start
 ## Requirements
 
 ### Required
+
 - Python 3.11+ (for geodetestlab-cli)
 - Geode binary (`../geode/zig-out/bin/geode`)
 
 ### Optional
+
 - Docker (for containerized server management)
 - **Zig**: 0.15.1+ for Zig runner
 - **Go**: 1.24+ for Go runner
