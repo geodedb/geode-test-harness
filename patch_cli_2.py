@@ -20,4 +20,3 @@ else:
 
 with open("geodetestlab-cli/geodetestlab/cli.py", "w") as f:
     f.write(content)
-

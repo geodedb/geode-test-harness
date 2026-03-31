@@ -83,7 +83,7 @@ new_check_persistence = '''            elif step_type == "check_persistence_file
                 # Check that the persistence files exist and have data
                 persistence_files = step.get("files", ["graph_store.dat"])
                 total_size = 0
-                
+
                 for filename in persistence_files:
                     persistence_file = os.path.join(self.data_dir, filename)
 
@@ -93,7 +93,7 @@ new_check_persistence = '''            elif step_type == "check_persistence_file
                         result["status"] = "failed"
                         result["error"] = f"Persistence file not found: {persistence_file}"
                         return result
-                        
+
                     file_size = self.get_file_size(persistence_file)
                     result["details"][f"persistence_file_size_{filename}"] = file_size
                     total_size += file_size
