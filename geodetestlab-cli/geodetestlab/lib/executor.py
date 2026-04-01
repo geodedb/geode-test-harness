@@ -56,28 +56,33 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
     subcmd = args[0]  # user, role, apikey, mfa, etc.
     action = args[1]  # create, list, delete, enable, disable, etc.
 
-    # Parse flags from remaining args
-    positionals: list[str] = []
-    flags: dict[str, str] = {}
-    i = 2
-    while i < len(args):
-        arg = args[i]
-        if arg.startswith("--") and i + 1 < len(args) and not args[i + 1].startswith("--"):
-            flags[arg] = args[i + 1]
-            i += 2
-        elif arg.startswith("--"):
-            flags[arg] = "true"
-            i += 1
-        elif arg.startswith("-") and len(arg) == 2 and i + 1 < len(args):
-            flags[arg] = args[i + 1]
-            i += 2
-        else:
-            positionals.append(arg)
-            i += 1
+    # Parse flags from remaining args (start at index 2 by default)
+    def _parse_flags_and_positionals(start: int = 2) -> tuple[list[str], dict[str, str]]:
+        positionals: list[str] = []
+        flags: dict[str, str] = {}
+        i = start
+        while i < len(args):
+            arg = args[i]
+            if arg.startswith("--") and i + 1 < len(args) and not args[i + 1].startswith("--"):
+                flags[arg] = args[i + 1]
+                i += 2
+            elif arg.startswith("--"):
+                flags[arg] = "true"
+                i += 1
+            elif arg.startswith("-") and len(arg) == 2 and i + 1 < len(args):
+                flags[arg] = args[i + 1]
+                i += 2
+            else:
+                positionals.append(arg)
+                i += 1
+        return positionals, flags
+
+    positionals, flags = _parse_flags_and_positionals()
 
     def esc(s: str) -> str:
         return _escape_gql_string(s)
 
+    # --- user commands ---
     if subcmd == "user" and action == "create":
         username = positionals[0] if positionals else flags.get("--username", "")
         email = positionals[1] if len(positionals) > 1 else flags.get("--email", "")
@@ -91,32 +96,134 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
     elif subcmd == "user" and action == "delete":
         username = positionals[0] if positionals else ""
         return f"CALL geode.auth.user_delete('{esc(username)}')"
+    elif subcmd == "user" and action in ("show", "info"):
+        username = positionals[0] if positionals else ""
+        return f"CALL geode.auth.user_show('{esc(username)}')"
+    elif subcmd == "user" and action in ("enable", "disable"):
+        username = positionals[0] if positionals else ""
+        return f"CALL geode.auth.user_{action}('{esc(username)}')"
+    elif subcmd == "user" and action == "assign-role":
+        username = positionals[0] if positionals else ""
+        role = positionals[1] if len(positionals) > 1 else flags.get("--role", "")
+        return f"CALL geode.auth.user_assign_role('{esc(username)}', '{esc(role)}')"
+    elif subcmd == "user" and action == "permissions":
+        username = positionals[0] if positionals else ""
+        return f"CALL geode.auth.user_permissions('{esc(username)}')"
+    elif subcmd == "user" and action == "change-password":
+        username = positionals[0] if positionals else ""
+        old_pw = flags.get("--old-password", "")
+        new_pw = flags.get("--new-password", "")
+        if "--generate-password" in flags:
+            new_pw = "auto_generated_password_placeholder"
+        return f"CALL geode.auth.user_change_password('{esc(username)}', '{esc(old_pw)}', '{esc(new_pw)}')"
+    elif subcmd == "user" and action == "reset-password":
+        username = positionals[0] if positionals else ""
+        new_pw = flags.get("--new-password", "")
+        if "--generate-password" in flags:
+            new_pw = "auto_generated_password_placeholder"
+        return f"CALL geode.auth.user_reset_password('{esc(username)}', '{esc(new_pw)}')"
+    elif subcmd == "user" and action == "mfa":
+        # Nested: user mfa enable/disable <username> [--code <code>]
+        # Re-parse from index 3 (after "user", "mfa", sub-action)
+        if len(args) < 3:
+            return None
+        mfa_action = args[2]
+        mfa_positionals, mfa_flags = _parse_flags_and_positionals(3)
+        if mfa_action in ("enable", "disable"):
+            username = mfa_positionals[0] if mfa_positionals else mfa_flags.get("-U", mfa_flags.get("--user", ""))
+            code = mfa_flags.get("--code", "")
+            if code:
+                return f"CALL geode.auth.mfa_{mfa_action}('{esc(username)}', '{esc(code)}')"
+            return f"CALL geode.auth.mfa_{mfa_action}('{esc(username)}')"
+        return None
+    elif subcmd == "user" and action == "mfa-setup":
+        username = positionals[0] if positionals else ""
+        show_uri = "--show-uri" in flags
+        show_recovery = "--show-recovery" in flags
+        regenerate = "--regenerate" in flags
+        opts: list[str] = []
+        if show_uri:
+            opts.append("show-uri")
+        if show_recovery:
+            opts.append("show-recovery")
+        if regenerate:
+            opts.append("regenerate")
+        opts_str = ",".join(opts) if opts else ""
+        return f"CALL geode.auth.mfa_setup('{esc(username)}', '{esc(opts_str)}')"
+    elif subcmd == "user" and action == "mfa-verify":
+        username = positionals[0] if positionals else ""
+        token = flags.get("--token", "")
+        return f"CALL geode.auth.mfa_verify('{esc(username)}', '{esc(token)}')"
+
+    # --- role commands ---
     elif subcmd == "role" and action == "create":
         role_name = positionals[0] if positionals else ""
         desc = positionals[1] if len(positionals) > 1 else ""
-        return f"CALL geode.auth.role_create('{esc(role_name)}', '{esc(desc)}')"
+        perms = flags.get("--permissions", "")
+        return f"CALL geode.auth.role_create('{esc(role_name)}', '{esc(desc)}', '{esc(perms)}')"
     elif subcmd == "role" and action == "list":
         return "CALL geode.auth.role_list()"
     elif subcmd == "role" and action == "delete":
         role_name = positionals[0] if positionals else ""
         return f"CALL geode.auth.role_delete('{esc(role_name)}')"
+    elif subcmd == "role" and action == "show":
+        role_name = positionals[0] if positionals else ""
+        return f"CALL geode.auth.role_show('{esc(role_name)}')"
+
+    # --- mfa commands (top-level) ---
     elif subcmd == "mfa" and action in ("enable", "disable"):
         username = positionals[0] if positionals else flags.get("-U", flags.get("--user", ""))
         return f"CALL geode.auth.mfa_{action}('{esc(username)}')"
+
+    # --- apikey commands ---
     elif subcmd == "apikey" and action == "create":
-        username = positionals[0] if positionals else flags.get("--user", "")
-        return f"CALL geode.auth.apikey_create('{esc(username)}')"
-    elif subcmd == "apikey" and action in ("list", "revoke-all", "revoke"):
-        return f"CALL geode.auth.apikey_{action.replace('-', '_')}()"
+        username = flags.get("--user", positionals[0] if positionals else "")
+        name = flags.get("--name", "")
+        scope = flags.get("--scope", "")
+        expires_in = flags.get("--expires-in", "")
+        return f"CALL geode.auth.apikey_create('{esc(username)}', '{esc(name)}', '{esc(scope)}', '{esc(expires_in)}')"
+    elif subcmd == "apikey" and action == "list":
+        username = flags.get("--user", "")
+        return f"CALL geode.auth.apikey_list('{esc(username)}')"
+    elif subcmd == "apikey" and action == "revoke":
+        username = flags.get("--user", "")
+        name = flags.get("--name", "")
+        return f"CALL geode.auth.apikey_revoke('{esc(username)}', '{esc(name)}')"
+    elif subcmd == "apikey" and action == "revoke-all":
+        username = flags.get("--user", "")
+        return f"CALL geode.auth.apikey_revoke_all('{esc(username)}')"
+    elif subcmd == "apikey" and action == "validate":
+        return None  # Validation is client-side, keep local
+    elif subcmd == "apikey" and action == "check-scope":
+        username = flags.get("--user", "")
+        name = flags.get("--name", "")
+        scope = flags.get("--scope", "")
+        return f"CALL geode.auth.apikey_check_scope('{esc(username)}', '{esc(name)}', '{esc(scope)}')"
+
+    # --- policy commands ---
     elif subcmd == "policy" and action == "create":
         name = positionals[0] if positionals else ""
         desc = positionals[1] if len(positionals) > 1 else ""
-        return f"CALL geode.auth.policy_create('{esc(name)}', '{esc(desc)}')"
-    elif subcmd in ("grant", "revoke"):
-        # grant SELECT TO <role> / revoke SELECT FROM <role>
+        table = flags.get("--table", "")
+        condition = flags.get("--condition", flags.get("--using", ""))
+        return f"CALL geode.auth.policy_create('{esc(name)}', '{esc(desc)}', '{esc(table)}', '{esc(condition)}')"
+    elif subcmd == "policy" and action == "list":
+        return "CALL geode.auth.policy_list()"
+    elif subcmd == "policy" and action == "delete":
+        name = positionals[0] if positionals else ""
+        return f"CALL geode.auth.policy_delete('{esc(name)}')"
+
+    # --- grant/revoke commands ---
+    elif subcmd == "grant":
         perm = positionals[0] if positionals else action
-        target = flags.get("--to", flags.get("--from", positionals[-1] if positionals else ""))
-        return f"CALL geode.auth.grant('{esc(perm)}', '{esc(target)}')"
+        target = positionals[1] if len(positionals) > 1 else ""
+        resource = flags.get("--resource", "")
+        return f"CALL geode.auth.grant('{esc(perm)}', '{esc(target)}', '{esc(resource)}')"
+    elif subcmd == "revoke":
+        perm = positionals[0] if positionals else action
+        target = positionals[1] if len(positionals) > 1 else ""
+        resource = flags.get("--resource", "")
+        return f"CALL geode.auth.revoke('{esc(perm)}', '{esc(target)}', '{esc(resource)}')"
 
     return None  # Unknown command — fall back to local mode
 

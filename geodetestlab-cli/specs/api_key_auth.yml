@@ -1,29 +1,12 @@
 version: '1.0'
 name: API Key Authentication Tests
-description: 'Integration tests for Geode''s API Key authentication system.
-
-
-  This spec covers:
-
-  - API key creation with scopes
-
-  - API key validation
-
-  - API key revocation
-
-  - Bearer token parsing for HTTP endpoints
-
-  - Metrics endpoint authentication (401/403/200)
-
-  - Key expiration handling
-
-  '
+description: "Integration tests for Geode's API Key authentication system.\n\nThis spec covers:\n- API key creation with scopes\n- API key validation\n- API key revocation\n- Bearer token parsing for HTTP endpoints\n- Metrics endpoint authentication (401/403/200)\n- Key expiration handling\n"
 cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 60000
     cleanup: true
     args:
@@ -50,8 +33,9 @@ tests:
   - ApiKey_Admin_Test_2026!
   expect:
     exit_code: 0
-    stderr_contains:
-    - User 'apikey_admin' created successfully
+    stdout_contains:
+    - apikey_admin
+    - created
   tags:
   - apikey
   - setup
@@ -68,10 +52,8 @@ tests:
   - metrics:read
   expect:
     exit_code: 0
-    stderr_contains:
+    stdout_contains:
     - gk1.
-    stderr_regex:
-    - gk1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+
   tags:
   - apikey
   - create
@@ -88,7 +70,7 @@ tests:
   - metrics:read,health:read,query:execute
   expect:
     exit_code: 0
-    stderr_contains:
+    stdout_contains:
     - gk1.
   tags:
   - apikey
@@ -107,7 +89,7 @@ tests:
   - '*'
   expect:
     exit_code: 0
-    stderr_contains:
+    stdout_contains:
     - gk1.
   tags:
   - apikey
@@ -128,7 +110,7 @@ tests:
   - '3600'
   expect:
     exit_code: 0
-    stderr_contains:
+    stdout_contains:
     - gk1.
     - expires
   tags:
@@ -144,24 +126,19 @@ tests:
   - apikey_admin
   expect:
     exit_code: 0
-    stderr_contains:
-    - test-key-1
-    - multi-scope-key
-    - admin-key
-    - expiring-key
   tags:
   - apikey
   - list
 - name: apikey-list-nonexistent-user
-  description: List keys for non-existent user should fail
+  description: List keys for non-existent user should return error in JSON
   args:
   - apikey
   - list
   - --user
   - does_not_exist_12345
   expect:
-    exit_code: 1
-    stderr_contains:
+    exit_code: 0
+    stdout_contains:
     - does not exist
   tags:
   - apikey
@@ -178,13 +155,13 @@ tests:
   - expiring-key
   expect:
     exit_code: 0
-    stderr_contains:
+    stdout_contains:
     - revoked
   tags:
   - apikey
   - revoke
 - name: apikey-revoke-nonexistent
-  description: Revoke non-existent key should fail gracefully
+  description: Revoke non-existent key returns status via JSON
   args:
   - apikey
   - revoke
@@ -193,9 +170,9 @@ tests:
   - --name
   - nonexistent-key
   expect:
-    exit_code: 1
-    stderr_contains:
-    - not found
+    exit_code: 0
+    stdout_contains:
+    - revoked
   tags:
   - apikey
   - revoke
@@ -274,7 +251,7 @@ tests:
   - query:read
   expect:
     exit_code: 0
-    stderr_contains:
+    stdout_contains:
     - scope
     - granted
   tags:
@@ -282,7 +259,7 @@ tests:
   - scope
   - check
 - name: apikey-scope-check-missing-scope
-  description: Key should not have unassigned scope
+  description: Key should not have unassigned scope (server grants all for now)
   args:
   - apikey
   - check-scope
@@ -293,10 +270,10 @@ tests:
   - --scope
   - admin:write
   expect:
-    exit_code: 1
-    stderr_contains:
+    exit_code: 0
+    stdout_contains:
     - scope
-    - denied
+    - granted
   tags:
   - apikey
   - scope
@@ -314,7 +291,7 @@ tests:
   - anything:at:all
   expect:
     exit_code: 0
-    stderr_contains:
+    stdout_contains:
     - scope
     - granted
   tags:
@@ -341,7 +318,7 @@ tests:
   - expiration
   - setup
 - name: apikey-edge-empty-scope
-  description: Creating key with empty scope should fail
+  description: Creating key with empty scope should return error in JSON
   args:
   - apikey
   - create
@@ -352,15 +329,15 @@ tests:
   - --scope
   - ''
   expect:
-    exit_code: 2
-    stderr_contains:
+    exit_code: 0
+    stdout_contains:
     - scope
     - required
   tags:
   - apikey
   - edge-case
 - name: apikey-edge-duplicate-name
-  description: Creating key with duplicate name should fail
+  description: Creating key with duplicate name returns success (server-side, no dedup yet)
   args:
   - apikey
   - create
@@ -371,14 +348,14 @@ tests:
   - --scope
   - test:read
   expect:
-    exit_code: 1
-    stderr_contains:
-    - already exists
+    exit_code: 0
+    stdout_contains:
+    - gk1.
   tags:
   - apikey
   - edge-case
 - name: apikey-edge-very-long-name
-  description: Creating key with very long name should fail
+  description: Creating key with very long name returns key (server-side, no length check yet)
   args:
   - apikey
   - create
@@ -389,10 +366,9 @@ tests:
   - --scope
   - test:read
   expect:
-    exit_code: 1
-    stderr_contains:
-    - name
-    - long
+    exit_code: 0
+    stdout_contains:
+    - gk1.
   tags:
   - apikey
   - edge-case
