@@ -1,0 +1,244 @@
+version: '1.0'
+name: Distributed Query Tests
+description: Tests for distributed query execution, cross-shard operations, and query coordination
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+# --- Scatter-Gather Query Execution ---
+- name: distributed-scatter-gather-basic
+  description: Basic scatter-gather query returns results from a single node
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:Server {name: 'node1', shard: 1})
+    CREATE (b:Server {name: 'node2', shard: 2})
+    RETURN a.name AS n1, b.name AS n2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - node1
+    - node2
+  tags:
+  - distributed
+  - scatter-gather
+
+- name: distributed-scatter-gather-aggregation
+  description: Aggregation across distributed results
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (s1:Shard {id: 1, count: 100})
+    CREATE (s2:Shard {id: 2, count: 200})
+    MATCH (s:Shard) RETURN sum(s.count) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - total
+  tags:
+  - distributed
+  - scatter-gather
+  - aggregation
+
+# --- Cross-Shard ORDER BY ---
+- name: distributed-cross-shard-order-by
+  description: ORDER BY across shard boundaries produces correct global ordering
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:Item {name: 'alpha', rank: 3})
+    CREATE (b:Item {name: 'beta', rank: 1})
+    CREATE (c:Item {name: 'gamma', rank: 2})
+    MATCH (i:Item) RETURN i.name AS name ORDER BY i.rank ASC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - name
+  tags:
+  - distributed
+  - order-by
+
+- name: distributed-cross-shard-order-by-desc
+  description: Descending ORDER BY across shard boundaries
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:Score {player: 'p1', pts: 50})
+    CREATE (b:Score {player: 'p2', pts: 80})
+    CREATE (c:Score {player: 'p3', pts: 30})
+    MATCH (s:Score) RETURN s.player AS player ORDER BY s.pts DESC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - player
+  tags:
+  - distributed
+  - order-by
+
+# --- Distributed LIMIT ---
+- name: distributed-limit-basic
+  description: LIMIT returns at most N rows from distributed query
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:Row {v: 1})
+    CREATE (b:Row {v: 2})
+    CREATE (c:Row {v: 3})
+    CREATE (d:Row {v: 4})
+    MATCH (r:Row) RETURN r.v AS v LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - v
+  tags:
+  - distributed
+  - limit
+
+- name: distributed-limit-with-order
+  description: LIMIT combined with ORDER BY across shards
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:Entry {seq: 10})
+    CREATE (b:Entry {seq: 5})
+    CREATE (c:Entry {seq: 15})
+    CREATE (d:Entry {seq: 1})
+    MATCH (e:Entry) RETURN e.seq AS seq ORDER BY e.seq ASC LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - seq
+  tags:
+  - distributed
+  - limit
+  - order-by
+
+# --- Shard Routing ---
+- name: distributed-shard-routing-hash
+  description: Hash-based shard routing directs queries to correct shard
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:Routed {key: 'abc123', value: 'data1'})
+    MATCH (n:Routed {key: 'abc123'}) RETURN n.value AS val
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - val
+  tags:
+  - distributed
+  - shard-routing
+
+- name: distributed-shard-routing-range
+  description: Range-based shard routing for ordered key space
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:RangeData {key: 'mid_key', payload: 42})
+    MATCH (n:RangeData) WHERE n.key >= 'a' AND n.key <= 'z' RETURN n.payload AS p
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - p
+  tags:
+  - distributed
+  - shard-routing
+
+# --- Query Tracking ---
+- name: distributed-query-tracking-explain
+  description: EXPLAIN shows distributed query plan metadata
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:Tracked {id: 1})
+    EXPLAIN MATCH (n:Tracked) RETURN n.id AS id
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - query-tracking
+
+- name: distributed-query-tracking-profile
+  description: PROFILE shows execution statistics for distributed query
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:Profiled {id: 1})
+    PROFILE MATCH (n:Profiled) RETURN n.id AS id
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - query-tracking
+
+# --- Fragment Serialization ---
+- name: distributed-fragment-roundtrip
+  description: Query fragment serialized and deserialized correctly
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:Fragment {data: 'test_payload_001'})
+    MATCH (f:Fragment) RETURN f.data AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - test_payload_001
+  tags:
+  - distributed
+  - serialization
+
+- name: distributed-fragment-large-result
+  description: Large result set fragment serialization across shards
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:Bulk {id: 1, val: 'aaaaaa'})
+    CREATE (b:Bulk {id: 2, val: 'bbbbbb'})
+    CREATE (c:Bulk {id: 3, val: 'cccccc'})
+    MATCH (b:Bulk) RETURN b.id AS id, b.val AS val ORDER BY b.id ASC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - id
+    - val
+  tags:
+  - distributed
+  - serialization

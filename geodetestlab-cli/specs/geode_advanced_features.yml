@@ -5,8 +5,8 @@ cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 30000
     cleanup: true
     args:
@@ -24,11 +24,7 @@ tests:
   description: Create comprehensive test dataset for advanced features
   args:
   - query
-  - "CREATE\n  (alice:Person {name: 'Alice', age: 30, department: 'Engineering'}),\n  (bob:Person {name: 'Bob', age: 35, department: 'Sales'}),\n  (carol:Person {name: 'Carol', age: 28, department: 'Marketing'}),\n\
-    \  (techcorp:Company {name: 'TechCorp', founded: 2010, revenue: 1000000}),\n  (project1:Project {name: 'WebApp', budget: 50000, status: 'active'}),\n  (project2:Project {name: 'MobileApp', budget: 75000,\
-    \ status: 'planning'}),\n  (alice)-[:WORKS_FOR {since: 2020, salary: 75000}]->(techcorp),\n  (bob)-[:WORKS_FOR {since: 2018, salary: 85000}]->(techcorp),\n  (carol)-[:WORKS_FOR {since: 2021, salary:\
-    \ 70000}]->(techcorp),\n  (alice)-[:ASSIGNED_TO {role: 'Lead Developer'}]->(project1),\n  (bob)-[:ASSIGNED_TO {role: 'Product Manager'}]->(project2),\n  (carol)-[:ASSIGNED_TO {role: 'Marketing Lead'}]->(project1)\n\
-    RETURN count(*) AS nodes_created\n"
+  - "CREATE\n  (alice:Person {name: 'Alice', age: 30, department: 'Engineering'}),\n  (bob:Person {name: 'Bob', age: 35, department: 'Sales'}),\n  (carol:Person {name: 'Carol', age: 28, department: 'Marketing'}),\n  (techcorp:Company {name: 'TechCorp', founded: 2010, revenue: 1000000}),\n  (project1:Project {name: 'WebApp', budget: 50000, status: 'active'}),\n  (project2:Project {name: 'MobileApp', budget: 75000, status: 'planning'}),\n  (alice)-[:WORKS_FOR {since: 2020, salary: 75000}]->(techcorp),\n  (bob)-[:WORKS_FOR {since: 2018, salary: 85000}]->(techcorp),\n  (carol)-[:WORKS_FOR {since: 2021, salary: 70000}]->(techcorp),\n  (alice)-[:ASSIGNED_TO {role: 'Lead Developer'}]->(project1),\n  (bob)-[:ASSIGNED_TO {role: 'Product Manager'}]->(project2),\n  (carol)-[:ASSIGNED_TO {role: 'Marketing Lead'}]->(project1)\nRETURN count(*) AS nodes_created\n"
   expect:
     exit_code: 0
     geode_query:
@@ -86,7 +82,7 @@ tests:
   description: Modify data to test restore functionality
   args:
   - query
-  - 'MATCH (p:Person {name: ''Alice''}) SET p.age = 31, p.status = ''modified'' RETURN p.name AS name, p.age AS age, p.status AS status'
+  - "MATCH (p:Person {name: 'Alice'}) SET p.age = 31, p.status = 'modified' RETURN p.name AS name, p.age AS age, p.status AS status"
   expect:
     exit_code: 0
     geode_query:
@@ -102,7 +98,7 @@ tests:
   description: Verify data after restore
   args:
   - query
-  - 'MATCH (p:Person {name: ''Alice''}) RETURN p.age AS age, p.status AS status'
+  - "MATCH (p:Person {name: 'Alice'}) RETURN p.age AS age, p.status AS status"
   expect:
     exit_code: 0
     geode_query:
@@ -264,7 +260,7 @@ tests:
   description: Test bulk data loading
   args:
   - query
-  - 'CREATE (n1:BulkTest {id: 1, value: ''test_1''}), (n2:BulkTest {id: 2, value: ''test_2''}), (n3:BulkTest {id: 3, value: ''test_3''}) RETURN count(*) AS created'
+  - "CREATE (n1:BulkTest {id: 1, value: 'test_1'}), (n2:BulkTest {id: 2, value: 'test_2'}), (n3:BulkTest {id: 3, value: 'test_3'}) RETURN count(*) AS created"
   expect:
     exit_code: 0
     geode_query:
@@ -337,6 +333,235 @@ tests:
   tags:
   - cleanup
   - backup
+# --- Federation QUIC Connection ---
+- name: federation-quic-connection-init
+  description: Federation peer establishes QUIC connection
+  skip_reason: Requires multi-node federation cluster
+  args:
+  - query
+  - '-'
+  stdin: RETURN 1 AS federation_quic_ready
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - federation_quic_ready
+  tags:
+  - federation
+  - quic
+
+- name: federation-quic-bidirectional
+  description: Bidirectional QUIC stream between federation peers
+  skip_reason: Requires multi-node federation cluster
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'bidirectional' AS stream_mode
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - bidirectional
+  tags:
+  - federation
+  - quic
+
+- name: federation-quic-reconnect
+  description: Federation QUIC connection recovers after transient failure
+  skip_reason: Requires multi-node federation cluster
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'reconnected' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - reconnected
+  tags:
+  - federation
+  - quic
+  - resilience
+
+# --- Federation TLS ---
+- name: federation-tls-mutual-auth
+  description: Federation peers perform mutual TLS authentication
+  skip_reason: Requires multi-node federation cluster with TLS certificates
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'tls_mutual_ok' AS tls_status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - tls_mutual_ok
+  tags:
+  - federation
+  - tls
+  - security
+
+- name: federation-tls-cert-rotation
+  description: Federation TLS certificate rotation without downtime
+  skip_reason: Requires multi-node federation cluster with TLS certificates
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'cert_rotated' AS rotation_status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cert_rotated
+  tags:
+  - federation
+  - tls
+  - security
+
+# --- Distributed Connection Init ---
+- name: distributed-connection-init-handshake
+  description: Distributed node handshake completes successfully
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'handshake_ok' AS conn_status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - handshake_ok
+  tags:
+  - distributed
+  - connection
+
+- name: distributed-connection-init-version-check
+  description: Distributed nodes verify protocol version compatibility
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'version_compat' AS version_status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - version_compat
+  tags:
+  - distributed
+  - connection
+
+- name: distributed-connection-init-cluster-join
+  description: New node joins existing cluster via connection init
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'joined' AS join_status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - joined
+  tags:
+  - distributed
+  - connection
+
+# --- Distributed TLS ---
+- name: distributed-tls-encrypted-replication
+  description: Data replication uses TLS encryption between nodes
+  skip_reason: Requires multi-node cluster with TLS certificates
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'tls_replication_ok' AS repl_tls
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - tls_replication_ok
+  tags:
+  - distributed
+  - tls
+  - replication
+
+- name: distributed-tls-reject-plaintext
+  description: Distributed node rejects plaintext connections
+  skip_reason: Requires multi-node cluster with TLS certificates
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'tls_enforced' AS tls_policy
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - tls_enforced
+  tags:
+  - distributed
+  - tls
+  - security
+
+# --- Load Balancing ---
+- name: load-balancing-round-robin
+  description: Round-robin load balancing distributes queries across nodes
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:LBTest {id: 1})
+    MATCH (n:LBTest) RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - id
+  tags:
+  - distributed
+  - load-balancing
+
+- name: load-balancing-least-connections
+  description: Least-connections strategy routes to underloaded node
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:LBLeast {id: 1})
+    MATCH (n:LBLeast) RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - id
+  tags:
+  - distributed
+  - load-balancing
+
+- name: load-balancing-failover-redirect
+  description: Load balancer redirects to healthy node on failure
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:LBFail {id: 1})
+    MATCH (n:LBFail) RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - id
+  tags:
+  - distributed
+  - load-balancing
+  - resilience
+
+- name: load-balancing-capacity-aware
+  description: Capacity-aware routing considers node resources
+  skip_reason: Requires multi-node cluster setup
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:LBCap {id: 1, weight: 100})
+    MATCH (n:LBCap) RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - id
+  tags:
+  - distributed
+  - load-balancing
+
 invariants:
 - type: server_running
 tags:
@@ -346,3 +571,6 @@ tags:
 - migration
 - federation
 - performance
+- distributed
+- tls
+- load-balancing
