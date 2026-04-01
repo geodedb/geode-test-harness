@@ -389,7 +389,7 @@ def run(
                             spec_entry["results"] = result["results"]
                         all_results.append(spec_entry)
 
-                    if not ci and verbose:
+                    if not ci:
                         passed = summary.get("passed", 0)
                         # FAIL if: failed > 0, or error occurred, or no tests ran at all
                         if failed_count > 0 or has_error or total_count == 0:
@@ -397,6 +397,7 @@ def run(
                         else:
                             status = "[green]PASS[/green]"
                         console.print(f"  {status} {spec_file.name}: {passed} passed, {failed_count} failed")
+                        sys.stdout.flush()
 
                 # Retry failed specs serially to eliminate false positives
                 # from resource contention during parallel execution.
@@ -435,20 +436,22 @@ def run(
                         if retry_failed == 0 and not retry_has_error and retry_total > 0:
                             # Retry passed — use retry result (contention was the cause)
                             use_result = retry_result
-                            if not ci and verbose:
+                            if not ci:
                                 console.print(
                                     f"  [green]PASS[/green] {spec_file.name}: "
                                     f"{retry_summary.get('passed', 0)} passed (retry succeeded)"
                                 )
+                                sys.stdout.flush()
                         else:
                             # Retry also failed — genuine failure, use retry result
                             use_result = retry_result
-                            if not ci and verbose:
+                            if not ci:
                                 console.print(
                                     f"  [red]FAIL[/red] {spec_file.name}: "
                                     f"{retry_summary.get('passed', 0)} passed, "
                                     f"{retry_failed} failed (confirmed failure)"
                                 )
+                                sys.stdout.flush()
 
                         use_summary = use_result["summary"]
                         total_exit_code = max(total_exit_code, use_result["exit_code"])
