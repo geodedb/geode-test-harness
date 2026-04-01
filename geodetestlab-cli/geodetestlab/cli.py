@@ -55,8 +55,8 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 
-console = Console()
-console_err = Console(stderr=True)
+console = Console(force_terminal=True)
+console_err = Console(stderr=True, force_terminal=True)
 
 
 _tracked_pids: set[int] = set()
