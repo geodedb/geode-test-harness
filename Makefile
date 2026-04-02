@@ -16,7 +16,7 @@
 .PHONY: test-unit test-unit-verbose
 .PHONY: test-quic test-grpc test-all-transports
 .PHONY: lint format type-check security-check quality
-.PHONY: loadtest loadtest-go loadtest-python loadtest-cli loadtest-build
+.PHONY: loadtest loadtest-go loadtest-python loadtest-cli loadtest-build loadtest-scenario loadtest-scenarios
 
 # Default target: run full test suite with Docker
 all: clean docker-start test-all docker-stop
@@ -110,6 +110,8 @@ help:
 	@echo "  loadtest-python      - Python CLI concurrent processes"
 	@echo "  loadtest-cli         - Geodetestlab sequential stress spec"
 	@echo "  loadtest-build       - Build Go load test binary"
+	@echo "  loadtest-scenario SCENARIO=<name> - Run a specific load test scenario"
+	@echo "  loadtest-scenarios   - Run all 5 load test scenarios"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  lint / format / type-check / security-check / quality"
@@ -488,6 +490,36 @@ loadtest-go: loadtest-build
 		-output ../../reports/loadtest_go.json
 	@echo ""
 	@cat reports/loadtest_go.json | python3 -c "import json,sys; r=json.load(sys.stdin); print(r.get('summary',''))"
+
+# Run a specific load test scenario
+# Usage: make loadtest-scenario SCENARIO=one_hop
+SCENARIO ?= ping
+loadtest-scenario: loadtest-build
+	mkdir -p reports
+	cd loadtest/go && ./geode-loadtest \
+		-dsn "$(LOADTEST_DSN)" \
+		-scenario "$(SCENARIO)" \
+		-levels "$(LOADTEST_LEVELS)" \
+		-duration $(LOADTEST_DURATION) \
+		-output ../../reports/loadtest_$(SCENARIO).json
+
+# Run all load test scenarios sequentially
+loadtest-scenarios: loadtest-build
+	mkdir -p reports
+	@for scenario in ping point_read one_hop two_hop fan_out; do \
+		echo ""; \
+		echo "=== Running scenario: $$scenario ==="; \
+		cd loadtest/go && ./geode-loadtest \
+			-dsn "$(LOADTEST_DSN)" \
+			-scenario "$$scenario" \
+			-levels "$(LOADTEST_LEVELS)" \
+			-duration $(LOADTEST_DURATION) \
+			-output ../../reports/loadtest_$${scenario}.json; \
+		cd ../..; \
+	done
+	@echo ""
+	@echo "=== All scenarios complete ==="
+	@echo "Reports: reports/loadtest_*.json"
 
 # Run Python CLI-based load test (subprocess per query)
 loadtest-python:

@@ -9,6 +9,7 @@
 //	go run . -dsn "localhost:3141?insecure=true&user=geode&pass=YourPass"
 //	go run . -dsn "localhost:3141?insecure=true" -levels "1,2,4,8,16,32"
 //	go run . -dsn "localhost:3141?insecure=true" -duration 10s -output report.json
+//	go run . -dsn "localhost:3141?insecure=true" -scenario point_read
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"os"
 	"sort"
 	"strconv"
@@ -30,26 +32,28 @@ import (
 )
 
 type LevelResult struct {
-	Concurrency   int       `json:"concurrency"`
-	TotalQueries  int64     `json:"total_queries"`
-	Errors        int64     `json:"errors"`
-	ErrorRate     float64   `json:"error_rate"`
-	Duration      string    `json:"duration"`
-	QPS           float64   `json:"qps"`
-	LatencyP50    string    `json:"latency_p50"`
-	LatencyP95    string    `json:"latency_p95"`
-	LatencyP99    string    `json:"latency_p99"`
-	LatencyMean   string    `json:"latency_mean"`
-	LatencyMax    string    `json:"latency_max"`
-	ErrorSamples  []string  `json:"error_samples,omitempty"`
+	Concurrency  int      `json:"concurrency"`
+	TotalQueries int64    `json:"total_queries"`
+	Errors       int64    `json:"errors"`
+	ErrorRate    float64  `json:"error_rate"`
+	Duration     string   `json:"duration"`
+	QPS          float64  `json:"qps"`
+	LatencyP50   string   `json:"latency_p50"`
+	LatencyP95   string   `json:"latency_p95"`
+	LatencyP99   string   `json:"latency_p99"`
+	LatencyMean  string   `json:"latency_mean"`
+	LatencyMax   string   `json:"latency_max"`
+	ErrorSamples []string `json:"error_samples,omitempty"`
 }
 
 type Report struct {
-	Timestamp   string        `json:"timestamp"`
-	DSN         string        `json:"dsn"`
-	QueryType   string        `json:"query_type"`
-	Levels      []LevelResult `json:"levels"`
-	Summary     string        `json:"summary"`
+	Timestamp string        `json:"timestamp"`
+	DSN       string        `json:"dsn"`
+	Scenario  string        `json:"scenario"`
+	QueryType string        `json:"query_type"`
+	DataSize  DataSize      `json:"data_size"`
+	Levels    []LevelResult `json:"levels"`
+	Summary   string        `json:"summary"`
 }
 
 func main() {
@@ -57,25 +61,57 @@ func main() {
 	levelsStr := flag.String("levels", "1,2,4,8,16,32,64", "Comma-separated concurrency levels")
 	duration := flag.Duration("duration", 5*time.Second, "Duration per concurrency level")
 	output := flag.String("output", "", "JSON output file (stdout if empty)")
-	queryType := flag.String("query", "read", "Query type: read, write, mixed")
+	scenarioName := flag.String("scenario", "ping", "Scenario: "+scenarioNames())
 	flag.Parse()
+
+	sc := findScenario(*scenarioName)
+	if sc == nil {
+		fmt.Fprintf(os.Stderr, "ERROR: unknown scenario %q (available: %s)\n", *scenarioName, scenarioNames())
+		os.Exit(1)
+	}
 
 	levels := parseLevels(*levelsStr)
 
 	fmt.Fprintf(os.Stderr, "Geode Load Test\n")
-	fmt.Fprintf(os.Stderr, "  DSN:      %s\n", *dsn)
-	fmt.Fprintf(os.Stderr, "  Levels:   %v\n", levels)
-	fmt.Fprintf(os.Stderr, "  Duration: %s per level\n", *duration)
-	fmt.Fprintf(os.Stderr, "  Query:    %s\n\n", *queryType)
+	fmt.Fprintf(os.Stderr, "  DSN:       %s\n", *dsn)
+	fmt.Fprintf(os.Stderr, "  Scenario:  %s — %s\n", sc.Name, sc.Description)
+	fmt.Fprintf(os.Stderr, "  Data:      %d nodes, %d edges\n", sc.Data.Nodes, sc.Data.Edges)
+	fmt.Fprintf(os.Stderr, "  Levels:    %v\n", levels)
+	fmt.Fprintf(os.Stderr, "  Duration:  %s per level\n\n", *duration)
+
+	// Setup data
+	if sc.Data.Nodes > 0 || sc.Data.Edges > 0 {
+		fmt.Fprintf(os.Stderr, "  Setting up data...\n")
+		setupDB, err := sql.Open("geode", *dsn)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: setup connection: %v\n", err)
+			os.Exit(1)
+		}
+		setupDB.SetMaxOpenConns(1)
+		setupDB.SetMaxIdleConns(1)
+		// Teardown first to clean leftover data from crashed runs
+		_ = sc.Teardown(setupDB)
+		if err := sc.Setup(setupDB); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: setup failed: %v\n", err)
+			setupDB.Close()
+			os.Exit(1)
+		}
+		setupDB.Close()
+		fmt.Fprintf(os.Stderr, "  Setup complete.\n\n")
+	}
+
+	queryFn := sc.QueryFn(sc.Data.Nodes)
 
 	report := Report{
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 		DSN:       sanitizeDSN(*dsn),
-		QueryType: *queryType,
+		Scenario:  sc.Name,
+		QueryType: sc.Description,
+		DataSize:  sc.Data,
 	}
 
 	for _, concurrency := range levels {
-		result := runLevel(*dsn, concurrency, *duration, *queryType)
+		result := runLevel(*dsn, concurrency, *duration, queryFn)
 		report.Levels = append(report.Levels, result)
 
 		fmt.Fprintf(os.Stderr, "  c=%-3d  qps=%-8.1f  p50=%-10s  p99=%-10s  errors=%d/%d\n",
@@ -86,6 +122,19 @@ func main() {
 			fmt.Fprintf(os.Stderr, "  ⚠ >50%% error rate at c=%d, stopping ramp\n", concurrency)
 			break
 		}
+	}
+
+	// Teardown data
+	if sc.Data.Nodes > 0 || sc.Data.Edges > 0 {
+		fmt.Fprintf(os.Stderr, "\n  Tearing down data...\n")
+		teardownDB, err := sql.Open("geode", *dsn)
+		if err == nil {
+			teardownDB.SetMaxOpenConns(1)
+			teardownDB.SetMaxIdleConns(1)
+			_ = sc.Teardown(teardownDB)
+			teardownDB.Close()
+		}
+		fmt.Fprintf(os.Stderr, "  Teardown complete.\n")
 	}
 
 	// Summary
@@ -111,7 +160,7 @@ func main() {
 	}
 }
 
-func runLevel(dsn string, concurrency int, duration time.Duration, queryType string) LevelResult {
+func runLevel(dsn string, concurrency int, duration time.Duration, queryFn QueryFunc) LevelResult {
 	db, err := sql.Open("geode", dsn)
 	if err != nil {
 		return LevelResult{Concurrency: concurrency, ErrorSamples: []string{err.Error()}}
@@ -148,23 +197,10 @@ func runLevel(dsn string, concurrency int, duration time.Duration, queryType str
 	for i := range concurrency {
 		go func(workerID int) {
 			defer wg.Done()
+			rng := rand.New(rand.NewPCG(uint64(workerID)*12345+1, uint64(workerID)*67890+1))
 			for time.Now().Before(deadline) {
 				start := time.Now()
-				var qerr error
-
-				switch queryType {
-				case "write":
-					qerr = execWrite(db, workerID)
-				case "mixed":
-					if workerID%2 == 0 {
-						qerr = execRead(db)
-					} else {
-						qerr = execWrite(db, workerID)
-					}
-				default:
-					qerr = execRead(db)
-				}
-
+				qerr := queryFn(db, rng)
 				elapsed := time.Since(start)
 				totalQueries.Add(1)
 
@@ -221,37 +257,7 @@ func runLevel(dsn string, concurrency int, duration time.Duration, queryType str
 		result.LatencyMean = (sum / time.Duration(len(all))).String()
 	}
 
-	// Cleanup write data
-	if queryType == "write" || queryType == "mixed" {
-		db.ExecContext(context.Background(), "MATCH (n:LoadTestNode) DELETE n")
-	}
-
 	return result
-}
-
-func execRead(db *sql.DB) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	rows, err := db.QueryContext(ctx, "RETURN 1 AS x")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var x int
-		if err := rows.Scan(&x); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
-}
-
-func execWrite(db *sql.DB, workerID int) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_, err := db.ExecContext(ctx,
-		fmt.Sprintf("CREATE (:LoadTestNode {worker: %d, ts: %d})", workerID, time.Now().UnixNano()))
-	return err
 }
 
 func percentile(sorted []time.Duration, p float64) time.Duration {
