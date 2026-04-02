@@ -1,0 +1,228 @@
+name: "Multi-Hop Query Regression Tests"
+description: >
+  Regression tests for server segfault on multi-hop queries (v0.1.4-beta.2).
+  Root cause: slog text_handler.zig:137 crashed in @errorName() when logging
+  error attributes via Attr.err() with potentially corrupt anyerror values.
+  Fix: eagerly resolve @errorName() at Attr creation time.
+  These tests exercise multi-hop patterns and long query strings (100-300+ bytes)
+  to verify the server handles them without crashing.
+mode: server
+
+tests:
+  # --- Setup: Create test graph with network topology ---
+  - name: "setup-create-firewall"
+    query: "CREATE (:Firewall {name: 'fw-edge-01', vendor: 'Palo Alto', firmware: '10.2.3'})"
+    expected:
+      exit_code: 0
+
+  - name: "setup-create-interface"
+    query: "CREATE (:Interface {name: 'eth0', ip: '10.0.1.1', subnet: '255.255.255.0'})"
+    expected:
+      exit_code: 0
+
+  - name: "setup-create-acl"
+    query: "CREATE (:ACL {name: 'inbound-filter', priority: 100, direction: 'inbound'})"
+    expected:
+      exit_code: 0
+
+  - name: "setup-create-acl-rule"
+    query: "CREATE (:ACLRule {action: 'permit', protocol: 'tcp', src: '10.0.0.0/8', dst_port: 443})"
+    expected:
+      exit_code: 0
+
+  - name: "setup-create-zone"
+    query: "CREATE (:SecurityZone {name: 'DMZ', trust_level: 50})"
+    expected:
+      exit_code: 0
+
+  - name: "setup-create-policy"
+    query: "CREATE (:Policy {name: 'web-access', enforcement: 'strict', created: '2026-01-15'})"
+    expected:
+      exit_code: 0
+
+  - name: "setup-create-subnet"
+    query: "CREATE (:Subnet {cidr: '10.0.1.0/24', vlan: 100, gateway: '10.0.1.1'})"
+    expected:
+      exit_code: 0
+
+  - name: "setup-link-fw-interface"
+    query: >
+      MATCH (fw:Firewall {name: 'fw-edge-01'}), (iface:Interface {name: 'eth0'})
+      CREATE (fw)-[:HAS_INTERFACE]->(iface)
+    expected:
+      exit_code: 0
+
+  - name: "setup-link-acl-interface"
+    query: >
+      MATCH (iface:Interface {name: 'eth0'}), (acl:ACL {name: 'inbound-filter'})
+      CREATE (acl)-[:APPLIED_TO]->(iface)
+    expected:
+      exit_code: 0
+
+  - name: "setup-link-acl-rule"
+    query: >
+      MATCH (acl:ACL {name: 'inbound-filter'}), (rule:ACLRule {action: 'permit'})
+      CREATE (acl)-[:HAS_RULE]->(rule)
+    expected:
+      exit_code: 0
+
+  - name: "setup-link-zone-fw"
+    query: >
+      MATCH (zone:SecurityZone {name: 'DMZ'}), (fw:Firewall {name: 'fw-edge-01'})
+      CREATE (zone)-[:INCLUDES]->(fw)
+    expected:
+      exit_code: 0
+
+  - name: "setup-link-policy-zone"
+    query: >
+      MATCH (policy:Policy {name: 'web-access'}), (zone:SecurityZone {name: 'DMZ'})
+      CREATE (policy)-[:MANAGES]->(zone)
+    expected:
+      exit_code: 0
+
+  - name: "setup-link-subnet-interface"
+    query: >
+      MATCH (subnet:Subnet {cidr: '10.0.1.0/24'}), (iface:Interface {name: 'eth0'})
+      CREATE (subnet)-[:SERVED_BY]->(iface)
+    expected:
+      exit_code: 0
+
+  # --- 3-hop query (baseline) ---
+  - name: "3-hop-firewall-interface-acl"
+    query: >
+      MATCH (fw:Firewall)-[r1:HAS_INTERFACE]->(iface:Interface)<-[r2:APPLIED_TO]-(acl:ACL)
+      RETURN fw.name, iface.name, acl.name
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "fw-edge-01"
+        - "eth0"
+        - "inbound-filter"
+
+  # --- 4-hop query (original crash length ~131 bytes) ---
+  - name: "4-hop-fw-iface-acl-rule"
+    query: >
+      MATCH (fw:Firewall)-[r1:HAS_INTERFACE]->(iface:Interface)<-[r2:APPLIED_TO]-(acl:ACL)-[r3:HAS_RULE]->(rule:ACLRule)
+      RETURN fw.name, iface.name, acl.name, rule.action
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "fw-edge-01"
+        - "inbound-filter"
+        - "permit"
+
+  # --- Multi-hop returning all node properties (long RETURN clause) ---
+  - name: "4-hop-return-all-fields"
+    query: >
+      MATCH (fw:Firewall)-[r1:HAS_INTERFACE]->(iface:Interface)<-[r2:APPLIED_TO]-(acl:ACL)-[r3:HAS_RULE]->(rule:ACLRule)
+      RETURN fw.name, fw.vendor, iface.name, iface.ip, acl.name, acl.priority, rule.action, rule.protocol
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "fw-edge-01"
+        - "Palo Alto"
+        - "permit"
+        - "tcp"
+
+  # --- Multi-hop with WHERE clause ---
+  - name: "4-hop-with-where"
+    query: >
+      MATCH (fw:Firewall)-[r1:HAS_INTERFACE]->(iface:Interface)<-[r2:APPLIED_TO]-(acl:ACL)-[r3:HAS_RULE]->(rule:ACLRule)
+      WHERE rule.action = 'permit'
+      RETURN fw.name, acl.name, rule.protocol
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "fw-edge-01"
+        - "tcp"
+
+  # --- Multi-hop with COUNT aggregation ---
+  - name: "multi-hop-count"
+    query: >
+      MATCH (fw:Firewall)-[:HAS_INTERFACE]->(iface:Interface)<-[:APPLIED_TO]-(acl:ACL)-[:HAS_RULE]->(rule:ACLRule)
+      RETURN COUNT(*) AS chain_count
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "1"
+
+  # --- Long query string with verbose aliases (~220 bytes, above crash threshold) ---
+  - name: "long-query-verbose-aliases"
+    query: >
+      MATCH (firewall_node:Firewall)-[has_interface_rel:HAS_INTERFACE]->(interface_node:Interface)<-[applied_to_rel:APPLIED_TO]-(access_control_list:ACL)-[has_rule_rel:HAS_RULE]->(acl_rule_node:ACLRule)
+      RETURN firewall_node.name AS firewall_name, interface_node.name AS interface_name, access_control_list.name AS acl_name, acl_rule_node.action AS rule_action
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "fw-edge-01"
+        - "permit"
+
+  # --- Forward-only 3-hop: zone -> fw -> interface ---
+  - name: "3-hop-forward-zone-fw-iface"
+    query: >
+      MATCH (zone:SecurityZone)-[r1:INCLUDES]->(fw:Firewall)-[r2:HAS_INTERFACE]->(iface:Interface)
+      RETURN zone.name, fw.name, iface.name
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "DMZ"
+        - "fw-edge-01"
+        - "eth0"
+
+  # --- Forward-only 3-hop: policy -> zone -> fw ---
+  - name: "3-hop-forward-policy-zone-fw"
+    query: >
+      MATCH (policy:Policy)-[r1:MANAGES]->(zone:SecurityZone)-[r2:INCLUDES]->(fw:Firewall)
+      RETURN policy.name, zone.name, fw.name
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "web-access"
+        - "DMZ"
+        - "fw-edge-01"
+
+  # --- Forward-only 4-hop: policy -> zone -> fw -> interface ---
+  - name: "4-hop-forward-policy-zone-fw-iface"
+    query: >
+      MATCH (policy:Policy)-[r1:MANAGES]->(zone:SecurityZone)-[r2:INCLUDES]->(fw:Firewall)-[r3:HAS_INTERFACE]->(iface:Interface)
+      RETURN policy.name, zone.name, fw.name, iface.name
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "web-access"
+        - "DMZ"
+        - "fw-edge-01"
+        - "eth0"
+
+  # --- ACL chain: acl -> interface, acl -> rule ---
+  - name: "3-hop-acl-interface-rule"
+    query: >
+      MATCH (acl:ACL)-[r1:APPLIED_TO]->(iface:Interface)
+      RETURN acl.name, iface.name
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "inbound-filter"
+        - "eth0"
+
+  - name: "3-hop-acl-rule"
+    query: >
+      MATCH (acl:ACL)-[r1:HAS_RULE]->(rule:ACLRule)
+      RETURN acl.name, rule.action, rule.protocol
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "inbound-filter"
+        - "permit"
+        - "tcp"
+
+  # --- Subnet -> interface chain ---
+  - name: "2-hop-subnet-interface"
+    query: >
+      MATCH (subnet:Subnet)-[r1:SERVED_BY]->(iface:Interface)
+      RETURN subnet.cidr, subnet.vlan, iface.name, iface.ip
+    expected:
+      exit_code: 0
+      stdout_contains:
+        - "10.0.1.0/24"
+        - "eth0"

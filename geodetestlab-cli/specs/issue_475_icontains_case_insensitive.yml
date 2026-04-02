@@ -1,0 +1,160 @@
+version: '1.0'
+name: 'Issue #475: Case-insensitive CONTAINS via icontains()'
+description: Verify icontains() function and tolower/toupper aliases for case-insensitive string matching
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: icontains-basic-match
+  description: icontains matches case-insensitively
+  args:
+  - query
+  - '-'
+  stdin: RETURN icontains('Hello World', 'hello') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'true'
+  tags:
+  - string
+  - issue-475
+- name: icontains-uppercase-needle
+  description: icontains matches uppercase needle against mixed-case string
+  args:
+  - query
+  - '-'
+  stdin: RETURN icontains('Hello World', 'WORLD') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'true'
+  tags:
+  - string
+  - issue-475
+- name: icontains-no-match
+  description: icontains returns false when substring not found
+  args:
+  - query
+  - '-'
+  stdin: RETURN icontains('Hello World', 'xyz') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'false'
+  tags:
+  - string
+  - issue-475
+- name: icontains-empty-needle
+  description: icontains with empty needle returns true
+  args:
+  - query
+  - '-'
+  stdin: RETURN icontains('Hello World', '') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'true'
+  tags:
+  - string
+  - issue-475
+- name: icontains-mixed-case-entity-name
+  description: icontains on entity properties for case-insensitive search
+  args:
+  - query
+  - '-'
+  stdin: >
+    CREATE (e:Person475 {name: 'Albert Einstein'})
+    RETURN e.name AS created
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Albert Einstein
+  tags:
+  - string
+  - issue-475
+  - setup
+- name: icontains-entity-search-lowercase
+  description: Search entity with lowercase keyword using icontains
+  args:
+  - query
+  - '-'
+  stdin: >
+    MATCH (e:Person475)
+    WHERE icontains(e.name, 'einstein')
+    RETURN e.name AS name
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Albert Einstein
+  tags:
+  - string
+  - issue-475
+- name: contains-case-sensitive-still-works
+  description: Regular CONTAINS remains case-sensitive
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'Hello World' CONTAINS 'hello' AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'false'
+  tags:
+  - string
+  - issue-475
+- name: tolower-function-alias
+  description: tolower() works as alias for lower()
+  args:
+  - query
+  - '-'
+  stdin: RETURN tolower('HELLO') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hello
+  tags:
+  - string
+  - issue-475
+- name: toupper-function-alias
+  description: toupper() works as alias for upper()
+  args:
+  - query
+  - '-'
+  stdin: RETURN toupper('hello') AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - HELLO
+  tags:
+  - string
+  - issue-475
+- name: tolower-contains-workaround
+  description: tolower() combined with CONTAINS for case-insensitive matching
+  args:
+  - query
+  - '-'
+  stdin: >
+    MATCH (e:Person475)
+    WHERE tolower(e.name) CONTAINS 'einstein'
+    RETURN e.name AS name
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Albert Einstein
+  tags:
+  - string
+  - issue-475

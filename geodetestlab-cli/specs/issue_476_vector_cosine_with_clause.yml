@@ -1,0 +1,122 @@
+version: '1.0'
+name: 'Issue #476: vector_cosine() in WITH clause'
+description: Verify vector_cosine returns NULL for non-vector args instead of TypeMismatch error
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: vector-cosine-return-clause
+  description: vector_cosine works in RETURN clause
+  args:
+  - query
+  - '-'
+  stdin: RETURN vector_cosine(vectorf32('[1.0, 2.0, 3.0]'), vectorf32('[1.0, 2.0, 3.0]')) AS score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - score
+  tags:
+  - vector
+  - issue-476
+- name: vector-cosine-with-clause-basic
+  description: vector_cosine in WITH clause should not error
+  args:
+  - query
+  - '-'
+  stdin: >
+    WITH vectorf32('[1.0, 2.0, 3.0]') AS v1, vectorf32('[0.4, 0.5, 0.6]') AS v2
+    RETURN vector_cosine(v1, v2) AS score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - score
+  tags:
+  - vector
+  - issue-476
+- name: vector-cosine-null-input-returns-null
+  description: vector_cosine with non-vector arg returns null, not error
+  args:
+  - query
+  - '-'
+  stdin: RETURN vector_cosine(42, 99) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - result
+  tags:
+  - vector
+  - issue-476
+- name: vector-cosine-with-clause-entity-filter
+  description: vector_cosine in WITH clause after entity match with filter
+  args:
+  - query
+  - '-'
+  stdin: >
+    CREATE (a:VecTest476 {name: 'node1', emb: vectorf32('[0.1, 0.2, 0.3]')})
+    RETURN a.name AS created
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - created
+  tags:
+  - vector
+  - issue-476
+  - setup
+- name: vector-cosine-with-clause-after-match
+  description: vector_cosine in WITH clause after MATCH WHERE filter
+  args:
+  - query
+  - '-'
+  stdin: >
+    MATCH (e:VecTest476)
+    WHERE e.emb IS NOT NULL
+    WITH e, vector_cosine(e.emb, vectorf32('[0.1, 0.2, 0.3]')) AS score
+    RETURN e.name AS name, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - name
+    - score
+  tags:
+  - vector
+  - issue-476
+- name: vector-dot-null-input-returns-null
+  description: vector_dot with non-vector arg returns null, not error
+  args:
+  - query
+  - '-'
+  stdin: RETURN vector_dot('not_a_vector', 42) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - result
+  tags:
+  - vector
+  - issue-476
+- name: vector-l2-null-input-returns-null
+  description: vector_l2 with non-vector arg returns null, not error
+  args:
+  - query
+  - '-'
+  stdin: RETURN vector_l2('not_a_vector', 42) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - result
+  tags:
+  - vector
+  - issue-476
