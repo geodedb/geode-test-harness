@@ -181,7 +181,7 @@ func scenarioTwoHop() Scenario {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				rows, err := db.QueryContext(ctx, fmt.Sprintf(
-					"MATCH (a:LT_Person {lt_id: %d})-[:LT_KNOWS]->(b)-[:LT_KNOWS]->(c) RETURN DISTINCT c.age, c.lt_id LIMIT 20", id))
+					"MATCH (a:LT_Person {lt_id: %d})-[:LT_KNOWS]->(b)-[:LT_KNOWS]->(c) RETURN DISTINCT c.name, c.lt_id LIMIT 20", id))
 				if err != nil {
 					return err
 				}
@@ -229,7 +229,7 @@ func scenarioFanOut() Scenario {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				rows, err := db.QueryContext(ctx, fmt.Sprintf(
-					"MATCH (a:LT_Person {lt_id: %d})-[:LT_KNOWS]->(b)-[:LT_WORKS_AT]->(c:LT_Company) RETURN b.age, c.founded LIMIT 20", id))
+					"MATCH (a:LT_Person {lt_id: %d})-[:LT_KNOWS]->(b)-[:LT_WORKS_AT]->(c:LT_Company) RETURN b.name, c.name LIMIT 20", id))
 				if err != nil {
 					return err
 				}
