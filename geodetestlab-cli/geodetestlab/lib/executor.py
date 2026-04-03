@@ -214,14 +214,16 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
         return f"CALL geode.auth.policy_delete('{esc(name)}')"
 
     # --- grant/revoke commands ---
+    # CLI syntax: geode grant <permission> <target> [--resource <resource>]
+    # args[0] = "grant"/"revoke", args[1] = permission name, positionals = [target, ...]
     elif subcmd == "grant":
-        perm = positionals[0] if positionals else action
-        target = positionals[1] if len(positionals) > 1 else ""
+        perm = action  # args[1] is always the permission name
+        target = positionals[0] if positionals else ""
         resource = flags.get("--resource", "")
         return f"CALL geode.auth.grant('{esc(perm)}', '{esc(target)}', '{esc(resource)}')"
     elif subcmd == "revoke":
-        perm = positionals[0] if positionals else action
-        target = positionals[1] if len(positionals) > 1 else ""
+        perm = action  # args[1] is always the permission name
+        target = positionals[0] if positionals else ""
         resource = flags.get("--resource", "")
         return f"CALL geode.auth.revoke('{esc(perm)}', '{esc(target)}', '{esc(resource)}')"
 
