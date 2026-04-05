@@ -1,0 +1,246 @@
+version: '1.0'
+name: Distributed Auth Enforcement Tests
+description: |
+  Integration tests verifying that authentication is required by default for all
+  server connections and that the GEODE_CLUSTER_TOKEN environment variable governs
+  inter-node cluster authentication.
+
+  This spec covers:
+  - Server starts with auth enabled by default (no --no-auth flag required)
+  - Queries without credentials fail with exit code 3
+  - Queries with valid admin credentials succeed
+  - Queries with an incorrect password are rejected with exit code 3
+  - The GEODE_CLUSTER_TOKEN environment variable is accepted by the server
+  - User creation and deletion lifecycle around auth-enabled server
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_CLUSTER_TOKEN: test-cluster-secret-2026
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+
+tests:
+# -----------------------------------------------------------------------
+# Auth enabled by default — unauthenticated access must be rejected
+# -----------------------------------------------------------------------
+- name: dist-auth-unauthenticated-query-rejected
+  description: |
+    Query issued without credentials must fail with auth error (exit code 3).
+    Validates that authentication is enforced by default — no --no-auth flag is
+    required on the server for this to hold.
+  args:
+  - query
+  - --no-saved-session
+  - RETURN 1 AS x
+  expect:
+    exit_code: 3
+  tags:
+  - distributed
+  - auth
+  - enforcement
+  - unauthenticated
+
+# -----------------------------------------------------------------------
+# Valid admin credentials must succeed
+# -----------------------------------------------------------------------
+- name: dist-auth-valid-admin-query
+  description: |
+    Query issued with the correct admin username and password must succeed.
+    Confirms that the default 'geode' admin user exists and its password is
+    the one set via GEODE_ADMIN_PASSWORD.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - RETURN 'auth_ok' AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - auth_ok
+  tags:
+  - distributed
+  - auth
+  - enforcement
+  - valid-credentials
+
+# -----------------------------------------------------------------------
+# Wrong password must be rejected
+# -----------------------------------------------------------------------
+- name: dist-auth-wrong-password-rejected
+  description: |
+    A query with the correct username but a wrong password must be rejected
+    with exit code 3. Tests that the server validates credentials and does
+    not grant access on partial match.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - definitely_wrong_password_xyz
+  - RETURN 1 AS x
+  expect:
+    exit_code: 3
+  tags:
+  - distributed
+  - auth
+  - enforcement
+  - wrong-password
+
+# -----------------------------------------------------------------------
+# Non-existent user must be rejected
+# -----------------------------------------------------------------------
+- name: dist-auth-nonexistent-user-rejected
+  description: |
+    A query for a username that does not exist must be rejected with exit
+    code 3. Tests that unknown users cannot authenticate regardless of the
+    password supplied.
+  args:
+  - query
+  - -U
+  - totally_unknown_user_99999
+  - -P
+  - anyPassword123!
+  - RETURN 1 AS x
+  expect:
+    exit_code: 3
+  tags:
+  - distributed
+  - auth
+  - enforcement
+  - nonexistent-user
+
+# -----------------------------------------------------------------------
+# Create a regular user and authenticate as them
+# -----------------------------------------------------------------------
+- name: dist-auth-create-test-user
+  description: Create a regular non-admin user for subsequent auth tests.
+  args:
+  - user
+  - create
+  - dist_auth_testuser
+  - dist_auth@test.example.com
+  - --password
+  - DistAuth_Test_Pass_2026!
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - dist_auth_testuser
+    - created
+  tags:
+  - distributed
+  - auth
+  - enforcement
+  - setup
+
+- name: dist-auth-new-user-valid-login
+  description: |
+    The newly created user can authenticate and execute a query. Confirms
+    that non-admin users are subject to the same auth validation as the
+    admin account.
+  args:
+  - query
+  - -U
+  - dist_auth_testuser
+  - -P
+  - DistAuth_Test_Pass_2026!
+  - RETURN 'user_auth_ok' AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - user_auth_ok
+  tags:
+  - distributed
+  - auth
+  - enforcement
+  - user-login
+
+- name: dist-auth-new-user-wrong-password
+  description: |
+    The newly created user with an incorrect password must be rejected.
+    Verifies consistent rejection behaviour across all user accounts.
+  args:
+  - query
+  - -U
+  - dist_auth_testuser
+  - -P
+  - wrong_pass_for_user
+  - RETURN 1 AS x
+  expect:
+    exit_code: 3
+  tags:
+  - distributed
+  - auth
+  - enforcement
+  - user-wrong-password
+
+# -----------------------------------------------------------------------
+# GEODE_CLUSTER_TOKEN accepted — server starts and processes queries
+# -----------------------------------------------------------------------
+- name: dist-auth-cluster-token-server-operational
+  description: |
+    Confirms the server started successfully even when GEODE_CLUSTER_TOKEN
+    is set in its environment. The admin can still execute queries through
+    the normal QUIC client path. Tests that the cluster token env var does
+    not interfere with regular authentication.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - RETURN 'cluster_token_compat' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cluster_token_compat
+  tags:
+  - distributed
+  - auth
+  - cluster-token
+  - enforcement
+
+# -----------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------
+- name: dist-auth-cleanup-delete-user
+  description: Delete the test user created during this spec.
+  args:
+  - user
+  - delete
+  - dist_auth_testuser
+  - --yes
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - auth
+  - cleanup
+
+tags:
+- distributed
+- auth
+- enforcement
+- security
+- cluster-token

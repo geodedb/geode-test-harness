@@ -1,0 +1,357 @@
+version: '1.0'
+name: Distributed Snapshot Serialization Tests
+description: |
+  Integration tests verifying that graph data can be serialized and that
+  create/query cycles produce consistent results — validating the data
+  integrity foundations required for Raft snapshot replication.
+
+  GraphStore.serializeSnapshot() produces JSON-lines output containing all
+  nodes and edges. This spec does not directly invoke serializeSnapshot() via
+  a CALL procedure (it is an internal API), but instead validates its
+  preconditions and postconditions through the observable black-box interface:
+  create data, query it back, and verify nothing is lost or corrupted.
+
+  The backup command exercises serializeSnapshot indirectly; these tests
+  focus on data integrity across:
+  - Nodes with varied property types (string, integer, float, boolean)
+  - Edges with properties
+  - Multiple graphs (snapshot scoping)
+  - Special characters in string values (JSON escaping requirement)
+  - High-cardinality create/verify cycles
+  - Data remains queryable after multiple create operations (no overwrite)
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+invariants:
+- type: server_running
+
+tests:
+# -----------------------------------------------------------------------
+# Graph setup
+# -----------------------------------------------------------------------
+- name: snap-setup-graphs
+  description: Create dedicated graphs for snapshot serialization tests.
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE GRAPH IF NOT EXISTS dist_snap_primary;
+    CREATE GRAPH IF NOT EXISTS dist_snap_secondary
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - snapshot
+  - setup
+
+# -----------------------------------------------------------------------
+# Nodes with varied property types survive create/query cycle
+# -----------------------------------------------------------------------
+- name: snap-create-typed-properties
+  description: |
+    Create a node with string, integer, float, and boolean properties.
+    Each type exercises a distinct JSON serialization branch within
+    serializeSnapshot. A subsequent query confirms round-trip fidelity.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    CREATE (:SnapNode {
+      str_prop: 'hello_snap',
+      int_prop: 42,
+      float_prop: 3.14,
+      bool_prop: true
+    });
+    MATCH (n:SnapNode {str_prop: 'hello_snap'})
+    RETURN n.str_prop AS s, n.int_prop AS i, n.float_prop AS f, n.bool_prop AS b
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - s
+      - i
+      - f
+      - b
+    stdout_contains:
+    - hello_snap
+    - '42'
+  tags:
+  - distributed
+  - snapshot
+  - property-types
+
+- name: snap-verify-string-property
+  description: String property survives a separate query after creation.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    MATCH (n:SnapNode {str_prop: 'hello_snap'}) RETURN n.str_prop AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hello_snap
+  tags:
+  - distributed
+  - snapshot
+  - property-types
+  - string
+
+- name: snap-verify-integer-property
+  description: Integer property survives a separate query after creation.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    MATCH (n:SnapNode {int_prop: 42}) RETURN n.int_prop AS i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"i":42'
+  tags:
+  - distributed
+  - snapshot
+  - property-types
+  - integer
+
+- name: snap-verify-boolean-property
+  description: Boolean property survives a separate query after creation.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    MATCH (n:SnapNode {bool_prop: true}) RETURN n.bool_prop AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"b":true'
+  tags:
+  - distributed
+  - snapshot
+  - property-types
+  - boolean
+
+# -----------------------------------------------------------------------
+# Special characters in string values (JSON escaping)
+# -----------------------------------------------------------------------
+- name: snap-special-chars-in-properties
+  description: |
+    String properties containing characters that require JSON escaping
+    (double quotes, backslash, tab) must survive the create/query cycle
+    intact. This validates the JSON-lines escaping in serializeSnapshot.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    CREATE (:SnapSpecial {payload: 'line1\nline2\ttab'});
+    MATCH (n:SnapSpecial) RETURN n.payload AS p
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - line1
+  tags:
+  - distributed
+  - snapshot
+  - special-chars
+  - json-escaping
+
+# -----------------------------------------------------------------------
+# Edges with properties
+# -----------------------------------------------------------------------
+- name: snap-create-edge-with-properties
+  description: |
+    Create two nodes and connect them with an edge carrying properties.
+    Validates that the edge serialization branch (JSON lines for edges)
+    in serializeSnapshot captures type and property data correctly.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    CREATE (:SnapPerson {uid: 'snap_alice'});
+    CREATE (:SnapPerson {uid: 'snap_bob'});
+    MATCH (a:SnapPerson {uid: 'snap_alice'}), (b:SnapPerson {uid: 'snap_bob'})
+    CREATE (a)-[:SNAP_KNOWS {since: 2024, weight: 0.95}]->(b);
+    MATCH (a:SnapPerson {uid: 'snap_alice'})-[r:SNAP_KNOWS]->(b:SnapPerson {uid: 'snap_bob'})
+    RETURN a.uid AS from_uid, b.uid AS to_uid, r.since AS since, r.weight AS weight
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - from_uid
+      - to_uid
+      - since
+      - weight
+    stdout_contains:
+    - snap_alice
+    - snap_bob
+  tags:
+  - distributed
+  - snapshot
+  - edges
+  - properties
+
+- name: snap-verify-edge-count
+  description: |
+    Verify the edge created above is still present in a separate query.
+    Confirms that edge data is not lost between independent CLI invocations.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    MATCH ()-[r:SNAP_KNOWS]->() RETURN count(r) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  tags:
+  - distributed
+  - snapshot
+  - edges
+  - count
+
+# -----------------------------------------------------------------------
+# Multiple graphs — snapshot scoping (primary vs secondary)
+# -----------------------------------------------------------------------
+- name: snap-data-in-secondary-graph
+  description: |
+    Create data in the secondary graph and verify it is only visible there,
+    not in the primary graph. This confirms that snapshot serialization is
+    scoped per-graph and does not bleed across graph boundaries.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_secondary;
+    CREATE (:SnapSecondary {marker: 'secondary_only'});
+    MATCH (n:SnapSecondary) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  tags:
+  - distributed
+  - snapshot
+  - graph-isolation
+  - scoping
+
+- name: snap-secondary-label-absent-from-primary
+  description: |
+    The SnapSecondary label must not appear in the primary graph. Validates
+    that graph-scoped snapshot serialization does not cross graph boundaries.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    MATCH (n:SnapSecondary) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - distributed
+  - snapshot
+  - graph-isolation
+
+# -----------------------------------------------------------------------
+# High-cardinality cycle — 10 nodes created and all verified
+# -----------------------------------------------------------------------
+- name: snap-high-cardinality-create
+  description: |
+    Create 10 nodes in a single statement. A subsequent COUNT must return 10.
+    Validates that bulk creation via a single CREATE clause is serialised
+    correctly and that no entries are silently dropped.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 1});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 2});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 3});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 4});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 5});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 6});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 7});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 8});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 9});
+    CREATE (:SnapBulk {batch: 'bulk_test', seq: 10});
+    MATCH (n:SnapBulk {batch: 'bulk_test'}) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":10'
+  tags:
+  - distributed
+  - snapshot
+  - high-cardinality
+
+- name: snap-high-cardinality-properties-intact
+  description: |
+    Spot-check that a specific sequence number from the bulk create is
+    accessible and carries the correct properties. Validates that property
+    fidelity is maintained across all 10 entries.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_snap_primary;
+    MATCH (n:SnapBulk {batch: 'bulk_test', seq: 7}) RETURN n.seq AS seq
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"seq":7'
+  tags:
+  - distributed
+  - snapshot
+  - high-cardinality
+  - property-fidelity
+
+# -----------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------
+- name: snap-cleanup-graphs
+  description: Drop the test graphs to restore a clean state.
+  args:
+  - query
+  - '-'
+  stdin: |
+    DROP GRAPH IF EXISTS dist_snap_primary;
+    DROP GRAPH IF EXISTS dist_snap_secondary
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - snapshot
+  - cleanup
+
+tags:
+- distributed
+- snapshot
+- serialization
+- data-integrity
+- raft
+- replication

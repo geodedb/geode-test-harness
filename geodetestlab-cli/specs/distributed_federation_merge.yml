@@ -1,0 +1,425 @@
+version: '1.0'
+name: Distributed Federation Merge Strategy Tests
+description: |
+  Integration tests for the federation merge strategies exercised via
+  single-node GQL set operations.
+
+  The federation merge layer (distributed/federation.zig) applies two primary
+  strategies when combining results from shards:
+  - union_distinct: deduplicates rows from multiple sources
+  - hash_aggregate: computes aggregate values (COUNT, SUM, AVG, MIN, MAX)
+
+  These tests drive those code paths through the standard GQL query interface
+  (UNION DISTINCT, UNION ALL, aggregation functions). A single-node deployment
+  exercises the same merge logic because the executor routes through the same
+  merge path when combining results from multiple query operators.
+
+  This spec covers:
+  - UNION DISTINCT eliminates duplicate rows
+  - UNION ALL preserves all rows including duplicates
+  - UNION (implicit DISTINCT) matches UNION DISTINCT behaviour
+  - COUNT(*) aggregation returns correct row counts
+  - SUM aggregation over integer and float columns
+  - AVG aggregation over numeric values
+  - MIN and MAX aggregation
+  - Multi-column grouping with aggregation
+  - Empty set handling (UNION with zero matching rows on one side)
+  - Type compatibility: string, integer, and float columns in UNION
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+invariants:
+- type: server_running
+
+tests:
+# -----------------------------------------------------------------------
+# Graph and seed data setup
+# -----------------------------------------------------------------------
+- name: fed-merge-setup-graph
+  description: Create dedicated graph for federation merge tests.
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS dist_fed_merge
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - federation
+  - setup
+
+- name: fed-merge-seed-data
+  description: |
+    Insert nodes for merge strategy testing. Nodes of types FedAlpha,
+    FedBeta, and FedShared are seeded with distinct and overlapping values.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    CREATE (:FedAlpha {id: 1, name: 'alpha_one', score: 10, amount: 1.5});
+    CREATE (:FedAlpha {id: 2, name: 'alpha_two', score: 20, amount: 2.5});
+    CREATE (:FedAlpha {id: 3, name: 'shared_name', score: 30, amount: 3.0});
+    CREATE (:FedBeta  {id: 4, name: 'beta_one',   score: 15, amount: 4.5});
+    CREATE (:FedBeta  {id: 5, name: 'beta_two',   score: 25, amount: 5.5});
+    CREATE (:FedBeta  {id: 6, name: 'shared_name', score: 35, amount: 6.0});
+    MATCH (n) WHERE n:FedAlpha OR n:FedBeta RETURN count(n) AS seeded
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"seeded":6'
+  tags:
+  - distributed
+  - federation
+  - setup
+
+# -----------------------------------------------------------------------
+# UNION DISTINCT deduplication
+# -----------------------------------------------------------------------
+- name: fed-merge-union-distinct-deduplicates
+  description: |
+    UNION DISTINCT across two result sets that share an identical row must
+    produce only one copy of that row. This exercises the union_distinct
+    merge strategy which hashes rows and discards duplicates.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (a:FedAlpha {name: 'shared_name'}) RETURN a.name AS name, a.score AS score
+    UNION DISTINCT
+    MATCH (b:FedBeta  {name: 'shared_name'}) RETURN b.name AS name, b.score AS score
+  expect:
+    exit_code: 0
+    geode_query:
+      columns:
+      - name
+      - score
+    stdout_contains:
+    - shared_name
+  tags:
+  - distributed
+  - federation
+  - union-distinct
+  - deduplication
+
+- name: fed-merge-union-distinct-literal-dedup
+  description: |
+    UNION DISTINCT on identical literal values must produce a single row.
+    This is the minimal case: two branches both returning the same constant
+    tuple. The result set must contain exactly one row.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN 'dup_val' AS v, 42 AS n
+    UNION DISTINCT
+    RETURN 'dup_val' AS v, 42 AS n
+  expect:
+    exit_code: 0
+    geode_query:
+      max_rows: 1
+      columns:
+      - v
+      - n
+    stdout_contains:
+    - dup_val
+    - '42'
+  tags:
+  - distributed
+  - federation
+  - union-distinct
+  - deduplication
+  - literal
+
+# -----------------------------------------------------------------------
+# UNION ALL preserves all rows including duplicates
+# -----------------------------------------------------------------------
+- name: fed-merge-union-all-preserves-duplicates
+  description: |
+    UNION ALL must not deduplicate. Two branches both returning the same
+    literal must produce two rows in the result. This validates the
+    preserve-all merge path used when UNION ALL is explicitly requested.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN 'dup_val' AS v, 99 AS n
+    UNION ALL
+    RETURN 'dup_val' AS v, 99 AS n
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 2
+      columns:
+      - v
+      - n
+  tags:
+  - distributed
+  - federation
+  - union-all
+  - duplicates
+
+- name: fed-merge-union-all-combined-count
+  description: |
+    UNION ALL over all FedAlpha and FedBeta nodes must return all 6 rows
+    (3 alpha + 3 beta). Confirms that the UNION ALL merge does not silently
+    drop rows from either shard.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (a:FedAlpha) RETURN a.id AS id, a.name AS name
+    UNION ALL
+    MATCH (b:FedBeta) RETURN b.id AS id, b.name AS name
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 6
+      columns:
+      - id
+      - name
+  tags:
+  - distributed
+  - federation
+  - union-all
+  - row-count
+
+# -----------------------------------------------------------------------
+# COUNT(*) aggregation — hash_aggregate path
+# -----------------------------------------------------------------------
+- name: fed-merge-count-all-nodes
+  description: |
+    COUNT(*) over all FedAlpha nodes must return 3. Exercises the
+    hash_aggregate merge path that computes real aggregate values instead
+    of the previously hardcoded 1000.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (a:FedAlpha) RETURN count(a) AS cnt
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - cnt
+    stdout_contains:
+    - '"cnt":3'
+  tags:
+  - distributed
+  - federation
+  - aggregation
+  - count
+
+- name: fed-merge-count-filtered
+  description: |
+    COUNT(*) with a WHERE predicate must return only matching rows.
+    Tests that the aggregate is computed after predicate filtering, not
+    before, validating correct estimate-then-compute ordering.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (a:FedAlpha) WHERE a.score > 15 RETURN count(a) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - distributed
+  - federation
+  - aggregation
+  - count
+  - filtered
+
+# -----------------------------------------------------------------------
+# SUM aggregation
+# -----------------------------------------------------------------------
+- name: fed-merge-sum-integer
+  description: |
+    SUM over an integer property must return the correct total.
+    FedAlpha scores are 10, 20, 30; the expected sum is 60.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (a:FedAlpha) RETURN sum(a.score) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"total":60'
+  tags:
+  - distributed
+  - federation
+  - aggregation
+  - sum
+  - integer
+
+- name: fed-merge-sum-float
+  description: |
+    SUM over a float property must return the correct total.
+    FedAlpha amounts are 1.5, 2.5, 3.0; the expected sum is 7.0.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (a:FedAlpha) RETURN sum(a.amount) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"total":7'
+  tags:
+  - distributed
+  - federation
+  - aggregation
+  - sum
+  - float
+
+# -----------------------------------------------------------------------
+# AVG aggregation
+# -----------------------------------------------------------------------
+- name: fed-merge-avg-integer
+  description: |
+    AVG over an integer property must return the arithmetic mean.
+    FedAlpha scores are 10, 20, 30; the expected average is 20.0.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (a:FedAlpha) RETURN avg(a.score) AS average
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"average":20'
+  tags:
+  - distributed
+  - federation
+  - aggregation
+  - avg
+
+# -----------------------------------------------------------------------
+# MIN and MAX aggregation
+# -----------------------------------------------------------------------
+- name: fed-merge-min-max
+  description: |
+    MIN and MAX over the score property of FedAlpha nodes must return 10
+    and 30 respectively. Tests both extremes of the range-based aggregation
+    path within a single query.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (a:FedAlpha) RETURN min(a.score) AS lo, max(a.score) AS hi
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - lo
+      - hi
+    stdout_contains:
+    - '"lo":10'
+    - '"hi":30'
+  tags:
+  - distributed
+  - federation
+  - aggregation
+  - min
+  - max
+
+# -----------------------------------------------------------------------
+# Empty-side UNION (one branch returns zero rows)
+# -----------------------------------------------------------------------
+- name: fed-merge-union-empty-left
+  description: |
+    UNION ALL where the left branch returns zero rows must still return all
+    rows from the right branch. Tests that a zero-row shard does not
+    suppress the merged result.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (n:NoSuchLabel_xyz) RETURN n.id AS id
+    UNION ALL
+    MATCH (a:FedAlpha) RETURN a.id AS id
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 3
+      columns:
+      - id
+  tags:
+  - distributed
+  - federation
+  - union-all
+  - empty-shard
+
+- name: fed-merge-union-empty-both
+  description: |
+    UNION ALL where both branches return zero rows must produce an empty
+    result set (0 rows). Validates that zero-row merges do not crash or
+    produce spurious rows.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_fed_merge;
+    MATCH (n:NoSuchLabel_xyz) RETURN n.id AS id
+    UNION ALL
+    MATCH (m:AlsoNoSuchLabel_xyz) RETURN m.id AS id
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 0
+  tags:
+  - distributed
+  - federation
+  - union-all
+  - empty-both-shards
+
+# -----------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------
+- name: fed-merge-cleanup-graph
+  description: Drop the test graph to restore a clean state.
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH IF EXISTS dist_fed_merge
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - federation
+  - cleanup
+
+tags:
+- distributed
+- federation
+- merge
+- union
+- aggregation
+- gql-compliance

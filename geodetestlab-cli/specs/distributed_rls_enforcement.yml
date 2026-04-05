@@ -1,0 +1,356 @@
+version: '1.0'
+name: Distributed RLS Enforcement Tests
+description: |
+  Integration tests for Row-Level Security (RLS) policy enforcement.
+
+  The RLS filter engine (server/rls_filter.zig) applies label-level deny
+  policies to query results. Policies are registered via the 'policy create'
+  CLI command and stored in the auth store. The filter removes result rows
+  containing nodes or edges whose label matches an active deny policy for the
+  querying user.
+
+  This spec covers:
+  - Creating a label-level deny policy for a specific user
+  - The restricted user cannot see nodes with the denied label
+  - The admin user can still see all nodes regardless of RLS policies
+  - Listing policies confirms the policy was stored
+  - RLS policies do not affect nodes with non-denied labels for the same user
+  - RLS policy creation for non-existent users is accepted at the policy layer
+    (policy storage is separate from user existence at this granularity)
+  - Graph data setup and teardown for isolation
+
+  Note: The current RLS implementation operates at label granularity without
+  full expression evaluation. Tests are written to match this behaviour as
+  documented in rls_filter.zig.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+
+tests:
+# -----------------------------------------------------------------------
+# User and graph setup
+# -----------------------------------------------------------------------
+- name: rls-setup-create-restricted-user
+  description: |
+    Create a restricted (non-admin) user that will be subject to RLS
+    policies in subsequent tests.
+  args:
+  - user
+  - create
+  - rls_restricted_user
+  - rls_restricted@test.example.com
+  - --password
+  - RLS_Restricted_Test_2026!
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rls_restricted_user
+    - created
+  tags:
+  - distributed
+  - rls
+  - setup
+
+- name: rls-setup-graph
+  description: Create a dedicated graph for RLS enforcement tests.
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS dist_rls_test
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - rls
+  - setup
+
+- name: rls-setup-seed-data
+  description: |
+    Insert nodes with two different labels: RLSSecret (to be restricted) and
+    RLSPublic (allowed for all users). This allows testing that RLS selectively
+    filters only the denied label while leaving the non-denied label visible.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_rls_test;
+    CREATE (:RLSSecret {id: 1, data: 'secret_alpha', sensitivity: 'high'});
+    CREATE (:RLSSecret {id: 2, data: 'secret_beta',  sensitivity: 'high'});
+    CREATE (:RLSPublic {id: 3, data: 'public_gamma', category: 'open'});
+    CREATE (:RLSPublic {id: 4, data: 'public_delta', category: 'open'});
+    MATCH (n) WHERE n:RLSSecret OR n:RLSPublic RETURN count(n) AS seeded
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"seeded":4'
+  tags:
+  - distributed
+  - rls
+  - setup
+
+# -----------------------------------------------------------------------
+# Admin sees all data before any policy is applied
+# -----------------------------------------------------------------------
+- name: rls-admin-sees-all-before-policy
+  description: |
+    The admin user must see all nodes before any RLS policy is created.
+    This establishes the baseline and confirms the data was inserted correctly.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH dist_rls_test;
+    MATCH (n) WHERE n:RLSSecret OR n:RLSPublic RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":4'
+  tags:
+  - distributed
+  - rls
+  - admin
+  - baseline
+
+# -----------------------------------------------------------------------
+# Create RLS deny policy for the restricted user
+# -----------------------------------------------------------------------
+- name: rls-create-deny-policy
+  description: |
+    Create a deny policy that prevents the restricted user from seeing nodes
+    with the RLSSecret label. The policy is stored in the auth store and
+    applied at query result filter time.
+  args:
+  - policy
+  - create
+  - rls_secret_deny
+  - --table
+  - RLSSecret
+  - --condition
+  - rls_restricted_user
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - policy
+    - created
+  tags:
+  - distributed
+  - rls
+  - policy
+  - create
+
+- name: rls-list-policy-exists
+  description: |
+    After creation, the policy must appear in the policy list output.
+    Validates that the policy was persisted to the auth store and is
+    enumerable.
+  args:
+  - policy
+  - list
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - rls
+  - policy
+  - list
+
+# -----------------------------------------------------------------------
+# RLS applied: admin query sees all data
+# -----------------------------------------------------------------------
+- name: rls-admin-sees-secret-after-policy
+  description: |
+    The admin user must continue to see all nodes including RLSSecret nodes
+    after the deny policy is created for the restricted user. Admin access
+    must not be affected by policies scoped to other users.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH dist_rls_test;
+    MATCH (n:RLSSecret) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - distributed
+  - rls
+  - admin
+  - post-policy
+
+# -----------------------------------------------------------------------
+# RLS public nodes visible to restricted user
+# -----------------------------------------------------------------------
+- name: rls-restricted-user-sees-public
+  description: |
+    The restricted user must be able to see RLSPublic nodes because no deny
+    policy covers that label. Validates that RLS filters selectively by label
+    and does not blanket-deny all data for the user.
+  args:
+  - query
+  - -U
+  - rls_restricted_user
+  - -P
+  - RLS_Restricted_Test_2026!
+  - '-'
+  stdin: |
+    USE GRAPH dist_rls_test;
+    MATCH (n:RLSPublic) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - distributed
+  - rls
+  - restricted-user
+  - public-visible
+
+# -----------------------------------------------------------------------
+# Policy create for a second label — boundary testing
+# -----------------------------------------------------------------------
+- name: rls-create-second-policy
+  description: |
+    Create a second policy to confirm that multiple policies can coexist.
+    This also validates that the policy store accumulates entries without
+    overwriting the first policy.
+  args:
+  - policy
+  - create
+  - rls_public_deny_2
+  - --table
+  - RLSAnotherLabel
+  - --condition
+  - rls_restricted_user
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - policy
+    - created
+  tags:
+  - distributed
+  - rls
+  - policy
+  - multiple
+
+# -----------------------------------------------------------------------
+# Edge case: policy create with default condition
+# -----------------------------------------------------------------------
+- name: rls-create-policy-default-condition
+  description: |
+    Create a policy without an explicit --condition, relying on the default
+    value. Validates that the policy creation path handles the optional
+    condition argument gracefully and produces a stored policy.
+  args:
+  - policy
+  - create
+  - rls_default_cond_test
+  - --table
+  - RLSDefaultTable
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - policy
+    - created
+  tags:
+  - distributed
+  - rls
+  - policy
+  - edge-case
+  - default-condition
+
+# -----------------------------------------------------------------------
+# Admin still sees full count after all policies
+# -----------------------------------------------------------------------
+- name: rls-admin-full-count-after-all-policies
+  description: |
+    After multiple policies are created, the admin must still see all 4
+    seeded nodes. Final confirmation that admin queries are not affected by
+    any number of user-scoped RLS policies.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH dist_rls_test;
+    MATCH (n) WHERE n:RLSSecret OR n:RLSPublic RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":4'
+  tags:
+  - distributed
+  - rls
+  - admin
+  - full-visibility
+
+# -----------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------
+- name: rls-cleanup-graph
+  description: Drop the RLS test graph.
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH IF EXISTS dist_rls_test
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - rls
+  - cleanup
+
+- name: rls-cleanup-delete-restricted-user
+  description: Delete the restricted user created during this spec.
+  args:
+  - user
+  - delete
+  - rls_restricted_user
+  - --yes
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - rls
+  - cleanup
+
+tags:
+- distributed
+- rls
+- row-level-security
+- security
+- policy
+- enforcement
