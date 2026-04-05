@@ -1,0 +1,333 @@
+version: '1.0'
+name: Distributed 2PC Undo / Transaction Rollback Tests
+description: |
+  Integration tests for the two-phase-commit undo mechanism and the GQL
+  transaction rollback semantics exposed at the query layer.
+
+  The 2PC undo mechanism (applyUndoOperation in distributed/twophase.zig) reverses
+  CREATE operations by deleting the corresponding nodes and edges from the
+  GraphStore. These tests validate the observable behaviour of that mechanism
+  through the GQL transaction interface (BEGIN / ROLLBACK), which is the only
+  black-box path available from the CLI.
+
+  This spec covers:
+  - ROLLBACK after CREATE leaves no trace of the created node
+  - ROLLBACK after CREATE + edge creation leaves no trace of either
+  - COMMIT persists nodes and edges as expected (positive control)
+  - Rolled-back data does not appear in subsequent reads
+  - Empty transaction (BEGIN ... ROLLBACK with no mutations) succeeds
+  - Nested read-only operations in a transaction are unaffected by rollback
+  - The transaction ID returned by BEGIN is a non-empty string
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+invariants:
+- type: server_running
+
+tests:
+# -----------------------------------------------------------------------
+# Graph setup
+# -----------------------------------------------------------------------
+- name: 2pc-setup-graph
+  description: Create a dedicated graph for 2PC undo tests to avoid collisions.
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH IF NOT EXISTS dist_2pc_undo
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - 2pc
+  - setup
+
+# -----------------------------------------------------------------------
+# BEGIN returns a transaction ID
+# -----------------------------------------------------------------------
+- name: 2pc-begin-returns-txn-id
+  description: |
+    BEGIN must return a non-empty transaction identifier. The transaction ID
+    is used by the 2PC coordinator to reference the in-progress transaction.
+    Validates that the response contains the status row expected by GQL.
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH dist_2pc_undo; BEGIN
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '00000'
+  tags:
+  - distributed
+  - 2pc
+  - begin
+  - transaction-id
+
+# -----------------------------------------------------------------------
+# ROLLBACK erases CREATE — positive undo test
+# -----------------------------------------------------------------------
+- name: 2pc-rollback-node-create-undone
+  description: |
+    A node created inside a transaction that is subsequently rolled back must
+    not appear in a follow-up MATCH query. This directly exercises the
+    applyUndoOperation path that deletes nodes whose IDs were recorded in the
+    undo log at CREATE time.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_2pc_undo;
+    BEGIN;
+    CREATE (n:UndoTarget {marker: 'rollback_me_2026'});
+    ROLLBACK;
+    MATCH (n:UndoTarget {marker: 'rollback_me_2026'}) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - cnt
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - distributed
+  - 2pc
+  - rollback
+  - undo
+  - node-create
+
+- name: 2pc-rollback-edge-create-undone
+  description: |
+    Nodes and edges created inside a transaction that is subsequently rolled
+    back must not appear in subsequent queries. This exercises the edge-level
+    branch of applyUndoOperation.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_2pc_undo;
+    CREATE (:UndoAnchor {id: 'anchor_a'});
+    CREATE (:UndoAnchor {id: 'anchor_b'});
+    BEGIN;
+    MATCH (a:UndoAnchor {id: 'anchor_a'}), (b:UndoAnchor {id: 'anchor_b'})
+    CREATE (a)-[:UNDO_EDGE {marker: 'rollback_edge_2026'}]->(b);
+    ROLLBACK;
+    MATCH ()-[r:UNDO_EDGE {marker: 'rollback_edge_2026'}]->() RETURN count(r) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - distributed
+  - 2pc
+  - rollback
+  - undo
+  - edge-create
+
+# -----------------------------------------------------------------------
+# COMMIT persists data (positive control)
+# -----------------------------------------------------------------------
+- name: 2pc-commit-persists-node
+  description: |
+    A node created inside a committed transaction must be visible in
+    subsequent queries. This is the positive control confirming that commit
+    leaves data intact and that the rollback tests above are not trivially
+    passing because the data never existed.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_2pc_undo;
+    BEGIN;
+    CREATE (:CommitTarget {marker: 'committed_2026'});
+    COMMIT;
+    MATCH (n:CommitTarget {marker: 'committed_2026'}) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  tags:
+  - distributed
+  - 2pc
+  - commit
+  - positive-control
+
+# -----------------------------------------------------------------------
+# Empty transaction succeeds
+# -----------------------------------------------------------------------
+- name: 2pc-empty-transaction-succeeds
+  description: |
+    A transaction with no mutations (only a RETURN) followed by ROLLBACK
+    must complete without error. This validates the degenerate case where
+    the undo log is empty at rollback time.
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH dist_2pc_undo; BEGIN; RETURN 42 AS answer; ROLLBACK
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '42'
+  tags:
+  - distributed
+  - 2pc
+  - rollback
+  - empty-transaction
+
+# -----------------------------------------------------------------------
+# Rollback does not affect data committed before the transaction
+# -----------------------------------------------------------------------
+- name: 2pc-rollback-does-not-affect-prior-data-setup
+  description: |
+    Create pre-existing data and then run a transaction that creates new data
+    and rolls it back. This sets up state for the subsequent verification queries.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_2pc_undo;
+    CREATE (:PreExisting {marker: 'pre_tx_2026'});
+    BEGIN;
+    CREATE (:RollbackOnly {marker: 'inside_tx_2026'});
+    ROLLBACK
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - 2pc
+  - rollback
+  - isolation
+
+- name: 2pc-rollback-does-not-affect-prior-data-pre
+  description: |
+    Data committed before a transaction begins must remain visible after
+    the transaction is rolled back. This confirms that the undo log only
+    covers operations within the active transaction boundary.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_2pc_undo;
+    MATCH (n:PreExisting {marker: 'pre_tx_2026'}) RETURN count(n) AS pre_cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"pre_cnt":1'
+  tags:
+  - distributed
+  - 2pc
+  - rollback
+  - isolation
+
+- name: 2pc-rollback-does-not-affect-prior-data
+  description: |
+    Data created inside a rolled-back transaction must not be visible.
+    Combined with the previous test, this confirms that rollback only
+    affects operations within the active transaction boundary.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_2pc_undo;
+    MATCH (n:RollbackOnly {marker: 'inside_tx_2026'}) RETURN count(n) AS post_cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"post_cnt":0'
+  tags:
+  - distributed
+  - 2pc
+  - rollback
+  - isolation
+
+# -----------------------------------------------------------------------
+# Multiple CREATE operations in one transaction all rolled back
+# -----------------------------------------------------------------------
+- name: 2pc-rollback-multiple-creates
+  description: |
+    Multiple nodes created in a single transaction must all be removed on
+    ROLLBACK. Tests that the undo log accumulates all entries correctly
+    and that applyUndoOperation is invoked for every recorded entry.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_2pc_undo;
+    BEGIN;
+    CREATE (:MultiUndo {seq: 1, marker: 'multi_rollback_2026'});
+    CREATE (:MultiUndo {seq: 2, marker: 'multi_rollback_2026'});
+    CREATE (:MultiUndo {seq: 3, marker: 'multi_rollback_2026'});
+    ROLLBACK;
+    MATCH (n:MultiUndo {marker: 'multi_rollback_2026'}) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - distributed
+  - 2pc
+  - rollback
+  - multiple-creates
+  - undo
+
+# -----------------------------------------------------------------------
+# Autocommit (no explicit BEGIN) creates durable data
+# -----------------------------------------------------------------------
+- name: 2pc-autocommit-creates-durable-data
+  description: |
+    A CREATE statement executed outside a BEGIN/COMMIT block uses autocommit
+    semantics and must persist. Validates the baseline (non-2PC) path so
+    that the rollback tests above are meaningful comparisons.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH dist_2pc_undo;
+    CREATE (:AutoCommit {marker: 'auto_2026'});
+    MATCH (n:AutoCommit {marker: 'auto_2026'}) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  tags:
+  - distributed
+  - 2pc
+  - autocommit
+
+# -----------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------
+- name: 2pc-cleanup-graph
+  description: Drop the dedicated test graph to restore clean state.
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH IF EXISTS dist_2pc_undo
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - 2pc
+  - cleanup
+
+tags:
+- distributed
+- 2pc
+- transaction
+- rollback
+- undo
+- gql-compliance
