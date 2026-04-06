@@ -260,6 +260,8 @@ class TestCase:
     plaintext_check: PlaintextCheck = field(default_factory=PlaintextCheck)
     # Setup files to create before running the test
     setup_files: list[dict[str, str]] = field(default_factory=list)
+    # Per-test setup queries to run before the test command
+    setup_queries: list[dict[str, Any]] = field(default_factory=list)
     # Per-test timeout override (if larger than global timeout, this takes precedence)
     timeout_ms: int = 0
     # HTTP test fields
@@ -360,9 +362,13 @@ class TestCase:
 
         # Parse setup files (files to create before running the test)
         setup_files = []
+        setup_queries: list[dict[str, Any]] = []
         setup_data = data.get("setup")
         if isinstance(setup_data, dict) and "files" in setup_data:
             setup_files = setup_data["files"]
+        elif isinstance(setup_data, list):
+            # Per-test setup queries: list of dicts with args/expect keys
+            setup_queries = [item for item in setup_data if isinstance(item, dict)]
 
         return cls(
             name=data["name"],
@@ -378,6 +384,7 @@ class TestCase:
             skip_reason=data.get("skip_reason"),
             plaintext_check=PlaintextCheck.from_dict(plaintext_data),
             setup_files=setup_files,
+            setup_queries=setup_queries,
             timeout_ms=data.get("timeout_ms", 0),
             http_requests=http_requests,
             steps=steps,

@@ -574,6 +574,41 @@ def run_cli_test(
                         error=f"Failed to create setup file {file_path}: {e}",
                     )
 
+    # Run per-test setup queries before the main test command
+    if test_case.setup_queries:
+        for i, setup_item in enumerate(test_case.setup_queries):
+            setup_tc = TestCase.from_dict(
+                {
+                    "name": f"{test_case.name}-setup-{i}",
+                    "description": f"Setup query {i} for {test_case.name}",
+                    **setup_item,
+                }
+            )
+            if verbose:
+                print(f"    Executing setup-{i}...")
+            setup_cmd, setup_err = _build_cli_command(setup_tc, binary, env, secrets, timeout_ms, data_dir, start_time)
+            if setup_err:
+                return TestResult(
+                    name=test_case.name,
+                    passed=False,
+                    duration_ms=(time.time() - start_time) * 1000,
+                    error=f"Setup query {i} failed to build: {setup_err.error}",
+                )
+            setup_result = _execute_and_check(
+                setup_tc, setup_cmd, env, secrets, timeout_ms, data_dir, verbose, start_time
+            )
+            if not setup_result.passed:
+                if verbose:
+                    print(f"    Setup-{i}: FAILED - {setup_result.error}")
+                return TestResult(
+                    name=test_case.name,
+                    passed=False,
+                    duration_ms=(time.time() - start_time) * 1000,
+                    error=f"Setup query {i} failed: {setup_result.error}",
+                )
+            if verbose:
+                print(f"    Setup-{i}: OK")
+
     cmd, error_result = _build_cli_command(test_case, binary, env, secrets, timeout_ms, data_dir, start_time)
     if error_result:
         return error_result
