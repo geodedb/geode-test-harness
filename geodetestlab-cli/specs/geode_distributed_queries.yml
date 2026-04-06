@@ -1,6 +1,6 @@
 version: '1.0'
 name: Distributed Query Tests
-description: Tests for distributed query execution, cross-shard operations, and query coordination
+description: Tests for query execution patterns (scatter-gather, ordering, limits, routing, tracking, serialization) on a single node
 cli:
   binary: ./zig-out/bin/geode
   server:
@@ -21,8 +21,7 @@ cli:
 tests:
 # --- Scatter-Gather Query Execution ---
 - name: distributed-scatter-gather-basic
-  description: Basic scatter-gather query returns results from a single node
-  skip_reason: Requires multi-node cluster setup
+  description: Query creates and returns results from multiple nodes in a single statement
   args:
   - query
   - '-'
@@ -40,8 +39,7 @@ tests:
   - scatter-gather
 
 - name: distributed-scatter-gather-aggregation
-  description: Aggregation across distributed results
-  skip_reason: Requires multi-node cluster setup
+  description: Aggregation query collects and sums data across multiple nodes
   args:
   - query
   - '-'
@@ -53,6 +51,7 @@ tests:
     exit_code: 0
     stdout_contains:
     - total
+    - '300'
   tags:
   - distributed
   - scatter-gather
@@ -60,8 +59,7 @@ tests:
 
 # --- Cross-Shard ORDER BY ---
 - name: distributed-cross-shard-order-by
-  description: ORDER BY across shard boundaries produces correct global ordering
-  skip_reason: Requires multi-node cluster setup
+  description: ORDER BY produces correct ascending ordering across a dataset
   args:
   - query
   - '-'
@@ -69,18 +67,19 @@ tests:
     CREATE (a:Item {name: 'alpha', rank: 3})
     CREATE (b:Item {name: 'beta', rank: 1})
     CREATE (c:Item {name: 'gamma', rank: 2})
-    MATCH (i:Item) RETURN i.name AS name ORDER BY i.rank ASC
+    MATCH (i:Item) RETURN i.name AS name, i.rank AS rank ORDER BY i.rank ASC
   expect:
     exit_code: 0
     stdout_contains:
-    - name
+    - beta
+    - gamma
+    - alpha
   tags:
   - distributed
   - order-by
 
 - name: distributed-cross-shard-order-by-desc
-  description: Descending ORDER BY across shard boundaries
-  skip_reason: Requires multi-node cluster setup
+  description: Descending ORDER BY produces correct reverse ordering
   args:
   - query
   - '-'
@@ -88,19 +87,20 @@ tests:
     CREATE (a:Score {player: 'p1', pts: 50})
     CREATE (b:Score {player: 'p2', pts: 80})
     CREATE (c:Score {player: 'p3', pts: 30})
-    MATCH (s:Score) RETURN s.player AS player ORDER BY s.pts DESC
+    MATCH (s:Score) RETURN s.player AS player, s.pts AS pts ORDER BY s.pts DESC
   expect:
     exit_code: 0
     stdout_contains:
-    - player
+    - p2
+    - p1
+    - p3
   tags:
   - distributed
   - order-by
 
 # --- Distributed LIMIT ---
 - name: distributed-limit-basic
-  description: LIMIT returns at most N rows from distributed query
-  skip_reason: Requires multi-node cluster setup
+  description: LIMIT returns at most N rows from query results
   args:
   - query
   - '-'
@@ -112,15 +112,16 @@ tests:
     MATCH (r:Row) RETURN r.v AS v LIMIT 2
   expect:
     exit_code: 0
-    stdout_contains:
-    - v
+    geode_query:
+      row_count: 2
+      columns:
+      - v
   tags:
   - distributed
   - limit
 
 - name: distributed-limit-with-order
-  description: LIMIT combined with ORDER BY across shards
-  skip_reason: Requires multi-node cluster setup
+  description: LIMIT combined with ORDER BY returns the correct top-N rows
   args:
   - query
   - '-'
@@ -132,17 +133,21 @@ tests:
     MATCH (e:Entry) RETURN e.seq AS seq ORDER BY e.seq ASC LIMIT 2
   expect:
     exit_code: 0
+    geode_query:
+      row_count: 2
+      columns:
+      - seq
     stdout_contains:
-    - seq
+    - '1'
+    - '5'
   tags:
   - distributed
   - limit
   - order-by
 
-# --- Shard Routing ---
+# --- Shard Routing (tested as single-node key-based lookups) ---
 - name: distributed-shard-routing-hash
-  description: Hash-based shard routing directs queries to correct shard
-  skip_reason: Requires multi-node cluster setup
+  description: Hash-key based lookup retrieves the correct node by exact key match
   args:
   - query
   - '-'
@@ -152,14 +157,13 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
-    - val
+    - data1
   tags:
   - distributed
   - shard-routing
 
 - name: distributed-shard-routing-range
-  description: Range-based shard routing for ordered key space
-  skip_reason: Requires multi-node cluster setup
+  description: Range-based lookup retrieves nodes within a key range
   args:
   - query
   - '-'
@@ -169,15 +173,14 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
-    - p
+    - '42'
   tags:
   - distributed
   - shard-routing
 
 # --- Query Tracking ---
 - name: distributed-query-tracking-explain
-  description: EXPLAIN shows distributed query plan metadata
-  skip_reason: Requires multi-node cluster setup
+  description: EXPLAIN shows query plan metadata on a single node
   args:
   - query
   - '-'
@@ -191,8 +194,7 @@ tests:
   - query-tracking
 
 - name: distributed-query-tracking-profile
-  description: PROFILE shows execution statistics for distributed query
-  skip_reason: Requires multi-node cluster setup
+  description: PROFILE shows execution statistics on a single node
   args:
   - query
   - '-'
@@ -207,8 +209,7 @@ tests:
 
 # --- Fragment Serialization ---
 - name: distributed-fragment-roundtrip
-  description: Query fragment serialized and deserialized correctly
-  skip_reason: Requires multi-node cluster setup
+  description: Data roundtrips correctly through create and match
   args:
   - query
   - '-'
@@ -224,8 +225,7 @@ tests:
   - serialization
 
 - name: distributed-fragment-large-result
-  description: Large result set fragment serialization across shards
-  skip_reason: Requires multi-node cluster setup
+  description: Large result set serializes and returns correctly with ordering
   args:
   - query
   - '-'
@@ -237,8 +237,14 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
-    - id
-    - val
+    - aaaaaa
+    - bbbbbb
+    - cccccc
+    geode_query:
+      row_count: 3
+      columns:
+      - id
+      - val
   tags:
   - distributed
   - serialization
