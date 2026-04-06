@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+from .cluster_types import ClusterConfig
+
 
 # ---------------------------------------------------------------------------
 # Custom YAML loader: disable YAML 1.1 sexagesimal number parsing.
@@ -438,6 +440,7 @@ class TestSpec:
     skip: str | None = (
         None  # Top-level skip directive (free-text reason). When set, the spec is pending and contributes 0 cases to the run.
     )
+    cluster_config: ClusterConfig | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestSpec:
@@ -474,6 +477,13 @@ class TestSpec:
         env = data.get("env", {}).copy()
         env.update(server_config.get("env", {}))
 
+        # Parse cluster configuration
+        cluster_config = None
+        cluster_data = data.get("cluster")
+        if cluster_data is not None:
+            cluster_config = ClusterConfig.from_dict(cluster_data)
+            mode = "cluster"  # Override mode when cluster block is present
+
         return cls(
             name=data.get("name", "unnamed"),
             description=data.get("description", ""),
@@ -490,6 +500,7 @@ class TestSpec:
             parallel_tests=bool(data.get("parallel_tests", False)),
             default_timeout_ms=data.get("default_timeout_ms", 0),
             skip=(str(data["skip"]) if data.get("skip") else None),
+            cluster_config=cluster_config,
         )
 
 
@@ -581,7 +592,7 @@ def load_spec(path: str | Path) -> TestSpec:
 
     # Validate mode
     mode = data.get("mode", "server")
-    if mode not in ("server", "cli"):
+    if mode not in ("server", "cli", "cluster"):
         raise SpecValidationError(f"Invalid mode '{mode}'. Must be 'server' or 'cli'")
 
     return TestSpec.from_dict(data)
