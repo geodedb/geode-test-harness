@@ -99,7 +99,7 @@ help:
 	@echo "  docker-status        - Check container status"
 	@echo ""
 	@echo "Setup & Build:"
-	@echo "  geodetestlab-install - Install geodetestlab to user env (pip)"
+	@echo "  geodetestlab-install - Install geodetestlab to user env (pipx)"
 	@echo "  geodetestlab-setup   - Install geodetestlab in venv (CI)"
 	@echo "  setup                - Full setup (venv + all runners)"
 	@echo "  build-all            - Build multi-language runners"
@@ -302,12 +302,8 @@ GEODETESTLAB_VENV := $(GEODETESTLAB_CLI)/.venv
 GEODETESTLAB_PIP := $(GEODETESTLAB_VENV)/bin/pip
 
 # Auto-detect geodetestlab: prefer system-installed, fall back to venv
-GEODETESTLAB := $(shell command -v geodetestlab 2>/dev/null)
-ifeq ($(GEODETESTLAB),)
-  ifneq (,$(wildcard $(GEODETESTLAB_VENV)/bin/geodetestlab))
-    GEODETESTLAB := $(GEODETESTLAB_VENV)/bin/geodetestlab
-  endif
-endif
+# Uses = (recursive) so it re-evaluates after auto-install
+GEODETESTLAB = $(or $(shell command -v geodetestlab 2>/dev/null),$(wildcard $(GEODETESTLAB_VENV)/bin/geodetestlab))
 
 # Geode binary: prefer ../geode/zig-out/bin/geode, then system
 GEODE_BINARY ?= $(shell \
@@ -336,19 +332,22 @@ geodetestlab-setup:
 	@$(GEODETESTLAB_PIP) install -e $(GEODETESTLAB_CLI)
 	@echo "geodetestlab-cli setup complete"
 
-# Install geodetestlab-cli to user site-packages (for local development)
+# Install geodetestlab-cli to user environment via pipx (for local development)
 geodetestlab-install:
 	@echo "Installing geodetestlab-cli to user environment..."
-	pip install -e $(GEODETESTLAB_CLI)
+	@if command -v pipx >/dev/null 2>&1; then \
+		pipx install --editable ./$(GEODETESTLAB_CLI) --force; \
+	else \
+		echo "Error: pipx not found. Install it with: apt install pipx"; \
+		exit 1; \
+	fi
 	@echo "Installed. Run 'geodetestlab --help' to verify."
 
-# Verify prerequisites before running tests
+# Verify prerequisites before running tests; auto-install via pipx if missing
 .check-geodetestlab:
 	@if [ -z "$(GEODETESTLAB)" ]; then \
-		echo "Error: geodetestlab not found. Run one of:"; \
-		echo "  make geodetestlab-install   (local development)"; \
-		echo "  make geodetestlab-setup     (CI/venv)"; \
-		exit 1; \
+		echo "geodetestlab not found, installing via pipx..."; \
+		$(MAKE) geodetestlab-install; \
 	fi
 
 .check-geode-binary:
