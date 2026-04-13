@@ -103,7 +103,10 @@ class NodeJSTestRunner {
         this.verbose = verbose;
         this.transport = transport;
         this.username = process.env.GEODE_USERNAME || DEFAULT_USERNAME;
-        this.password = process.env.GEODE_ADMIN_PASSWORD || DEFAULT_PASSWORD;
+        this.password =
+            process.env.GEODE_DEFAULT_PASSWORD ||
+            process.env.GEODE_ADMIN_PASSWORD ||
+            DEFAULT_PASSWORD;
         this.client = null;
         this.connection = null;
         this.transaction = null;
@@ -116,7 +119,7 @@ class NodeJSTestRunner {
      */
     buildDsn() {
         const scheme = this.transport === 'grpc' ? 'grpc' : 'quic';
-        const tlsParam = this.transport === 'grpc' ? 'tls=0' : 'insecure=true';
+        const tlsParam = 'insecure=true';
         return `${scheme}://${this.server}?${tlsParam}&user=${this.username}&pass=${encodeURIComponent(this.password)}`;
     }
 

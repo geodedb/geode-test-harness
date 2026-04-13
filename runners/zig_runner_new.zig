@@ -718,7 +718,9 @@ fn parseArgs(allocator: Allocator) !RunnerConfig {
 
     // Get credentials from environment or use defaults
     const username = std.posix.getenv("GEODE_USERNAME") orelse DEFAULT_USERNAME;
-    const password = std.posix.getenv("GEODE_ADMIN_PASSWORD") orelse DEFAULT_PASSWORD;
+    const password = std.posix.getenv("GEODE_DEFAULT_PASSWORD") orelse
+        std.posix.getenv("GEODE_ADMIN_PASSWORD") orelse
+        DEFAULT_PASSWORD;
 
     const spec_path = spec_path_opt orelse return error.MissingSpec;
     const server_parts = try parseServer(allocator, server);
@@ -744,7 +746,7 @@ const ClientContext = struct {
     username: []const u8,
     password: []const u8,
     client: ?GeodeClient = null,
-    connections: std.StringHashMap(GeodeClient) = undefined,  // Connection registry for multi-connection tests
+    connections: std.StringHashMap(GeodeClient) = undefined, // Connection registry for multi-connection tests
 
     fn initConnections(self: *ClientContext) void {
         self.connections = std.StringHashMap(GeodeClient).init(self.allocator);
@@ -903,7 +905,7 @@ const ClientContext = struct {
                         try all_rows.append(self.allocator, JsonValue{ .object = row_obj });
                     }
                     got_page = true;
-                    if (page.@"final") break;
+                    if (page.final) break;
                 }
 
                 // If we got a page, we're done for simple queries

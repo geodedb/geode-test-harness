@@ -1,7 +1,9 @@
 """Tests for utility functions."""
 
 import os
+import sys
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -98,6 +100,37 @@ def test_resolve_secrets_missing_required() -> None:
 
     with pytest.raises(SecretResolutionError, match="Required secret"):
         resolve_secrets(spec)
+
+
+def test_resolve_secrets_optional_keyring_backend_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Optional keyring secrets should not fail when no backend is available."""
+
+    class FakeKeyringError(Exception):
+        """Fake keyring backend error."""
+
+    fake_keyring = SimpleNamespace(
+        errors=SimpleNamespace(KeyringError=FakeKeyringError),
+        get_password=lambda service, key: (_ for _ in ()).throw(FakeKeyringError("no backend")),
+    )
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+
+    spec = TestSpec(
+        name="test-spec",
+        description="",
+        secrets={
+            "api_token": SecretConfig(
+                source="keyring",
+                service="geodetestlab",
+                key="api_token",
+                required=False,
+            )
+        },
+        tests=[],
+    )
+
+    secrets, env_vars = resolve_secrets(spec)
+    assert secrets == {}
+    assert env_vars == {}
 
 
 def test_get_free_port() -> None:

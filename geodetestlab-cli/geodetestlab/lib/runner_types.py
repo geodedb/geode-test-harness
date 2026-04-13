@@ -7,9 +7,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # Centralized test credential — every Python module should import this
-# constant instead of defining its own.  The value is read from the
-# environment at import time so it can be overridden externally.
-DEFAULT_ADMIN_PASSWORD: str = os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!")
+# constant instead of defining its own. Prefer the current server bootstrap
+# variable and fall back to the legacy harness variable for compatibility.
+DEFAULT_ADMIN_PASSWORD: str = os.environ.get(
+    "GEODE_DEFAULT_PASSWORD",
+    os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"),
+)
 
 # Network port defaults — centralised so every module imports from here.
 DEFAULT_QUIC_PORT: int = 3141

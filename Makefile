@@ -24,6 +24,7 @@ all: clean docker-start test-all docker-stop
 	@echo "Full test suite completed."
 
 # Docker settings (matching client repos)
+GO ?= $(if $(wildcard $(GOROOT)/bin/go),$(GOROOT)/bin/go,go)
 DOCKER ?= docker
 GEODE_IMAGE ?= geodedb/geode:latest
 GEODE_CONTAINER ?= geode-test-harness
@@ -34,6 +35,7 @@ GEODE_GRPC_PORT ?= 50051
 # Authentication settings
 GEODE_ADMIN_PASSWORD ?= GeodeTestPassword123!
 GEODE_USERNAME ?= geode
+GEODE_DEFAULT_PASSWORD ?= $(GEODE_ADMIN_PASSWORD)
 
 # Transport selection (quic or grpc)
 TRANSPORT ?= quic
@@ -139,6 +141,7 @@ docker-start:
 	@$(DOCKER) run -d --name $(GEODE_CONTAINER) \
 		-p $(GEODE_PORT):3141/udp \
 		-p $(GEODE_GRPC_PORT):50051/tcp \
+		-e GEODE_DEFAULT_PASSWORD=$(GEODE_DEFAULT_PASSWORD) \
 		-e GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) \
 		-e GEODE_DISABLE_AUDIT=1 \
 		$(GEODE_IMAGE) \
@@ -260,8 +263,8 @@ build-go:
 		echo "Warning: Go client not found at $(GO_CLIENT_PATH)"; \
 		exit 0; \
 	fi
-	@command -v go >/dev/null 2>&1 || { echo "Go not found, skipping"; exit 0; }
-	@cd runners && go build -o go_runner go_runner.go 2>/dev/null || echo "Go build skipped"
+	@command -v $(GO) >/dev/null 2>&1 || { echo "Go not found, skipping"; exit 0; }
+	@cd runners && $(GO) build -o go_runner go_runner.go 2>/dev/null || echo "Go build skipped"
 
 build-python:
 	@echo "Setting up Python runner..."
@@ -329,7 +332,7 @@ geodetestlab-setup:
 		$(PYTHON) -m venv $(GEODETESTLAB_VENV); \
 	fi
 	@$(GEODETESTLAB_PIP) install --upgrade pip
-	@$(GEODETESTLAB_PIP) install -e $(GEODETESTLAB_CLI)
+	@$(GEODETESTLAB_PIP) install -e "$(GEODETESTLAB_CLI)[dev]"
 	@echo "geodetestlab-cli setup complete"
 
 # Install geodetestlab-cli to user environment via pipx (for local development)
@@ -468,14 +471,14 @@ test-all-transports: .check-geodetestlab
 # ==============================================================================
 
 # Geode connection DSN for load tests (override as needed)
-LOADTEST_DSN ?= localhost:3141?insecure=true&user=$(GEODE_USERNAME)&pass=$(GEODE_ADMIN_PASSWORD)
+LOADTEST_DSN ?= localhost:3141?insecure=true&user=$(GEODE_USERNAME)&pass=$(GEODE_DEFAULT_PASSWORD)
 LOADTEST_LEVELS ?= 1,2,4,8,16,32
 LOADTEST_DURATION ?= 5s
 
 # Build Go load test binary
 loadtest-build:
 	@echo "Building Go load test..."
-	cd loadtest/go && go build -o geode-loadtest .
+	cd loadtest/go && $(GO) build -o geode-loadtest .
 	@echo "Built: loadtest/go/geode-loadtest"
 
 # Run Go client load test (native QUIC via quic-go, connection pooling)
@@ -548,10 +551,10 @@ loadtest: loadtest-go loadtest-cli
 
 test-unit:
 	@echo "Running geodetestlab unit tests..."
-	python3 -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v
+	$(GEODETESTLAB_VENV)/bin/python -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v
 
 test-unit-verbose:
-	python3 -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v --tb=long
+	$(GEODETESTLAB_VENV)/bin/python -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v --tb=long
 
 # ==============================================================================
 # Reporting

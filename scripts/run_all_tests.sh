@@ -58,6 +58,9 @@ echo "=== 4. Running Load Tests ==="
 # loadtest-go and loadtest-python expect a running server
 DATA_DIR=$(mktemp -d)
 echo "Starting Geode server on port $PORT for load tests..."
+GEODE_DEFAULT_PASSWORD="${GEODE_DEFAULT_PASSWORD:-${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}}" \
+GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-${GEODE_DEFAULT_PASSWORD:-GeodeTestPassword123!}}" \
+GEODE_DISABLE_AUDIT=1 \
 "$GEODE_BINARY" serve --data-dir "$DATA_DIR" --listen "127.0.0.1:$PORT" --log-level info &
 SERVER_PID=$!
 

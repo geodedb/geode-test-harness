@@ -323,7 +323,10 @@ def _resolve_secret(name: str, config: SecretConfig) -> str | None:
 
             service = config.service or "geodetestlab"
             key = config.key or name
-            value = keyring.get_password(service, key)
+            try:
+                value = keyring.get_password(service, key)
+            except getattr(getattr(keyring, "errors", object()), "KeyringError", ()):
+                value = None
         except ImportError:
             pass
 

@@ -125,7 +125,10 @@ func main() {
 	if username == "" {
 		username = defaultUsername
 	}
-	password := os.Getenv("GEODE_ADMIN_PASSWORD")
+	password := os.Getenv("GEODE_DEFAULT_PASSWORD")
+	if password == "" {
+		password = os.Getenv("GEODE_ADMIN_PASSWORD")
+	}
 	if password == "" {
 		password = defaultPassword
 	}
@@ -133,7 +136,7 @@ func main() {
 	// Create DSN based on transport type
 	var dsn string
 	if *transport == "grpc" {
-		dsn = fmt.Sprintf("grpc://%s?tls=0&user=%s&pass=%s", *server, username, password)
+		dsn = fmt.Sprintf("grpc://%s?insecure=true&user=%s&pass=%s", *server, username, password)
 	} else {
 		dsn = fmt.Sprintf("quic://%s?insecure=true&user=%s&pass=%s", *server, username, password)
 	}

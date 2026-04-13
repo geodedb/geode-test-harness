@@ -18,7 +18,10 @@ from typing import Dict, Optional
 from .utils import get_free_port
 
 # Default admin password for testing
-DEFAULT_ADMIN_PASSWORD = "GeodeTestPassword123!"
+DEFAULT_ADMIN_PASSWORD = os.environ.get(
+    "GEODE_DEFAULT_PASSWORD",
+    os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"),
+)
 
 
 class ServerManager:
@@ -142,8 +145,11 @@ class ServerManager:
         # Disable audit logging for testing (avoids signing key requirements)
         server_env["GEODE_DISABLE_AUDIT"] = "1"
 
-        # Set admin password for testing authentication
+        # Keep the current server bootstrap password and the legacy harness
+        # password in sync so both server startup and client-side helpers work.
+        server_env["GEODE_DEFAULT_PASSWORD"] = self.admin_password
         server_env["GEODE_ADMIN_PASSWORD"] = self.admin_password
+        server_env.setdefault("GEODE_USERNAME", "geode")
 
         # Start the server process
         try:

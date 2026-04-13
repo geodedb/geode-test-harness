@@ -132,8 +132,11 @@ def start_server(
         env.setdefault("GEODE_ALLOW_NO_AUTH", "1")
     else:
         logger.info("GEODE_ALLOW_NO_AUTH_GUARD=0: auth bypass NOT enabled")
-    # Set a known admin password for testing (used by query commands)
-    env.setdefault("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
+    # Keep the server bootstrap password and the legacy harness password in sync.
+    password = env.get("GEODE_DEFAULT_PASSWORD") or env.get("GEODE_ADMIN_PASSWORD") or DEFAULT_ADMIN_PASSWORD
+    env.setdefault("GEODE_DEFAULT_PASSWORD", password)
+    env.setdefault("GEODE_ADMIN_PASSWORD", password)
+    env.setdefault("GEODE_USERNAME", "geode")
 
     if verbose:
         print(f"Starting server: {' '.join(cmd)}")
