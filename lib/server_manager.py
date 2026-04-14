@@ -144,6 +144,8 @@ class ServerManager:
 
         # Set admin password for testing authentication
         server_env["GEODE_ADMIN_PASSWORD"] = self.admin_password
+        server_env["GEODE_DEFAULT_PASSWORD"] = self.admin_password
+        server_env.setdefault("GEODE_ADMIN_USERNAME", "geode")
 
         # Start the server process
         try:

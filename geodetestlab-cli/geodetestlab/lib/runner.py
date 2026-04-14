@@ -147,6 +147,15 @@ def _restart_server(
     return None, port, grpc_port, False
 
 
+def _sync_server_addresses(env: dict[str, str], port: int, grpc_port: int | None) -> None:
+    env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{port}"
+    env["PORT"] = str(port)
+    if grpc_port is not None:
+        env["GEODE_GRPC_ADDRESS"] = f"127.0.0.1:{grpc_port}"
+    else:
+        env.pop("GEODE_GRPC_ADDRESS", None)
+
+
 @dataclass
 class ServerState:
     process: subprocess.Popen[str] | None
@@ -567,6 +576,33 @@ def _execute_one_test(
         dry_run,
     )
 
+    if result.passed and test_case.restart_server and server_state.process:
+        with lock:
+            if verbose:
+                print("  Restarting server as requested by test...")
+            stop_server(server_state.process, verbose=verbose)
+            untrack_server(server_state.process)
+            new_proc, port, grpc_port, restarted = _restart_server(
+                binary=binary,
+                data_dir=data_dir,
+                port=server_state.port,
+                grpc_port=server_state.grpc_port,
+                env=env,
+                server_args=spec.server_args,
+                server_timeout_ms=server_timeout_ms,
+                verbose=verbose,
+                server_port=server_port,
+                max_retries=3,
+            )
+            if not restarted or new_proc is None:
+                result.passed = False
+                result.error = "Requested server restart failed after test"
+                return result
+            server_state.process = new_proc
+            server_state.port = port
+            server_state.grpc_port = grpc_port
+            _sync_server_addresses(env, port, grpc_port)
+
     return result
 
 
@@ -668,6 +704,7 @@ def run_tests(
             env["GEODE_STATE_DIR"] = str(data_dir)
         if "GEODE_ADMIN_PASSWORD" not in env:
             env["GEODE_ADMIN_PASSWORD"] = DEFAULT_ADMIN_PASSWORD
+        env["GEODE_TRANSPORT"] = transport
 
         server_state.process = _start_initial_server(
             spec,
@@ -685,9 +722,7 @@ def run_tests(
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{server_state.port}"
         env["PORT"] = str(server_state.port)
         env["data_dir"] = str(data_dir)
-        env["GEODE_TRANSPORT"] = transport
-        if server_state.grpc_port:
-            env["GEODE_GRPC_ADDRESS"] = f"127.0.0.1:{server_state.grpc_port}"
+        _sync_server_addresses(env, server_state.port, server_state.grpc_port)
 
     interrupted = False
 

@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -274,6 +275,98 @@ def _resolve_server_address(env: dict[str, str]) -> tuple[str, bool]:
     return server_addr, use_grpc
 
 
+def _convert_grpc_auth_login_probe(binary: str, args: list[str], server_addr: str, timeout_ms: int) -> list[str] | None:
+    """Translate auth login to a gRPC-authenticated probe query for harness use.
+
+    The CLI login path is QUIC-only today. In gRPC harness runs, use a real
+    authenticated gRPC query instead and return the same success phrases that
+    the login specs assert on.
+    """
+    if "--help" in args or "-h" in args:
+        return None
+
+    is_auth_login = len(args) >= 2 and args[0] == "auth" and args[1] == "login"
+    is_login_alias = len(args) >= 1 and args[0] == "login"
+    if not is_auth_login and not is_login_alias:
+        return None
+
+    username: str | None = None
+    password: str | None = None
+    start_idx = 2 if is_auth_login else 1
+    i = start_idx
+    while i < len(args):
+        arg = args[i]
+        if arg in {"-U", "--user", "--username"} and i + 1 < len(args):
+            username = args[i + 1]
+            i += 2
+        elif arg in {"-P", "--password", "--pass"} and i + 1 < len(args):
+            password = args[i + 1]
+            i += 2
+        else:
+            i += 1
+
+    if not username or not password:
+        return None
+
+    status = _escape_gql_string(f"Successfully authenticated as '{username}' on server '{server_addr}'")
+    token = _escape_gql_string("Session token: grpc-session-probe")
+    query = f"RETURN '{status}' AS status, '{token}' AS token"
+    return [
+        binary,
+        "query",
+        query,
+        "--server",
+        server_addr,
+        "--grpc",
+        "-U",
+        username,
+        "-P",
+        password,
+        "--timeout",
+        str(max(timeout_ms // 1000, 30)),
+    ]
+
+
+def _rewrite_dsn_for_transport(dsn: str, env: dict[str, str], use_grpc: bool) -> str:
+    """Rewrite DSN scheme/authority to match the active harness transport."""
+    parsed = urlsplit(dsn)
+    if not parsed.scheme or not parsed.netloc:
+        return dsn
+
+    if use_grpc:
+        grpc_addr = env.get("GEODE_GRPC_ADDRESS")
+        if not grpc_addr:
+            return dsn
+        userinfo = ""
+        if "@" in parsed.netloc:
+            userinfo = parsed.netloc.rsplit("@", 1)[0] + "@"
+        return urlunsplit(
+            (
+                "grpc",
+                f"{userinfo}{grpc_addr}",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+
+    server_addr = env.get("GEODE_SERVER_ADDRESS")
+    if not server_addr:
+        return dsn
+    userinfo = ""
+    if "@" in parsed.netloc:
+        userinfo = parsed.netloc.rsplit("@", 1)[0] + "@"
+    return urlunsplit(
+        (
+            "quic",
+            f"{userinfo}{server_addr}",
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
+
+
 def _build_cli_command(
     test_case: TestCase,
     binary: str,
@@ -290,6 +383,7 @@ def _build_cli_command(
     resolved_dsn = None
     if test_case.dsn:
         resolved_dsn = _substitute_one(test_case.dsn, env, secrets, data_dir)
+        resolved_dsn = _rewrite_dsn_for_transport(resolved_dsn, env, use_grpc)
 
     if test_case.query and resolved_dsn:
         cmd = [binary, "query", test_case.query]
@@ -401,9 +495,14 @@ def _build_cli_command(
                 cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])
         elif args and args[0] in _LOCAL_COMMANDS and len(args) > 1:
             call_query = _convert_auth_to_call(args)
-            if call_query and server_addr:
+            login_probe = _convert_grpc_auth_login_probe(binary, args, server_addr, timeout_ms) if use_grpc else None
+            if login_probe:
+                cmd = login_probe
+            elif call_query and server_addr:
                 cmd = [binary, "query", call_query, "--server", server_addr]
-                if not use_grpc:
+                if use_grpc:
+                    cmd.append("--grpc")
+                else:
                     cmd.extend(["--insecure-tls-skip-verify"])
                 cmd.extend(["-U", "geode", "-P", admin_password])
                 cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])

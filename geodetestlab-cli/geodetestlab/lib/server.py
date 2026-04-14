@@ -107,16 +107,17 @@ def start_server(
     Returns the server process handle. Raises ``ServerError`` if the
     server fails to start within the given timeout.
     """
+    use_grpc_only = grpc_port is not None and env.get("GEODE_TRANSPORT") == "grpc"
     cmd = [
         binary,
         "serve",
         "--data-dir",
         str(data_dir),
-        "--listen",
-        f"127.0.0.1:{port}",
         "--log-level",
         "info" if verbose else "warn",
     ]
+    if not use_grpc_only:
+        cmd.extend(["--listen", f"127.0.0.1:{port}"])
     if grpc_port:
         cmd.extend(["--listen-grpc", f"127.0.0.1:{grpc_port}"])
     cmd.extend(args)
@@ -134,6 +135,10 @@ def start_server(
         logger.info("GEODE_ALLOW_NO_AUTH_GUARD=0: auth bypass NOT enabled")
     # Set a known admin password for testing (used by query commands)
     env.setdefault("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
+    if use_grpc_only:
+        # The CLI gRPC query path is plaintext HTTP/2 in Debug builds, so
+        # the harness opts the server into matching plaintext mode for gRPC runs.
+        env.setdefault("GEODE_GRPC_ALLOW_PLAINTEXT_FALLBACK", "1")
 
     if verbose:
         print(f"Starting server: {' '.join(cmd)}")
@@ -165,7 +170,7 @@ def start_server(
 
         # Check if port is bound using zero-cost socket bind probe
         # (replaces subprocess-based ss/netstat polling — PERF-002)
-        quic_ready = _port_is_bound(port, socket.SOCK_DGRAM)  # UDP for QUIC
+        quic_ready = use_grpc_only or _port_is_bound(port, socket.SOCK_DGRAM)  # UDP for QUIC
         grpc_ready = grpc_port is None or _port_is_bound(grpc_port, socket.SOCK_STREAM)  # TCP for gRPC
 
         if quic_ready and grpc_ready:

@@ -264,6 +264,8 @@ class TestCase:
     setup_queries: list[dict[str, Any]] = field(default_factory=list)
     # Per-test timeout override (if larger than global timeout, this takes precedence)
     timeout_ms: int = 0
+    # Request a managed server restart after this test succeeds
+    restart_server: bool = False
     # HTTP test fields
     http_requests: list[HttpRequest] = field(default_factory=list)
     # Sequential test fields
@@ -386,6 +388,7 @@ class TestCase:
             setup_files=setup_files,
             setup_queries=setup_queries,
             timeout_ms=data.get("timeout_ms", 0),
+            restart_server=data.get("restart_server", False),
             http_requests=http_requests,
             steps=steps,
             dsn=data.get("dsn"),

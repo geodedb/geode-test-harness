@@ -324,7 +324,9 @@ def _resolve_secret(name: str, config: SecretConfig) -> str | None:
             service = config.service or "geodetestlab"
             key = config.key or name
             value = keyring.get_password(service, key)
-        except ImportError:
+        except Exception:
+            # ImportError: keyring not installed
+            # keyring.errors.NoKeyringError: no backend available (CI)
             pass
 
     elif config.source == "file":

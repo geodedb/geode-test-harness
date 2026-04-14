@@ -33,6 +33,7 @@ GEODE_GRPC_PORT ?= 50051
 
 # Authentication settings
 GEODE_ADMIN_PASSWORD ?= GeodeTestPassword123!
+GEODE_DEFAULT_PASSWORD ?= $(GEODE_ADMIN_PASSWORD)
 GEODE_USERNAME ?= geode
 
 # Transport selection (quic or grpc)
@@ -140,6 +141,7 @@ docker-start:
 		-p $(GEODE_PORT):3141/udp \
 		-p $(GEODE_GRPC_PORT):50051/tcp \
 		-e GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) \
+		-e GEODE_DEFAULT_PASSWORD=$(GEODE_DEFAULT_PASSWORD) \
 		-e GEODE_DISABLE_AUDIT=1 \
 		$(GEODE_IMAGE) \
 		serve --listen 0.0.0.0:3141 --listen-grpc 0.0.0.0:50051 --log-level info
@@ -312,15 +314,11 @@ GEODE_BINARY ?= $(shell \
 	else echo ""; fi)
 
 # Number of parallel workers for CLI tests.
-# QUIC transport: cap at 2 to avoid resource contention (each spec spawns a
-# full Geode server; >2 parallel servers causes timeouts and false failures).
-# gRPC transport: no cap needed — use full core count.
-NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-ifeq ($(TRANSPORT),grpc)
-  PARALLEL_WORKERS ?= $(NPROC)
-else
-  PARALLEL_WORKERS ?= $(shell echo $$(( $(NPROC) > 2 ? 2 : $(NPROC) )))
-endif
+# Each spec spawns a full Geode server and some suites leave background flush /
+# persistence work in flight long enough that parallel spec execution can cause
+# nondeterministic crashes and false failures. Default to serial execution for
+# trustworthy local verification; callers can still opt in explicitly.
+PARALLEL_WORKERS ?= 1
 
 # Setup geodetestlab-cli in a venv (for CI or first-time setup)
 geodetestlab-setup:
