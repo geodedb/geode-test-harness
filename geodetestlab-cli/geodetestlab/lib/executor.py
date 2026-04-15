@@ -275,6 +275,17 @@ def _resolve_server_address(env: dict[str, str]) -> tuple[str, bool]:
     return server_addr, use_grpc
 
 
+def _is_remote_admin_command(args: list[str]) -> bool:
+    """Return True for CLI commands that execute against the live server."""
+    if not args:
+        return False
+
+    if args[0] == "backup" and len(args) > 1 and args[1] == "create":
+        return True
+
+    return args[0] in {"restore", "migrate"}
+
+
 def _convert_grpc_auth_login_probe(binary: str, args: list[str], server_addr: str, timeout_ms: int) -> list[str] | None:
     """Translate auth login to a gRPC-authenticated probe query for harness use.
 
@@ -379,6 +390,7 @@ def _build_cli_command(
     """Build the CLI command and validate arguments."""
     admin_password = env.get("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
     server_addr, use_grpc = _resolve_server_address(env)
+    quic_server_addr = env.get("GEODE_SERVER_ADDRESS", f"127.0.0.1:{DEFAULT_QUIC_PORT}")
 
     resolved_dsn = None
     if test_case.dsn:
@@ -508,6 +520,20 @@ def _build_cli_command(
                 cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])
             elif "--data-dir" not in args and data_dir:
                 cmd.extend(["--data-dir", data_dir])
+        elif args and _is_remote_admin_command(args):
+            if use_grpc:
+                logger.warning(
+                    "gRPC transport requested but command '%s' is QUIC-only; using the managed QUIC address instead",
+                    args[0],
+                )
+            if "--server" not in args:
+                cmd.extend(["--server", quic_server_addr])
+            if "--insecure-tls-skip-verify" not in args and "--insecure" not in args:
+                cmd.extend(["--insecure-tls-skip-verify"])
+            if "-U" not in args and "--user" not in args:
+                cmd.extend(["--user", "geode"])
+            if "-P" not in args and "--password" not in args:
+                cmd.extend(["--password", admin_password])
 
     if test_case.test_type != "bash" and test_case.args:
         args_to_check = list(test_case.args)
