@@ -62,6 +62,14 @@ func main() {
 	duration := flag.Duration("duration", 5*time.Second, "Duration per concurrency level")
 	output := flag.String("output", "", "JSON output file (stdout if empty)")
 	scenarioName := flag.String("scenario", "ping", "Scenario: "+scenarioNames())
+	// Decouple setup / query / teardown so operators can seed data once
+	// (batch-CREATE is slow for two_hop / fan_out) and then run repeated
+	// query passes against the pre-seeded state. Useful for capturing
+	// real query-phase baselines and for per-thread perf profiling where
+	// setup noise would swamp the signal.
+	setupOnly := flag.Bool("setup-only", false, "Run scenario Setup, then exit (no queries, no teardown)")
+	skipSetup := flag.Bool("skip-setup", false, "Skip scenario Setup (assumes data is already seeded)")
+	skipTeardown := flag.Bool("skip-teardown", false, "Skip scenario Teardown on exit (leave data in place)")
 	flag.Parse()
 
 	sc := findScenario(*scenarioName)
@@ -79,8 +87,14 @@ func main() {
 	fmt.Fprintf(os.Stderr, "  Levels:    %v\n", levels)
 	fmt.Fprintf(os.Stderr, "  Duration:  %s per level\n\n", *duration)
 
-	// Setup data
-	if sc.Data.Nodes > 0 || sc.Data.Edges > 0 {
+	// Guard: -setup-only and -skip-setup are mutually exclusive.
+	if *setupOnly && *skipSetup {
+		fmt.Fprintf(os.Stderr, "ERROR: -setup-only and -skip-setup are mutually exclusive\n")
+		os.Exit(2)
+	}
+
+	// Setup data (unless skipped).
+	if (sc.Data.Nodes > 0 || sc.Data.Edges > 0) && !*skipSetup {
 		fmt.Fprintf(os.Stderr, "  Setting up data...\n")
 		setupDB, err := sql.Open("geode", *dsn)
 		if err != nil {
@@ -98,6 +112,15 @@ func main() {
 		}
 		setupDB.Close()
 		fmt.Fprintf(os.Stderr, "  Setup complete.\n\n")
+	} else if *skipSetup {
+		fmt.Fprintf(os.Stderr, "  Skipping setup (-skip-setup); assuming data is already seeded.\n\n")
+	}
+
+	// -setup-only: we're done. Deliberately skip teardown so the seeded
+	// data survives for a subsequent -skip-setup pass.
+	if *setupOnly {
+		fmt.Fprintf(os.Stderr, "  -setup-only: exiting after setup. Data retained for -skip-setup runs.\n")
+		return
 	}
 
 	queryFn := sc.QueryFn(sc.Data.Nodes)
@@ -124,8 +147,9 @@ func main() {
 		}
 	}
 
-	// Teardown data
-	if sc.Data.Nodes > 0 || sc.Data.Edges > 0 {
+	// Teardown data (unless skipped so subsequent runs can re-use the
+	// seeded data).
+	if (sc.Data.Nodes > 0 || sc.Data.Edges > 0) && !*skipTeardown {
 		fmt.Fprintf(os.Stderr, "\n  Tearing down data...\n")
 		teardownDB, err := sql.Open("geode", *dsn)
 		if err == nil {
@@ -135,6 +159,8 @@ func main() {
 			teardownDB.Close()
 		}
 		fmt.Fprintf(os.Stderr, "  Teardown complete.\n")
+	} else if *skipTeardown {
+		fmt.Fprintf(os.Stderr, "\n  Skipping teardown (-skip-teardown); data retained.\n")
 	}
 
 	// Summary
