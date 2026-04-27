@@ -62,6 +62,32 @@ console_err = Console(stderr=True, force_terminal=True)
 _tracked_pids: set[int] = set()
 
 
+def _flush_report(
+    report_json: Path | None,
+    aggregate_summary: dict[str, int],
+    all_results: list[dict[str, Any]],
+) -> None:
+    """Write the in-progress report to ``report_json`` after each spec.
+
+    Lets observers `tail`/`jq` the report mid-run instead of waiting until
+    every spec finishes. Writes are atomic-via-rename (no torn reads).
+    """
+    if report_json is None:
+        return
+    report_data = {
+        "summary": aggregate_summary,
+        "specs": all_results,
+    }
+    try:
+        report_json.parent.mkdir(parents=True, exist_ok=True)
+        tmp = report_json.with_suffix(report_json.suffix + ".tmp")
+        tmp.write_text(json.dumps(report_data, indent=2))
+        tmp.replace(report_json)
+    except Exception:
+        # Best-effort: an incremental flush failure should not crash the run.
+        pass
+
+
 def track_pid(pid: int) -> None:
     """Register a PID for cleanup on exit."""
     _tracked_pids.add(pid)
@@ -388,6 +414,7 @@ def run(
                         if "results" in result:
                             spec_entry["results"] = result["results"]
                         all_results.append(spec_entry)
+                        _flush_report(report_json, aggregate_summary, all_results)
 
                     if not ci:
                         passed = summary.get("passed", 0)
@@ -463,6 +490,7 @@ def run(
                         if "results" in use_result:
                             spec_entry["results"] = use_result["results"]
                         all_results.append(spec_entry)
+                        _flush_report(report_json, aggregate_summary, all_results)
 
             except KeyboardInterrupt:
                 interrupted = True
@@ -539,6 +567,14 @@ def run(
                     if "results" in summary:
                         spec_entry["results"] = summary.pop("results")
                     all_results.append(spec_entry)
+                    _flush_report(report_json, aggregate_summary, all_results)
+                    if not ci:
+                        passed = summary.get("passed", 0)
+                        failed_count = summary.get("failed", 0)
+                        total_count = summary.get("total", 0)
+                        status = "[red]FAIL[/red]" if (failed_count > 0 or total_count == 0) else "[green]PASS[/green]"
+                        console.print(f"  {status} {spec_file.name}: {passed} passed, {failed_count} failed")
+                        sys.stdout.flush()
                 except RunnerError as exc:
                     console_err.print(str(exc), style="red")
                     total_exit_code = max(total_exit_code, 3)
