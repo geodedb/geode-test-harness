@@ -213,7 +213,20 @@ def stop_server(process: subprocess.Popen[str], verbose: bool = False) -> None:
         # Also terminate the main process
         process.terminate()
         try:
-            process.wait(timeout=3)
+            # 2026-04-27: bumped from 3s -> 35s.  Geode's shutdown
+            # deinit chain (graph_store flush + persistence thread join,
+            # per-shard checkpoint flush, ShardedGraphEngine.close which
+            # waits up to 5s for its shared thread-pool to drain, then
+            # per-shard wal/manifest sync) measured ~29s on a clean run
+            # with three medium nodes; FLE-stress with 4-32KB encrypted
+            # writes can legitimately take longer.  Earlier we used 12s
+            # which still left WAL in a non-checkpointed state on
+            # `restart_server: true` (lost data → false test failures
+            # `regression_issue_539_wal_recovery_checkpoint.yml`,
+            # `fle_large_data_stress_verification.yml`).  35s is
+            # generous enough for any legitimate flush; truly hung
+            # servers still fall through to the SIGKILL path below.
+            process.wait(timeout=35)
         except subprocess.TimeoutExpired:
             if verbose:
                 print("Force killing server...")
