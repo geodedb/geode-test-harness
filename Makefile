@@ -476,6 +476,33 @@ loadtest-build:
 	cd loadtest/go && go build -o geode-loadtest .
 	@echo "Built: loadtest/go/geode-loadtest"
 
+# 2026-04-28 — concurrent BEGIN/EXEC/COMMIT regression test.
+# Pins post-fix expectations for the msft-graph parallel-seed failure
+# where 4-9 of 9 concurrent BEGINs returned "expected BEGIN response"
+# or "sql: connection is already closed" against pinned conns.
+.PHONY: test-concurrent-tx test-concurrent-tx-build
+test-concurrent-tx-build:
+	@echo "Building concurrent-tx regression test..."
+	cd tests/concurrent_tx && go build -o concurrent-tx-test .
+	@echo "Built: tests/concurrent_tx/concurrent-tx-test"
+
+# Run the concurrent-tx regression.  Override defaults via env vars:
+#   CTX_DSN     — override the DSN (default: localhost:3141 with insecure=true)
+#   CTX_CONNS   — number of pinned conns running concurrently (default 8)
+#   CTX_ITER    — tx iterations per conn (default 25)
+#   CTX_TIMEOUT — overall test timeout (default 5m)
+CTX_DSN     ?= 127.0.0.1:3141?insecure=true&user=geode&pass=$(GEODE_ADMIN_PASSWORD)&graph=concurrent_tx_test
+CTX_CONNS   ?= 8
+CTX_ITER    ?= 25
+CTX_TIMEOUT ?= 5m
+test-concurrent-tx: test-concurrent-tx-build
+	@echo "Running concurrent-tx regression: conns=$(CTX_CONNS) iter=$(CTX_ITER) timeout=$(CTX_TIMEOUT)"
+	cd tests/concurrent_tx && ./concurrent-tx-test \
+		-dsn "$(CTX_DSN)" \
+		-conns $(CTX_CONNS) \
+		-iter $(CTX_ITER) \
+		-timeout $(CTX_TIMEOUT)
+
 # Run Go client load test (native QUIC via quic-go, connection pooling)
 loadtest-go: loadtest-build
 	@mkdir -p reports
