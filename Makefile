@@ -302,6 +302,7 @@ GEODETESTLAB_CLI := geodetestlab-cli
 SPECS_DIR := $(GEODETESTLAB_CLI)/specs
 GEODETESTLAB_VENV := $(GEODETESTLAB_CLI)/.venv
 GEODETESTLAB_PIP := $(GEODETESTLAB_VENV)/bin/pip
+GEODETESTLAB_PYTHON := $(GEODETESTLAB_VENV)/bin/python3
 
 # Auto-detect geodetestlab: prefer system-installed, fall back to venv
 # Uses = (recursive) so it re-evaluates after auto-install
@@ -328,6 +329,7 @@ geodetestlab-setup:
 	fi
 	@$(GEODETESTLAB_PIP) install --upgrade pip
 	@$(GEODETESTLAB_PIP) install -e $(GEODETESTLAB_CLI)
+	@$(GEODETESTLAB_PIP) install pytest
 	@echo "geodetestlab-cli setup complete"
 
 # Install geodetestlab-cli to user environment via pipx (for local development)
@@ -573,10 +575,10 @@ loadtest: loadtest-go loadtest-cli
 
 test-unit:
 	@echo "Running geodetestlab unit tests..."
-	python3 -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v
+	$(GEODETESTLAB_PYTHON) -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v
 
 test-unit-verbose:
-	python3 -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v --tb=long
+	$(GEODETESTLAB_PYTHON) -m pytest $(GEODETESTLAB_CLI)/geodetestlab/tests/ -v --tb=long
 
 # ==============================================================================
 # Reporting
