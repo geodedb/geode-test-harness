@@ -61,6 +61,93 @@ python -m geodetestlab run --specs specs --parallel 4 -v
 python -m geodetestlab run --specs specs --transport grpc -v
 ```
 
+## OTel Monitoring (debugging via spans/metrics)
+
+When investigating slow queries, transaction failures, or connection issues,
+run the suite with OTel monitoring enabled to capture every span/metric
+geode emits during the test. This is the recommended path whenever a bug
+report includes phrases like "hung for N minutes", "connection died",
+"chunk failed", or any cross-layer behavior that's hard to bisect from logs
+alone.
+
+### Quick start
+
+```bash
+# One-shot: start collector → run full suite → verify → stop collector
+make test-everything-otel GEODE_BINARY=/path/to/geode
+
+# Manual control (useful when debugging a specific spec)
+make otel-start                      # spin up docker collector on :44318
+make otel-tail                       # docker logs -f (live span/metric stream)
+GEODE_OTEL=1 make test-spec SPEC=specs/foo.yml
+make otel-verify                     # assert spans with service.name=geode arrived
+make otel-stop                       # tear down
+```
+
+### What gets captured
+
+The collector runs with two exporters — `debug` (stdout, visible via
+`make otel-tail`) and `file` (`reports/spans.jsonl`, OTLP/JSON one record
+per line, rotates at 64 MB × 3). After a run:
+
+- `reports/spans.jsonl` — every span and metric in OTLP/JSON format. Filter
+  by `instrumentationScope.name` or any attribute to focus on a layer.
+  Example:
+  `jq '.resourceSpans[].scopeSpans[] | select(.scope.name=="wal")' reports/spans.jsonl`
+- `reports/otel-collector.log` — collector stdout drained on stop.
+- `reports/.otel-env` — exact env vars sourced into the test run (so you
+  can reproduce a single failing test interactively against the same
+  collector).
+
+### InstrumentationScopes
+
+| Scope | Origin | Useful for |
+|---|---|---|
+| `com.geodedb.geode` | geode itself | `geode.transport.request`, `geode.query.execute`, `geode.graph_store.{create_node,get_nodes_by_label}`, `gql.execute.PARSE`, `wal.{create,update,delete}_*` |
+| `wal` | DevNW wal lib | `wal.replay`, `wal.append` (×2 paths), `wal.append_batch` (×2), `wal.commit`, `wal.checkpoint`, `wal.truncate` |
+| `gql` | DevNW gql lib | parser entry (`gql.execute.query`) |
+| `dns` | DevNW dns lib | client/recursive/stub query lookups |
+| `vulkan` | DevNW vulkan lib | GPU compute ops |
+| `thread_pool` | DevNW thread-pool lib | task lifecycle |
+| `repl` | DevNW repl lib | REPL command execution |
+| `protobuf` / `slog` | DevNW libs | bound but no internal spans yet |
+
+### When to use
+
+- **Pipeline failure cascades** (`make test-shell`, parallel-seed bugs) —
+  see which `wal.*` or `geode.graph_store.*` span throws first; the parent
+  `geode.transport.request` carries `network.peer.address` for connection
+  attribution.
+- **"driver: bad connection" / "expected BEGIN response"** — correlate
+  `geode.transport.request` start times with QUIC handshake metrics
+  (`quic_active_connections`, `quic_min_smoothed_rtt_ns`); the
+  `proto_reader_*` counter family shows whether bytes ever reached the
+  server.
+- **Slow queries** — `gql.execute.PARSE` + `geode.query.execute` durations
+  side by side; the lib-emitted `gql.execute.query` parses too, giving a
+  parser-vs-execute split.
+- **Connection drops** — `quic_active_connections` gauge over time.
+
+### Defaults (override via env)
+
+- `OTEL_COLLECTOR_HTTP_PORT=44318`, `OTEL_COLLECTOR_GRPC_PORT=44317` —
+  uncommon ports so a host-resident collector on `:4317`/`:4318` keeps
+  running.
+- `OTEL_TRACES_SAMPLER=always_on`, `OTEL_BSP_SCHEDULE_DELAY=2000`,
+  `OTEL_METRIC_EXPORT_INTERVAL=3000` — tight enough that a 30 s
+  `make loadtest` produces visible exports.
+- `service.name=geode` resource attribute (used by `make otel-verify`).
+- `OTEL_COLLECTOR_IMAGE=otel/opentelemetry-collector-contrib:0.96.0` —
+  pinned for reproducibility.
+
+### Files
+
+- `scripts/otel-collector.sh` — collector lifecycle (`start|stop|logs|tail|verify`)
+- `scripts/run_all_tests.sh` — sources `reports/.otel-env` when `GEODE_OTEL=1`
+- `Makefile` — `otel-*` + `test-everything-otel` targets
+- `reports/.otel-env`, `reports/.otel-collector.yaml`, `reports/spans.jsonl`,
+  `reports/otel-collector.log` — generated, all under `reports/` (gitignored)
+
 ## Architecture
 
 ### Test Flow
