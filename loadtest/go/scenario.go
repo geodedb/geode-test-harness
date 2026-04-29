@@ -36,6 +36,8 @@ var scenarios = []Scenario{
 	scenarioOneHop(),
 	scenarioTwoHop(),
 	scenarioFanOut(),
+	scenarioEdgeCreate(),
+	scenarioEdgeCreateWithProps(),
 }
 
 // scenarioNames returns a comma-separated list for help text.
@@ -187,6 +189,95 @@ func scenarioTwoHop() Scenario {
 				}
 				defer rows.Close()
 				return drainRows(rows)
+			}
+		},
+	}
+}
+
+// edgeCreateNumNodes is the source/target pool for edge_create* scenarios.
+// Sized to match point_read's pool — known to seed cleanly through the
+// single-connection batchCreateNodes path — while still giving random pair
+// selection plenty of variety.  2000+ has been observed to hit a periodic
+// single-connection write stall on this build that is unrelated to the
+// edge-merge bug under investigation; the smaller pool keeps the scenario
+// usable until that separate issue is triaged.
+const edgeCreateNumNodes = 500
+
+// edgeCreateRelType is the relationship type used by edge_create* scenarios.
+// Distinct from LT_KNOWS so teardown does not interfere with one_hop/two_hop
+// runs that may share the LT_Person pool in mixed sequences.
+const edgeCreateRelType = "LT_KNOWS_BENCH"
+
+// scenarioEdgeCreate exercises the MATCH+CREATE-edge path that the msft seed
+// pipeline uses (`MATCH (a:L {k:?}), (b:L {k:?}) CREATE (a)-[:R]->(b)`). This
+// shape currently runs under the per-graph EXCLUSIVE write lock at
+// `quic_connection_handler.zig:3387` for the full duration of MATCH endpoint
+// resolve + CREATE + WAL fsync, so concurrent workers serialize. The scenario
+// is the first-class regression vehicle for that fix.
+func scenarioEdgeCreate() Scenario {
+	return Scenario{
+		Name:        "edge_create",
+		Description: "Concurrent MATCH+CREATE edges by node_id (2K nodes, write-heavy, no edge props)",
+		Data:        DataSize{Nodes: edgeCreateNumNodes, Edges: 0},
+		Setup: func(db *sql.DB) error {
+			return batchCreateNodes(db, "LT_Person", edgeCreateNumNodes)
+		},
+		Teardown: func(db *sql.DB) error {
+			_ = deleteEdgesByType(db, edgeCreateRelType)
+			return deleteByLabel(db, "LT_Person")
+		},
+		QueryFn: func(maxNodeID int) QueryFunc {
+			return func(db *sql.DB, rng *rand.Rand) error {
+				src := rng.IntN(edgeCreateNumNodes)
+				dst := rng.IntN(edgeCreateNumNodes)
+				if dst == src {
+					dst = (dst + 1) % edgeCreateNumNodes
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				_, err := db.ExecContext(ctx, fmt.Sprintf(
+					"MATCH (a:LT_Person {lt_id: %d}), (b:LT_Person {lt_id: %d}) CREATE (a)-[:%s]->(b)",
+					src, dst, edgeCreateRelType))
+				return err
+			}
+		},
+	}
+}
+
+// scenarioEdgeCreateWithProps mirrors the exact statement shape the msft seed
+// pipeline emits — endpoint MATCH by `node_id` plus a CREATE that sets a
+// fixed `link_id` + `snapshot_id` and three string properties on the edge.
+// This is the closest in-tree benchmark to the msft chunk_size=8/workers=8
+// workload the user reported (~18s first-chunk stall).
+func scenarioEdgeCreateWithProps() Scenario {
+	return Scenario{
+		Name:        "edge_create_with_props",
+		Description: "Concurrent MATCH+CREATE edges with msft-style props (link_id, snapshot_id, 3 strings)",
+		Data:        DataSize{Nodes: edgeCreateNumNodes, Edges: 0},
+		Setup: func(db *sql.DB) error {
+			return batchCreateNodes(db, "LT_Person", edgeCreateNumNodes)
+		},
+		Teardown: func(db *sql.DB) error {
+			_ = deleteEdgesByType(db, edgeCreateRelType)
+			return deleteByLabel(db, "LT_Person")
+		},
+		QueryFn: func(maxNodeID int) QueryFunc {
+			return func(db *sql.DB, rng *rand.Rand) error {
+				src := rng.IntN(edgeCreateNumNodes)
+				dst := rng.IntN(edgeCreateNumNodes)
+				if dst == src {
+					dst = (dst + 1) % edgeCreateNumNodes
+				}
+				// Per-call link_id keeps each edge unique without coordination.
+				linkID := fmt.Sprintf("lk-%d-%d-%d", src, dst, rng.Int64())
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				_, err := db.ExecContext(ctx, fmt.Sprintf(
+					"MATCH (a:LT_Person {lt_id: %d}), (b:LT_Person {lt_id: %d}) "+
+						"CREATE (a)-[:%s {link_id: '%s', snapshot_id: 'snap-bench', "+
+						"prop_role: 'reader', prop_status: 'active', prop_kind: 'bench'}]->(b)",
+					src, dst, edgeCreateRelType, linkID))
+				return err
 			}
 		},
 	}

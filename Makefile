@@ -576,10 +576,13 @@ loadtest-scenario: loadtest-build
 		-duration $(LOADTEST_DURATION) \
 		-output ../../reports/loadtest_$(SCENARIO).json
 
-# Run all load test scenarios sequentially
+# Run all load test scenarios sequentially.  edge_create and
+# edge_create_with_props are the regression vehicles for the MATCH+CREATE
+# write-lock contention path (see geode crud_operations.zig executeMerge and
+# quic_connection_handler.zig:3387 acquireGraphWriteLockCancelable).
 loadtest-scenarios: loadtest-build
 	mkdir -p reports
-	@for scenario in ping point_read one_hop two_hop fan_out; do \
+	@for scenario in ping point_read one_hop two_hop fan_out edge_create edge_create_with_props; do \
 		echo ""; \
 		echo "=== Running scenario: $$scenario ==="; \
 		cd loadtest/go && ./geode-loadtest \
