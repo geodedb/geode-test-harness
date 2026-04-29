@@ -37,6 +37,31 @@ echo "============================================================"
 echo "Running Geode Test Harness Unified Suite"
 echo "============================================================"
 
+# OTel monitoring (opt-in via GEODE_OTEL=1).
+# When set, source the env file written by `make otel-start` so every
+# subprocess in this script (the geodetestlab specs that spawn their own
+# geode under the hood AND the load-test server we spawn below) inherits
+# OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_TRACES_EXPORTER=otlp, etc. Spans land
+# in the docker collector launched by `scripts/otel-collector.sh start`.
+HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OTEL_ENV_FILE="${HARNESS_ROOT}/reports/.otel-env"
+if [[ "${GEODE_OTEL:-0}" == "1" ]]; then
+    if [[ -f "$OTEL_ENV_FILE" ]]; then
+        echo ""
+        echo "=== OTel monitoring enabled (sourcing $OTEL_ENV_FILE) ==="
+        # set -a so each export propagates to spawned commands.
+        set -a
+        # shellcheck disable=SC1090
+        source "$OTEL_ENV_FILE"
+        set +a
+        echo "OTEL_EXPORTER_OTLP_ENDPOINT=$OTEL_EXPORTER_OTLP_ENDPOINT"
+    else
+        echo ""
+        echo "WARNING: GEODE_OTEL=1 set but $OTEL_ENV_FILE missing." >&2
+        echo "         Run \`make otel-start\` first, or unset GEODE_OTEL." >&2
+    fi
+fi
+
 # 1. Run the geodetestlab-cli unit tests
 echo ""
 echo "=== 1. Running geodetestlab-cli Unit Tests ==="

@@ -93,6 +93,14 @@ help:
 	@echo "  test-grpc            - Run with gRPC transport"
 	@echo "  test-all-transports  - Run with both transports"
 	@echo ""
+	@echo "OTel Monitoring (full suite with span/metric capture):"
+	@echo "  test-everything-otel - Run test-everything with a docker OTel collector"
+	@echo "  otel-start           - Start the harness's OTel collector container"
+	@echo "  otel-stop            - Stop the collector"
+	@echo "  otel-tail            - docker logs -f the running collector"
+	@echo "  otel-logs            - Cat captured collector log"
+	@echo "  otel-verify          - Assert spans with service.name=geode arrived"
+	@echo ""
 	@echo "Docker Server:"
 	@echo "  docker-start         - Start Geode server container"
 	@echo "  docker-stop          - Stop container"
@@ -438,6 +446,45 @@ geodetestlab-run: test-spec
 test-everything: .check-geode-binary
 	@echo "Running all tests with geode binary: $(GEODE_BINARY)"
 	@bash scripts/run_all_tests.sh --geode-binary "$(GEODE_BINARY)"
+
+# ==============================================================================
+# OTel monitoring
+# ==============================================================================
+# Spin up a local otel/opentelemetry-collector-contrib container, point geode
+# at it via env vars, run the test suite, then drain + stop the collector.
+# The collector emits to stdout (visible via `make otel-tail`) and writes
+# every span/metric to reports/spans.jsonl via the file exporter.
+
+.PHONY: otel-start otel-stop otel-logs otel-tail otel-verify test-everything-otel
+
+otel-start:
+	@bash scripts/otel-collector.sh start
+
+otel-stop:
+	@bash scripts/otel-collector.sh stop
+
+otel-logs:
+	@bash scripts/otel-collector.sh logs
+
+otel-tail:
+	@bash scripts/otel-collector.sh tail
+
+otel-verify:
+	@bash scripts/otel-collector.sh verify
+
+# Run the full suite with OTel monitoring enabled. Brings the collector up,
+# sources its env file inside run_all_tests.sh (gated on GEODE_OTEL=1), then
+# verifies + tears the collector down regardless of test outcome.
+test-everything-otel: .check-geode-binary
+	@bash scripts/otel-collector.sh start
+	@trap 'bash scripts/otel-collector.sh stop >/dev/null 2>&1 || true' EXIT; \
+	GEODE_OTEL=1 bash scripts/run_all_tests.sh --geode-binary "$(GEODE_BINARY)"; \
+	rc=$$?; \
+	echo ""; \
+	echo "--- post-run OTel verification ---"; \
+	bash scripts/otel-collector.sh verify || rc=$$?; \
+	bash scripts/otel-collector.sh stop >/dev/null 2>&1 || true; \
+	exit $$rc
 
 # ==============================================================================
 # Transport-Specific Tests
