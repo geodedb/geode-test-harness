@@ -1,0 +1,507 @@
+version: '1.0'
+name: GQL Auth DDL Integration Tests
+description: |
+  Over-the-wire integration tests for GQL auth DDL statements:
+  CREATE/ALTER/DROP USER, CREATE/DROP ROLE, GRANT/REVOKE,
+  SHOW USERS/ROLES/PERMISSIONS/VERSION/CAPABILITIES.
+
+  All queries run against a real geode server — no mocking.
+  Validates Tasks 1-7 of the auth DDL implementation plan.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# 1. CREATE USER ddl_alice
+# ---------------------------------------------------------------------------
+- name: auth-ddl-create-alice
+  description: CREATE USER ddl_alice with password, email, and readwrite role
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - CREATE USER ddl_alice SET PASSWORD 'Passw0rd!ddl' EMAIL 'alice@ddl.test' ROLE readwrite
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ddl_alice
+  tags:
+  - auth-ddl
+  - create-user
+
+# ---------------------------------------------------------------------------
+# 2. SHOW USERS -- ddl_alice must appear
+# ---------------------------------------------------------------------------
+- name: auth-ddl-show-users-contains-alice
+  description: SHOW USERS must list ddl_alice after creation
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - SHOW USERS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ddl_alice
+  tags:
+  - auth-ddl
+  - show-users
+
+# ---------------------------------------------------------------------------
+# 3. SHOW VERSION -- must return a version column
+# ---------------------------------------------------------------------------
+- name: auth-ddl-show-version
+  description: SHOW VERSION returns at least one row with a version column
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - SHOW VERSION
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - version
+  tags:
+  - auth-ddl
+  - show-version
+
+# ---------------------------------------------------------------------------
+# 4. SHOW CAPABILITIES -- must report admin_writable = true
+# ---------------------------------------------------------------------------
+- name: auth-ddl-show-capabilities
+  description: SHOW CAPABILITIES returns admin_writable and true
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - SHOW CAPABILITIES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - admin_writable
+    - 'true'
+  tags:
+  - auth-ddl
+  - show-capabilities
+
+# ---------------------------------------------------------------------------
+# 5. CREATE ROLE ddl_auditor
+# ---------------------------------------------------------------------------
+- name: auth-ddl-create-role-auditor
+  description: CREATE ROLE ddl_auditor with a description
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - CREATE ROLE ddl_auditor SET DESCRIPTION 'integration test role'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ddl_auditor
+  tags:
+  - auth-ddl
+  - create-role
+
+# ---------------------------------------------------------------------------
+# 6. SHOW ROLES -- ddl_auditor and admin must appear
+# ---------------------------------------------------------------------------
+- name: auth-ddl-show-roles-contains-auditor-and-admin
+  description: SHOW ROLES must list both ddl_auditor (custom) and admin (built-in)
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - SHOW ROLES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ddl_auditor
+    - admin
+  tags:
+  - auth-ddl
+  - show-roles
+
+# ---------------------------------------------------------------------------
+# 7. CREATE ROLE admin -- must return "already exists" + "built-in"
+# ---------------------------------------------------------------------------
+- name: auth-ddl-create-role-admin-builtin
+  description: |
+    CREATE ROLE admin must be acknowledged as a built-in role and
+    must NOT overwrite or duplicate the existing built-in.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - CREATE ROLE admin
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - already exists
+    - built-in
+  tags:
+  - auth-ddl
+  - create-role
+  - builtin-guard
+
+# ---------------------------------------------------------------------------
+# 8a. CREATE USER ddl_carol with user role
+# ---------------------------------------------------------------------------
+- name: auth-ddl-create-carol
+  description: Create ddl_carol with default user role (read-only)
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - CREATE USER ddl_carol SET PASSWORD 'Passw0rd!c1' ROLE user
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ddl_carol
+  tags:
+  - auth-ddl
+  - create-user
+  - role-roundtrip
+
+# ---------------------------------------------------------------------------
+# 8b. SHOW PERMISSIONS FOR ddl_carol (user role = read only)
+# ---------------------------------------------------------------------------
+- name: auth-ddl-permissions-carol-before
+  description: |
+    User role has only read permission. Verify read is present before
+    role assignment.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - SHOW PERMISSIONS FOR ddl_carol
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - read
+  tags:
+  - auth-ddl
+  - show-permissions
+  - role-roundtrip
+
+# ---------------------------------------------------------------------------
+# 8c. ALTER USER ddl_carol SET ROLE admin
+# ---------------------------------------------------------------------------
+- name: auth-ddl-alter-carol-role-to-admin
+  description: ALTER USER ddl_carol SET ROLE admin must assign the admin role
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - ALTER USER ddl_carol SET ROLE admin
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - admin
+    - ddl_carol
+  tags:
+  - auth-ddl
+  - alter-user
+  - role-roundtrip
+
+# ---------------------------------------------------------------------------
+# 8d. SHOW PERMISSIONS FOR ddl_carol (admin role = read + write + schema)
+#     KEY assertion: proves real mutation occurred
+# ---------------------------------------------------------------------------
+- name: auth-ddl-permissions-carol-after
+  description: |
+    After ALTER USER SET ROLE admin, ddl_carol must have schema permission
+    (Admin role = read + write + schema). This proves role assignment is real
+    and not a stub.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - SHOW PERMISSIONS FOR ddl_carol
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - schema
+    - write
+    - read
+  tags:
+  - auth-ddl
+  - show-permissions
+  - role-roundtrip
+  - key-assertion
+
+# ---------------------------------------------------------------------------
+# 8e. DROP USER ddl_carol
+# ---------------------------------------------------------------------------
+- name: auth-ddl-drop-carol
+  description: Drop ddl_carol after role-assignment round-trip
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - DROP USER ddl_carol
+  expect:
+    exit_code: 0
+  tags:
+  - auth-ddl
+  - drop-user
+  - role-roundtrip
+
+# ---------------------------------------------------------------------------
+# 9. GRANT ROLE ddl_auditor TO ddl_alice
+# ---------------------------------------------------------------------------
+- name: auth-ddl-grant-role-auditor-to-alice
+  description: |
+    GRANT ROLE ddl_auditor TO ddl_alice — custom role assignment.
+    Asserts at least one row returned and ddl_auditor appears in output.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - GRANT ROLE ddl_auditor TO ddl_alice
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ddl_auditor
+  tags:
+  - auth-ddl
+  - grant-role
+
+# ---------------------------------------------------------------------------
+# 10. GRANT READ ON GRAPH default TO ddl_alice
+# ---------------------------------------------------------------------------
+- name: auth-ddl-grant-read-on-graph
+  description: GRANT READ ON GRAPH default TO ddl_alice returns "Granted READ"
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - GRANT READ ON GRAPH default TO ddl_alice
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Granted
+    - READ
+  tags:
+  - auth-ddl
+  - grant-privilege
+
+# ---------------------------------------------------------------------------
+# 11. REVOKE READ ON GRAPH default FROM ddl_alice
+# ---------------------------------------------------------------------------
+- name: auth-ddl-revoke-read-on-graph
+  description: REVOKE READ ON GRAPH default FROM ddl_alice returns "Revoked READ"
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - REVOKE READ ON GRAPH default FROM ddl_alice
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Revoked
+    - READ
+  tags:
+  - auth-ddl
+  - revoke-privilege
+
+# ---------------------------------------------------------------------------
+# 12. ALTER USER ddl_alice SET PASSWORD
+# ---------------------------------------------------------------------------
+- name: auth-ddl-alter-alice-password
+  description: ALTER USER ddl_alice SET PASSWORD resets the password
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - ALTER USER ddl_alice SET PASSWORD 'Passw0rd!ddl2'
+  expect:
+    exit_code: 0
+  tags:
+  - auth-ddl
+  - alter-user
+  - password-reset
+
+# ---------------------------------------------------------------------------
+# 13a. ALTER USER ddl_alice DISABLE
+# ---------------------------------------------------------------------------
+- name: auth-ddl-disable-alice
+  description: ALTER USER ddl_alice DISABLE must succeed
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - ALTER USER ddl_alice DISABLE
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ddl_alice
+  tags:
+  - auth-ddl
+  - alter-user
+  - enable-disable
+
+# ---------------------------------------------------------------------------
+# 13b. ALTER USER ddl_alice ENABLE
+# ---------------------------------------------------------------------------
+- name: auth-ddl-enable-alice
+  description: ALTER USER ddl_alice ENABLE must succeed
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - ALTER USER ddl_alice ENABLE
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ddl_alice
+  tags:
+  - auth-ddl
+  - alter-user
+  - enable-disable
+
+# ---------------------------------------------------------------------------
+# 14. DROP ROLE IF EXISTS ddl_auditor
+# ---------------------------------------------------------------------------
+- name: auth-ddl-drop-role-auditor
+  description: DROP ROLE IF EXISTS ddl_auditor must succeed
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - DROP ROLE IF EXISTS ddl_auditor
+  expect:
+    exit_code: 0
+  tags:
+  - auth-ddl
+  - drop-role
+
+# ---------------------------------------------------------------------------
+# 15. DROP USER ddl_alice
+# ---------------------------------------------------------------------------
+- name: auth-ddl-drop-alice
+  description: DROP USER ddl_alice must succeed
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - DROP USER ddl_alice
+  expect:
+    exit_code: 0
+  tags:
+  - auth-ddl
+  - drop-user
+
+# ---------------------------------------------------------------------------
+# 16. DROP USER IF EXISTS ddl_alice (idempotent -- user already gone)
+# ---------------------------------------------------------------------------
+- name: auth-ddl-drop-alice-idempotent
+  description: |
+    DROP USER IF EXISTS ddl_alice on an already-deleted user must not error.
+    handleUserDelete swallows errors and always returns a status row, making
+    IF EXISTS structurally idempotent.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - DROP USER IF EXISTS ddl_alice
+  expect:
+    exit_code: 0
+  tags:
+  - auth-ddl
+  - drop-user
+  - idempotent
+
+# ---------------------------------------------------------------------------
+# 17. Non-admin access to CREATE USER must be rejected
+#     (unauthenticated query -- no -U/-P supplied)
+# ---------------------------------------------------------------------------
+- name: auth-ddl-unauth-create-user-rejected
+  description: |
+    CREATE USER without credentials must fail with auth error (exit code 3).
+    This validates that the admin-only guard in auth_dispatch.execute()
+    is enforced over the wire for DDL statements.
+  args:
+  - query
+  - --no-saved-session
+  - CREATE USER hacker SET PASSWORD 'Hack0rd!bad'
+  expect:
+    exit_code: 3
+  tags:
+  - auth-ddl
+  - authorization
+  - security
+
+tags:
+- auth-ddl
+- security
+- gql-compliance
+- integration
