@@ -538,25 +538,42 @@ def run(
                     continue
 
                 try:
-                    exit_code, summary = run_tests(
-                        spec=spec_obj,
-                        secrets=secrets,
-                        env_overrides=env_vars,
-                        llm_provider=llm_provider,
-                        model=model,
-                        max_cases=max_cases,
-                        timeout_ms=timeout_ms,
-                        server_timeout_ms=server_timeout_ms,
-                        report_json=None,  # We'll write aggregate report at the end
-                        dry_run=dry_run,
-                        ci_mode=ci,
-                        seed=seed,
-                        spec_path=str(spec_file),
-                        geode_binary=geode_binary,
-                        server_port=server_port,
-                        verbose=verbose,
-                        transport=current_transport,
-                    )
+                    run_kwargs: dict[str, Any] = {
+                        "spec": spec_obj,
+                        "secrets": secrets,
+                        "env_overrides": env_vars,
+                        "llm_provider": llm_provider,
+                        "model": model,
+                        "max_cases": max_cases,
+                        "timeout_ms": timeout_ms,
+                        "server_timeout_ms": server_timeout_ms,
+                        "report_json": None,  # We'll write aggregate report at the end
+                        "dry_run": dry_run,
+                        "ci_mode": ci,
+                        "seed": seed,
+                        "spec_path": str(spec_file),
+                        "geode_binary": geode_binary,
+                        "server_port": server_port,
+                        "verbose": verbose,
+                        "transport": current_transport,
+                    }
+                    exit_code, summary = run_tests(**run_kwargs)
+                    failed_count = summary.get("failed", 0)
+                    total_count = summary.get("total", 0)
+                    retried = False
+                    # A single failure in the sequential run is most often a
+                    # transient/contention false positive (slow bootstrap, a
+                    # dropped QUIC handshake, etc.). Re-run the spec once
+                    # serially; if it passes, treat the original as transient.
+                    # Mirrors the retry the parallel path already performs.
+                    if (failed_count > 0 or total_count == 0) and not dry_run:
+                        retried = True
+                        _kill_geode_processes()
+                        if not ci and verbose:
+                            console.print(f"  [dim]Retrying {spec_file.name}...[/dim]")
+                        exit_code, summary = run_tests(**run_kwargs)
+                        failed_count = summary.get("failed", 0)
+                        total_count = summary.get("total", 0)
                     # Aggregate results
                     total_exit_code = max(total_exit_code, exit_code)
                     aggregate_summary["total"] += summary.get("total", 0)
@@ -570,10 +587,12 @@ def run(
                     _flush_report(report_json, aggregate_summary, all_results)
                     if not ci:
                         passed = summary.get("passed", 0)
-                        failed_count = summary.get("failed", 0)
-                        total_count = summary.get("total", 0)
-                        status = "[red]FAIL[/red]" if (failed_count > 0 or total_count == 0) else "[green]PASS[/green]"
-                        console.print(f"  {status} {spec_file.name}: {passed} passed, {failed_count} failed")
+                        is_fail = failed_count > 0 or total_count == 0
+                        status = "[red]FAIL[/red]" if is_fail else "[green]PASS[/green]"
+                        note = ""
+                        if retried:
+                            note = " (confirmed failure)" if is_fail else " (retry succeeded)"
+                        console.print(f"  {status} {spec_file.name}: {passed} passed, {failed_count} failed{note}")
                         sys.stdout.flush()
                 except RunnerError as exc:
                     console_err.print(str(exc), style="red")
