@@ -1,0 +1,65 @@
+# LSP schema-aware completion end-to-end spec.
+#
+# This spec is intentionally marked skipped until Phase 9 of
+# docs/superpowers/plans/2026-05-14-lsp-permission-aware-completion.md
+# lands the geode-serve-hosted LSP TCP listener. Task 37 of that plan
+# removes the `skip:` line and runs the spec for real.
+#
+# Until then, the spec documents the contract Phase 9 must honor:
+#   1. The harness can speak LSP JSON-RPC over the same connection it
+#      uses for GQL queries (or a sibling endpoint exposed by the
+#      embedded LSP listener — see Phase 9 design notes).
+#   2. `initialize` with `initializationOptions.geode.authToken` binds a
+#      per-session AuthState; `textDocument/didOpen` registers a virtual
+#      `file:///q.gql` document; `textDocument/completion` returns
+#      schema-derived items filtered by the authenticated user's
+#      visibility on the named graph.
+#   3. The two seeded labels `Person` and `Product` MUST appear in the
+#      completion response for `(n:`; labels from other tenants or
+#      graphs the user cannot access MUST NOT appear.
+
+name: lsp_schema_completion
+description: >
+  LSP completion suggests user-visible node labels after `(n:`. Verifies
+  Phase 5 (schema-aware completion) and Phase 3 (auth gate) end-to-end
+  through the Phase 9 TCP/WS transport.
+
+skip: pending Phase 9 (geode-serve-hosted LSP TCP listener)
+
+setup:
+- CREATE GRAPH demo;
+- USE GRAPH demo;
+- "CREATE (:Person {name: 'alice'})"
+- "CREATE (:Product {sku: 'X'})"
+
+steps:
+- lsp:
+    method: initialize
+    params:
+      capabilities: {}
+      initializationOptions:
+        geode:
+          authToken: ${AUTH_TOKEN}
+          graph: demo
+          tenant: ${TENANT}
+    expect:
+      result.capabilities.completionProvider: not_null
+
+- lsp:
+    method: textDocument/didOpen
+    params:
+      textDocument:
+        uri: file:///q.gql
+        languageId: gql
+        version: 1
+        text: 'MATCH (n:'
+
+- lsp:
+    method: textDocument/completion
+    params:
+      textDocument: {uri: file:///q.gql}
+      position: {line: 0, character: 9}
+    expect:
+      result_contains_labels:
+      - Person
+      - Product
