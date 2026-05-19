@@ -400,8 +400,9 @@ def run(
                     failed_count = summary.get("failed", 0)
                     total_count = summary.get("total", 0)
                     has_error = result.get("error") is not None
+                    skip_reason = result.get("skip_reason")
 
-                    if failed_count > 0 or has_error or total_count == 0:
+                    if failed_count > 0 or has_error or (total_count == 0 and not skip_reason):
                         # Track failed specs for retry
                         failed_specs.append((spec_file, result))
                     else:
@@ -413,17 +414,24 @@ def run(
                         spec_entry = {"spec": result["spec"], "summary": summary}
                         if "results" in result:
                             spec_entry["results"] = result["results"]
+                        if skip_reason:
+                            spec_entry["skip_reason"] = skip_reason
                         all_results.append(spec_entry)
                         _flush_report(report_json, aggregate_summary, all_results)
 
                     if not ci:
                         passed = summary.get("passed", 0)
-                        # FAIL if: failed > 0, or error occurred, or no tests ran at all
-                        if failed_count > 0 or has_error or total_count == 0:
-                            status = "[red]FAIL[/red]"
+                        if total_count == 0 and skip_reason:
+                            status = "[yellow]SKIP[/yellow]"
+                            console.print(
+                                f"  {status} {spec_file.name}: 0 passed, 0 failed (skipped: {skip_reason[:80]})"
+                            )
+                        elif failed_count > 0 or has_error or total_count == 0:
+                            console.print(f"  [red]FAIL[/red] {spec_file.name}: {passed} passed, {failed_count} failed")
                         else:
-                            status = "[green]PASS[/green]"
-                        console.print(f"  {status} {spec_file.name}: {passed} passed, {failed_count} failed")
+                            console.print(
+                                f"  [green]PASS[/green] {spec_file.name}: {passed} passed, {failed_count} failed"
+                            )
                         sys.stdout.flush()
 
                 # Retry failed specs serially to eliminate false positives
@@ -561,12 +569,16 @@ def run(
                     failed_count = summary.get("failed", 0)
                     total_count = summary.get("total", 0)
                     retried = False
+                    spec_skipped = bool(getattr(spec_obj, "skip", None))
                     # A single failure in the sequential run is most often a
                     # transient/contention false positive (slow bootstrap, a
                     # dropped QUIC handshake, etc.). Re-run the spec once
                     # serially; if it passes, treat the original as transient.
                     # Mirrors the retry the parallel path already performs.
-                    if (failed_count > 0 or total_count == 0) and not dry_run:
+                    # NB: a spec with a top-level `skip:` directive contributes
+                    # zero cases by design — don't treat that as a failure or
+                    # waste a retry on it.
+                    if (failed_count > 0 or (total_count == 0 and not spec_skipped)) and not dry_run:
                         retried = True
                         _kill_geode_processes()
                         if not ci and verbose:
@@ -587,11 +599,15 @@ def run(
                     _flush_report(report_json, aggregate_summary, all_results)
                     if not ci:
                         passed = summary.get("passed", 0)
-                        is_fail = failed_count > 0 or total_count == 0
-                        status = "[red]FAIL[/red]" if is_fail else "[green]PASS[/green]"
-                        note = ""
-                        if retried:
-                            note = " (confirmed failure)" if is_fail else " (retry succeeded)"
+                        if total_count == 0 and spec_skipped:
+                            status = "[yellow]SKIP[/yellow]"
+                            note = f" (skipped: {spec_obj.skip[:80]})"
+                        else:
+                            is_fail = failed_count > 0 or total_count == 0
+                            status = "[red]FAIL[/red]" if is_fail else "[green]PASS[/green]"
+                            note = ""
+                            if retried:
+                                note = " (confirmed failure)" if is_fail else " (retry succeeded)"
                         console.print(f"  {status} {spec_file.name}: {passed} passed, {failed_count} failed{note}")
                         sys.stdout.flush()
                 except RunnerError as exc:

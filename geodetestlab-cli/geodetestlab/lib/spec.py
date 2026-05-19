@@ -435,6 +435,9 @@ class TestSpec:
     plaintext_verification: PlaintextCheck = field(default_factory=PlaintextCheck)
     parallel_tests: bool = False
     default_timeout_ms: int = 0  # Spec-level default timeout for all tests (0 = use runner default)
+    skip: str | None = (
+        None  # Top-level skip directive (free-text reason). When set, the spec is pending and contributes 0 cases to the run.
+    )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestSpec:
@@ -486,6 +489,7 @@ class TestSpec:
             plaintext_verification=PlaintextCheck.from_dict(data.get("plaintext_verification")),
             parallel_tests=bool(data.get("parallel_tests", False)),
             default_timeout_ms=data.get("default_timeout_ms", 0),
+            skip=(str(data["skip"]) if data.get("skip") else None),
         )
 
 
@@ -530,8 +534,16 @@ def load_spec(path: str | Path) -> TestSpec:
     if "name" not in data:
         raise SpecValidationError("Specification must have a 'name' field")
 
+    # A spec-level `skip:` directive (string reason or truthy value) means
+    # the spec documents a future / pending capability and need not yet
+    # define `tests:`. The runner contributes 0 cases to the run.
+    spec_skipped = bool(data.get("skip"))
+
     if "tests" not in data:
-        raise SpecValidationError("Specification must have a 'tests' field")
+        if spec_skipped:
+            data["tests"] = []
+        else:
+            raise SpecValidationError("Specification must have a 'tests' field")
 
     if not isinstance(data["tests"], list):
         raise SpecValidationError("'tests' must be a list")

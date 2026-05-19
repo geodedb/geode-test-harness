@@ -33,6 +33,7 @@ def _run_single_spec(
         "exit_code": 0,
         "summary": {"total": 0, "passed": 0, "failed": 0, "skipped": 0},
         "error": None,
+        "skip_reason": None,
     }
 
     try:
@@ -45,6 +46,9 @@ def _run_single_spec(
         result["exit_code"] = 2
         result["error"] = f"SCHEMA_ERROR in {spec_file}: {exc}"
         return result
+
+    if getattr(spec_obj, "skip", None):
+        result["skip_reason"] = str(spec_obj.skip)
 
     try:
         secrets, env_vars = resolve_secrets(spec_obj)
