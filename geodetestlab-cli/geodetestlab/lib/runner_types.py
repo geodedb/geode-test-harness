@@ -31,6 +31,7 @@ class TestResult:
     error: str = ""
     skip_reason: str | None = None
     plaintext_violations: list[str] = field(default_factory=list)
+    cluster_node: int | None = None
 
 
 @dataclass

@@ -28,6 +28,8 @@ from typing import Any
 
 import httpx
 
+from .cluster import start_cluster, stop_cluster
+from .cluster_types import ClusterState
 from .executor import (
     DEFAULT_HTTP_TIMEOUT_S,
     SSL_VERIFY,
@@ -690,6 +692,7 @@ def run_tests(
 
     data_dir = None
     server_state = ServerState(process=None, port=0, grpc_port=None)
+    cluster_state: ClusterState | None = None
 
     if spec.mode == "server":
         data_dir = Path(tempfile.mkdtemp(prefix="geode-test-"))
@@ -723,6 +726,42 @@ def run_tests(
         env["PORT"] = str(server_state.port)
         env["data_dir"] = str(data_dir)
         _sync_server_addresses(env, server_state.port, server_state.grpc_port)
+
+    elif spec.mode == "cluster" and spec.cluster_config is not None:
+        cluster_config = spec.cluster_config
+
+        _run_pre_server_commands(spec.pre_server, dry_run, verbose)
+
+        if not dry_run:
+            cluster_state = start_cluster(
+                cluster_config,
+                binary=binary,
+                base_env=env,
+                spec_server_args=spec.server_args,
+                verbose=verbose,
+                transport=transport,
+            )
+
+            # Point tests at the target node
+            target = cluster_state.get_target_node(cluster_config.target_node)
+            env["GEODE_SERVER_ADDRESS"] = target.address
+            env["PORT"] = str(target.port)
+            env["GEODE_TRANSPORT"] = transport
+            if target.grpc_port:
+                env["GEODE_GRPC_ADDRESS"] = target.grpc_address or ""
+
+            # Inject cluster metadata
+            env["GEODE_CLUSTER_SIZE"] = str(cluster_config.node_count)
+            env["GEODE_CLUSTER_PORTS"] = ",".join(str(n.port) for n in cluster_state.nodes)
+
+            data_dir = Path(target.data_dir)
+
+            # Create ServerState for compatibility with _execute_one_test
+            server_state = ServerState(
+                process=target.process,
+                port=target.port,
+                grpc_port=target.grpc_port,
+            )
 
     interrupted = False
 
@@ -793,24 +832,68 @@ def run_tests(
             for test_case in spec.tests:
                 if interrupted:
                     break
-                summary.total += 1
-                result = _execute_one_test(
-                    test_case,
-                    dry_run,
-                    _lock,
-                    server_state,
-                    binary,
-                    data_dir,
-                    env,
-                    spec,
-                    server_timeout_ms,
-                    verbose,
-                    server_port,
-                    secrets,
-                    timeout_ms,
-                    _shared_http,
-                )
-                _record_result(test_case, result)
+
+                # "all" mode: run each test against every cluster node
+                if cluster_state is not None and spec.cluster_config and spec.cluster_config.target_node == "all":
+                    for node in cluster_state.nodes:
+                        if interrupted:
+                            break
+                        summary.total += 1
+                        env["GEODE_SERVER_ADDRESS"] = node.address
+                        env["PORT"] = str(node.port)
+                        if node.grpc_port:
+                            env["GEODE_GRPC_ADDRESS"] = node.grpc_address or ""
+                        server_state = ServerState(process=node.process, port=node.port, grpc_port=node.grpc_port)
+                        result = _execute_one_test(
+                            test_case,
+                            dry_run,
+                            _lock,
+                            server_state,
+                            binary,
+                            data_dir,
+                            env,
+                            spec,
+                            server_timeout_ms,
+                            verbose,
+                            server_port,
+                            secrets,
+                            timeout_ms,
+                            _shared_http,
+                        )
+                        result.cluster_node = node.node_id
+                        _record_result(test_case, result)
+                else:
+                    summary.total += 1
+
+                    # Round-robin: update target for each test
+                    if (
+                        cluster_state is not None
+                        and spec.cluster_config
+                        and spec.cluster_config.target_node == "round-robin"
+                    ):
+                        next_node = cluster_state.next_round_robin_node()
+                        env["GEODE_SERVER_ADDRESS"] = next_node.address
+                        env["PORT"] = str(next_node.port)
+                        if next_node.grpc_port:
+                            env["GEODE_GRPC_ADDRESS"] = next_node.grpc_address or ""
+
+                    result = _execute_one_test(
+                        test_case,
+                        dry_run,
+                        _lock,
+                        server_state,
+                        binary,
+                        data_dir,
+                        env,
+                        spec,
+                        server_timeout_ms,
+                        verbose,
+                        server_port,
+                        secrets,
+                        timeout_ms,
+                        _shared_http,
+                    )
+                    _record_result(test_case, result)
 
         _run_plaintext_checks(spec, data_dir, dry_run, verbose, summary)
 
@@ -823,6 +906,9 @@ def run_tests(
 
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
+
+        if cluster_state is not None:
+            stop_cluster(cluster_state, verbose=verbose, cleanup_data=True)
 
         if server_state.process:
             stop_server(server_state.process, verbose=verbose)
