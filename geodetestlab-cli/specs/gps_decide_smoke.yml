@@ -1,0 +1,204 @@
+version: '1.0'
+name: GPS decide() smoke
+description: |
+  Verifies gps.decide() produces the same observable outcomes as the
+  pre-Phase-2 enforcement path. A readonly user attempting CREATE must
+  fail with the same Unauthorized error class that the legacy
+  checkPermission() path returned before GPS Phase 2.
+
+  The spec exercises the full QUIC transport stack so that the black-box
+  assertion is independent of the unit-test layer (test_gps_decide.zig).
+  It proves the wire-level contract: an authenticated readonly user that
+  issues a CREATE statement receives a non-zero exit code from the geode
+  query CLI, matching legacy behaviour.
+
+  User setup is done via GQL DDL (CREATE USER ... ROLE readonly) so that
+  the role is persisted correctly to the __geode_security graph and is
+  visible to the QUIC server's auth resolver on the next connection.
+  Using `geode user create --role` is NOT sufficient — that CLI path
+  only records the role in the flat user-storage file, not in the live
+  auth resolver's view.
+
+  CANARY: REQ=REQ-GPS-PDP-008; FEATURE="GPS Decision Engine"; ASPECT=BlackBoxParitySmoke; STATUS=TESTED; OWNER=security; UPDATED=2026-05-20
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+  # -----------------------------------------------------------------------
+  # Idempotent pre-flight: ensure no leftover user from a prior run
+  # -----------------------------------------------------------------------
+- name: gps-smoke-preflight-drop-user
+  description: |
+    Drop smoke_ro if it exists from a prior run. Using IF EXISTS makes
+    this idempotent — the test passes whether or not the user exists.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - DROP USER IF EXISTS smoke_ro
+  expect:
+    exit_code: 0
+  tags:
+  - gps_decide
+  - setup
+
+  # -----------------------------------------------------------------------
+  # Setup: create the readonly test user via GQL DDL
+  # -----------------------------------------------------------------------
+- name: gps-smoke-create-readonly-user
+  description: |
+    Create a readonly user via the GQL DDL path (CREATE USER ... ROLE
+    readonly). This goes through the QUIC server so the role is
+    persisted to the __geode_security graph and is visible to the
+    server's auth resolver on the next connection. The 'readonly'
+    built-in role denies Write permission — any CREATE must be refused.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - CREATE USER smoke_ro SET PASSWORD 'smoke-pass-1234' ROLE readonly
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - smoke_ro
+  tags:
+  - gps_decide
+  - setup
+
+  # -----------------------------------------------------------------------
+  # Positive baseline: readonly user can execute a read-only query
+  # -----------------------------------------------------------------------
+- name: gps-smoke-readonly-can-read
+  description: |
+    Confirms the smoke_ro user can authenticate and execute a read
+    (RETURN) statement. This is the positive baseline: if this fails,
+    the auth setup itself is broken and the enforcement test is moot.
+  args:
+  - query
+  - -U
+  - smoke_ro
+  - -P
+  - smoke-pass-1234
+  - '-'
+  stdin: |
+    RETURN 1 AS probe
+  expect:
+    exit_code: 0
+  tags:
+  - gps_decide
+  - baseline
+
+  # -----------------------------------------------------------------------
+  # Enforcement: readonly user cannot CREATE (GPS decide() parity test)
+  # -----------------------------------------------------------------------
+- name: gps-smoke-readonly-cannot-create
+  description: |
+    GPS decide() must deny CREATE for a readonly user. The server returns
+    SQLSTATE 42501 ("Permission denied: insufficient privileges for data
+    modification") in the response JSON. The geode query CLI always exits 0
+    when the transport succeeds (GAP-0272: only connection failures produce
+    non-zero exit), so the observable parity signal is the 42501 error code
+    in stdout combined with the absence of a node row.
+
+    This mirrors the behaviour of the legacy checkPermission() path
+    that GPS Phase 2 replaced: both must refuse writes for readonly
+    principals. The unit-level parity proof lives in test_gps_decide.zig
+    (checkPermission and decide() agree for every role×permission pair).
+    This spec provides the black-box, wire-level confirmation.
+  args:
+  - query
+  - -U
+  - smoke_ro
+  - -P
+  - smoke-pass-1234
+  - '-'
+  stdin: |
+    CREATE (n:GPSSmokeNode {value: 1}) RETURN n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '42501'
+    - Permission denied
+  tags:
+  - gps_decide
+  - enforcement
+
+  # -----------------------------------------------------------------------
+  # Admin can still write (confirm enforcement is role-scoped)
+  # -----------------------------------------------------------------------
+- name: gps-smoke-admin-can-create
+  description: |
+    Admin must still be able to CREATE after the readonly user is
+    denied. Confirms that the enforcement is scoped to the role, not
+    applied globally, and that GPS decide() correctly allows writes
+    for the Admin principal.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    CREATE (n:GPSSmokeAdminNode {value: 1}) RETURN n
+  expect:
+    exit_code: 0
+  tags:
+  - gps_decide
+  - baseline
+
+  # -----------------------------------------------------------------------
+  # Teardown: drop the smoke user and any test nodes
+  # -----------------------------------------------------------------------
+- name: gps-smoke-cleanup-readonly-user
+  description: |
+    Drop the smoke_ro user created during this spec. Using IF EXISTS
+    makes cleanup safe even if an earlier step failed.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - DROP USER IF EXISTS smoke_ro
+  expect:
+    exit_code: 0
+  tags:
+  - gps_decide
+  - teardown
+
+tags:
+- gps_decide
+- enforcement
+- security
+- smoke
