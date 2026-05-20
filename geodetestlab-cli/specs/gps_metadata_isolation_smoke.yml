@@ -1,0 +1,470 @@
+version: '1.0'
+name: GPS Phase 3 — metadata isolation smoke
+description: |
+  Black-box smoke test for GPS Phase 3 tenant/graph enforcement.
+
+  Coverage:
+  1. Graph data isolation — MATCH queries are scoped to the active graph.
+     Data created in graph alpha is invisible when graph beta is active.
+  2. SHOW GRAPHS — admin sees both graphs; this exercises the Phase 3
+     SHOW GRAPHS path (fail-open site #7, now CLOSED at commit fd7586da).
+  3. db.labels() positive containment — labels seeded in each graph appear
+     when calling CALL db.labels().
+  4. db.relationshipTypes() positive containment — edge types appear
+     correctly per-graph after edge creation.
+  5. db.propertyKeys() presence — property keys are visible to admin.
+
+  Scope note — tenant-level label isolation:
+  The `db.labels()` filter is keyed on `ctx.tenant_id` (GPS Task 3-4,
+  commit 7246449e). The CLI sets tenant_id = null for all connections
+  (the tenant_id is passed via the QUIC HelloRequest which the CLI does
+  not expose as a flag). Admin with null tenant_id sees the union of all
+  labels across all graphs — this is correct per the documented admin
+  all-tenant view. Cross-graph label isolation in CALL db.labels() is
+  only enforced when the caller presents a non-null tenant_id (i.e., via
+  a tenant-bound HelloRequest), which cannot be exercised via the CLI.
+  The unit-level proof lives in tests/test_gps_metadata_filtering.zig
+  (CANARY REQ-GPS-METADATA-001, STATUS=TESTED).
+
+  This spec provides the wire-level confirmation for the observable subset:
+  graph data isolation (MATCH scoping) + SHOW GRAPHS filtering + positive
+  metadata presence assertions.
+
+  CANARY: REQ=REQ-GPS-METADATA-001; FEATURE="GPS Metadata Isolation"; ASPECT=BlackBoxSmokeSpec; STATUS=TESTED; OWNER=security; UPDATED=2026-05-20
+
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+  # -----------------------------------------------------------------------
+  # Pre-flight: drop graphs from any prior run (idempotent)
+  # -----------------------------------------------------------------------
+- name: meta-iso-preflight-cleanup
+  description: |
+    Drop both test graphs if they exist from a prior run.
+    Makes the spec idempotent across repeated executions.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    DROP GRAPH IF EXISTS gps_meta_graph_alpha;
+    DROP GRAPH IF EXISTS gps_meta_graph_beta
+  expect:
+    exit_code: 0
+  tags:
+  - gps_metadata_isolation
+  - setup
+
+  # -----------------------------------------------------------------------
+  # Setup: create two graphs with distinct labels and relationship types
+  # -----------------------------------------------------------------------
+- name: meta-iso-create-graphs
+  description: Create both test graphs.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    CREATE GRAPH IF NOT EXISTS gps_meta_graph_alpha;
+    CREATE GRAPH IF NOT EXISTS gps_meta_graph_beta
+  expect:
+    exit_code: 0
+  tags:
+  - gps_metadata_isolation
+  - setup
+
+- name: meta-iso-seed-alpha
+  description: |
+    Seed graph alpha with a LabelAlpha node and an AlphaEdge relationship.
+    Uses distinct labels and edge types per graph to enable isolation checks.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_alpha;
+    CREATE (a:LabelAlpha {alpha_prop: 'alpha_value'});
+    CREATE (b:LabelAlpha {alpha_prop: 'second_alpha'});
+    MATCH (x:LabelAlpha), (y:LabelAlpha) WHERE x.alpha_prop < y.alpha_prop CREATE (x)-[:AlphaEdge]->(y);
+    MATCH (n:LabelAlpha) RETURN count(n) AS seeded
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"seeded":2'
+  tags:
+  - gps_metadata_isolation
+  - setup
+  - graph-alpha
+
+- name: meta-iso-seed-beta
+  description: |
+    Seed graph beta with a LabelBeta node. LabelBeta must NOT appear in
+    any alpha-context query result.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_beta;
+    CREATE (b:LabelBeta {beta_prop: 'beta_value'});
+    MATCH (n:LabelBeta) RETURN count(n) AS seeded
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"seeded":1'
+  tags:
+  - gps_metadata_isolation
+  - setup
+  - graph-beta
+
+  # -----------------------------------------------------------------------
+  # Graph data isolation: MATCH queries are scoped to the active graph
+  # -----------------------------------------------------------------------
+- name: meta-iso-data-isolation-alpha-positive
+  description: |
+    MATCH (n:LabelAlpha) inside graph alpha must return 2 nodes.
+    Confirms data was successfully written and is visible in the correct graph.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_alpha;
+    MATCH (n:LabelAlpha) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - gps_metadata_isolation
+  - data-isolation
+  - graph-alpha
+  - positive
+
+- name: meta-iso-data-isolation-alpha-no-beta-nodes
+  description: |
+    MATCH (n:LabelBeta) inside graph alpha must return 0 nodes.
+    This is the core graph data isolation assertion: Phase 3 graph scoping
+    must prevent cross-graph data leakage even for admin. Graph data lives
+    in per-graph storage partitions.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_alpha;
+    MATCH (n:LabelBeta) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - gps_metadata_isolation
+  - data-isolation
+  - graph-alpha
+  - no-leak
+
+- name: meta-iso-data-isolation-beta-positive
+  description: |
+    MATCH (n:LabelBeta) inside graph beta must return 1 node.
+    Symmetrical positive assertion.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_beta;
+    MATCH (n:LabelBeta) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  tags:
+  - gps_metadata_isolation
+  - data-isolation
+  - graph-beta
+  - positive
+
+- name: meta-iso-data-isolation-beta-no-alpha-nodes
+  description: |
+    MATCH (n:LabelAlpha) inside graph beta must return 0 nodes.
+    Symmetrical no-leak assertion for beta.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_beta;
+    MATCH (n:LabelAlpha) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - gps_metadata_isolation
+  - data-isolation
+  - graph-beta
+  - no-leak
+
+  # -----------------------------------------------------------------------
+  # Edge isolation: AlphaEdge exists only in alpha
+  # -----------------------------------------------------------------------
+- name: meta-iso-edge-isolation-alpha
+  description: |
+    AlphaEdge must exist in graph alpha. Confirms that edge creation is
+    properly scoped to the active graph.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_alpha;
+    MATCH ()-[r:AlphaEdge]->() RETURN count(r) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  tags:
+  - gps_metadata_isolation
+  - edge-isolation
+  - graph-alpha
+
+- name: meta-iso-edge-isolation-beta-no-alpha-edges
+  description: |
+    AlphaEdge must NOT exist in graph beta. This validates that edge
+    graph scoping is enforced: edges from alpha are invisible in beta.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_beta;
+    MATCH ()-[r:AlphaEdge]->() RETURN count(r) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - gps_metadata_isolation
+  - edge-isolation
+  - graph-beta
+  - no-leak
+
+  # -----------------------------------------------------------------------
+  # db.labels() — positive containment (admin all-graph view)
+  # -----------------------------------------------------------------------
+- name: meta-iso-labels-alpha-present
+  description: |
+    CALL db.labels() when alpha is active must include LabelAlpha.
+    Admin (null tenant_id) sees the union of all tenant labels per
+    the documented admin all-tenant view. The unit test
+    test_gps_metadata_filtering.zig covers the tenant-filtered path.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_alpha;
+    CALL db.labels() YIELD label RETURN label ORDER BY label
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - LabelAlpha
+  tags:
+  - gps_metadata_isolation
+  - db.labels
+  - positive
+
+- name: meta-iso-labels-beta-present
+  description: |
+    CALL db.labels() when beta is active must include LabelBeta.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_beta;
+    CALL db.labels() YIELD label RETURN label ORDER BY label
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - LabelBeta
+  tags:
+  - gps_metadata_isolation
+  - db.labels
+  - positive
+
+  # -----------------------------------------------------------------------
+  # db.relationshipTypes() — positive containment
+  # -----------------------------------------------------------------------
+- name: meta-iso-reltypes-alpha-present
+  description: |
+    CALL db.relationshipTypes() in graph alpha must include AlphaEdge.
+    Confirms the relationship type index is populated correctly.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_alpha;
+    CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType ORDER BY relationshipType
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - AlphaEdge
+  tags:
+  - gps_metadata_isolation
+  - db.relationshipTypes
+  - positive
+
+  # -----------------------------------------------------------------------
+  # db.propertyKeys() — positive containment
+  # -----------------------------------------------------------------------
+- name: meta-iso-propertykeys-alpha-present
+  description: |
+    CALL db.propertyKeys() in graph alpha must include alpha_prop.
+    Verifies the property key index is populated from alpha's LabelAlpha nodes.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    USE GRAPH gps_meta_graph_alpha;
+    CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey ORDER BY propertyKey
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - alpha_prop
+  tags:
+  - gps_metadata_isolation
+  - db.propertyKeys
+  - positive
+
+  # -----------------------------------------------------------------------
+  # SHOW GRAPHS: admin sees both graphs (Phase 3 Site #7 closed)
+  # -----------------------------------------------------------------------
+- name: meta-iso-show-graphs-admin-sees-both
+  description: |
+    Admin calling SHOW GRAPHS must see both gps_meta_graph_alpha and
+    gps_meta_graph_beta. This exercises the Phase 3 SHOW GRAPHS path:
+    fail-open site #7 (SHOW GRAPHS global) was closed at commit fd7586da
+    by applying gps.decide(.bind_graph) per graph. Admin principal always
+    gets bind_graph=Allow for all graphs, so the full list is returned.
+    The unit-level proof for non-admin principal filtering lives in
+    tests/test_gps_metadata_filtering.zig.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    SHOW GRAPHS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - gps_meta_graph_alpha
+    - gps_meta_graph_beta
+  tags:
+  - gps_metadata_isolation
+  - show-graphs
+  - admin
+
+  # -----------------------------------------------------------------------
+  # Cleanup
+  # -----------------------------------------------------------------------
+- name: meta-iso-cleanup
+  description: Drop both test graphs to restore a clean state.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    DROP GRAPH IF EXISTS gps_meta_graph_alpha;
+    DROP GRAPH IF EXISTS gps_meta_graph_beta
+  expect:
+    exit_code: 0
+  tags:
+  - gps_metadata_isolation
+  - teardown
+
+tags:
+- gps_metadata_isolation
+- enforcement
+- security
+- smoke
+- phase3
