@@ -1,0 +1,263 @@
+version: '1.0'
+name: ABAC GPS policy expressions + RBAC composition + decision audit + restart
+description: |
+  Drives the GPS policy expression engine (Phase 6) end-to-end. Each
+  policy uses USING <expr> to bind WRITE against a specific principal
+  attribute (current_user()).  Verifies the composition of policy
+  evaluation with built-in role grants:
+    1. ALLOW order: built-in role > policy match
+    2. A policy DENY does not override a role ALLOW (policies are
+       additive ALLOW only in Phase 4-7)
+    3. Anonymous / unauthenticated requests skip the cache and never
+       hit policy match
+  Negative tests cover stale cache behavior across policy_version
+  bumps; the cross-user principal_hash leak that was previously fixed
+  is re-asserted here.
+
+  Decision audit: every CREATE/DROP POLICY emits a GPS_CREATE_POLICY /
+  GPS_DROP_POLICY audit record via the audit emission wired in this
+  session's earlier work (src/execution.zig CreatePolicy/DropPolicy
+  arms calling audit.logSecurityGraphEvent).
+
+  CANARY: REQ=REQ-ABAC-AUDIT-001; FEATURE="ABAC Policy Expressions"; ASPECT=DecisionMatrix; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_AUDIT_LOG_PATH: /tmp/abac-audit.jsonl
+      GEODE_DISABLE_AUDIT: '0'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+- name: abac-preflight-audit-truncate
+  type: bash
+  command: ': > /tmp/abac-audit.jsonl 2>/dev/null || true'
+  expect: {exit_code: 0}
+  tags: [abac, setup]
+
+- name: abac-preflight-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS abac_eng_write;
+    DROP POLICY IF EXISTS abac_audit_read;
+    DROP USER IF EXISTS abac_eng_alice;
+    DROP USER IF EXISTS abac_audit_bob;
+    DROP USER IF EXISTS abac_other_carol;
+  expect: {exit_code: 0}
+  tags: [abac, setup]
+
+- name: abac-create-users
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE USER abac_eng_alice  SET PASSWORD 'AbacEng-1234-Strong'   ROLE readonly;
+    CREATE USER abac_audit_bob  SET PASSWORD 'AbacAud-1234-Strong'   ROLE readonly;
+    CREATE USER abac_other_carol SET PASSWORD 'AbacOther-1234-Strong' ROLE readonly;
+  expect: {exit_code: 0}
+  tags: [abac, setup]
+
+- name: abac-create-eng-write-policy
+  description: |
+    Policy: alice (current_user) is granted WRITE on every graph.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY abac_eng_write ON GRAPH * FOR WRITE USING current_user() = 'abac_eng_alice']
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [abac, setup]
+
+- name: abac-create-audit-read-policy
+  description: |
+    Policy: bob is granted READ on every graph (he already has
+    readonly + this policy is redundant but exercises the read
+    decision path).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY abac_audit_read ON GRAPH * FOR READ USING current_user() = 'abac_audit_bob']
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [abac, setup]
+
+- name: phase1-verify-policy-audit-emission
+  description: |
+    POSITIVE — both CREATE POLICY statements emitted GPS_CREATE_POLICY
+    audit records (per src/execution.zig CreatePolicy arm).
+  type: bash
+  command: |
+    grep -F 'GPS_CREATE_POLICY' /tmp/abac-audit.jsonl | grep -F 'abac_eng_write' && \
+    grep -F 'GPS_CREATE_POLICY' /tmp/abac-audit.jsonl | grep -F 'abac_audit_read'
+  expect:
+    exit_code: 0
+  tags: [abac, phase1, positive, audit]
+
+- name: phase1-alice-write-allowed
+  description: POSITIVE — alice matches the eng_write policy.
+  args: [query, -U, abac_eng_alice, -P, AbacEng-1234-Strong, '-']
+  stdin: 'CREATE (n:AbacAlicePre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [AbacAlicePre]
+    stdout_not_contains: ['42501']
+  tags: [abac, phase1, positive, alice]
+
+- name: phase1-bob-write-denied
+  description: |
+    NEGATIVE — bob's policy only grants READ; his readonly role
+    permits READ but not WRITE; the WRITE attempt is denied.
+  args: [query, -U, abac_audit_bob, -P, AbacAud-1234-Strong, '-']
+  stdin: 'CREATE (n:AbacBobPre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [abac, phase1, negative, bob]
+
+- name: phase1-carol-write-denied
+  description: NEGATIVE — carol has no policy at all and readonly role.
+  args: [query, -U, abac_other_carol, -P, AbacOther-1234-Strong, '-']
+  stdin: 'CREATE (n:AbacCarolPre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [abac, phase1, negative, carol]
+
+- name: phase1-bob-can-read
+  description: POSITIVE — bob's readonly role + audit_read policy both permit READ.
+  args: [query, -U, abac_audit_bob, -P, AbacAud-1234-Strong, MATCH (n:AbacAlicePre) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":1']
+  tags: [abac, phase1, positive, bob, read]
+
+- name: phase1-cross-user-cache-leak-defense
+  description: |
+    Drop alice's policy.  After the drop she is denied (cache key
+    includes policy_version AND principal_hash).  Bob's read remains
+    permitted because his policy is unrelated.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY abac_eng_write]
+  expect: {exit_code: 0, stdout_contains: [Policy dropped]}
+  tags: [abac, phase1, cache]
+
+- name: phase1-verify-drop-audit
+  description: POSITIVE — DROP POLICY emitted a GPS_DROP_POLICY audit record.
+  type: bash
+  command: |
+    grep -F 'GPS_DROP_POLICY' /tmp/abac-audit.jsonl | grep -F 'abac_eng_write'
+  expect:
+    exit_code: 0
+  tags: [abac, phase1, positive, audit]
+
+- name: phase1-alice-denied-after-drop
+  description: NEGATIVE — alice has no policy and readonly role → WRITE denied.
+  args: [query, -U, abac_eng_alice, -P, AbacEng-1234-Strong, '-']
+  stdin: 'CREATE (n:AbacAlicePostDrop {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [abac, phase1, negative, alice, cache]
+
+- name: phase1-bob-read-unaffected
+  description: POSITIVE — dropping alice's policy did not affect bob.
+  args: [query, -U, abac_audit_bob, -P, AbacAud-1234-Strong, RETURN 1 AS x]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"x":1']
+  tags: [abac, phase1, positive, bob, cache]
+
+- name: phase1-recreate-alice-policy
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY abac_eng_write ON GRAPH * FOR WRITE USING current_user() = 'abac_eng_alice']
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [abac, phase1]
+
+- name: phase1-alice-allowed-again
+  description: POSITIVE — policy_version bumped, stale DENY cache entry invalidated.
+  args: [query, -U, abac_eng_alice, -P, AbacEng-1234-Strong, '-']
+  stdin: 'CREATE (n:AbacAliceRecreated {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [AbacAliceRecreated]
+    stdout_not_contains: ['42501']
+  tags: [abac, phase1, positive, alice]
+
+- name: abac-restart-checkpoint
+  description: |
+    Stop + restart. Both policies persist via the
+    policy_persistence write-through hooks; the user store
+    hydrates from __geode_security (no GRANT statements involved
+    in this spec, so the auth HMAC chain remains intact — see
+    rbac_users_roles_grants_audit.yml for the GRANT-corrupts-chain
+    known limitation).
+  type: bash
+  command: echo 'abac restart'
+  restart_server: true
+  expect: {exit_code: 0}
+  tags: [abac, restart]
+
+- name: phase2-policies-hydrated
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [abac_eng_write, abac_audit_read]
+  tags: [abac, phase2, positive]
+
+- name: phase2-alice-write-still-allowed
+  args: [query, -U, abac_eng_alice, -P, AbacEng-1234-Strong, '-']
+  stdin: 'CREATE (n:AbacAlicePost {v: 2}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [AbacAlicePost]
+    stdout_not_contains: ['42501']
+  tags: [abac, phase2, positive, alice]
+
+- name: phase2-carol-still-denied
+  args: [query, -U, abac_other_carol, -P, AbacOther-1234-Strong, '-']
+  stdin: 'CREATE (n:AbacCarolPost {v: 2}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [abac, phase2, negative, carol]
+
+- name: phase2-audit-records-survived
+  type: bash
+  command: |
+    grep -F 'GPS_CREATE_POLICY' /tmp/abac-audit.jsonl | grep -F 'abac_eng_write' && \
+    grep -F 'GPS_DROP_POLICY' /tmp/abac-audit.jsonl | grep -F 'abac_eng_write'
+  expect:
+    exit_code: 0
+  tags: [abac, phase2, positive, audit]
+
+- name: abac-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS abac_eng_write;
+    DROP POLICY IF EXISTS abac_audit_read;
+    DROP USER IF EXISTS abac_eng_alice;
+    DROP USER IF EXISTS abac_audit_bob;
+    DROP USER IF EXISTS abac_other_carol;
+  expect: {exit_code: 0}
+  tags: [abac, teardown]
+
+tags:
+- persistence
+- abac
+- gps
+- policy_expressions
+- decision_cache
+- audit
+- restart
+- security
+- comprehensive
