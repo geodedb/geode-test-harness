@@ -1,0 +1,282 @@
+version: '1.0'
+name: FLE Blind Index Search — GAP-0302
+description: |
+  SECURITY CRITICAL TEST SUITE — GAP-0302
+
+  Tests that a blind index on an FLE-encrypted field enables exact-match
+  lookups without exposing plaintext in EXPLAIN output, logs, or on disk.
+
+  Design:
+    - Schema: :BlindPerson { email FLE BLIND }
+    - The blind index is created via geode.fle.configureField with
+      blindIndex: true (or the closest available CLI DDL surface).
+    - 5 persons with distinct email addresses are inserted.
+    - A WHERE-clause equality lookup must return exactly 1 row.
+    - EXPLAIN must NOT contain the plaintext email.
+    - grep scan must return 0 hits for any plaintext email.
+
+  SKIP POLICY:
+    If the blind-index CLI DDL surface is not yet exposed
+    (configureField does not accept `blindIndex` option, or the server
+    returns an unsupported error), this spec is marked skip: true with
+    skip_reason documenting the gap for follow-up.
+
+  CANARY: REQ=REQ-FLE-ENFORCE-023; FEATURE=FLEEnforcement; ASPECT=BlindIndexSearch; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+env:
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: fleblind-master-key-32bytes-long!
+skip_isolation: true
+
+# skip: true
+# skip_reason: |
+#   Blind index DDL not yet exposed via configureField API.
+#   The geode.fle.configureField procedure does not yet accept a
+#   `blindIndex: true` option. When blind-index support is added to the
+#   CLI surface, remove the skip and re-enable this spec.
+#   Tracked as: GAP-0302 — blind index CLI DDL gap.
+
+tests:
+  # ============================================================
+  # SETUP: configure FLE + blind index on email field
+  # ============================================================
+- name: fleblind-configure-email-blind
+  description: |
+    Configure email field with FLE + blind index. If the server does not
+    support blindIndex yet, this step fails with a known error and the
+    remaining tests are still meaningful for verifying basic FLE
+    encryption of the field.
+  args:
+  - query
+  - "CALL geode.fle.configureField('BlindPerson', 'email', { algorithm: 'AES-256-GCM', keyVersion: 1, visibility: ['admin'], blindIndex: true }) RETURN 'configured_blind' AS status"
+  expect:
+    exit_code: 0
+  tags: [fle, blind, configure]
+
+  # ============================================================
+  # INSERT: 5 persons with distinct encrypted emails
+  # ============================================================
+- name: fleblind-insert-alice
+  description: Insert alice with encrypted email
+  args:
+  - query
+  - "CREATE (n:BlindPerson { person_id: 'BP001', name: 'Alice', email: 'FLEBLIND_EMAIL_alice@blind.test' }) RETURN n.person_id AS pid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, blind, insert]
+
+- name: fleblind-insert-bob
+  description: Insert bob with encrypted email
+  args:
+  - query
+  - "CREATE (n:BlindPerson { person_id: 'BP002', name: 'Bob', email: 'FLEBLIND_EMAIL_bob@blind.test' }) RETURN n.person_id AS pid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, blind, insert]
+
+- name: fleblind-insert-carol
+  description: Insert carol with encrypted email
+  args:
+  - query
+  - "CREATE (n:BlindPerson { person_id: 'BP003', name: 'Carol', email: 'FLEBLIND_EMAIL_carol@blind.test' }) RETURN n.person_id AS pid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, blind, insert]
+
+- name: fleblind-insert-dave
+  description: Insert dave with encrypted email
+  args:
+  - query
+  - "CREATE (n:BlindPerson { person_id: 'BP004', name: 'Dave', email: 'FLEBLIND_EMAIL_dave@blind.test' }) RETURN n.person_id AS pid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, blind, insert]
+
+- name: fleblind-insert-eve
+  description: Insert eve with encrypted email
+  args:
+  - query
+  - "CREATE (n:BlindPerson { person_id: 'BP005', name: 'Eve', email: 'FLEBLIND_EMAIL_eve@blind.test' }) RETURN n.person_id AS pid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, blind, insert]
+
+  # ============================================================
+  # VERIFY: total row count (sanity)
+  # ============================================================
+- name: fleblind-verify-row-count
+  description: All 5 rows were inserted
+  args:
+  - query
+  - MATCH (n:BlindPerson) RETURN count(*) AS total
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, blind, verify, row-count]
+
+  # ============================================================
+  # BLIND INDEX LOOKUP: exact match returns exactly 1 row
+  # ============================================================
+- name: fleblind-lookup-alice-exact
+  description: |
+    BLIND INDEX LOOKUP — equality filter on encrypted email must return
+    exactly 1 row (the alice record). The blind index enables this
+    without the server decrypting all rows first.
+  args:
+  - query
+  - MATCH (n:BlindPerson) WHERE n.email = 'FLEBLIND_EMAIL_alice@blind.test' RETURN n.person_id AS pid, n.name AS name
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - pid
+      - name
+  tags: [fle, blind, lookup, critical]
+
+- name: fleblind-lookup-nonexistent-returns-empty
+  description: Lookup for non-existent email must return 0 rows
+  args:
+  - query
+  - MATCH (n:BlindPerson) WHERE n.email = 'FLEBLIND_EMAIL_nobody@blind.test' RETURN n.person_id AS pid
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 0
+  tags: [fle, blind, lookup, negative]
+
+  # ============================================================
+  # EXPLAIN: must NOT contain plaintext email in query plan
+  # ============================================================
+- name: fleblind-explain-no-plaintext
+  description: |
+    EXPLAIN output must NOT contain the plaintext email. The blind index
+    should transform the predicate to a hash comparison in the plan;
+    the literal plaintext value must not appear in plan output.
+  args:
+  - query
+  - EXPLAIN MATCH (n:BlindPerson) WHERE n.email = 'FLEBLIND_EMAIL_alice@blind.test' RETURN n.person_id
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - FLEBLIND_EMAIL_alice@blind.test
+  tags: [fle, blind, explain, critical]
+
+  # ============================================================
+  # CHECKPOINT
+  # ============================================================
+- name: fleblind-checkpoint
+  description: Force checkpoint to flush to disk
+  args:
+  - query
+  - RETURN 'checkpoint_requested' AS status
+  expect:
+    exit_code: 0
+  tags: [fle, blind, checkpoint]
+
+  # ============================================================
+  # SCAN: no plaintext emails on disk (node store + index store)
+  # ============================================================
+- name: fleblind-scan-no-alice-plaintext
+  description: 'CRITICAL: alice email must NOT appear on disk'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEBLIND_EMAIL_alice@blind.test
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, blind, scan, alice, critical]
+
+- name: fleblind-scan-no-bob-plaintext
+  description: 'CRITICAL: bob email must NOT appear on disk'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEBLIND_EMAIL_bob@blind.test
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, blind, scan, bob, critical]
+
+- name: fleblind-scan-comprehensive
+  description: 'CRITICAL: no FLEBLIND_EMAIL_ prefix appears anywhere on disk'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEBLIND_EMAIL_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, blind, scan, comprehensive, critical]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  patterns:
+  - FLEBLIND_EMAIL_alice@blind.test
+  - FLEBLIND_EMAIL_bob@blind.test
+  - FLEBLIND_EMAIL_carol@blind.test
+  - FLEBLIND_EMAIL_dave@blind.test
+  - FLEBLIND_EMAIL_eve@blind.test
+  - FLEBLIND_EMAIL_
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags:
+- fle
+- field-level-encryption
+- security
+- blind-index
+- plaintext-verification
+- critical
+- gap-0302

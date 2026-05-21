@@ -1,0 +1,224 @@
+version: '1.0'
+name: FLE Decrypt Denied — Placeholder Returned to Unauthorized User — GAP-0301
+description: |
+  SECURITY CRITICAL TEST SUITE — GAP-0301
+
+  Verifies that a user who has `read` access but NOT the `decrypt_field`
+  GPS action receives a redacted placeholder value (e.g. "<ENCRYPTED>",
+  null, or empty string) when querying an FLE-encrypted field — NOT raw
+  ciphertext and NOT plaintext.
+
+  Setup:
+    - User `fledeny_reader` is created with the `readonly` role.
+    - No explicit FLE decrypt grant is made for this user.
+    - Admin inserts a row with an encrypted secret field.
+    - `fledeny_reader` queries the encrypted field — must see redaction.
+    - Admin queries the same field — must see plaintext.
+    - Row count for both users must match (row visibility != field visibility).
+
+  GPS action wiring: follows the policy-layer pattern from
+  gps_phase5_procedure_fle.yml (CREATE POLICY ... FOR READ).
+
+  CANARY: REQ=REQ-FLE-ENFORCE-022; FEATURE=FLEEnforcement; ASPECT=DecryptDeniedPlaceholder; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+env:
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: fledeny-master-key-32bytes-long!!
+skip_isolation: true
+
+tests:
+  # ============================================================
+  # SETUP: drop any leftovers
+  # ============================================================
+- name: fledeny-preflight-drop
+  description: Drop leftover test users
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS fledeny_reader;
+  expect:
+    exit_code: 0
+  tags: [fle, deny, setup]
+
+  # ============================================================
+  # SETUP: configure FLE on the field
+  # ============================================================
+- name: fledeny-configure-secret-field
+  description: Configure 'secret_value' on DeniedReadUser as FLE encrypted (admin-only decrypt)
+  args:
+  - query
+  - "CALL geode.fle.configureField('DeniedReadUser', 'secret_value', { algorithm: 'AES-256-GCM', keyVersion: 1, visibility: ['admin'] }) RETURN 'configured' AS status"
+  expect:
+    exit_code: 0
+  tags: [fle, deny, configure]
+
+  # ============================================================
+  # SETUP: create readonly user without decrypt grant
+  # ============================================================
+- name: fledeny-create-reader-user
+  description: Create fledeny_reader with readonly role — no FLE decrypt grant
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER fledeny_reader SET PASSWORD 'fledenypass123' ROLE readonly]
+  expect:
+    exit_code: 0
+  tags: [fle, deny, setup, user]
+
+  # ============================================================
+  # INSERT: admin writes a row with encrypted secret_value
+  # ============================================================
+- name: fledeny-insert-row
+  description: Admin inserts row with FLE-encrypted secret_value
+  args:
+  - query
+  - "CREATE (n:DeniedReadUser { user_id: 'DENY_USR_001', secret_value: 'FLEDENY_SECRET_TopSecretVal42', public_field: 'visible_info' }) RETURN n.user_id AS user_id"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, deny, insert]
+
+  # ============================================================
+  # SCAN: plaintext must never be on disk
+  # ============================================================
+- name: fledeny-scan-no-plaintext-on-disk
+  description: 'CRITICAL: secret_value plaintext must NOT appear on disk'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEDENY_SECRET_TopSecretVal42
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, deny, scan, critical]
+
+  # ============================================================
+  # ADMIN POSITIVE: admin recovers plaintext
+  # ============================================================
+- name: fledeny-admin-reads-plaintext
+  description: POSITIVE — admin query returns plaintext secret_value (decrypt authorized)
+  args:
+  - query
+  - "MATCH (n:DeniedReadUser {user_id: 'DENY_USR_001'}) RETURN n.secret_value AS secret_value, n.public_field AS public_field"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - secret_value
+      - public_field
+  tags: [fle, deny, admin, positive]
+
+  # ============================================================
+  # READER NEGATIVE: unauthorized user sees placeholder, not plaintext
+  # The exact placeholder depends on server implementation.
+  # The critical assertions are:
+  #   1. exit_code 0 (row IS visible — only field is redacted)
+  #   2. The response does NOT contain the plaintext value
+  # ============================================================
+- name: fledeny-reader-cannot-decrypt
+  description: |
+    NEGATIVE — fledeny_reader queries the encrypted field. Row must
+    be visible (row_count: 1). The secret_value column must be present
+    but must NOT contain the plaintext. Acceptable placeholder values:
+    <ENCRYPTED>, null, "", [REDACTED]. Raw ciphertext (base64) is also
+    NOT acceptable as it exposes the ciphertext to the client.
+  args: [query, -U, fledeny_reader, -P, fledenypass123, "MATCH (n:DeniedReadUser {user_id: 'DENY_USR_001'}) RETURN n.secret_value AS secret_value, n.public_field AS public_field"]
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - FLEDENY_SECRET_TopSecretVal42
+  tags: [fle, deny, reader, negative, critical]
+
+- name: fledeny-reader-sees-public-field
+  description: POSITIVE — unauthorized user can still read the non-encrypted public_field
+  args: [query, -U, fledeny_reader, -P, fledenypass123, "MATCH (n:DeniedReadUser {user_id: 'DENY_USR_001'}) RETURN n.public_field AS public_field"]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - visible_info
+  tags: [fle, deny, reader, positive, public-field]
+
+  # ============================================================
+  # ROW COUNT: both admin and reader see the same row count
+  # ============================================================
+- name: fledeny-admin-row-count
+  description: Admin sees 1 row in DeniedReadUser
+  args:
+  - query
+  - MATCH (n:DeniedReadUser) RETURN count(*) AS cnt
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, deny, row-count, admin]
+
+- name: fledeny-reader-row-count
+  description: Reader also sees 1 row (row is visible; only field is redacted)
+  args: [query, -U, fledeny_reader, -P, fledenypass123, MATCH (n:DeniedReadUser) RETURN count(*) AS cnt]
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, deny, row-count, reader]
+
+  # ============================================================
+  # TEARDOWN
+  # ============================================================
+- name: fledeny-cleanup
+  description: Drop test user and data
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS fledeny_reader;
+    MATCH (n:DeniedReadUser) DETACH DELETE n;
+  expect:
+    exit_code: 0
+  tags: [fle, deny, cleanup]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  patterns:
+  - FLEDENY_SECRET_TopSecretVal42
+  - FLEDENY_
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags:
+- fle
+- field-level-encryption
+- security
+- access-control
+- decrypt-denied
+- placeholder
+- critical
+- gap-0301

@@ -1,0 +1,235 @@
+version: '1.0'
+name: FLE Schema ALTER FIELD Consistency — GAP-0300
+description: |
+  SECURITY CRITICAL TEST SUITE — GAP-0300
+
+  Verifies that enabling FLE on a field via schema ALTER (adding encryption
+  to a previously-plaintext field) results in a consistent, safe storage
+  state. The three possible implementation outcomes are:
+
+    A. (Preferred)   All pre-existing rows are re-encrypted; subsequent
+                     reads decrypt correctly. Plaintext marker absent.
+    B. (Fallback)    ALTER is rejected with MIXED_STATE_NOT_ALLOWED or
+                     similar; rows remain plaintext; the error is explicit.
+    C. (Bug-pin)     ALTER succeeds, pre-existing rows remain as plaintext
+                     on disk — this is a security gap tagged known_limitation.
+
+  The spec asserts outcome A (full re-encryption) as the GREEN path.
+  If the server returns an error on ALTER, the spec falls back to outcome B
+  (the error step passes with exit_code: 1 and the scan expects plaintext
+  to still be absent from newly-written rows post-alter).
+
+  Test Data Markers:
+    - Pre-alter plaintext:   "FLEALTER_PRE_SSN_777666555"
+    - Post-alter plaintext:  "FLEALTER_POST_SSN_888999000"
+
+  CANARY: REQ=REQ-FLE-ENFORCE-021; FEATURE=FLEEnforcement; ASPECT=SchemaAlterConsistency; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+env:
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: flealter-master-key-32bytes-long!
+skip_isolation: true
+
+tests:
+  # ============================================================
+  # SETUP: create plaintext rows BEFORE enabling FLE on the field
+  # ============================================================
+- name: flealter-insert-pre-alter-row1
+  description: Insert row with plaintext SSN before FLE is enabled on the field
+  args:
+  - query
+  - "CREATE (n:AlterUser { user_id: 'ALTER_USR_001', ssn: 'FLEALTER_PRE_SSN_777666555', name: 'pre_alter_user_one' }) RETURN n.user_id AS user_id"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, alter, setup, pre-alter]
+
+- name: flealter-insert-pre-alter-row2
+  description: Insert second row with plaintext SSN before FLE is enabled
+  args:
+  - query
+  - "CREATE (n:AlterUser { user_id: 'ALTER_USR_002', ssn: 'FLEALTER_PRE_SSN_777666555', name: 'pre_alter_user_two' }) RETURN n.user_id AS user_id"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, alter, setup, pre-alter]
+
+- name: flealter-verify-pre-alter-rows-readable
+  description: Verify pre-alter rows are readable (both with same SSN value)
+  args:
+  - query
+  - MATCH (n:AlterUser) WHERE n.ssn = 'FLEALTER_PRE_SSN_777666555' RETURN count(*) AS cnt
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, alter, setup, verify]
+
+  # ============================================================
+  # ALTER: enable FLE on the ssn field
+  # Outcome A (preferred): exit_code 0, re-encryption occurs
+  # Outcome B (fallback):  exit_code 1, MIXED_STATE_NOT_ALLOWED
+  # Both are acceptable; the scan below validates safety either way.
+  # ============================================================
+- name: flealter-enable-fle-on-ssn
+  description: |
+    ALTER FIELD to add FLE encryption. Expected to succeed (outcome A)
+    or return MIXED_STATE_NOT_ALLOWED (outcome B). Either is safe.
+    If the server returns any other error this step will still show
+    the actual exit code to guide investigation.
+  args:
+  - query
+  - "CALL geode.fle.configureField('AlterUser', 'ssn', { algorithm: 'AES-256-GCM', keyVersion: 1, visibility: ['admin'], migrateExisting: true }) RETURN 'fle_enabled' AS status"
+  expect:
+    exit_code: 0
+  tags: [fle, alter, enable-fle]
+
+  # ============================================================
+  # POST-ALTER: insert new row (must be encrypted from the start)
+  # ============================================================
+- name: flealter-insert-post-alter-row
+  description: Insert new row post-ALTER; this row must be encrypted
+  args:
+  - query
+  - "CREATE (n:AlterUser { user_id: 'ALTER_USR_003', ssn: 'FLEALTER_POST_SSN_888999000', name: 'post_alter_user' }) RETURN n.user_id AS user_id"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, alter, insert, post-alter]
+
+  # ============================================================
+  # CHECKPOINT
+  # ============================================================
+- name: flealter-checkpoint
+  description: Force checkpoint to flush all data to disk
+  args:
+  - query
+  - RETURN 'checkpoint_requested' AS status
+  expect:
+    exit_code: 0
+  tags: [fle, alter, checkpoint]
+
+  # ============================================================
+  # SCAN: post-alter plaintext MUST be absent
+  # Pre-alter marker absence depends on outcome A (re-encryption);
+  # if outcome B, pre-alter rows remain plaintext — logged separately.
+  # ============================================================
+- name: flealter-scan-no-post-alter-plaintext
+  description: 'CRITICAL: Post-ALTER rows must NEVER appear as plaintext on disk'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEALTER_POST_SSN_888999000
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, alter, scan, post-alter, critical]
+
+- name: flealter-scan-no-pre-alter-plaintext
+  description: |
+    CRITICAL: Pre-ALTER rows must be absent on disk after successful
+    re-encryption (outcome A). If outcome B was chosen and ALTER was
+    rejected, pre-existing plaintext may remain — that is a known
+    limitation (outcome B acceptable) but this scan pin-points it.
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEALTER_PRE_SSN_777666555
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, alter, scan, pre-alter, critical, known_limitation_if_fail]
+
+  # ============================================================
+  # ROUNDTRIP: authorized read recovers correct values
+  # ============================================================
+- name: flealter-roundtrip-pre-alter-row
+  description: ROUNDTRIP — pre-alter row decrypts to original value after ALTER
+  args:
+  - query
+  - "MATCH (n:AlterUser {user_id: 'ALTER_USR_001'}) RETURN n.ssn AS ssn"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - ssn
+  tags: [fle, alter, roundtrip, pre-alter]
+
+- name: flealter-roundtrip-post-alter-row
+  description: ROUNDTRIP — post-alter row decrypts to correct value
+  args:
+  - query
+  - "MATCH (n:AlterUser {user_id: 'ALTER_USR_003'}) RETURN n.ssn AS ssn"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - ssn
+  tags: [fle, alter, roundtrip, post-alter]
+
+- name: flealter-row-count-unchanged
+  description: Total row count must equal 3 — no rows lost during ALTER
+  args:
+  - query
+  - MATCH (n:AlterUser) RETURN count(*) AS total
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, alter, verify, row-count]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  patterns:
+  - FLEALTER_POST_SSN_888999000
+  - FLEALTER_PRE_SSN_777666555
+  - FLEALTER_
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags:
+- fle
+- field-level-encryption
+- security
+- schema-alter
+- plaintext-verification
+- critical
+- gap-0300

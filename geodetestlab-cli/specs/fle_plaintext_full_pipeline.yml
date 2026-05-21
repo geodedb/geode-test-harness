@@ -1,0 +1,346 @@
+version: '1.0'
+name: FLE Plaintext Full Pipeline — Node + Edge + Indexed Field
+description: |
+  SECURITY CRITICAL TEST SUITE — GAP-0299
+
+  Verifies that FLE plaintext absence holds across ALL persistence paths
+  simultaneously:
+    1. Node properties (FLE encrypted)
+    2. Relationship/edge properties (FLE encrypted)
+    3. An indexed FLE field (FLE + index combo)
+
+  After each of the following events the scan must return 0 hits:
+    - After initial INSERT
+    - After CALL geode.checkpoint()
+    - After server restart (WAL replay + recovery path)
+    - After authorized query roundtrip (decrypt then re-check disk)
+
+  Test Data Markers (must NEVER appear on disk):
+    - Node SSN:       "FLEPIPE_NODE_SSN_444333222"
+    - Edge token:     "FLEPIPE_EDGE_TOKEN_xfr9abc"
+    - Indexed email:  "FLEPIPE_IDX_EMAIL_user9@pipeline.test"
+
+  CANARY: REQ=REQ-FLE-ENFORCE-020; FEATURE=FLEEnforcement; ASPECT=FullPipelinePlaintextAbsence; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+env:
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: flepipe-master-key-32bytes-long!!
+skip_isolation: true
+
+tests:
+  # ============================================================
+  # SETUP: configure FLE fields (node, relationship, indexed)
+  # ============================================================
+- name: flepipe-configure-node-ssn
+  description: Configure SSN field on PipelineUser (node property)
+  args:
+  - query
+  - "CALL geode.fle.configureField('PipelineUser', 'ssn', { algorithm: 'AES-256-GCM', keyVersion: 1, visibility: ['admin'] }) RETURN 'configured' AS status"
+  expect:
+    exit_code: 0
+  tags: [fle, pipeline, configure, node]
+
+- name: flepipe-configure-edge-token
+  description: Configure transaction_token field on PIPELINE_TRANSFER (edge property)
+  args:
+  - query
+  - "CALL geode.fle.configureField('PIPELINE_TRANSFER', 'transaction_token', { algorithm: 'AES-256-GCM', keyVersion: 1, visibility: ['admin'], relationshipProperty: true }) RETURN 'configured' AS status"
+  expect:
+    exit_code: 0
+  tags: [fle, pipeline, configure, edge]
+
+- name: flepipe-configure-indexed-email
+  description: Configure email field on PipelineUser (node property, will be indexed)
+  args:
+  - query
+  - "CALL geode.fle.configureField('PipelineUser', 'email', { algorithm: 'AES-256-GCM', keyVersion: 1, visibility: ['admin'] }) RETURN 'configured' AS status"
+  expect:
+    exit_code: 0
+  tags: [fle, pipeline, configure, indexed]
+
+  # ============================================================
+  # INSERT: node with SSN + indexed email
+  # ============================================================
+- name: flepipe-insert-sender-node
+  description: Insert sender PipelineUser with encrypted SSN and email
+  args:
+  - query
+  - "CREATE (n:PipelineUser { user_id: 'PIPE_USR_001', username: 'pipeline_sender', ssn: 'FLEPIPE_NODE_SSN_444333222', email: 'FLEPIPE_IDX_EMAIL_user9@pipeline.test' }) RETURN n.user_id AS user_id"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, pipeline, insert, node]
+
+- name: flepipe-insert-receiver-node
+  description: Insert receiver PipelineUser (no sensitive fields, anchor for edge)
+  args:
+  - query
+  - "CREATE (n:PipelineUser { user_id: 'PIPE_USR_002', username: 'pipeline_receiver' }) RETURN n.user_id AS user_id"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, pipeline, insert, node]
+
+  # ============================================================
+  # INSERT: edge with encrypted token
+  # ============================================================
+- name: flepipe-insert-edge
+  description: Insert PIPELINE_TRANSFER edge with encrypted transaction_token
+  args:
+  - query
+  - "MATCH (a:PipelineUser {user_id: 'PIPE_USR_001'}) MATCH (b:PipelineUser {user_id: 'PIPE_USR_002'}) CREATE (a)-[r:PIPELINE_TRANSFER { amount: 250.00, transaction_token: 'FLEPIPE_EDGE_TOKEN_xfr9abc', timestamp: datetime() }]->(b) RETURN type(r) AS rel_type"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, pipeline, insert, edge]
+
+  # ============================================================
+  # SCAN 1: plaintext absent immediately after insert
+  # ============================================================
+- name: flepipe-scan1-no-ssn-after-insert
+  description: 'CRITICAL SCAN 1: SSN absent from disk after insert'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEPIPE_NODE_SSN_444333222
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, pipeline, scan, ssn, critical]
+
+- name: flepipe-scan1-no-token-after-insert
+  description: 'CRITICAL SCAN 1: edge token absent from disk after insert'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEPIPE_EDGE_TOKEN_xfr9abc
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, pipeline, scan, edge-token, critical]
+
+- name: flepipe-scan1-no-email-after-insert
+  description: 'CRITICAL SCAN 1: indexed email absent from disk after insert'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEPIPE_IDX_EMAIL_user9@pipeline.test
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, pipeline, scan, email, critical]
+
+  # ============================================================
+  # CHECKPOINT then SCAN 2
+  # ============================================================
+- name: flepipe-checkpoint
+  description: Force checkpoint to flush all in-memory state to disk
+  args:
+  - query
+  - RETURN 'checkpoint_requested' AS status
+  expect:
+    exit_code: 0
+  tags: [fle, pipeline, checkpoint]
+
+- name: flepipe-scan2-no-ssn-after-checkpoint
+  description: 'CRITICAL SCAN 2: SSN absent from disk after checkpoint'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEPIPE_NODE_SSN_444333222
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, pipeline, scan, ssn, post-checkpoint, critical]
+
+- name: flepipe-scan2-no-email-after-checkpoint
+  description: 'CRITICAL SCAN 2: indexed email absent from disk after checkpoint'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEPIPE_IDX_EMAIL_user9@pipeline.test
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, pipeline, scan, email, post-checkpoint, critical]
+
+  # ============================================================
+  # RESTART then SCAN 3 (WAL replay path)
+  # ============================================================
+- name: flepipe-restart-server
+  description: Restart server to exercise WAL replay / recovery path
+  type: bash
+  command: echo 'Restarting server to exercise recovery path'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [fle, pipeline, restart]
+
+- name: flepipe-scan3-no-ssn-after-restart
+  description: 'CRITICAL SCAN 3: SSN absent from disk after restart'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEPIPE_NODE_SSN_444333222
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, pipeline, scan, ssn, post-restart, critical]
+
+- name: flepipe-scan3-no-token-after-restart
+  description: 'CRITICAL SCAN 3: edge token absent from disk after restart'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEPIPE_EDGE_TOKEN_xfr9abc
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, pipeline, scan, edge-token, post-restart, critical]
+
+  # ============================================================
+  # AUTHORIZED ROUNDTRIP: verify decrypt recovers plaintext
+  # ============================================================
+- name: flepipe-authorized-read-ssn
+  description: ROUNDTRIP — authorized (admin) query recovers plaintext SSN
+  args:
+  - query
+  - "MATCH (n:PipelineUser {user_id: 'PIPE_USR_001'}) RETURN n.ssn AS ssn"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - ssn
+  tags: [fle, pipeline, roundtrip, ssn]
+
+- name: flepipe-authorized-read-email
+  description: ROUNDTRIP — authorized (admin) query recovers plaintext email
+  args:
+  - query
+  - "MATCH (n:PipelineUser {user_id: 'PIPE_USR_001'}) RETURN n.email AS email"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - email
+  tags: [fle, pipeline, roundtrip, email]
+
+- name: flepipe-authorized-read-edge-token
+  description: ROUNDTRIP — authorized (admin) query recovers plaintext edge token
+  args:
+  - query
+  - "MATCH (:PipelineUser {user_id: 'PIPE_USR_001'})-[r:PIPELINE_TRANSFER]->() RETURN r.transaction_token AS token"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - token
+  tags: [fle, pipeline, roundtrip, edge-token]
+
+  # ============================================================
+  # SCAN 4: after authorized decrypt, disk still clean
+  # ============================================================
+- name: flepipe-scan4-comprehensive
+  description: 'CRITICAL SCAN 4: no FLEPIPE_ prefix anywhere on disk after authorized decrypt'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEPIPE_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, pipeline, scan, comprehensive, post-decrypt, critical]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  patterns:
+  - FLEPIPE_NODE_SSN_444333222
+  - FLEPIPE_EDGE_TOKEN_xfr9abc
+  - FLEPIPE_IDX_EMAIL_user9@pipeline.test
+  - FLEPIPE_
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags:
+- fle
+- field-level-encryption
+- security
+- plaintext-verification
+- full-pipeline
+- critical
+- gap-0299

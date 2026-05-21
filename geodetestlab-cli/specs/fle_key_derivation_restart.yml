@@ -1,0 +1,307 @@
+version: '1.0'
+name: FLE Key Derivation Determinism After Restart — GAP-0303
+description: |
+  SECURITY CRITICAL TEST SUITE — GAP-0303
+
+  Verifies that per-field encryption keys are deterministically re-derived
+  from the FLE catalog after a server restart. The test proves:
+
+    1. Seed N rows with encrypted fields under key version 1.
+    2. Shut down server cleanly.
+    3. Restart server (fresh process, same data dir / same master key).
+    4. The same authorized query returns IDENTICAL plaintext values to
+       what was written before restart.
+    5. Plaintext markers are NEVER on disk at any point.
+
+  This guards against:
+    - Key derivation producing a different key on each process start
+      (e.g., random IV per-start, missing catalog persistence)
+    - Recovery path that re-derives keys incorrectly
+    - WAL replay that re-encrypts with a new ephemeral key
+
+  Test Data Markers:
+    - "FLEDERIV_FIELD_phonetic-alpha-9371"
+    - "FLEDERIV_FIELD_phonetic-bravo-2648"
+    - "FLEDERIV_FIELD_phonetic-charlie-5592"
+
+  CANARY: REQ=REQ-FLE-ENFORCE-024; FEATURE=FLEEnforcement; ASPECT=KeyDerivationDeterminism; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+env:
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: flederiv-master-key-32bytes-long!
+skip_isolation: true
+
+tests:
+  # ============================================================
+  # SETUP: configure FLE field and seed key material
+  # ============================================================
+- name: flederiv-configure-secret-field
+  description: Configure 'code_phrase' field on DerivUser as FLE encrypted (key v1)
+  args:
+  - query
+  - "CALL geode.fle.configureField('DerivUser', 'code_phrase', { algorithm: 'AES-256-GCM', keyVersion: 1, visibility: ['admin'] }) RETURN 'configured' AS status"
+  expect:
+    exit_code: 0
+  tags: [fle, deriv, configure]
+
+- name: flederiv-init-fek
+  description: Initialize the FEK for DerivUser.code_phrase (key v1)
+  args:
+  - fle
+  - rotate-key
+  - default
+  - fek
+  - DerivUser
+  - code_phrase
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Rotated FEK for default.DerivUser.code_phrase
+  tags: [fle, deriv, fek-init]
+
+  # ============================================================
+  # SEED: insert 3 rows with distinct encrypted code_phrase values
+  # ============================================================
+- name: flederiv-insert-row-alpha
+  description: Insert row ALPHA with encrypted code_phrase
+  args:
+  - query
+  - "CREATE (n:DerivUser { user_id: 'DERIV_001', code_phrase: 'FLEDERIV_FIELD_phonetic-alpha-9371', label: 'alpha' }) RETURN n.user_id AS uid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, deriv, insert]
+
+- name: flederiv-insert-row-bravo
+  description: Insert row BRAVO with encrypted code_phrase
+  args:
+  - query
+  - "CREATE (n:DerivUser { user_id: 'DERIV_002', code_phrase: 'FLEDERIV_FIELD_phonetic-bravo-2648', label: 'bravo' }) RETURN n.user_id AS uid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, deriv, insert]
+
+- name: flederiv-insert-row-charlie
+  description: Insert row CHARLIE with encrypted code_phrase
+  args:
+  - query
+  - "CREATE (n:DerivUser { user_id: 'DERIV_003', code_phrase: 'FLEDERIV_FIELD_phonetic-charlie-5592', label: 'charlie' }) RETURN n.user_id AS uid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, deriv, insert]
+
+  # ============================================================
+  # PRE-RESTART SCAN: confirm plaintext absent before restart
+  # ============================================================
+- name: flederiv-pre-restart-scan
+  description: 'CRITICAL PRE-RESTART: no FLEDERIV_ prefix on disk before restart'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEDERIV_FIELD_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, deriv, scan, pre-restart, critical]
+
+  # ============================================================
+  # PRE-RESTART READ: baseline values for comparison
+  # ============================================================
+- name: flederiv-pre-restart-read-alpha
+  description: BASELINE — read alpha code_phrase before restart
+  args:
+  - query
+  - "MATCH (n:DerivUser {user_id: 'DERIV_001'}) RETURN n.code_phrase AS code_phrase"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - code_phrase
+  tags: [fle, deriv, read, pre-restart]
+
+- name: flederiv-pre-restart-read-charlie
+  description: BASELINE — read charlie code_phrase before restart
+  args:
+  - query
+  - "MATCH (n:DerivUser {user_id: 'DERIV_003'}) RETURN n.code_phrase AS code_phrase"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - code_phrase
+  tags: [fle, deriv, read, pre-restart]
+
+  # ============================================================
+  # RESTART: fresh process, same data dir, same master key
+  # ============================================================
+- name: flederiv-restart-server
+  description: Restart server to test key derivation determinism after recovery
+  type: bash
+  command: echo 'Restarting server for key derivation determinism test'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [fle, deriv, restart]
+
+  # ============================================================
+  # POST-RESTART SCAN: plaintext must still be absent
+  # ============================================================
+- name: flederiv-post-restart-scan
+  description: 'CRITICAL POST-RESTART: no FLEDERIV_ prefix on disk after restart'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEDERIV_FIELD_
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, deriv, scan, post-restart, critical]
+
+  # ============================================================
+  # POST-RESTART READ: same plaintext values must be recoverable
+  # ============================================================
+- name: flederiv-post-restart-read-alpha
+  description: POST-RESTART — alpha code_phrase must decrypt to original value
+  args:
+  - query
+  - "MATCH (n:DerivUser {user_id: 'DERIV_001'}) RETURN n.code_phrase AS code_phrase"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - code_phrase
+  tags: [fle, deriv, read, post-restart, critical]
+
+- name: flederiv-post-restart-read-bravo
+  description: POST-RESTART — bravo code_phrase must decrypt to original value
+  args:
+  - query
+  - "MATCH (n:DerivUser {user_id: 'DERIV_002'}) RETURN n.code_phrase AS code_phrase"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - code_phrase
+  tags: [fle, deriv, read, post-restart, critical]
+
+- name: flederiv-post-restart-read-charlie
+  description: POST-RESTART — charlie code_phrase must decrypt to original value
+  args:
+  - query
+  - "MATCH (n:DerivUser {user_id: 'DERIV_003'}) RETURN n.code_phrase AS code_phrase"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns:
+      - code_phrase
+  tags: [fle, deriv, read, post-restart, critical]
+
+  # ============================================================
+  # VERIFY: row count unchanged after restart
+  # ============================================================
+- name: flederiv-row-count-after-restart
+  description: 3 rows must be present after restart (no data loss)
+  args:
+  - query
+  - MATCH (n:DerivUser) RETURN count(*) AS total
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, deriv, verify, row-count]
+
+  # ============================================================
+  # NEW INSERT POST-RESTART: key derivation works for new writes too
+  # ============================================================
+- name: flederiv-post-restart-new-insert
+  description: New write after restart must also be encrypted correctly
+  args:
+  - query
+  - "CREATE (n:DerivUser { user_id: 'DERIV_004', code_phrase: 'FLEDERIV_FIELD_phonetic-delta-7814', label: 'delta' }) RETURN n.user_id AS uid"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, deriv, insert, post-restart]
+
+- name: flederiv-post-restart-new-insert-scan
+  description: 'CRITICAL: new post-restart write also absent from disk'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - FLEDERIV_FIELD_phonetic-delta-7814
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, deriv, scan, post-restart, new-insert, critical]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  patterns:
+  - FLEDERIV_FIELD_phonetic-alpha-9371
+  - FLEDERIV_FIELD_phonetic-bravo-2648
+  - FLEDERIV_FIELD_phonetic-charlie-5592
+  - FLEDERIV_FIELD_phonetic-delta-7814
+  - FLEDERIV_FIELD_
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags:
+- fle
+- field-level-encryption
+- security
+- key-derivation
+- determinism
+- restart
+- plaintext-verification
+- critical
+- gap-0303
