@@ -1,0 +1,294 @@
+version: '1.0'
+name: RBAC users + roles + per-graph grants — audit emission (pre-restart matrix)
+description: |
+  Exercises the RBAC surface that is end-to-end stable in geode
+  today: built-in roles, custom roles, per-graph READ grants, and
+  the audit records emitted by
+  src/security/auth_graph_manager.zig:786 logSecurityGraphMutation.
+
+  Audit emission inventory (verified from emitter source + JSONL trace):
+
+    CREATE USER (non-admin)  → CREATE_ROLE (lazy built-in role node
+                                registration) + ASSIGN_ROLE
+                                (binding user to role)
+    CREATE USER (admin)      → NO AUDIT (admin path skips
+                                ASSIGN_ROLE because is_superuser=true
+                                short-circuits role assignment in
+                                writerCreateUser at
+                                server_init.zig:723-731)
+    CREATE ROLE              → CREATE_ROLE (role name carried in
+                                audit details.username)
+    GRANT READ ON GRAPH ...  → GRANT_GRAPH_PERMISSION (graph_name
+                                in audit details.username, not the
+                                grantee username — see
+                                auth_graph_manager.zig:1037)
+
+  KNOWN PRODUCT BUG (pinned by the absence of a restart phase):
+
+    Any GRANT statement (READ / WRITE / SCHEMA / ALL — verified
+    against the current binary) writes a GraphGrant record to the
+    `__geode_security` graph whose HMAC fails to verify on next
+    server startup. The startup path in
+    src/security/auth_graph_manager.zig verifyGraphGrantRecords
+    returns error.AuthChainTampered → error.RecordHmacMismatch,
+    which causes the auth subsystem to refuse ALL authentications
+    (including the built-in geode admin) until the data dir is
+    wiped. Reproducer (manual):
+
+      CREATE USER ...; CREATE GRAPH g; GRANT READ ON GRAPH g TO ...;
+      SIGTERM server; restart against same data_dir → admin auth
+      hangs / times out, alice auth times out, no SHOW USERS works.
+
+    The corresponding GPS policy / user / role persistence DOES
+    survive restart cleanly when GRANT statements are absent (see
+    gps_persistence_*.yml specs which pass restart cycles 100%).
+
+    This spec therefore exercises CREATE USER / CREATE ROLE /
+    CREATE GRAPH / GRANT / SHOW USERS / SHOW ROLES and their audit
+    emissions WITHOUT a restart. When the HMAC chain bug is fixed
+    a sibling spec rbac_users_roles_grants_persistence.yml should
+    be added with the restart_server checkpoint and post-restart
+    matrix.
+
+  KNOWN LIMITATIONS (in addition to the HMAC chain bug above):
+
+    1. Per-graph READ grants only widen the BIND check, not
+       data-read or data-write enforcement
+       (quic_connection_handler.zig:3382 mutation gate uses global
+       role + GPS policy only). bob@readonly cannot write anywhere
+       regardless of grants.
+
+    2. ALTER USER SET ROLE to a custom role name silently falls
+       back to .User (handleUserAssignRole accepts the custom name
+       in g_custom_roles but does not bind it to the user's Role
+       enum).
+
+    3. Admin user creation emits no audit record (writerCreateUser
+       admin branch never calls assignUserRole, so no
+       logSecurityGraphMutation fires). This spec creates alice as
+       admin and asserts the audit log does NOT contain an
+       ASSIGN_ROLE for her username.
+
+  Matrix:
+    Users:
+      rbac_admin_alice   — admin (data-modify allowed)
+      rbac_readonly_bob  — readonly (denied data-modify, gets
+                           BIND-via-grant on rbac_finance)
+      rbac_custom_carol  — readwrite (data-modify allowed)
+    Custom role:
+      rbac_data_steward  — appears in SHOW ROLES; not bound to any
+                           user (gap #2)
+    Per-graph grant:
+      GRANT READ ON GRAPH rbac_finance TO rbac_readonly_bob
+
+  CANARY: REQ=REQ-RBAC-AUDIT-001; FEATURE="RBAC End-to-End Audit"; ASPECT=BlackBoxMatrix; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, info]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_AUDIT_LOG_PATH: /tmp/rbac-audit.jsonl
+      GEODE_DISABLE_AUDIT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: rbac-preflight-audit-truncate
+  description: Reset the audit log so we observe only this run's records.
+  type: bash
+  command: ': > /tmp/rbac-audit.jsonl 2>/dev/null || true'
+  expect:
+    exit_code: 0
+  tags: [rbac, setup]
+
+- name: rbac-create-finance-graph
+  description: Create a named graph to scope the per-graph READ grant against.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH rbac_finance]
+  expect:
+    exit_code: 0
+  tags: [rbac, setup]
+
+- name: rbac-create-admin-alice
+  description: |
+    Create alice with admin role. The writerCreateUser admin branch
+    skips ASSIGN_ROLE — no audit record is emitted for alice
+    (gap #3). Verified by rbac-verify-no-audit-for-admin-create below.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_admin_alice SET PASSWORD 'RbacAlice-1234-Strong' ROLE admin]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_admin_alice]
+  tags: [rbac, setup]
+
+- name: rbac-create-readonly-bob
+  description: |
+    Create bob with built-in readonly role. Emits CREATE_ROLE
+    (readonly) + ASSIGN_ROLE(rbac_readonly_bob).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_readonly_bob SET PASSWORD 'RbacBob-1234-Strong' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_readonly_bob]
+  tags: [rbac, setup]
+
+- name: rbac-create-role-steward
+  description: |
+    Create the custom role rbac_data_steward. Appears in SHOW ROLES
+    but cannot be bound to a user at create time (gap #2). Pinned
+    here to prove CREATE_ROLE audit emission.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE ROLE rbac_data_steward]
+  expect:
+    exit_code: 0
+  tags: [rbac, setup]
+
+- name: rbac-create-readwrite-carol
+  description: |
+    Create carol with built-in readwrite role. Used to prove a
+    non-admin user can write data.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_custom_carol SET PASSWORD 'RbacCarol-1234-Strong' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_custom_carol]
+  tags: [rbac, setup]
+
+- name: rbac-grant-bob-read-finance
+  description: |
+    GRANT READ ON GRAPH rbac_finance TO rbac_readonly_bob.
+
+    NOTE: per the HMAC chain bug pinned in the spec description, the
+    presence of this grant will cause the server to fail
+    authentication on the next restart. This is why the spec has no
+    restart phase. The audit emission of GRANT_GRAPH_PERMISSION is
+    still verified below.
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT READ ON GRAPH rbac_finance TO rbac_readonly_bob]
+  expect:
+    exit_code: 0
+    stdout_contains: [Granted]
+  tags: [rbac, setup, grant]
+
+- name: rbac-verify-audit-setup-emissions
+  description: |
+    POSITIVE — every non-admin user creation emits ASSIGN_ROLE; the
+    custom role emits CREATE_ROLE; the grant emits
+    GRANT_GRAPH_PERMISSION (graph_name in details.username).
+  type: bash
+  command: |
+    grep -F 'ASSIGN_ROLE' /tmp/rbac-audit.jsonl | grep -F 'rbac_readonly_bob' && \
+    grep -F 'ASSIGN_ROLE' /tmp/rbac-audit.jsonl | grep -F 'rbac_custom_carol' && \
+    grep -F 'CREATE_ROLE' /tmp/rbac-audit.jsonl | grep -F 'rbac_data_steward' && \
+    grep -F 'GRANT_GRAPH_PERMISSION' /tmp/rbac-audit.jsonl | grep -F 'rbac_finance'
+  expect:
+    exit_code: 0
+  tags: [rbac, phase1, positive, audit]
+
+- name: rbac-verify-no-audit-for-admin-create
+  description: |
+    NEGATIVE — admin user creation emits no ASSIGN_ROLE for alice
+    (gap #3). Pinning current behavior; will flip when
+    writerCreateUser emits for admins.
+  type: bash
+  command: |
+    ! grep -F 'ASSIGN_ROLE' /tmp/rbac-audit.jsonl | grep -F 'rbac_admin_alice'
+  expect:
+    exit_code: 0
+  tags: [rbac, phase1, negative, audit, known_limitation]
+
+- name: phase1-show-users
+  description: POSITIVE — SHOW USERS lists all three test users.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW USERS]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_admin_alice, rbac_readonly_bob, rbac_custom_carol]
+  tags: [rbac, phase1, positive, show]
+
+- name: phase1-show-roles
+  description: POSITIVE — SHOW ROLES lists built-in + custom rbac_data_steward.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW ROLES]
+  expect:
+    exit_code: 0
+    stdout_contains: [admin, readonly, readwrite, rbac_data_steward]
+  tags: [rbac, phase1, positive, show]
+
+- name: phase1-bob-readonly-cannot-write
+  description: |
+    NEGATIVE — bob (readonly) cannot write anywhere, including
+    rbac_finance where he has a per-graph READ grant.  Per gap #1,
+    per-graph READ grants do not confer WRITE.
+  args: [query, -U, rbac_readonly_bob, -P, RbacBob-1234-Strong, '-']
+  stdin: |
+    USE GRAPH rbac_finance;
+    CREATE (n:RbacBobShouldFail {v: 1}) RETURN n;
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [rbac, phase1, negative, bob, known_limitation, gap1]
+
+- name: phase1-alice-admin-can-write
+  description: POSITIVE — alice (admin) can write to rbac_finance.
+  args: [query, -U, rbac_admin_alice, -P, RbacAlice-1234-Strong, '-']
+  stdin: |
+    USE GRAPH rbac_finance;
+    CREATE (n:RbacAliceFinance {v: 1}) RETURN n;
+  expect:
+    exit_code: 0
+    stdout_contains: [RbacAliceFinance]
+    stdout_not_contains: ['42501']
+  tags: [rbac, phase1, positive, alice]
+
+- name: phase1-carol-readwrite-can-write
+  description: POSITIVE — carol (readwrite) can write outside any grant.
+  args: [query, -U, rbac_custom_carol, -P, RbacCarol-1234-Strong, 'CREATE (n:RbacCarolWrite {v: 1}) RETURN n']
+  expect:
+    exit_code: 0
+    stdout_contains: [RbacCarolWrite]
+    stdout_not_contains: ['42501']
+  tags: [rbac, phase1, positive, carol]
+
+- name: rbac-cleanup
+  description: |
+    Tear down test users / role / graph. Cleanup MUST run before
+    server shutdown so that the next spec run starts clean — but
+    even without it, `cleanup: true` in the CLI block forces a
+    fresh data_dir on each invocation.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rbac_admin_alice;
+    DROP USER IF EXISTS rbac_readonly_bob;
+    DROP USER IF EXISTS rbac_custom_carol;
+    DROP ROLE IF EXISTS rbac_data_steward;
+    DROP GRAPH IF EXISTS rbac_finance;
+  expect:
+    exit_code: 0
+  tags: [rbac, teardown]
+
+tags:
+- rbac
+- users
+- roles
+- grants
+- audit
+- security
+- comprehensive
+- known_limitation
