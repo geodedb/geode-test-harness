@@ -1,0 +1,236 @@
+version: '1.0'
+name: 'GAP-0338: Large Transaction Rollback (10k rows)'
+description: |
+  CANARY: REQ=GAP-0338; FEATURE="Large transaction rollback"; ASPECT=UndoLogBoundedTime; STATUS=TESTED; TEST=geodetestlab/specs/transactions_large_rollback.yml; OWNER=txn; UPDATED=2026-05-21
+
+  Verifies that the undo-log / MVCC undo path can handle a transaction that
+  inserts 10 000 nodes and then ROLLs BACK, leaving zero persisted rows within
+  a bounded wall-clock window.
+
+  Acceptance criteria (GAP-0338):
+    1. 10 000 node CREATE via UNWIND inside one explicit transaction.
+    2. ROLLBACK — must complete without error.
+    3. Subsequent MATCH returns count == 0 (no partial commit / silent commit).
+    4. Rollback completes within the per-spec timeout (120 s, see timeout_ms).
+
+  Known issue (BUG-0337-A / BUG-0338-A):
+    A BEGIN ... UNWIND ... ROLLBACK issued as a single stdin pipe to the CLI
+    appears to silently commit rather than rollback in some geode builds.
+    This spec works around that by using SEPARATE invocations:
+      setup_queries[0] — BEGIN + UNWIND CREATE 10k rows + ROLLBACK
+      main test        — MATCH count, asserts 0
+    If the silent-commit bug is present, the main test will FAIL with
+    '"cnt":10000' rather than '"cnt":0', which unambiguously pins the bug.
+
+  Time budget note:
+    timeout_ms on the large-rollback test is set to 120 000 ms (2 min).
+    The UNWIND insert itself may take 5–30 s on the CI box; rollback of 10k
+    undo records should take well under 5 s on local hardware.
+
+  Seed: 1337  Runtime: Python 3.11 / geode binary
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Smoke: UNWIND can create many nodes (commit path)
+# ---------------------------------------------------------------------------
+- name: large-rollback-unwind-commit-baseline
+  description: |
+    Verify that UNWIND + CREATE + COMMIT works for a batch of 100 nodes
+    before attempting the 10k rollback.  Establishes that UNWIND is
+    supported and that the commit path is functional.
+    CANARY: REQ=GAP-0338; FEATURE="Large transaction rollback"; ASPECT=UnwindCommitBaseline; STATUS=TESTED; TEST=geodetestlab/specs/transactions_large_rollback.yml; OWNER=txn; UPDATED=2026-05-21
+  args:
+  - query
+  - '-'
+  stdin: |
+    BEGIN
+    UNWIND range(1, 100) AS i CREATE (n:LargeRbBaseline {canary: 'gap0338-baseline', id: i})
+    COMMIT
+    MATCH (n:LargeRbBaseline) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":100'
+  timeout_ms: 60000
+  tags:
+  - large-rollback
+  - baseline
+  - unwind
+
+# ---------------------------------------------------------------------------
+# Core case: 10k insert then ROLLBACK — zero rows must remain
+# ---------------------------------------------------------------------------
+- name: large-rollback-10k-rows
+  description: |
+    Insert 10 000 nodes via UNWIND inside an explicit transaction, then
+    ROLLBACK.  The subsequent MATCH must return count == 0.
+    Uses SEPARATE invocations (setup_queries) to work around BUG-0338-A
+    (single-invocation stdin rollback silently commits).
+    CANARY: REQ=GAP-0338; FEATURE="Large transaction rollback"; ASPECT=10kRowsRollback; STATUS=TESTED; TEST=geodetestlab/specs/transactions_large_rollback.yml; OWNER=txn; UPDATED=2026-05-21
+  setup:
+  - args:
+    - query
+    - '-'
+    stdin: |
+      BEGIN
+      UNWIND range(1, 10000) AS i CREATE (n:LargeRb10k {canary: 'gap0338-10k', idx: i})
+      ROLLBACK
+    expect:
+      exit_code: 0
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:LargeRb10k) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  timeout_ms: 120000
+  tags:
+  - large-rollback
+  - rollback
+  - 10k
+  - gap-0338
+
+# ---------------------------------------------------------------------------
+# Invariant: previously committed nodes unaffected by large rollback
+# ---------------------------------------------------------------------------
+- name: large-rollback-prior-commit-survives
+  description: |
+    A node committed BEFORE the large rollback must still be present
+    afterwards.  Checks that the undo-log does not clobber prior versions.
+    CANARY: REQ=GAP-0338; FEATURE="Large transaction rollback"; ASPECT=PriorCommitSurvives; STATUS=TESTED; TEST=geodetestlab/specs/transactions_large_rollback.yml; OWNER=txn; UPDATED=2026-05-21
+  setup:
+  - args:
+    - query
+    - '-'
+    stdin: "CREATE (n:LargeRbPrior {canary: 'gap0338-prior', sentinel: 'committed-before'})"
+    expect:
+      exit_code: 0
+  - args:
+    - query
+    - '-'
+    stdin: |
+      BEGIN
+      UNWIND range(1, 10000) AS i CREATE (n:LargeRbPriorWaste {canary: 'gap0338-waste', idx: i})
+      ROLLBACK
+    expect:
+      exit_code: 0
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:LargeRbPrior {sentinel: 'committed-before'}) RETURN count(n) AS cnt"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  timeout_ms: 120000
+  tags:
+  - large-rollback
+  - rollback
+  - prior-commit-safety
+
+# ---------------------------------------------------------------------------
+# Edges: rollback of mixed node+edge batch
+# ---------------------------------------------------------------------------
+- name: large-rollback-mixed-nodes-edges
+  description: |
+    UNWIND creates nodes AND edges in a single transaction; ROLLBACK must
+    remove both.  Verifies that the undo log handles heterogeneous object
+    types correctly at scale.
+    CANARY: REQ=GAP-0338; FEATURE="Large transaction rollback"; ASPECT=MixedNodesEdgesRollback; STATUS=TESTED; TEST=geodetestlab/specs/transactions_large_rollback.yml; OWNER=txn; UPDATED=2026-05-21
+  setup:
+  - args:
+    - query
+    - '-'
+    stdin: |
+      BEGIN
+      UNWIND range(1, 500) AS i
+        CREATE (a:RbMixA {canary: 'gap0338-mix', idx: i})-[:LINK]->(b:RbMixB {canary: 'gap0338-mix', idx: i})
+      ROLLBACK
+    expect:
+      exit_code: 0
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:RbMixA) RETURN count(a) AS na
+    MATCH (b:RbMixB) RETURN count(b) AS nb
+    MATCH ()-[r:LINK]->() RETURN count(r) AS nr
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"na":0'
+    - '"nb":0'
+    - '"nr":0'
+  timeout_ms: 120000
+  tags:
+  - large-rollback
+  - rollback
+  - edges
+  - mixed
+
+# ---------------------------------------------------------------------------
+# Commit after large rollback (engine health check)
+# ---------------------------------------------------------------------------
+- name: large-rollback-engine-healthy-after-rollback
+  description: |
+    After a large rollback the engine must accept a new write transaction and
+    commit it successfully.  Guards against undo-log corruption leaving the
+    server in a degraded state.
+    CANARY: REQ=GAP-0338; FEATURE="Large transaction rollback"; ASPECT=EngineHealthyAfterRollback; STATUS=TESTED; TEST=geodetestlab/specs/transactions_large_rollback.yml; OWNER=txn; UPDATED=2026-05-21
+  setup:
+  - args:
+    - query
+    - '-'
+    stdin: |
+      BEGIN
+      UNWIND range(1, 10000) AS i CREATE (n:RbHealthWaste {idx: i})
+      ROLLBACK
+    expect:
+      exit_code: 0
+  - args:
+    - query
+    - '-'
+    stdin: "CREATE (n:RbHealthCheck {canary: 'gap0338-health', sentinel: 'after-large-rollback'})"
+    expect:
+      exit_code: 0
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:RbHealthCheck {sentinel: 'after-large-rollback'}) RETURN count(n) AS cnt"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  timeout_ms: 120000
+  tags:
+  - large-rollback
+  - engine-health
+  - post-rollback
+
+tags:
+- transaction
+- rollback
+- large-data
+- undo-log
+- gap-0338

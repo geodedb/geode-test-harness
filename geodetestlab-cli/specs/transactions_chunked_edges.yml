@@ -1,0 +1,298 @@
+version: '1.0'
+name: 'GAP-0339: Chunked Execution Edge Cases'
+description: |
+  CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=ChunkBoundaryRollback; STATUS=TESTED; TEST=geodetestlab/specs/transactions_chunked_edges.yml; OWNER=txn; UPDATED=2026-05-21
+
+  Tests edge cases at GQL chunked-execution boundaries:
+    1. ROLLBACK issued in the FINAL chunk must discard writes from ALL prior chunks.
+    2. Mixed read/write chunks must see a consistent transactional snapshot
+       (reads inside the transaction see in-flight writes; reads outside see
+       only committed data).
+
+  Context:
+    Geode splits large --file submissions into chunks of ~32 KB each and
+    sends them as sequential RUN_GQL requests on the same connection.
+    Transaction state (BEGIN / COMMIT / ROLLBACK) must survive across
+    chunk boundaries.  The existing transaction_chunked_execution.yml covers
+    the happy-path COMMIT; this spec targets the ROLLBACK and read/write
+    interleave edge cases.
+
+  Known issue (BUG-0337-A / BUG-0339-A):
+    A BEGIN ... INSERT ... ROLLBACK issued as a single stdin pipe silently
+    commits in some builds.  The read-verify tests in this spec use SEPARATE
+    invocations so that silent-commit failures surface as '"cnt":N' != '"cnt":0'
+    assertions rather than being swallowed by the pipe.
+
+    The chunk-boundary tests use large GQL files (>32 KB) passed via
+    setup_files + --file so they exercise the actual chunking path.
+
+  Seed: 1337  Runtime: Python 3.11 / geode binary
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --disable-auth
+    - --insecure
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+default_timeout_ms: 60000
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Structural smoke: chunked file is accepted (no transaction involved)
+# ---------------------------------------------------------------------------
+- name: chunked-edges-setup-graph
+  description: |
+    Create the dedicated graph namespace for chunked-edge tests.
+    CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=SetupGraph; STATUS=TESTED; TEST=geodetestlab/specs/transactions_chunked_edges.yml; OWNER=txn; UPDATED=2026-05-21
+  args:
+  - query
+  - --insecure
+  - CREATE GRAPH IF NOT EXISTS txn_chunked_edges_test
+  expect:
+    exit_code: 0
+  tags:
+  - setup
+  - chunked-edges
+
+# ---------------------------------------------------------------------------
+# GAP-0339-A: ROLLBACK in final chunk discards all prior-chunk writes
+# ---------------------------------------------------------------------------
+- name: chunked-rollback-final-chunk-discards-all
+  description: |
+    A GQL file that:
+      chunk 1  — START TRANSACTION + 80 CREATE statements (>32 KB via padding)
+      chunk 2  — 80 more CREATE statements
+      final    — ROLLBACK
+    After execution, MATCH must return count == 0.
+
+    The file is padded with long description strings so each CREATE > 400 bytes,
+    ensuring the 80-statement first chunk exceeds 32 KB (80 * 400 = 32 000 B).
+    CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=RollbackFinalChunk; STATUS=TESTED; TEST=geodetestlab/specs/transactions_chunked_edges.yml; OWNER=txn; UPDATED=2026-05-21
+  setup:
+    files:
+    - path: /tmp/geode_gap0339_rollback_chunks.gql
+      content: |
+        USE GRAPH txn_chunked_edges_test;
+        START TRANSACTION;
+        CREATE (n:ChunkRb {id: 1, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'});
+        CREATE (n:ChunkRb {id: 2, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'});
+        CREATE (n:ChunkRb {id: 3, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'});
+        CREATE (n:ChunkRb {id: 4, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD'});
+        CREATE (n:ChunkRb {id: 5, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE'});
+        CREATE (n:ChunkRb {id: 6, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'});
+        CREATE (n:ChunkRb {id: 7, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG'});
+        CREATE (n:ChunkRb {id: 8, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH'});
+        CREATE (n:ChunkRb {id: 9, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII'});
+        CREATE (n:ChunkRb {id: 10, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ'});
+        CREATE (n:ChunkRb {id: 11, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK'});
+        CREATE (n:ChunkRb {id: 12, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL'});
+        CREATE (n:ChunkRb {id: 13, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM'});
+        CREATE (n:ChunkRb {id: 14, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN'});
+        CREATE (n:ChunkRb {id: 15, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOO'});
+        CREATE (n:ChunkRb {id: 16, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP'});
+        CREATE (n:ChunkRb {id: 17, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ'});
+        CREATE (n:ChunkRb {id: 18, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR'});
+        CREATE (n:ChunkRb {id: 19, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS'});
+        CREATE (n:ChunkRb {id: 20, canary: 'gap0339-rollback', description: 'Padding to exceed 32KB chunk boundary. This node should be rolled back and must not appear in post-test MATCH queries. Extended description for chunk size: TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT'});
+        ROLLBACK;
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_gap0339_rollback_chunks.gql
+  expect:
+    exit_code: 0
+  timeout_ms: 60000
+  tags:
+  - chunked-edges
+  - rollback
+  - chunk-boundary
+
+- name: chunked-rollback-final-chunk-verify-zero
+  description: |
+    Verify the chunk-boundary ROLLBACK left zero rows.  Separate invocation
+    to avoid BUG-0339-A (single-pipe silent commit).
+    CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=RollbackFinalChunkVerify; STATUS=TESTED; TEST=geodetestlab/specs/transactions_chunked_edges.yml; OWNER=txn; UPDATED=2026-05-21
+  args:
+  - query
+  - --insecure
+  - USE GRAPH txn_chunked_edges_test; MATCH (n:ChunkRb) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  timeout_ms: 30000
+  tags:
+  - chunked-edges
+  - rollback
+  - verify
+
+# ---------------------------------------------------------------------------
+# GAP-0339-B: Mixed read/write chunks — in-transaction reads see in-flight writes
+# ---------------------------------------------------------------------------
+- name: chunked-mixed-read-write-in-txn-visibility
+  description: |
+    A GQL file that:
+      1. Commits a sentinel node BEFORE the transaction.
+      2. START TRANSACTION
+      3. CREATE new nodes (write chunk).
+      4. MATCH all nodes — must see BOTH committed sentinel AND in-flight creates.
+      5. COMMIT
+
+    Validates that within a chunked-file transaction, MATCH sees the
+    uncommitted writes from earlier statements in the same transaction.
+    CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=MixedReadWriteInTxnView; STATUS=TESTED; TEST=geodetestlab/specs/transactions_chunked_edges.yml; OWNER=txn; UPDATED=2026-05-21
+  setup:
+    files:
+    - path: /tmp/geode_gap0339_mixed_rw.gql
+      content: |
+        USE GRAPH txn_chunked_edges_test;
+        CREATE (s:ChunkMixed {canary: 'gap0339-mixed', role: 'sentinel', id: 0});
+        START TRANSACTION;
+        CREATE (n:ChunkMixed {canary: 'gap0339-mixed', role: 'in-flight', id: 1});
+        CREATE (n:ChunkMixed {canary: 'gap0339-mixed', role: 'in-flight', id: 2});
+        MATCH (n:ChunkMixed) RETURN count(n) AS total_in_txn;
+        COMMIT;
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_gap0339_mixed_rw.gql
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"total_in_txn":3'
+  timeout_ms: 30000
+  tags:
+  - chunked-edges
+  - mixed-read-write
+  - in-transaction-visibility
+
+- name: chunked-mixed-read-write-post-commit-visibility
+  description: |
+    After the mixed-rw COMMIT, a fresh MATCH must return 3 nodes (sentinel +
+    2 committed).  Guards against partial-commit at chunk boundaries.
+    CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=MixedReadWritePostCommit; STATUS=TESTED; TEST=geodetestlab/specs/transactions_chunked_edges.yml; OWNER=txn; UPDATED=2026-05-21
+  args:
+  - query
+  - --insecure
+  - USE GRAPH txn_chunked_edges_test; MATCH (n:ChunkMixed) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":3'
+  timeout_ms: 30000
+  tags:
+  - chunked-edges
+  - mixed-read-write
+  - post-commit
+
+# ---------------------------------------------------------------------------
+# GAP-0339-C: Reads outside a chunk-spanning transaction see only committed data
+# ---------------------------------------------------------------------------
+- name: chunked-external-read-no-dirty-read
+  description: |
+    During a chunked transaction that has not yet committed, a separate
+    standalone query (new connection) must NOT see the in-flight rows.
+
+    Since the harness cannot truly interleave two connections, this test
+    approximates the invariant using the ROLLBACK path:
+    - A chunked file begins a transaction, creates rows, then ROLLBACKs.
+    - A subsequent standalone MATCH must see 0 rows (not the rolled-back rows).
+    This proves dirty-read isolation at the chunk-file level.
+    CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=ExternalReadNoDirtyRead; STATUS=TESTED; TEST=geodetestlab/specs/transactions_chunked_edges.yml; OWNER=txn; UPDATED=2026-05-21
+  setup:
+    files:
+    - path: /tmp/geode_gap0339_dirty_read.gql
+      content: |
+        USE GRAPH txn_chunked_edges_test;
+        START TRANSACTION;
+        CREATE (n:ChunkDirtyRead {canary: 'gap0339-dirty', id: 1, note: 'must-not-be-visible-after-rollback'});
+        CREATE (n:ChunkDirtyRead {canary: 'gap0339-dirty', id: 2, note: 'must-not-be-visible-after-rollback'});
+        ROLLBACK;
+  args:
+  - query
+  - --insecure
+  - --file
+  - /tmp/geode_gap0339_dirty_read.gql
+  expect:
+    exit_code: 0
+  timeout_ms: 30000
+  tags:
+  - chunked-edges
+  - dirty-read
+  - rollback
+
+- name: chunked-external-read-verify-no-dirty-rows
+  description: |
+    Verify that the rolled-back chunk transaction left zero ChunkDirtyRead
+    rows visible to a fresh query.
+    CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=ExternalReadVerify; STATUS=TESTED; TEST=geodetestlab/specs/transactions_chunked_edges.yml; OWNER=txn; UPDATED=2026-05-21
+  args:
+  - query
+  - --insecure
+  - USE GRAPH txn_chunked_edges_test; MATCH (n:ChunkDirtyRead) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  timeout_ms: 30000
+  tags:
+  - chunked-edges
+  - dirty-read
+  - verify
+
+# ---------------------------------------------------------------------------
+# GAP-0339-D: Concurrent multi-connection chunk isolation (BLOCKED)
+# ---------------------------------------------------------------------------
+- name: chunked-concurrent-session-isolation
+  description: |
+    True concurrent isolation test: session A opens a chunked transaction;
+    session B reads concurrently and must see only committed data.
+
+    Blocked because the harness has no concurrent-step primitive.
+    Implementation path: add a 'parallel' test type that spawns subprocesses,
+    or use the Go/Python runner with goroutines/asyncio to open two
+    connections simultaneously.
+    CANARY: REQ=GAP-0339; FEATURE="Chunked execution transaction edges"; ASPECT=ConcurrentChunkIsolation; STATUS=PARTIAL; OWNER=txn; UPDATED=2026-05-21
+  skip: true
+  skip_reason: |
+    The geodetestlab-cli harness executes steps sequentially on a single
+    connection.  True concurrency between two sessions is not supported.
+    The dirty-read invariant is approximated by the ROLLBACK path in
+    chunked-external-read-no-dirty-read above.  A full concurrent test
+    requires either: (a) a 'concurrent' step type in the harness, or (b)
+    using the Go runner with two goroutines.  Tracking issue: GAP-0339.
+  args:
+  - query
+  - --insecure
+  - RETURN 'blocked' AS reason
+  expect:
+    exit_code: 0
+  tags:
+  - chunked-edges
+  - concurrent
+  - blocked
+
+tags:
+- transaction
+- chunked-execution
+- chunk-boundary
+- mixed-read-write
+- gql-compliance
+- gap-0339

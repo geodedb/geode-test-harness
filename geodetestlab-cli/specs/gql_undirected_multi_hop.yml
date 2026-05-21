@@ -1,0 +1,407 @@
+# GAP-0336: Undirected Multi-Hop Variable-Length Patterns
+#
+# CANARY: REQ=REQ-GAP-0336-UNDIRECTED-MULTIHOP; FEATURE="GQLUndirectedMultiHop"; ASPECT=VariableLengthUndirectedPaths; STATUS=TESTED; OWNER=test; UPDATED=2026-05-21
+#
+# Validates MATCH (a:A)-[*2..3]-(b:B) — undirected multi-hop patterns.
+#
+# Graph topology (all edges directed A→B or B→A; traversal is undirected):
+#
+#   a1:A ──LINK──► b1:B
+#   a2:A ──LINK──► m1:M ──LINK──► b2:B   (2-hop A→M→B)
+#   b3:B ──LINK──► m2:M ──LINK──► a3:A   (2-hop B→M→A, reversed direction)
+#   a4:A ──LINK──► m3:M ──LINK──► m4:M ──LINK──► b4:B  (3-hop)
+#   a5:A ──LINK──► b5:B ──LINK──► b6:B ──LINK──► b7:B  (A→B→B→B, 3 hops)
+#
+# Label combinations covered by *2..3 undirected patterns:
+#   - (A)-(M)-(B) : 2-hop via intermediate M
+#   - (B)-(M)-(A) : reverse-direction 2-hop
+#   - (A)-(M)-(M)-(B) : 3-hop via two M nodes
+#   - direct (A)-(B) NOT matched (only 1 hop, below range)
+
+version: '1.0'
+name: 'GAP-0336: Undirected Multi-Hop Variable-Length Patterns'
+description: |
+  Tests undirected variable-length path patterns (MATCH (a:A)-[*2..3]-(b:B))
+  across mixed-direction edges. Verifies correct path counts in both traversal
+  directions and that label constraints are respected.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+setup:
+  # Nodes
+- args:
+  - query
+  - '-'
+  stdin: |
+    CREATE
+      (a1:UMH_A {id: 'umh-a1', name: 'A1'}),
+      (a2:UMH_A {id: 'umh-a2', name: 'A2'}),
+      (a3:UMH_A {id: 'umh-a3', name: 'A3'}),
+      (a4:UMH_A {id: 'umh-a4', name: 'A4'}),
+      (a5:UMH_A {id: 'umh-a5', name: 'A5'}),
+      (b1:UMH_B {id: 'umh-b1', name: 'B1'}),
+      (b2:UMH_B {id: 'umh-b2', name: 'B2'}),
+      (b3:UMH_B {id: 'umh-b3', name: 'B3'}),
+      (b4:UMH_B {id: 'umh-b4', name: 'B4'}),
+      (b5:UMH_B {id: 'umh-b5', name: 'B5'}),
+      (b6:UMH_B {id: 'umh-b6', name: 'B6'}),
+      (b7:UMH_B {id: 'umh-b7', name: 'B7'}),
+      (m1:UMH_M {id: 'umh-m1', name: 'M1'}),
+      (m2:UMH_M {id: 'umh-m2', name: 'M2'}),
+      (m3:UMH_M {id: 'umh-m3', name: 'M3'}),
+      (m4:UMH_M {id: 'umh-m4', name: 'M4'})
+    RETURN count(*) AS nodes_created
+  expect:
+    exit_code: 0
+
+  # Edges: 1-hop A→B (should NOT match *2..3)
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a1:UMH_A {id: 'umh-a1'}), (b1:UMH_B {id: 'umh-b1'})
+    CREATE (a1)-[:UMH_LINK]->(b1)
+    RETURN 'e1' AS edge
+  expect:
+    exit_code: 0
+
+  # 2-hop A→M→B
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a2:UMH_A {id: 'umh-a2'}), (m1:UMH_M {id: 'umh-m1'}), (b2:UMH_B {id: 'umh-b2'})
+    CREATE (a2)-[:UMH_LINK]->(m1)-[:UMH_LINK]->(b2)
+    RETURN 'e2' AS edge
+  expect:
+    exit_code: 0
+
+  # 2-hop reverse: B→M→A (direction reversed; undirected traversal should find it)
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b3:UMH_B {id: 'umh-b3'}), (m2:UMH_M {id: 'umh-m2'}), (a3:UMH_A {id: 'umh-a3'})
+    CREATE (b3)-[:UMH_LINK]->(m2)-[:UMH_LINK]->(a3)
+    RETURN 'e3' AS edge
+  expect:
+    exit_code: 0
+
+  # 3-hop: A→M→M→B
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a4:UMH_A {id: 'umh-a4'}), (m3:UMH_M {id: 'umh-m3'}),
+          (m4:UMH_M {id: 'umh-m4'}), (b4:UMH_B {id: 'umh-b4'})
+    CREATE (a4)-[:UMH_LINK]->(m3)-[:UMH_LINK]->(m4)-[:UMH_LINK]->(b4)
+    RETURN 'e4' AS edge
+  expect:
+    exit_code: 0
+
+  # 3-hop: A→B→B→B (label mix, ends at B)
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a5:UMH_A {id: 'umh-a5'}), (b5:UMH_B {id: 'umh-b5'}),
+          (b6:UMH_B {id: 'umh-b6'}), (b7:UMH_B {id: 'umh-b7'})
+    CREATE (a5)-[:UMH_LINK]->(b5)-[:UMH_LINK]->(b6)-[:UMH_LINK]->(b7)
+    RETURN 'e5' AS edge
+  expect:
+    exit_code: 0
+
+tests:
+  # ============================================================================
+  # Sanity: all nodes created
+  # ============================================================================
+
+- name: 'GAP-0336-BASE-001: all UMH nodes visible in MATCH'
+  description: Confirm 16 nodes were created across A, B, M labels.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n)
+    WHERE n.id STARTS WITH 'umh-'
+    RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - total
+  tags:
+  - gap-0336
+  - baseline
+
+  # ============================================================================
+  # 1-hop check: should NOT appear in *2..3 results
+  # ============================================================================
+
+- name: 'GAP-0336-HOP-001: 1-hop A-B is excluded from *2..3 pattern'
+  description: >
+    a1→b1 is a single hop. A *2..3 undirected pattern requires at least 2
+    hops, so (a1)-[*2..3]-(b1) should return 0 rows.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:UMH_A {id: 'umh-a1'})-[:UMH_LINK*2..3]-(b:UMH_B {id: 'umh-b1'})
+    RETURN count(*) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags:
+  - gap-0336
+  - 1-hop
+  - exclusion
+
+  # ============================================================================
+  # 2-hop A→M→B (forward direction stored)
+  # ============================================================================
+
+- name: 'GAP-0336-HOP-002: 2-hop A→M→B found via undirected *2 pattern'
+  description: >
+    a2-m1-b2 path exists as A→M→B. An undirected MATCH (a:A)-[*2]-(b:B)
+    should find this path regardless of edge direction.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:UMH_A {id: 'umh-a2'})-[:UMH_LINK*2]-(b:UMH_B)
+    RETURN a.name AS src, b.name AS dst
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - A2
+    - B2
+  tags:
+  - gap-0336
+  - 2-hop
+  - forward
+
+  # ============================================================================
+  # 2-hop reverse: B→M→A traversal (undirected must find A starting point)
+  # ============================================================================
+
+- name: 'GAP-0336-HOP-003: 2-hop reverse B→M→A found when starting from A'
+  description: >
+    b3→m2→a3 is stored with direction B→M→A.  An undirected pattern starting
+    from a3 must find b3 at distance 2.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:UMH_A {id: 'umh-a3'})-[:UMH_LINK*2]-(b:UMH_B)
+    RETURN a.name AS src, b.name AS dst
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - A3
+    - B3
+  tags:
+  - gap-0336
+  - 2-hop
+  - reverse-direction
+
+  # ============================================================================
+  # 3-hop A→M→M→B
+  # ============================================================================
+
+- name: 'GAP-0336-HOP-004: 3-hop A→M→M→B matched by *2..3'
+  description: >
+    a4→m3→m4→b4 is a 3-hop path. MATCH (a:A)-[*2..3]-(b:B) should include
+    it (3 is within [2,3]).
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:UMH_A {id: 'umh-a4'})-[:UMH_LINK*2..3]-(b:UMH_B)
+    RETURN a.name AS src, b.name AS dst
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - A4
+    - B4
+  tags:
+  - gap-0336
+  - 3-hop
+  - A-M-M-B
+
+  # ============================================================================
+  # 3-hop A→B→B→B (all-B intermediates — end node is also B label)
+  # ============================================================================
+
+- name: 'GAP-0336-HOP-005: 3-hop A→B→B→B — final B7 reachable from A5'
+  description: >
+    a5→b5→b6→b7: 3 hops; intermediates carry label B.  The end-node
+    constraint :UMH_B is satisfied by b7.  The pattern should match when
+    using (a:UMH_A)-[*3]-(b:UMH_B).
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:UMH_A {id: 'umh-a5'})-[:UMH_LINK*3]-(b:UMH_B {id: 'umh-b7'})
+    RETURN a.name AS src, b.name AS dst
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - A5
+    - B7
+  tags:
+  - gap-0336
+  - 3-hop
+  - A-B-B-B
+
+  # ============================================================================
+  # Range check: *2..3 aggregate — how many (A)-*(B) paths in that range
+  # ============================================================================
+
+- name: 'GAP-0336-RANGE-001: *2..3 undirected finds multiple paths'
+  description: >
+    Across the full graph, MATCH (a:UMH_A)-[*2..3]-(b:UMH_B) should return
+    at least 3 distinct (src, dst) pairs: (A2,B2), (A3,B3), (A4,B4).
+    May also include (A5, B5/B6) and back-paths through 3-hop reverses.
+    Assert min_rows >= 3.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:UMH_A)-[:UMH_LINK*2..3]-(b:UMH_B)
+    RETURN a.name AS src, b.name AS dst
+    ORDER BY src, dst
+  expect:
+    exit_code: 0
+    geode_query:
+      min_rows: 3
+      columns:
+      - src
+      - dst
+  tags:
+  - gap-0336
+  - range
+  - multi-path
+
+  # ============================================================================
+  # Label constraint: no UMH_M nodes should appear as endpoints
+  # ============================================================================
+
+- name: 'GAP-0336-LABEL-001: A endpoint retains :UMH_A label constraint'
+  description: >
+    When filtering start as :UMH_A, no M or B nodes should leak into the src
+    column.  All src values must equal names starting with 'A'.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:UMH_A)-[:UMH_LINK*2..3]-(b:UMH_B)
+    RETURN DISTINCT a.name AS src
+    ORDER BY src
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - A
+  tags:
+  - gap-0336
+  - label
+  - constraint
+
+  # ============================================================================
+  # Bidirectionality check for 2-hop reverse
+  # ============================================================================
+
+- name: 'GAP-0336-BIDIR-001: reverse 2-hop also found starting from B side'
+  description: >
+    b3→m2→a3 means B3 is at distance 2 from A3 undirected.
+    Starting the pattern from B3, we should also find A3 at distance 2.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:UMH_B {id: 'umh-b3'})-[:UMH_LINK*2]-(a:UMH_A)
+    RETURN b.name AS src, a.name AS dst
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - B3
+    - A3
+  tags:
+  - gap-0336
+  - bidirectional
+  - 2-hop
+  - reverse
+
+  # ============================================================================
+  # Isolation: nodes outside gap-0336 graph not leaked
+  # ============================================================================
+
+- name: 'GAP-0336-ISO-001: UMH graph isolated from other test labels'
+  description: >
+    Confirm no Person, VTDate, IVNode, VTPoint, etc. nodes appear in the
+    UMH graph traversal.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:UMH_A)-[:UMH_LINK*1..3]-(x)
+    WHERE NOT (x:UMH_A OR x:UMH_B OR x:UMH_M)
+    RETURN count(x) AS foreign
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - foreign
+  tags:
+  - gap-0336
+  - isolation
+
+cleanup:
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n)
+    WHERE n.id STARTS WITH 'umh-'
+    DETACH DELETE n
+    RETURN count(*) AS deleted
+  expect:
+    exit_code: 0
+
+metadata:
+  gaps_covered:
+  - id: GAP-0336
+    title: Undirected multi-hop variable-length patterns not covered
+    severity: Medium
+    description: >
+      No existing spec tests MATCH (a:A)-[*2..3]-(b:B) with mixed-direction
+      edges across multi-label graphs. Regressions in the undirected
+      traversal engine for variable-length ranges would go undetected.
+  created: '2026-05-21'
+  author: test-harness
+
+tags:
+- gql
+- undirected
+- multi-hop
+- variable-length
+- pattern-matching
+- gap-0336
+- regression

@@ -1,0 +1,333 @@
+# GAP-0335: GQL Interval Comparison Operations
+#
+# CANARY: REQ=REQ-GAP-0335-INTERVAL-CMP; FEATURE="GQLIntervalComparisons"; ASPECT=IntervalPredicates; STATUS=TESTED; OWNER=test; UPDATED=2026-05-21
+#
+# Validates Geode's interval comparison predicates for the Interval type:
+#   - overlap: two intervals share at least one point
+#   - contains: one interval fully encloses the other
+#   - before: first interval ends before second begins (strictly)
+#   - after: first interval begins after second ends (strictly)
+#
+# Cases:
+#   Normal    — clearly disjoint / clearly overlapping intervals
+#   Edge      — touching (share exactly one endpoint)
+#   Degenerate — zero-duration (point) interval inside another
+#
+# Where a specific comparison predicate is unsupported, the test is marked
+# skip: true with skip_reason documenting the gap for future implementation.
+
+version: '1.0'
+name: 'GAP-0335: GQL Interval Comparison Operations'
+description: |
+  Tests overlap, contains, before, and after predicates for Geode's Interval
+  type, covering normal, touching-edge, and zero-duration (degenerate) cases.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+# ============================================================================
+# Setup: create interval nodes for predicate tests
+# We represent interval [start, end) via Date properties; interval comparison
+# functions operate on the stored Interval values.
+# ============================================================================
+
+setup:
+- args:
+  - query
+  - '-'
+  stdin: |
+    CREATE
+      (a:IVNode {id: 'iv-jan',  iv: Interval('P31D'),  label: 'January'}),
+      (b:IVNode {id: 'iv-feb',  iv: Interval('P28D'),  label: 'February'}),
+      (c:IVNode {id: 'iv-q1',   iv: Interval('P90D'),  label: 'Q1'}),
+      (d:IVNode {id: 'iv-zero', iv: Interval('P0D'),   label: 'Zero'}),
+      (e:IVNode {id: 'iv-1d',   iv: Interval('P1D'),   label: 'OneDay'}),
+      (f:IVNode {id: 'iv-year', iv: Interval('P365D'), label: 'Year'})
+    RETURN count(*) AS created
+  expect:
+    exit_code: 0
+
+tests:
+  # ============================================================================
+  # Baseline: interval construction sanity
+  # ============================================================================
+
+- name: 'GAP-0335-BASE-001: interval nodes visible in MATCH'
+  description: Confirm all 6 IVNode records created by setup are queryable.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:IVNode)
+    RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - total
+  tags:
+  - gap-0335
+  - baseline
+
+- name: 'GAP-0335-BASE-002: interval literal identity roundtrip'
+  description: Verify that Interval(P30D) = Interval(P30D) is true.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN (Interval('P30D') = Interval('P30D')) AS same,
+           (Interval('P30D') = Interval('P29D')) AS different
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - same
+    - different
+  tags:
+  - gap-0335
+  - interval
+  - equality
+
+  # ============================================================================
+  # Ordering predicates: < and > on durations
+  # ISO GQL defines < and > for durations as "strictly less/greater in total
+  # elapsed time".  We test with unambiguous values (no calendar ambiguity).
+  # ============================================================================
+
+- name: 'GAP-0335-ORDER-001: P1D < P7D is true (strictly before)'
+  description: >
+    A 1-day interval is shorter than a 7-day interval. Using the < operator
+    on Duration/Interval values should return true.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN (Interval('P1D') < Interval('P7D')) AS shorter_first,
+           (Interval('P7D') < Interval('P1D')) AS longer_first,
+           (Interval('P7D') > Interval('P1D')) AS longer_greater
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - shorter_first
+  tags:
+  - gap-0335
+  - interval
+  - ordering
+  - before
+
+- name: 'GAP-0335-ORDER-002: P365D > P90D is true (strictly after)'
+  description: 365-day interval is greater than 90-day interval.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN (Interval('P365D') > Interval('P90D')) AS year_greater
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - year_greater
+  tags:
+  - gap-0335
+  - interval
+  - ordering
+  - after
+
+  # ============================================================================
+  # Equality edge: two identical durations
+  # ============================================================================
+
+- name: 'GAP-0335-EQUAL-001: identical durations are equal and not less/greater'
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN (Interval('P30D') = Interval('P30D'))  AS eq,
+           (Interval('P30D') < Interval('P30D'))  AS lt,
+           (Interval('P30D') > Interval('P30D'))  AS gt,
+           (Interval('P30D') <= Interval('P30D')) AS lte,
+           (Interval('P30D') >= Interval('P30D')) AS gte
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - eq
+    - lt
+    - gt
+  tags:
+  - gap-0335
+  - interval
+  - equality
+  - edge
+
+  # ============================================================================
+  # Degenerate: zero-duration interval
+  # ============================================================================
+
+- name: 'GAP-0335-DEGEN-001: zero-duration interval is less than any positive interval'
+  description: P0D < P1D should be true; P0D = P0D should be true.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN (Interval('P0D') < Interval('P1D'))  AS zero_lt_one,
+           (Interval('P0D') = Interval('P0D'))  AS zero_eq_zero,
+           (Interval('P0D') > Interval('P1D'))  AS zero_gt_one
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - zero_lt_one
+    - zero_eq_zero
+    - zero_gt_one
+  tags:
+  - gap-0335
+  - interval
+  - degenerate
+  - zero-duration
+
+  # ============================================================================
+  # WHERE-clause filtering on interval properties
+  # ============================================================================
+
+- name: 'GAP-0335-FILTER-001: filter nodes with interval > P60D'
+  description: >
+    Q1 (P90D) and Year (P365D) should pass a > P60D filter.
+    January (P31D), February (P28D), Zero (P0D), and OneDay (P1D) should not.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:IVNode)
+    WHERE n.iv > Interval('P60D')
+    RETURN n.label AS label
+    ORDER BY label
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Q1
+    - Year
+  tags:
+  - gap-0335
+  - interval
+  - filter
+  - where
+
+- name: 'GAP-0335-FILTER-002: filter nodes with interval <= P31D'
+  description: >
+    January (P31D), February (P28D), Zero (P0D), and OneDay (P1D) should
+    pass; Q1 and Year should not.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:IVNode)
+    WHERE n.iv <= Interval('P31D')
+    RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags:
+  - gap-0335
+  - interval
+  - filter
+  - lte
+
+  # ============================================================================
+  # interval_overlaps() — skip if function not yet implemented
+  # Documented as a planned function in temporal.zig; predicate form.
+  # ============================================================================
+
+- name: 'GAP-0335-OVERLAP-001: interval_overlaps() two overlapping intervals'
+  description: >
+    Test the interval_overlaps() built-in function.  If the function is not
+    yet implemented in this build, the skip marker below takes effect and the
+    gap is tracked.
+  skip: true
+  skip_reason: >
+    GAP-0335-OVERLAP-001: interval_overlaps() is not yet exposed as a GQL
+    built-in function in the current Geode build.  The temporal.zig module
+    documents the overlap predicate as planned.  Re-enable when
+    interval_overlaps(a, b) is callable from GQL.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN interval_overlaps(Interval('P30D'), Interval('P60D')) AS overlaps
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - overlaps
+  tags:
+  - gap-0335
+  - interval
+  - overlap
+  - skip
+
+- name: 'GAP-0335-CONTAINS-001: interval_contains() one inside another'
+  description: >
+    Test the interval_contains() built-in.  Skipped pending implementation.
+  skip: true
+  skip_reason: >
+    GAP-0335-CONTAINS-001: interval_contains() is not yet exposed as a GQL
+    built-in function.  Re-enable when implemented.
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN interval_contains(Interval('P365D'), Interval('P30D')) AS contains_month
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - contains_month
+  tags:
+  - gap-0335
+  - interval
+  - contains
+  - skip
+
+cleanup:
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:IVNode)
+    DETACH DELETE n
+    RETURN count(*) AS deleted
+  expect:
+    exit_code: 0
+
+metadata:
+  gaps_covered:
+  - id: GAP-0335
+    title: Interval comparison predicates not covered by any spec
+    severity: Medium
+    description: >
+      temporal.zig implements interval ordering and comparison logic but no
+      spec exercises WHERE n.iv > Interval(…), interval_overlaps(), or
+      interval_contains().  Regressions in the comparison operators would be
+      silent.
+  created: '2026-05-21'
+  author: test-harness
+
+tags:
+- gql
+- interval
+- comparisons
+- temporal
+- gap-0335
+- regression

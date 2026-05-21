@@ -1,0 +1,442 @@
+# GAP-0334: GQL Value Types Roundtrip
+#
+# CANARY: REQ=REQ-GAP-0334-VALUE-TYPES; FEATURE="GQLValueTypesRoundtrip"; ASPECT=TypeRoundtrip; STATUS=TESTED; OWNER=test; UPDATED=2026-05-21
+#
+# Verifies that each first-class value type in Geode's type system can be:
+#   1. Expressed as a literal in a RETURN clause (parse + evaluate)
+#   2. Stored as a node property and retrieved via a MATCH query
+#   3. Used in a WHERE equality predicate
+#
+# Types covered: Date, Time, Duration, Point (LatLon), Path, Interval
+#
+# For types whose literal syntax is unsupported, individual tests carry
+# skip: true + skip_reason so the spec remains runnable while the gap is
+# tracked.
+
+version: '1.0'
+name: 'GAP-0334: GQL Value Types Roundtrip'
+description: |
+  Roundtrip tests for Geode's extended value types. Each type is inserted as a
+  literal, queried back, and compared with an equality predicate. Unsupported
+  literal syntaxes are skipped with documented rationale.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+setup:
+- args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:VTRoundtrip {tag: 'gap0334-setup'})
+    RETURN n.tag AS tag
+  expect:
+    exit_code: 0
+
+# ============================================================================
+# Date
+# ============================================================================
+
+tests:
+- name: 'GAP-0334-DATE-001: Date literal RETURN'
+  description: RETURN a Date literal and confirm the column appears.
+  args:
+  - query
+  - '-'
+  stdin: RETURN Date('2026-05-21') AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - d
+  tags:
+  - gap-0334
+  - date
+  - literal
+
+- name: 'GAP-0334-DATE-002: Date stored in node property and retrieved'
+  description: >
+    Create a node with a Date property, match it, and assert the value is
+    present in the output.
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:VTDate {id: 'gap0334-date', born: Date('2026-05-21')})
+    RETURN n.born AS born
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - born
+  tags:
+  - gap-0334
+  - date
+  - storage
+
+- name: 'GAP-0334-DATE-003: Date equality predicate'
+  description: >
+    Match the previously created VTDate node using a WHERE equality on the
+    Date property.
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:VTDate {id: 'gap0334-date'})
+    WHERE n.born = Date('2026-05-21')
+    RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - gap0334-date
+  tags:
+  - gap-0334
+  - date
+  - equality
+
+# ============================================================================
+# Time
+# ============================================================================
+
+- name: 'GAP-0334-TIME-001: Time literal RETURN'
+  description: RETURN a Time literal and confirm the column appears.
+  args:
+  - query
+  - '-'
+  stdin: RETURN Time('14:30:00') AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - t
+  tags:
+  - gap-0334
+  - time
+  - literal
+
+- name: 'GAP-0334-TIME-002: Time stored in node property and retrieved'
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:VTTime {id: 'gap0334-time', slot: Time('09:00:00')})
+    RETURN n.slot AS slot
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - slot
+  tags:
+  - gap-0334
+  - time
+  - storage
+
+- name: 'GAP-0334-TIME-003: Time equality predicate'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:VTTime {id: 'gap0334-time'})
+    WHERE n.slot = Time('09:00:00')
+    RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - gap0334-time
+  tags:
+  - gap-0334
+  - time
+  - equality
+
+# ============================================================================
+# Duration (ISO-8601 P…T… format via DURATION())
+# ============================================================================
+
+- name: 'GAP-0334-DURATION-001: Duration literal RETURN'
+  description: RETURN a DURATION literal in ISO-8601 P1DT2H format.
+  args:
+  - query
+  - '-'
+  stdin: RETURN DURATION('P1DT2H') AS dur
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - dur
+  tags:
+  - gap-0334
+  - duration
+  - literal
+
+- name: 'GAP-0334-DURATION-002: Duration stored in node property and retrieved'
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:VTDuration {id: 'gap0334-dur', span: DURATION('P7D')})
+    RETURN n.span AS span
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - span
+  tags:
+  - gap-0334
+  - duration
+  - storage
+
+- name: 'GAP-0334-DURATION-003: Duration equality predicate'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:VTDuration {id: 'gap0334-dur'})
+    WHERE n.span = DURATION('P7D')
+    RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - gap0334-dur
+  tags:
+  - gap-0334
+  - duration
+  - equality
+
+# ============================================================================
+# Point (LatLon)
+# ============================================================================
+
+- name: 'GAP-0334-POINT-001: LatLon literal RETURN'
+  description: >
+    RETURN a LatLon point literal. LatLon is Geode's 2-D coordinate type;
+    GQL ISO-39075 does not standardise a point() function, so we use
+    Geode's LatLon() constructor.
+  args:
+  - query
+  - '-'
+  stdin: RETURN LatLon(51.5074, -0.1278) AS pt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - pt
+  tags:
+  - gap-0334
+  - point
+  - literal
+
+- name: 'GAP-0334-POINT-002: LatLon stored in node property and retrieved'
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:VTPoint {id: 'gap0334-point', loc: LatLon(51.5074, -0.1278)})
+    RETURN n.loc AS loc
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - loc
+  tags:
+  - gap-0334
+  - point
+  - storage
+
+- name: 'GAP-0334-POINT-003: LatLon equality predicate'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:VTPoint {id: 'gap0334-point'})
+    WHERE n.loc = LatLon(51.5074, -0.1278)
+    RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - gap0334-point
+  tags:
+  - gap-0334
+  - point
+  - equality
+
+# ============================================================================
+# Interval (Geode Interval constructor)
+# ============================================================================
+
+- name: 'GAP-0334-INTERVAL-001: Interval literal RETURN'
+  description: >
+    RETURN an Interval literal using Geode's Interval() constructor with an
+    ISO-8601 duration string.
+  args:
+  - query
+  - '-'
+  stdin: RETURN Interval('P1Y2M3DT4H5M6S') AS iv
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - iv
+  tags:
+  - gap-0334
+  - interval
+  - literal
+
+- name: 'GAP-0334-INTERVAL-002: Interval stored in node property and retrieved'
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (n:VTInterval {id: 'gap0334-interval', window: Interval('P30D')})
+    RETURN n.window AS window
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - window
+  tags:
+  - gap-0334
+  - interval
+  - storage
+
+- name: 'GAP-0334-INTERVAL-003: Interval equality predicate'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:VTInterval {id: 'gap0334-interval'})
+    WHERE n.window = Interval('P30D')
+    RETURN n.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - gap0334-interval
+  tags:
+  - gap-0334
+  - interval
+  - equality
+
+# ============================================================================
+# Path — skip: literal path values cannot be constructed outside a MATCH
+# ============================================================================
+
+- name: 'GAP-0334-PATH-001: Path variable from MATCH'
+  description: >
+    ISO GQL paths are bound via MATCH path = …, not as free literals.
+    This test creates a minimal 1-hop graph and asserts that a path variable
+    is bound and length() returns the expected integer.
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:VTPathA {id: 'gap0334-pa'})-[:VT_LINK]->(b:VTPathB {id: 'gap0334-pb'})
+    RETURN 'path-nodes-created' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - status
+  tags:
+  - gap-0334
+  - path
+  - setup
+
+- name: 'GAP-0334-PATH-002: Path length via path variable'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH p = (a:VTPathA {id: 'gap0334-pa'})-[:VT_LINK]->(b:VTPathB)
+    RETURN length(p) AS hops
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hops
+    - '1'
+  tags:
+  - gap-0334
+  - path
+  - length
+
+- name: 'GAP-0334-PATH-003: Path as free literal — not supported, documented'
+  description: >
+    ISO GQL 39075 does not define a path literal constructor syntax outside
+    of MATCH.  Geode similarly has no path() or path literal constructor
+    function callable in a RETURN-only clause.  This test is skipped with
+    rationale so the gap is tracked.
+  skip: true
+  skip_reason: >
+    GAP-0334-PATH-003: There is no GQL path literal constructor (e.g.,
+    path(a, r, b)) that can be called in a pure RETURN clause without a
+    MATCH context.  ISO 39075 defines paths only as pattern-bound variables.
+    Re-evaluate if Geode adds a path() constructor function.
+  args:
+  - query
+  - '-'
+  stdin: RETURN path() AS p
+  expect:
+    exit_code: 0
+  tags:
+  - gap-0334
+  - path
+  - skip
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+cleanup:
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n)
+    WHERE n.id IN [
+      'gap0334-date', 'gap0334-time', 'gap0334-dur',
+      'gap0334-point', 'gap0334-interval',
+      'gap0334-pa', 'gap0334-pb'
+    ]
+    DETACH DELETE n
+    RETURN count(*) AS deleted
+  expect:
+    exit_code: 0
+
+- args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:VTRoundtrip {tag: 'gap0334-setup'})
+    DETACH DELETE n
+    RETURN count(*) AS deleted
+  expect:
+    exit_code: 0
+
+metadata:
+  gaps_covered:
+  - id: GAP-0334
+    title: Value types (Date, Time, Duration, Point, Path, Interval) lack roundtrip specs
+    severity: Medium
+    description: >
+      No existing spec exercises store-and-retrieve + equality predicate for
+      each extended type. Type regressions (serialisation changes, equality
+      semantics) would go undetected.
+  created: '2026-05-21'
+  author: test-harness
+
+tags:
+- gql
+- types
+- roundtrip
+- date
+- time
+- duration
+- point
+- path
+- interval
+- gap-0334
