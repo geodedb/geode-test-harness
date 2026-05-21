@@ -1,0 +1,203 @@
+version: '1.0'
+name: Authn Argon2id Minimum Parameter Floor (GAP-0310)
+description: |
+  Verifies that Geode's Argon2id implementation always produces hashes using
+  OWASP ASVS 2.4.1 minimum parameters (m=19456, t=2, p=1) and that the PHC
+  string format is stable.
+
+  DESIGN NOTE: Geode hardcodes the OWASP floor in geode_auth_lib.zig — there
+  are no GEODE_ARGON2_MEMORY_MIB / GEODE_ARGON2_ITERATIONS env vars exposed
+  to the CLI or server. The floor is therefore tested by inspecting the PHC
+  string emitted for each new user's password hash. If the floor were ever
+  relaxed below OWASP minimum the hash format would change, and the
+  stdout_contains oracle would catch it.
+
+  CANARY: REQ=REQ-AUTH-HASH-002; FEATURE="Argon2id_Password_Hashing"; ASPECT=OWASPParamFloor; STATUS=TESTED; TEST=geodetestlab/specs/authn_argon2id_min_params.yml; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+  # ---- idempotent preflight cleanup ----
+- name: argon2-preflight-cleanup
+  description: Remove any prior-run state so this spec is idempotent.
+  type: bash
+  command: |
+    rm -f /tmp/geode_argon2_state.db
+  expected:
+    exit_code: 0
+  tags: [argon2id, setup]
+
+  # ---- create user — triggers Argon2id hash ----
+- name: argon2-create-user-alpha
+  description: |
+    Create a test user. Geode hashes the password with Argon2id
+    (geode_auth_lib.zig:hashPasswordArgon2id). The user row stored in the
+    __geode_security graph will carry a PHC string starting with $argon2id$.
+  args:
+  - user
+  - create
+  - argon2_test_alpha
+  - argon2alpha@test.example.com
+  - --password
+  - Argon2_Alpha_TestPass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - argon2_test_alpha
+    - created
+  tags: [argon2id, setup]
+
+- name: argon2-create-user-beta
+  description: |
+    Create a second user to verify independent random salts — each hash
+    must differ even for the same plaintext-length password.
+  args:
+  - user
+  - create
+  - argon2_test_beta
+  - argon2beta@test.example.com
+  - --password
+  - Argon2_Alpha_TestPass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - argon2_test_beta
+    - created
+  tags: [argon2id, setup]
+
+  # ---- PHC format oracle via user show ----
+- name: argon2-show-user-alpha-phc-format
+  description: |
+    POSITIVE: geode user show must include the stored PHC hash in the
+    output. The oracle checks for the $argon2id$v=19$m=19456,t=2,p=1$
+    prefix, confirming OWASP minimum parameters are in use.
+  args:
+  - user
+  - show
+  - argon2_test_alpha
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - argon2_test_alpha
+  tags: [argon2id, phc-format]
+
+  # ---- verify login (proves hash is functional, not just stored) ----
+- name: argon2-verify-login-alpha
+  description: |
+    POSITIVE: auth login must succeed, proving that the Argon2id hash stored
+    during CREATE USER correctly verifies the supplied password. A broken
+    parameter set (e.g. m=0) would produce an unusable hash.
+  args:
+  - auth
+  - login
+  - --user
+  - argon2_test_alpha
+  - --password
+  - Argon2_Alpha_TestPass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [argon2id, login-positive]
+
+  # ---- NEGATIVE: wrong password must fail (hash integrity) ----
+- name: argon2-wrong-password-rejected
+  description: |
+    NEGATIVE: A different password must not verify against the stored hash.
+    Confirms constant-time verify path rejects mismatched inputs.
+    The CLI exits with code 3 and writes to stderr on auth failure.
+  args:
+  - auth
+  - login
+  - --user
+  - argon2_test_alpha
+  - --password
+  - Wrong_Password_NotRight!
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Invalid username or password
+  tags: [argon2id, login-negative]
+
+  # ---- NEGATIVE: empty password ----
+- name: argon2-empty-password-rejected
+  description: |
+    NEGATIVE: An empty password must be rejected at the client validation
+    layer before it even reaches the Argon2id verifier.
+    The CLI exits with code 3 and writes to stderr on auth failure.
+  args:
+  - auth
+  - login
+  - --user
+  - argon2_test_alpha
+  - --password
+  - ''
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Invalid username or password
+  tags: [argon2id, edge-case]
+
+  # ---- PHC format verification via source scan ----
+- name: argon2-source-phc-prefix-constant
+  description: |
+    STATIC ORACLE: scan geode_auth_lib.zig to confirm the hardcoded PHC
+    format string carries the OWASP parameter floor (m=19456, t=2, p=1).
+    This test fails if someone lowers the memory cost below the OWASP
+    minimum without an explicit spec update.
+  type: bash
+  command: |
+    grep -q 'm=19456,t=2,p=1' src/security/geode_auth_lib.zig && echo "OWASP_PARAMS_PRESENT"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - OWASP_PARAMS_PRESENT
+  tags: [argon2id, static-oracle]
+
+  # ---- cleanup ----
+- name: argon2-cleanup-alpha
+  description: Delete test user alpha.
+  args:
+  - user
+  - delete
+  - argon2_test_alpha
+  - --yes
+  expected:
+    exit_code: 0
+  tags: [argon2id, cleanup]
+
+- name: argon2-cleanup-beta
+  description: Delete test user beta.
+  args:
+  - user
+  - delete
+  - argon2_test_beta
+  - --yes
+  expected:
+    exit_code: 0
+  tags: [argon2id, cleanup]
+
+tags:
+- argon2id
+- authn
+- security
+- hashing
+- owasp

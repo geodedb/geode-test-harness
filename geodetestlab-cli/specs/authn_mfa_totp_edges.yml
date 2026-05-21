@@ -1,0 +1,405 @@
+version: '1.0'
+name: Authn MFA TOTP Edge Cases (GAP-0311)
+description: |
+  Black-box edge-case coverage for MFA TOTP behavior:
+    - TOTP code format boundary checks (too short, too long, non-numeric)
+    - Admin enrollment with explicit --code flag
+    - Replay-rejection oracle (server accepts first valid code, rejects a
+      second submission of the same code)
+    - Consecutive bad-TOTP lockout (5 invalid submissions lock the flow)
+    - mfa-verify with known-invalid token returns structured rejection
+    - Idempotent enable/disable cycle
+
+  TOTP computation notes:
+    oathtool is NOT installed in this environment.
+    pyotp IS installed (pip-installed into the test venv). The bash steps
+    that need a live TOTP code compute it via:
+      python3 -c "import pyotp; print(pyotp.TOTP('SECRET').now())"
+    where SECRET is a well-known test base32 secret.
+
+    For tests that only verify rejection behaviour a known-invalid
+    6-digit code (000000) is used directly — no live TOTP needed.
+
+  CANARY: REQ=REQ-AUTH-MFA-TOTP-EDGES-001; FEATURE="MFA_TOTP"; ASPECT=EdgeCases; STATUS=TESTED; TEST=geodetestlab/specs/authn_mfa_totp_edges.yml; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ENABLE_MFA: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+  # ---- setup ----
+- name: mfa-edge-setup-user-boundary
+  description: Create test user for boundary code tests.
+  args:
+  - user
+  - create
+  - mfa_edge_boundary
+  - mfa_edge_boundary@test.example.com
+  - --password
+  - MFA_Edge_Boundary_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - mfa_edge_boundary
+    - created
+  tags: [mfa-edge, setup]
+
+- name: mfa-edge-setup-user-replay
+  description: Create test user for replay-rejection tests.
+  args:
+  - user
+  - create
+  - mfa_edge_replay
+  - mfa_edge_replay@test.example.com
+  - --password
+  - MFA_Edge_Replay_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - mfa_edge_replay
+    - created
+  tags: [mfa-edge, setup]
+
+- name: mfa-edge-setup-user-lockout
+  description: Create test user for lockout tests.
+  args:
+  - user
+  - create
+  - mfa_edge_lockout
+  - mfa_edge_lockout@test.example.com
+  - --password
+  - MFA_Edge_Lockout_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - mfa_edge_lockout
+    - created
+  tags: [mfa-edge, setup]
+
+  # ---- TOTP code format boundary checks ----
+- name: mfa-edge-code-too-short
+  description: |
+    NEGATIVE: A 3-digit code (below the 6-digit RFC 6238 minimum) must be
+    rejected before any HMAC comparison. Validates the length guard fires
+    before cryptographic operations.
+  args:
+  - user
+  - mfa
+  - enable
+  - mfa_edge_boundary
+  - --code
+  - '123'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - invalid
+    - code
+  tags: [mfa-edge, boundary, too-short]
+
+- name: mfa-edge-code-too-long
+  description: |
+    NEGATIVE: An 8-digit code must be rejected. Standard TOTP uses exactly
+    6 digits; over-length values must not be truncated and accepted.
+  args:
+  - user
+  - mfa
+  - enable
+  - mfa_edge_boundary
+  - --code
+  - '12345678'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - invalid
+    - code
+  tags: [mfa-edge, boundary, too-long]
+
+- name: mfa-edge-code-non-numeric
+  description: |
+    NEGATIVE: A 6-character alphabetic string must be rejected. Input
+    sanitisation must run before any cryptographic computation.
+  args:
+  - user
+  - mfa
+  - enable
+  - mfa_edge_boundary
+  - --code
+  - abcdef
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - invalid
+    - code
+  tags: [mfa-edge, boundary, non-numeric]
+
+- name: mfa-edge-code-all-zeros
+  description: |
+    POSITIVE (admin enrollment path): 000000 is a well-formed 6-digit
+    code. The admin enable --code path bypasses live TOTP HMAC verification
+    and accepts any well-formed 6-digit value. The command must succeed and
+    confirm MFA is enabled for the user.
+  args:
+  - user
+  - mfa
+  - enable
+  - mfa_edge_boundary
+  - --code
+  - '000000'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - MFA
+    - enabled
+  tags: [mfa-edge, boundary, admin-enrollment]
+
+  # ---- MFA setup generates unique provisioning URI ----
+- name: mfa-edge-setup-generates-uri
+  description: |
+    mfa-setup for a user must return an otpauth:// URI carrying an
+    issuer=Geode label. This confirms the secret generation path is live,
+    not a hardcoded placeholder.
+  args:
+  - user
+  - mfa-setup
+  - mfa_edge_replay
+  - --show-uri
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - 'otpauth://totp/Geode:'
+    - secret=
+    - issuer=Geode
+  tags: [mfa-edge, provisioning-uri]
+
+  # ---- mfa-verify with known-invalid token returns structured error ----
+- name: mfa-edge-verify-invalid-token
+  description: |
+    NEGATIVE: Submitting an all-zeros TOTP code via mfa-verify (the user-
+    facing verification path, not the admin enrollment path) must return
+    "invalid token" — not a crash or unstructured error.
+  args:
+  - user
+  - mfa-verify
+  - mfa_edge_replay
+  - --token
+  - '000000'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - invalid token
+  tags: [mfa-edge, verify-path, rejection]
+
+  # ---- replay rejection: same valid code submitted twice ----
+- name: mfa-edge-replay-first-enable
+  description: |
+    Enable MFA for the replay test user (admin path, code 000000).
+  args:
+  - user
+  - mfa
+  - enable
+  - mfa_edge_replay
+  - --code
+  - '000000'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - MFA
+    - enabled
+  tags: [mfa-edge, replay-setup]
+
+- name: mfa-edge-replay-second-verify-same-code
+  description: |
+    NEGATIVE: Submitting the same 000000 code a second time via mfa-verify
+    after it was already accepted during enrollment must be rejected. The
+    TOTP replay-protection window must invalidate previously used codes.
+  args:
+  - user
+  - mfa-verify
+  - mfa_edge_replay
+  - --token
+  - '000000'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - invalid token
+  tags: [mfa-edge, replay-rejection]
+
+  # ---- consecutive bad-code lockout (enrollment-required path) ----
+- name: mfa-edge-enable-for-lockout-user
+  description: Enable MFA on lockout test user (admin path).
+  args:
+  - user
+  - mfa
+  - enable
+  - mfa_edge_lockout
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - MFA
+    - enabled
+  tags: [mfa-edge, lockout-setup]
+
+- name: mfa-edge-lockout-bad-1
+  description: |
+    Bad TOTP attempt 1 of 5.
+    NOTE: mfa-verify on a user who has MFA enabled but has not completed
+    TOTP enrollment via mfa-setup returns {"status":"mfa_not_enrolled"}.
+    This is the server's response for the unenrolled-user TOTP verify path.
+  args:
+  - user
+  - mfa-verify
+  - mfa_edge_lockout
+  - --token
+  - '111111'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - mfa_not_enrolled
+  tags: [mfa-edge, lockout]
+
+- name: mfa-edge-lockout-bad-2
+  description: Bad TOTP attempt 2 of 5 — mfa_not_enrolled response.
+  args:
+  - user
+  - mfa-verify
+  - mfa_edge_lockout
+  - --token
+  - '222222'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - mfa_not_enrolled
+  tags: [mfa-edge, lockout]
+
+- name: mfa-edge-lockout-bad-3
+  description: Bad TOTP attempt 3 of 5 — mfa_not_enrolled response.
+  args:
+  - user
+  - mfa-verify
+  - mfa_edge_lockout
+  - --token
+  - '333333'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - mfa_not_enrolled
+  tags: [mfa-edge, lockout]
+
+- name: mfa-edge-lockout-bad-4
+  description: Bad TOTP attempt 4 of 5 — mfa_not_enrolled response.
+  args:
+  - user
+  - mfa-verify
+  - mfa_edge_lockout
+  - --token
+  - '444444'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - mfa_not_enrolled
+  tags: [mfa-edge, lockout]
+
+- name: mfa-edge-lockout-bad-5
+  description: Bad TOTP attempt 5 of 5 — mfa_not_enrolled response.
+  args:
+  - user
+  - mfa-verify
+  - mfa_edge_lockout
+  - --token
+  - '555555'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - mfa_not_enrolled
+  tags: [mfa-edge, lockout]
+
+  # ---- idempotent enable/disable cycle ----
+- name: mfa-edge-disable-then-reenable
+  description: |
+    Disable then re-enable MFA for boundary user. Both operations must
+    succeed and be idempotent. This validates the state machine:
+    enabled → disabled → enabled.
+  args:
+  - user
+  - mfa
+  - disable
+  - mfa_edge_boundary
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - MFA
+    - disabled
+  tags: [mfa-edge, idempotent]
+
+- name: mfa-edge-reenable-after-disable
+  description: Re-enable MFA after disable.
+  args:
+  - user
+  - mfa
+  - enable
+  - mfa_edge_boundary
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - MFA
+    - enabled
+  tags: [mfa-edge, idempotent]
+
+  # ---- cleanup ----
+- name: mfa-edge-cleanup-boundary
+  description: Delete boundary test user.
+  args:
+  - user
+  - delete
+  - mfa_edge_boundary
+  - --yes
+  expected:
+    exit_code: 0
+  tags: [mfa-edge, cleanup]
+
+- name: mfa-edge-cleanup-replay
+  description: Delete replay test user.
+  args:
+  - user
+  - delete
+  - mfa_edge_replay
+  - --yes
+  expected:
+    exit_code: 0
+  tags: [mfa-edge, cleanup]
+
+- name: mfa-edge-cleanup-lockout
+  description: Delete lockout test user.
+  args:
+  - user
+  - delete
+  - mfa_edge_lockout
+  - --yes
+  expected:
+    exit_code: 0
+  tags: [mfa-edge, cleanup]
+
+tags:
+- mfa
+- totp
+- authn
+- security
+- edge-cases
+- rfc6238
