@@ -1,0 +1,666 @@
+version: '1.0'
+name: 'GAP-0345: MCP Full Surface — list_tools, call_tool, error mapping'
+description: |
+  CANARY: REQ=REQ-MCP-SURFACE-001; FEATURE="MCPFullSurface"; ASPECT=JSONRPCToolSurface; STATUS=TESTED; OWNER=mcp; UPDATED=2026-05-21
+
+  Tests the full MCP tool-invocation surface exposed by `geode mcp --stdio`:
+    1. tools/list     — server returns at least one tool with name + inputSchema
+    2. call_tool (valid GQL)    — execute a well-formed GQL query via the MCP tool
+    3. call_tool (empty args)   — missing required field maps to a structured error
+    4. call_tool (bad GQL)      — syntactically invalid GQL maps to an error
+                                  result (not a server crash)
+    5. call_tool (unknown tool) — unknown tool name returns error, not crash
+
+  Transport: `geode mcp --stdio` (JSONRPC 2.0 newline-delimited over stdin/stdout).
+  The --endpoint flag connects the MCP server to the managed Geode instance.
+
+  Skips: Any tool that is not listed in tools/list is skipped gracefully.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Phase 0: Smoke — subcommand discovery
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0345-SMOKE-001: mcp --help mentions stdio and port transports'
+  description: Verify geode mcp --help exits 0 and documents both transports
+  args:
+  - mcp
+  - --help
+  expect:
+    exit_code: 0
+    stderr_contains:
+    - Model Context Protocol
+    - --stdio
+    - --port
+  tags:
+  - gap-0345
+  - mcp
+  - smoke
+
+# ---------------------------------------------------------------------------
+# Phase 1: MCP initialize handshake
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0345-INIT-001: MCP initialize returns protocol version'
+  description: |
+    Send MCP initialize and assert a valid InitializeResult with
+    protocolVersion. Uses newline-delimited JSONRPC (MCP stdio transport).
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/mcp_init_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+    server_addr = os.environ.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")
+
+    def mcp_frame(msg):
+        return (json.dumps(msg) + "\n").encode()
+
+    def read_mcp(proc, timeout_secs=8):
+        deadline = time.time() + timeout_secs
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.2)[0]
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        return json.loads(line)
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "mcp", "--stdio", "--endpoint", server_addr],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"geode-test-harness","version":"1.0"}}}))
+        proc.stdin.flush()
+        resp = read_mcp(proc, timeout_secs=10)
+        if resp is None:
+            print("mcp_init=error no_response=true")
+            sys.exit(1)
+        result = resp.get("result") or {}
+        protocol_version = result.get("protocolVersion", "")
+        server_name = (result.get("serverInfo") or {}).get("name", "unknown")
+        print("mcp_init=ok protocol_version=" + str(protocol_version) + " server_name=" + str(server_name))
+        sys.exit(0 if protocol_version else 1)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 20000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - mcp_init=ok
+  tags:
+  - gap-0345
+  - mcp
+  - initialize
+
+# ---------------------------------------------------------------------------
+# Phase 2: tools/list
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0345-LIST-001: tools/list returns tools with name and inputSchema'
+  description: |
+    Call tools/list and assert result.tools is a non-empty array where
+    each tool has a name and at least one has a non-null inputSchema.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/mcp_list_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+    server_addr = os.environ.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")
+
+    def mcp_frame(msg):
+        return (json.dumps(msg) + "\n").encode()
+
+    def read_mcp(proc, timeout_secs=8):
+        deadline = time.time() + timeout_secs
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.2)[0]
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        return json.loads(line)
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "mcp", "--stdio", "--endpoint", server_addr],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"geode-test-harness","version":"1.0"}}}))
+        proc.stdin.flush()
+        read_mcp(proc, timeout_secs=10)
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        proc.stdin.flush()
+
+        resp = None
+        for _ in range(10):
+            r = read_mcp(proc, timeout_secs=5)
+            if r is None:
+                break
+            if r.get("id") == 2:
+                resp = r
+                break
+
+        if resp is None:
+            print("tools_list=error no_response=true")
+            sys.exit(1)
+
+        tools = (resp.get("result") or {}).get("tools", [])
+        tool_count = len(tools)
+        has_schema = any(t.get("inputSchema") is not None for t in tools)
+        names = ",".join(t.get("name","?") for t in tools[:10])
+        print("tools_list=ok count=" + str(tool_count) + " has_schema=" + str(has_schema) + " names=" + names)
+        sys.exit(0 if tool_count > 0 else 1)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 20000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - tools_list=ok
+  tags:
+  - gap-0345
+  - mcp
+  - list-tools
+
+# ---------------------------------------------------------------------------
+# Phase 3: call_tool with valid GQL
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0345-CALL-001: call_tool with valid GQL returns result content'
+  description: |
+    Discover the GQL execution tool from tools/list and invoke it with
+    "RETURN 1 AS x". Assert no JSONRPC error and content is non-empty.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/mcp_call_valid_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+    server_addr = os.environ.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")
+
+    def mcp_frame(msg):
+        return (json.dumps(msg) + "\n").encode()
+
+    def read_mcp(proc, timeout_secs=8):
+        deadline = time.time() + timeout_secs
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.2)[0]
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        return json.loads(line)
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "mcp", "--stdio", "--endpoint", server_addr],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"geode-test-harness","version":"1.0"}}}))
+        proc.stdin.flush()
+        read_mcp(proc, timeout_secs=10)
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        proc.stdin.flush()
+
+        list_resp = None
+        for _ in range(10):
+            r = read_mcp(proc, timeout_secs=5)
+            if r and r.get("id") == 2:
+                list_resp = r
+                break
+
+        if list_resp is None:
+            print("call_tool_valid=skipped reason=tools_list_failed")
+            sys.exit(0)
+
+        tools = (list_resp.get("result") or {}).get("tools", [])
+        if not tools:
+            print("call_tool_valid=skipped reason=no_tools_listed")
+            sys.exit(0)
+
+        gql_tool = next(
+            (t for t in tools if any(kw in t.get("name","").lower() for kw in ["query","execute","gql","run"])),
+            tools[0]
+        )
+        tool_name = gql_tool["name"]
+        schema = gql_tool.get("inputSchema") or {}
+        props = schema.get("properties") or {}
+        query_param = next(
+            (k for k in props if k.lower() in ("query","gql","statement","sql","text")),
+            "query"
+        )
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":tool_name,"arguments":{query_param:"RETURN 1 AS x"}}}))
+        proc.stdin.flush()
+
+        call_resp = None
+        for _ in range(10):
+            r = read_mcp(proc, timeout_secs=8)
+            if r and r.get("id") == 3:
+                call_resp = r
+                break
+
+        if call_resp is None:
+            print("call_tool_valid=error tool=" + tool_name + " no_response=true")
+            sys.exit(1)
+
+        has_error = bool(call_resp.get("error"))
+        result = call_resp.get("result") or {}
+        content = result.get("content") or []
+        content_text = " ".join(c.get("text","") for c in content if isinstance(c, dict)) if isinstance(content, list) else str(content)
+        print("call_tool_valid=ok tool=" + tool_name + " has_error=" + str(has_error) + " content_len=" + str(len(content_text)))
+        sys.exit(0 if not has_error else 1)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - call_tool_valid=ok
+  tags:
+  - gap-0345
+  - mcp
+  - call-tool
+  - valid
+
+# ---------------------------------------------------------------------------
+# Phase 4: call_tool with invalid/empty args
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0345-CALL-002: call_tool with empty args returns structured error'
+  description: |
+    Invoke the GQL tool with {} (missing required query param). Expect
+    either a JSONRPC error (code -32602) or isError=true in the result.
+    A crash or missing response fails the test.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/mcp_call_empty_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+    server_addr = os.environ.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")
+
+    def mcp_frame(msg):
+        return (json.dumps(msg) + "\n").encode()
+
+    def read_mcp(proc, timeout_secs=8):
+        deadline = time.time() + timeout_secs
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.2)[0]
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        return json.loads(line)
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "mcp", "--stdio", "--endpoint", server_addr],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"geode-test-harness","version":"1.0"}}}))
+        proc.stdin.flush()
+        read_mcp(proc, timeout_secs=10)
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        proc.stdin.flush()
+
+        list_resp = None
+        for _ in range(10):
+            r = read_mcp(proc, timeout_secs=5)
+            if r and r.get("id") == 2:
+                list_resp = r
+                break
+
+        if list_resp is None:
+            print("call_tool_invalid=skipped reason=tools_list_failed")
+            sys.exit(0)
+
+        tools = (list_resp.get("result") or {}).get("tools", [])
+        if not tools:
+            print("call_tool_invalid=skipped reason=no_tools_listed")
+            sys.exit(0)
+
+        gql_tool = next(
+            (t for t in tools if any(kw in t.get("name","").lower() for kw in ["query","execute","gql","run"])),
+            tools[0]
+        )
+        tool_name = gql_tool["name"]
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":tool_name,"arguments":{}}}))
+        proc.stdin.flush()
+
+        call_resp = None
+        for _ in range(10):
+            r = read_mcp(proc, timeout_secs=8)
+            if r and r.get("id") == 3:
+                call_resp = r
+                break
+
+        if call_resp is None:
+            print("call_tool_invalid=error tool=" + tool_name + " no_response=true")
+            sys.exit(1)
+
+        has_rpc_error = bool(call_resp.get("error"))
+        result = call_resp.get("result") or {}
+        is_error_content = result.get("isError", False)
+        error_code = (call_resp.get("error") or {}).get("code", 0)
+        print("call_tool_invalid=ok tool=" + tool_name + " has_rpc_error=" + str(has_rpc_error) + " is_error_content=" + str(is_error_content) + " error_code=" + str(error_code))
+        sys.exit(0 if (has_rpc_error or is_error_content) else 1)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - call_tool_invalid=ok
+  tags:
+  - gap-0345
+  - mcp
+  - call-tool
+  - invalid-args
+  - error-mapping
+
+# ---------------------------------------------------------------------------
+# Phase 5: call_tool with syntactically invalid GQL
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0345-CALL-003: call_tool with bad GQL returns error not panic'
+  description: |
+    Pass "SELEC * FORM nodes" (invalid GQL) to the GQL execution tool.
+    Assert no crash (exit code not 139/134) and an error signal in the response.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/mcp_call_badgql_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+    server_addr = os.environ.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")
+
+    def mcp_frame(msg):
+        return (json.dumps(msg) + "\n").encode()
+
+    def read_mcp(proc, timeout_secs=8):
+        deadline = time.time() + timeout_secs
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.2)[0]
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        return json.loads(line)
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "mcp", "--stdio", "--endpoint", server_addr],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"geode-test-harness","version":"1.0"}}}))
+        proc.stdin.flush()
+        read_mcp(proc, timeout_secs=10)
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        proc.stdin.flush()
+
+        list_resp = None
+        for _ in range(10):
+            r = read_mcp(proc, timeout_secs=5)
+            if r and r.get("id") == 2:
+                list_resp = r
+                break
+
+        if list_resp is None:
+            print("call_tool_bad_gql=skipped reason=tools_list_failed")
+            sys.exit(0)
+
+        tools = (list_resp.get("result") or {}).get("tools", [])
+        if not tools:
+            print("call_tool_bad_gql=skipped reason=no_tools_listed")
+            sys.exit(0)
+
+        gql_tool = next(
+            (t for t in tools if any(kw in t.get("name","").lower() for kw in ["query","execute","gql","run"])),
+            tools[0]
+        )
+        tool_name = gql_tool["name"]
+        schema = gql_tool.get("inputSchema") or {}
+        props = schema.get("properties") or {}
+        query_param = next(
+            (k for k in props if k.lower() in ("query","gql","statement","sql","text")),
+            "query"
+        )
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":tool_name,"arguments":{query_param:"SELEC * FORM nodes"}}}))
+        proc.stdin.flush()
+
+        call_resp = None
+        for _ in range(10):
+            r = read_mcp(proc, timeout_secs=8)
+            if r and r.get("id") == 3:
+                call_resp = r
+                break
+
+        if call_resp is None:
+            print("call_tool_bad_gql=error tool=" + tool_name + " no_response=true")
+            sys.exit(1)
+
+        has_rpc_error = bool(call_resp.get("error"))
+        result = call_resp.get("result") or {}
+        is_error_content = result.get("isError", False)
+        content = result.get("content") or []
+        content_text = " ".join(c.get("text","") for c in content if isinstance(c, dict)).lower() if isinstance(content, list) else ""
+        rpc_msg = ((call_resp.get("error") or {}).get("message") or "").lower()
+        error_mentioned = any(kw in content_text + rpc_msg for kw in ["parse","syntax","error","invalid","unexpected","unknown"])
+
+        print("call_tool_bad_gql=ok tool=" + tool_name + " has_rpc_error=" + str(has_rpc_error) + " is_error_content=" + str(is_error_content) + " error_mentioned=" + str(error_mentioned))
+        sys.exit(0 if (has_rpc_error or is_error_content) else 1)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        exit_code = proc.wait(timeout=5)
+        if exit_code in (-11, 139, -6, 134):
+            print("GEODE_BUG: mcp server crashed on bad GQL exit_code=" + str(exit_code))
+            sys.exit(1)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - call_tool_bad_gql=ok
+  tags:
+  - gap-0345
+  - mcp
+  - call-tool
+  - bad-gql
+  - error-mapping
+
+# ---------------------------------------------------------------------------
+# Phase 6: call_tool with unknown tool name
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0345-CALL-004: call_tool with unknown tool name returns error'
+  description: |
+    Call a non-existent tool name. Assert error signal (JSONRPC error or
+    isError content). No crash.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/mcp_call_unk_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+    server_addr = os.environ.get("GEODE_SERVER_ADDRESS", "127.0.0.1:3141")
+
+    def mcp_frame(msg):
+        return (json.dumps(msg) + "\n").encode()
+
+    def read_mcp(proc, timeout_secs=8):
+        deadline = time.time() + timeout_secs
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.2)[0]
+            if ready:
+                line = proc.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        return json.loads(line)
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "mcp", "--stdio", "--endpoint", server_addr],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"geode-test-harness","version":"1.0"}}}))
+        proc.stdin.flush()
+        read_mcp(proc, timeout_secs=10)
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(mcp_frame({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"nonexistent_tool_gap0345","arguments":{}}}))
+        proc.stdin.flush()
+
+        call_resp = None
+        for _ in range(10):
+            r = read_mcp(proc, timeout_secs=8)
+            if r and r.get("id") == 2:
+                call_resp = r
+                break
+
+        if call_resp is None:
+            print("call_tool_unknown=error no_response=true")
+            sys.exit(1)
+
+        has_rpc_error = bool(call_resp.get("error"))
+        result = call_resp.get("result") or {}
+        is_error_content = result.get("isError", False)
+        error_code = (call_resp.get("error") or {}).get("code", 0)
+        print("call_tool_unknown=ok has_rpc_error=" + str(has_rpc_error) + " is_error_content=" + str(is_error_content) + " error_code=" + str(error_code))
+        sys.exit(0 if (has_rpc_error or is_error_content) else 1)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 20000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - call_tool_unknown=ok
+  tags:
+  - gap-0345
+  - mcp
+  - call-tool
+  - unknown-tool
+  - error-mapping
+
+tags:
+- gap-0345
+- mcp
+- list-tools
+- call-tool
+- error-mapping
+- jsonrpc

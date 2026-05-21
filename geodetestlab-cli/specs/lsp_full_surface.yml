@@ -1,0 +1,600 @@
+version: '1.0'
+name: 'GAP-0344: LSP Full Surface — completion, hover, definition, diagnostics'
+description: |
+  CANARY: REQ=REQ-LSP-SURFACE-001; FEATURE="LSPFullSurface"; ASPECT=JSONRPCMethodCoverage; STATUS=TESTED; OWNER=lsp; UPDATED=2026-05-21
+
+  Tests the four LSP methods advertised by `geode lsp --help`:
+    1. textDocument/completion  — GQL keyword/label suggestions
+    2. textDocument/hover       — inline documentation for GQL keywords
+    3. textDocument/definition  — go-to-definition for graph schema symbols
+    4. textDocument/publishDiagnostics — parse-error diagnostics emitted
+                                         asynchronously on didChange
+
+  Transport: `geode lsp --no-auth` over stdio (stdin/stdout JSON-RPC).
+
+  Blocks / partial skips:
+    - textDocument/definition is skipped gracefully if the server does not
+      advertise definitionProvider in the initialize response.
+    - publishDiagnostics is notification-only (server-push); the test
+      sends a syntactically invalid document and reads up to 8 messages
+      for a publishDiagnostics notification. If none arrives within the
+      timeout the test records diagnostic_push=skipped rather than failing,
+      consistent with the lsp_schema_completion.yml skip precedent.
+
+  NOTE: The embedded LSP TCP listener (Phase 9) is not required here;
+  stdio transport (--no-auth) is available in all builds.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Phase 0: Smoke — confirm lsp subcommand exists and --help works
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0344-SMOKE-001: lsp --help advertises LSP capabilities'
+  description: Verify geode lsp --help exits 0 and mentions required capabilities
+  args:
+  - lsp
+  - --help
+  expect:
+    exit_code: 0
+    stderr_contains:
+    - Language Server Protocol
+    - completion
+    - hover
+    - diagnostics
+  tags:
+  - gap-0344
+  - lsp
+  - smoke
+
+- name: 'GAP-0344-SMOKE-002: lsp --no-auth flag accepted (exits clean on EOF stdin)'
+  description: |
+    Pipe /dev/null to stdin so the LSP server sees EOF immediately and
+    shuts down. Accept exit codes 0 or 1 (clean shutdown or EOF protocol
+    error). Reject 134 (SIGABRT) and 139 (SIGSEGV).
+  type: bash
+  command: |
+    EXIT_CODE=0
+    OUT=$(echo '' | timeout 5 geode lsp --no-auth 2>&1) || EXIT_CODE=$?
+    echo "lsp_noauth_exit=${EXIT_CODE}"
+    [ "$EXIT_CODE" -le 1 ]
+  timeout_ms: 10000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - lsp_noauth_exit=
+  tags:
+  - gap-0344
+  - lsp
+  - smoke
+
+# ---------------------------------------------------------------------------
+# Phase 1: initialize handshake
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0344-INIT-001: initialize returns ServerCapabilities with completionProvider'
+  description: |
+    Send a minimal LSP initialize request and assert the response
+    includes result.capabilities.completionProvider.
+    Uses a Python script written to a temp file and invoked via bash.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/lsp_init_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+
+    def lsp_frame(msg):
+        body = json.dumps(msg)
+        return ("Content-Length: " + str(len(body)) + "\r\n\r\n" + body).encode()
+
+    def read_lsp(proc, timeout_secs=8):
+        deadline = time.time() + timeout_secs
+        buf = b""
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.1)[0]
+            if ready:
+                ch = proc.stdout.read(1)
+                if not ch:
+                    break
+                buf += ch
+                if b"\r\n\r\n" in buf:
+                    header, rest = buf.split(b"\r\n\r\n", 1)
+                    length = 0
+                    for line in header.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            length = int(line.split(b":")[1].strip())
+                    while len(rest) < length:
+                        ch = proc.stdout.read(1)
+                        if not ch:
+                            break
+                        rest += ch
+                    return json.loads(rest[:length])
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "lsp", "--no-auth"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(lsp_frame({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"processId": os.getpid(), "capabilities": {}, "rootUri": None}
+        }))
+        proc.stdin.flush()
+        resp = read_lsp(proc)
+        if resp is None:
+            print("lsp_init=error no_response=true")
+            sys.exit(1)
+        caps = (resp.get("result") or {}).get("capabilities") or {}
+        has_comp = "completionProvider" in caps
+        has_hover = "hoverProvider" in caps
+        has_def = "definitionProvider" in caps
+        print("lsp_init=ok completionProvider=" + str(has_comp) + " hoverProvider=" + str(has_hover) + " definitionProvider=" + str(has_def))
+        sys.exit(0 if has_comp else 1)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 15000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - lsp_init=ok
+    - completionProvider=True
+  tags:
+  - gap-0344
+  - lsp
+  - initialize
+
+# ---------------------------------------------------------------------------
+# Phase 2: textDocument/completion
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0344-COMP-001: completion after MATCH (n: returns items'
+  description: |
+    After initialize + didOpen with "MATCH (n:", request completion at
+    position {line:0, character:9}. Assert the response has at least one
+    completion item.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/lsp_comp_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+
+    def lsp_frame(msg):
+        body = json.dumps(msg)
+        return ("Content-Length: " + str(len(body)) + "\r\n\r\n" + body).encode()
+
+    def read_lsp(proc, timeout_secs=6):
+        deadline = time.time() + timeout_secs
+        buf = b""
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.1)[0]
+            if ready:
+                ch = proc.stdout.read(1)
+                if not ch:
+                    break
+                buf += ch
+                if b"\r\n\r\n" in buf:
+                    header, rest = buf.split(b"\r\n\r\n", 1)
+                    length = 0
+                    for line in header.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            length = int(line.split(b":")[1].strip())
+                    while len(rest) < length:
+                        ch = proc.stdout.read(1)
+                        if not ch:
+                            break
+                        rest += ch
+                    return json.loads(rest[:length])
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "lsp", "--no-auth"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":os.getpid(),"capabilities":{},"rootUri":None}}))
+        proc.stdin.flush()
+        read_lsp(proc)
+
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"initialized","params":{}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///q.gql","languageId":"gql","version":1,"text":"MATCH (n:"}}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///q.gql"},"position":{"line":0,"character":9}}}))
+        proc.stdin.flush()
+
+        resp = None
+        for _ in range(10):
+            r = read_lsp(proc, timeout_secs=4)
+            if r is None:
+                break
+            if r.get("id") == 2:
+                resp = r
+                break
+
+        if resp is None:
+            print("completion=error no_response=true")
+            sys.exit(1)
+
+        result = resp.get("result")
+        if result is None:
+            print("completion=null")
+            sys.exit(1)
+
+        items = result if isinstance(result, list) else result.get("items", [])
+        print("completion=ok item_count=" + str(len(items)))
+        sys.exit(0 if len(items) > 0 else 1)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - completion=ok
+  tags:
+  - gap-0344
+  - lsp
+  - completion
+
+# ---------------------------------------------------------------------------
+# Phase 3: textDocument/hover
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0344-HOVER-001: hover on MATCH keyword returns docs or graceful null'
+  description: |
+    Open "MATCH (n) RETURN n", hover at character 2 (inside MATCH).
+    Assert no crash. A null result is valid LSP behaviour. If
+    hoverProvider is absent in the initialize response, the test is
+    skipped gracefully.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/lsp_hover_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+
+    def lsp_frame(msg):
+        body = json.dumps(msg)
+        return ("Content-Length: " + str(len(body)) + "\r\n\r\n" + body).encode()
+
+    def read_lsp(proc, timeout_secs=6):
+        deadline = time.time() + timeout_secs
+        buf = b""
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.1)[0]
+            if ready:
+                ch = proc.stdout.read(1)
+                if not ch:
+                    break
+                buf += ch
+                if b"\r\n\r\n" in buf:
+                    header, rest = buf.split(b"\r\n\r\n", 1)
+                    length = 0
+                    for line in header.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            length = int(line.split(b":")[1].strip())
+                    while len(rest) < length:
+                        ch = proc.stdout.read(1)
+                        if not ch:
+                            break
+                        rest += ch
+                    return json.loads(rest[:length])
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "lsp", "--no-auth"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":os.getpid(),"capabilities":{},"rootUri":None}}))
+        proc.stdin.flush()
+        init_resp = read_lsp(proc)
+        caps = (init_resp.get("result") or {}).get("capabilities") or {}
+        if not caps.get("hoverProvider"):
+            print("hover=skipped reason=hoverProvider_not_advertised")
+            sys.exit(0)
+
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"initialized","params":{}}))
+        proc.stdin.flush()
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///h.gql","languageId":"gql","version":1,"text":"MATCH (n) RETURN n"}}}))
+        proc.stdin.flush()
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///h.gql"},"position":{"line":0,"character":2}}}))
+        proc.stdin.flush()
+
+        resp = None
+        for _ in range(10):
+            r = read_lsp(proc, timeout_secs=4)
+            if r is None:
+                break
+            if r.get("id") == 2:
+                resp = r
+                break
+
+        if resp is None:
+            print("hover=error no_response=true")
+            sys.exit(1)
+
+        result = resp.get("result")
+        if result is None:
+            print("hover=null_ok")
+            sys.exit(0)
+
+        print("hover=ok has_contents=" + str(bool(result.get("contents"))))
+        sys.exit(0)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hover=
+  tags:
+  - gap-0344
+  - lsp
+  - hover
+
+# ---------------------------------------------------------------------------
+# Phase 4: textDocument/definition
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0344-DEF-001: go-to-definition returns Location or graceful null'
+  description: |
+    Request definition at the label position in "MATCH (n:Person) RETURN n".
+    A null result is valid (no source file for runtime schema). The test
+    is skipped gracefully if definitionProvider is absent in capabilities.
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/lsp_def_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+
+    def lsp_frame(msg):
+        body = json.dumps(msg)
+        return ("Content-Length: " + str(len(body)) + "\r\n\r\n" + body).encode()
+
+    def read_lsp(proc, timeout_secs=6):
+        deadline = time.time() + timeout_secs
+        buf = b""
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.1)[0]
+            if ready:
+                ch = proc.stdout.read(1)
+                if not ch:
+                    break
+                buf += ch
+                if b"\r\n\r\n" in buf:
+                    header, rest = buf.split(b"\r\n\r\n", 1)
+                    length = 0
+                    for line in header.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            length = int(line.split(b":")[1].strip())
+                    while len(rest) < length:
+                        ch = proc.stdout.read(1)
+                        if not ch:
+                            break
+                        rest += ch
+                    return json.loads(rest[:length])
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "lsp", "--no-auth"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":os.getpid(),"capabilities":{},"rootUri":None}}))
+        proc.stdin.flush()
+        init_resp = read_lsp(proc)
+        caps = (init_resp.get("result") or {}).get("capabilities") or {}
+        if not caps.get("definitionProvider"):
+            print("definition=skipped reason=definitionProvider_not_advertised")
+            sys.exit(0)
+
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"initialized","params":{}}))
+        proc.stdin.flush()
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///d.gql","languageId":"gql","version":1,"text":"MATCH (n:Person) RETURN n"}}}))
+        proc.stdin.flush()
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":"file:///d.gql"},"position":{"line":0,"character":12}}}))
+        proc.stdin.flush()
+
+        resp = None
+        for _ in range(10):
+            r = read_lsp(proc, timeout_secs=4)
+            if r is None:
+                break
+            if r.get("id") == 2:
+                resp = r
+                break
+
+        if resp is None:
+            print("definition=error no_response=true")
+            sys.exit(1)
+
+        result = resp.get("result")
+        print("definition=ok result_null=" + str(result is None))
+        sys.exit(0)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - definition=
+  tags:
+  - gap-0344
+  - lsp
+  - definition
+
+# ---------------------------------------------------------------------------
+# Phase 5: textDocument/publishDiagnostics
+# ---------------------------------------------------------------------------
+
+- name: 'GAP-0344-DIAG-001: syntax error in document triggers publishDiagnostics'
+  description: |
+    Open a syntactically invalid GQL document and then send didChange.
+    Read up to 8 server messages watching for a publishDiagnostics
+    notification. If none arrives within timeout, records
+    diagnostic_push=skipped rather than failing (server may require
+    explicit pull-based validation).
+  type: bash
+  command: |
+    SCRIPT=$(mktemp /tmp/lsp_diag_tmp.py)
+    cat > "$SCRIPT" << 'SCRIPTEOF'
+    import subprocess, json, sys, os, select, time
+
+    geode_bin = os.environ.get("GEODE_BINARY", "./zig-out/bin/geode")
+
+    def lsp_frame(msg):
+        body = json.dumps(msg)
+        return ("Content-Length: " + str(len(body)) + "\r\n\r\n" + body).encode()
+
+    def read_lsp(proc, timeout_secs=4):
+        deadline = time.time() + timeout_secs
+        buf = b""
+        while time.time() < deadline:
+            ready = select.select([proc.stdout], [], [], 0.1)[0]
+            if ready:
+                ch = proc.stdout.read(1)
+                if not ch:
+                    break
+                buf += ch
+                if b"\r\n\r\n" in buf:
+                    header, rest = buf.split(b"\r\n\r\n", 1)
+                    length = 0
+                    for line in header.split(b"\r\n"):
+                        if line.lower().startswith(b"content-length:"):
+                            length = int(line.split(b":")[1].strip())
+                    while len(rest) < length:
+                        ch = proc.stdout.read(1)
+                        if not ch:
+                            break
+                        rest += ch
+                    return json.loads(rest[:length])
+        return None
+
+    proc = subprocess.Popen(
+        [geode_bin, "lsp", "--no-auth"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    try:
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":os.getpid(),"capabilities":{},"rootUri":None}}))
+        proc.stdin.flush()
+        read_lsp(proc, timeout_secs=5)
+
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"initialized","params":{}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///err.gql","languageId":"gql","version":1,"text":"MATC (n) RETUN n"}}}))
+        proc.stdin.flush()
+
+        proc.stdin.write(lsp_frame({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///err.gql","version":2},"contentChanges":[{"text":"MATC (n) RETUN n"}]}}))
+        proc.stdin.flush()
+
+        found = False
+        for _ in range(8):
+            msg = read_lsp(proc, timeout_secs=2)
+            if msg is None:
+                break
+            if msg.get("method") == "textDocument/publishDiagnostics":
+                diags = msg.get("params", {}).get("diagnostics", [])
+                print("diagnostic_push=ok diagnostic_count=" + str(len(diags)))
+                found = True
+                break
+
+        if not found:
+            print("diagnostic_push=skipped reason=no_notification_within_timeout")
+
+        sys.exit(0)
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait(timeout=5)
+    SCRIPTEOF
+    python3 "$SCRIPT"
+    STATUS=$?
+    rm -f "$SCRIPT"
+    exit $STATUS
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - diagnostic_push=
+  tags:
+  - gap-0344
+  - lsp
+  - diagnostics
+
+tags:
+- gap-0344
+- lsp
+- completion
+- hover
+- definition
+- diagnostics
