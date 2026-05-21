@@ -1,0 +1,242 @@
+version: '1.0'
+name: GPS policy persistence — CREATE/DROP survive server restart
+description: |
+  Verifies that policies created via CREATE POLICY DDL survive a real
+  server restart against the same data directory, and that enforcement
+  is preserved across the restart boundary. Uses the harness
+  `restart_server: true` step to stop the running server (SIGTERM +
+  flush) and start a fresh process against the same data dir.
+
+  PHASE 1 (writes, before restart):
+  - Create alice (readonly)
+  - Create universal `true` policy granting WRITE to all → alice can CREATE
+  - Create alice-specific policy via current_user() expression
+  - Drop the universal policy, leaving only alice's policy
+
+  RESTART
+
+  PHASE 2 (asserts, after restart):
+  - SHOW POLICIES still lists the alice-specific policy
+  - The dropped universal policy does NOT reappear
+  - alice can still CREATE (her policy enforces across restart)
+  - bob (readonly) is still denied CREATE (no policy matches him)
+
+  This proves:
+  1. policy_persistence.persistPolicy writes to __geode_security HMAC chain.
+  2. hydrateCatalog at startup restores all enabled policies.
+  3. dropPolicy removes from both in-memory + persistent layers.
+  4. The compiled expression (current_user() = '...') re-compiles
+     correctly after hydration.
+
+  CANARY: REQ=REQ-GPS-CATALOG-003; FEATURE="GPS Policy Persistence"; ASPECT=BlackBoxRestartLifecycle; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+  # ============================================================================
+  # PHASE 1: writes that must survive the restart
+  # ============================================================================
+- name: persist-preflight-cleanup
+  description: Idempotent preflight cleanup (covers reruns against the same dir).
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS persist_universal;
+    DROP POLICY IF EXISTS persist_alice_only;
+    DROP USER IF EXISTS persist_alice;
+    DROP USER IF EXISTS persist_bob;
+  expect: {exit_code: 0}
+  tags: [persistence, setup]
+
+- name: persist-create-alice
+  description: Create alice (readonly).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER persist_alice SET PASSWORD 'persist-alice-pass-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+  tags: [persistence, setup]
+
+- name: persist-create-bob
+  description: Create bob (readonly, no policy will match him).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER persist_bob SET PASSWORD 'persist-bob-pass-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+  tags: [persistence, setup]
+
+- name: persist-create-universal-policy
+  description: Universal `true` policy granting WRITE — will be dropped before restart.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY persist_universal ON GRAPH * FOR WRITE USING true]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [persistence, phase1]
+
+- name: persist-create-alice-policy
+  description: alice-specific policy via current_user() — must survive restart.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY persist_alice_only ON GRAPH * FOR WRITE USING current_user() = 'persist_alice']
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [persistence, phase1]
+
+- name: persist-confirm-alice-write-pre-restart
+  description: POSITIVE — alice can CREATE pre-restart (universal policy active).
+  args: [query, -U, persist_alice, -P, persist-alice-pass-1234, '-']
+  stdin: 'CREATE (n:PersistPreRestart {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [PersistPreRestart]
+    stdout_not_contains: ['42501']
+  tags: [persistence, phase1, positive]
+
+- name: persist-drop-universal-pre-restart
+  description: |
+    Drop the universal policy pre-restart. After this, alice still
+    has her own policy; bob has none.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY persist_universal]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy dropped]
+  tags: [persistence, phase1]
+
+- name: persist-bob-denied-pre-restart
+  description: NEGATIVE pre-restart — bob is denied (no matching policy).
+  args: [query, -U, persist_bob, -P, persist-bob-pass-1234, '-']
+  stdin: 'CREATE (n:PersistBobDeniedPre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, phase1, negative]
+
+  # ============================================================================
+  # SERVER RESTART
+  # ============================================================================
+- name: persist-restart-checkpoint
+  description: |
+    Stop the running server (SIGTERM + flush) and start a fresh
+    process against the same data directory. All persisted policies
+    must be hydrated from __geode_security.
+  type: bash
+  command: echo 'GPS policy persistence restart checkpoint'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [persistence, restart]
+
+  # ============================================================================
+  # PHASE 2: asserts after restart
+  # ============================================================================
+- name: persist-show-policies-post-restart
+  description: |
+    POSITIVE — SHOW POLICIES after restart returns the alice policy
+    but NOT the dropped universal policy.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [persist_alice_only]
+    stdout_not_contains: [persist_universal]
+  tags: [persistence, phase2, positive]
+
+- name: persist-alice-write-post-restart
+  description: |
+    POSITIVE — alice can CREATE after restart. Her current_user()
+    policy was hydrated and re-compiled from the persistent layer.
+  args: [query, -U, persist_alice, -P, persist-alice-pass-1234, '-']
+  stdin: 'CREATE (n:PersistAlicePostRestart {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [PersistAlicePostRestart]
+    stdout_not_contains: ['42501']
+  tags: [persistence, phase2, positive]
+
+- name: persist-bob-denied-post-restart
+  description: |
+    NEGATIVE — bob is still denied after restart. The universal
+    policy was dropped pre-restart and stays gone; alice's policy
+    is user-specific and does not match bob.
+  args: [query, -U, persist_bob, -P, persist-bob-pass-1234, '-']
+  stdin: 'CREATE (n:PersistBobDeniedPost {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, phase2, negative]
+
+  # ============================================================================
+  # Verify the pre-restart node survived (graph data persistence)
+  # ============================================================================
+- name: persist-pre-restart-node-survives
+  description: |
+    POSITIVE — the node alice created BEFORE the restart is still in
+    the store after restart (sanity check for the data path).
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:PersistPreRestart) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":1']
+  tags: [persistence, phase2, positive]
+
+  # ============================================================================
+  # NEGATIVE: drop alice's policy post-restart and verify enforcement
+  # ============================================================================
+- name: persist-drop-alice-post-restart
+  description: POSITIVE — DROP alice's policy after restart.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY persist_alice_only]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy dropped]
+  tags: [persistence, phase2, positive]
+
+- name: persist-alice-denied-after-drop
+  description: |
+    NEGATIVE — after dropping her policy, alice is denied CREATE
+    (no policy and readonly role lacks Write).
+  args: [query, -U, persist_alice, -P, persist-alice-pass-1234, '-']
+  stdin: 'CREATE (n:PersistAliceDenied {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, phase2, negative]
+
+  # ============================================================================
+  # TEARDOWN
+  # ============================================================================
+- name: persist-cleanup
+  description: Drop test users and any leftover state for repeatable reruns.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS persist_universal;
+    DROP POLICY IF EXISTS persist_alice_only;
+    DROP USER IF EXISTS persist_alice;
+    DROP USER IF EXISTS persist_bob;
+    MATCH (n:PersistPreRestart) DELETE n;
+    MATCH (n:PersistAlicePostRestart) DELETE n;
+  expect: {exit_code: 0}
+  tags: [persistence, teardown]
+
+tags:
+- persistence
+- gps_policy_ddl
+- restart
+- security
+- comprehensive

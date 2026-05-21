@@ -1,0 +1,185 @@
+version: '1.0'
+name: GPS ALTER POLICY known persistence limitation
+description: |
+  Phase 7 outcome documented (docs/security/gps-phase7-outcome.md):
+  ALTER POLICY persistence is in-memory only — the WriteThroughHooks
+  struct on policy_catalog.zig has only `persist` (CREATE) and `drop`
+  (DROP) function pointers; there is no `alter` hook. This is a
+  documented Phase 8 deferral.
+
+  This spec PINS the limitation so a future fix is forced to flip the
+  assertion (rather than silently changing behaviour). When ALTER
+  persistence lands, this spec will fail and need to be updated.
+
+  PHASE 1 (pre-restart):
+  - Create alice (readonly)
+  - Create universal `true` policy granting WRITE → alice can write
+  - ALTER POLICY ... SET ENABLED false → alice denied
+
+  RESTART
+
+  PHASE 2 (post-restart): the policy is hydrated with ENABLED=true
+  (its persisted state). alice can write again because the in-memory
+  ALTER didn't make it to __geode_security.
+
+  CANARY: REQ=REQ-GPS-ALTER-001; FEATURE="GPS ALTER POLICY"; ASPECT=PersistenceLimitation; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+  # ============================================================================
+  # PHASE 1
+  # ============================================================================
+- name: alterlim-preflight
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS alterlim_global;
+    DROP USER IF EXISTS alterlim_alice;
+  expect: {exit_code: 0}
+  tags: [persistence, alter, setup]
+
+- name: alterlim-create-alice
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER alterlim_alice SET PASSWORD 'alterlim-pass-1234' ROLE readonly]
+  expect: {exit_code: 0}
+  tags: [persistence, alter, setup]
+
+- name: alterlim-create-policy
+  description: Create the universal policy granting WRITE.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY alterlim_global ON GRAPH * FOR WRITE USING true]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [persistence, alter, phase1]
+
+- name: alterlim-alice-write-pre-alter
+  description: POSITIVE — alice can write while the policy is enabled.
+  args: [query, -U, alterlim_alice, -P, alterlim-pass-1234, '-']
+  stdin: 'CREATE (n:AlterLimPre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [AlterLimPre]
+    stdout_not_contains: ['42501']
+  tags: [persistence, alter, phase1, positive]
+
+- name: alterlim-disable-policy
+  description: ALTER POLICY SET ENABLED false (in-memory only — does NOT persist).
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER POLICY alterlim_global SET ENABLED false]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy altered]
+  tags: [persistence, alter, phase1]
+
+- name: alterlim-alice-denied-after-alter
+  description: |
+    POSITIVE — alice is denied AFTER ALTER (in-memory flag works
+    within the same server lifetime).
+  args: [query, -U, alterlim_alice, -P, alterlim-pass-1234, '-']
+  stdin: 'CREATE (n:AlterLimMid {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, alter, phase1, negative]
+
+  # ============================================================================
+  # RESTART
+  # ============================================================================
+- name: alterlim-restart-checkpoint
+  description: |
+    Stop + restart the server. The ALTER's `enabled=false` flip lives
+    only in memory; the persistent layer still has enabled=true.
+  type: bash
+  command: echo 'ALTER POLICY persistence limitation restart checkpoint'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [persistence, alter, restart]
+
+  # ============================================================================
+  # PHASE 2: the ALTER did NOT persist, so policy comes back enabled.
+  # When Phase 8 wires the alter write-through, this assertion FLIPS and
+  # the test should be updated to assert alice STAYS denied across restart.
+  # ============================================================================
+- name: alterlim-alice-allowed-post-restart
+  description: |
+    KNOWN-LIMITATION — alice can write again post-restart. The ALTER
+    did not propagate to __geode_security; the hydrated policy is
+    ENABLED. This is a Phase 7→Phase 8 transition pin: when ALTER
+    persistence lands, this test will fail and should be updated to
+    assert alice REMAINS denied across restart.
+  args: [query, -U, alterlim_alice, -P, alterlim-pass-1234, '-']
+  stdin: 'CREATE (n:AlterLimPost {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [AlterLimPost]
+    stdout_not_contains: ['42501']
+  tags: [persistence, alter, phase2, known-limitation]
+
+  # ============================================================================
+  # POSITIVE follow-up: after restart re-disable, behaviour is identical
+  # (proves the ALTER call itself still works post-restart).
+  # ============================================================================
+- name: alterlim-disable-again-post-restart
+  description: |
+    POSITIVE — ALTER POLICY works after restart (the procedure path
+    is restored from policy_catalog hydration).
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER POLICY alterlim_global SET ENABLED false]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy altered]
+  tags: [persistence, alter, phase2]
+
+- name: alterlim-alice-denied-again-after-second-alter
+  description: |
+    POSITIVE — re-issuing the ALTER post-restart denies alice again,
+    confirming the in-memory flip behaves identically across restart
+    boundaries.
+  args: [query, -U, alterlim_alice, -P, alterlim-pass-1234, '-']
+  stdin: 'CREATE (n:AlterLimPost2 {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, alter, phase2, negative]
+
+  # ============================================================================
+  # TEARDOWN
+  # ============================================================================
+- name: alterlim-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS alterlim_global;
+    DROP USER IF EXISTS alterlim_alice;
+    MATCH (n:AlterLimPre) DELETE n;
+    MATCH (n:AlterLimPost) DELETE n;
+  expect: {exit_code: 0}
+  tags: [persistence, alter, teardown]
+
+tags:
+- persistence
+- alter_policy
+- known_limitation
+- restart
+- security

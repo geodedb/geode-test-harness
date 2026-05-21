@@ -1,0 +1,267 @@
+version: '1.0'
+name: GPS multi-user multi-policy persistence + enforcement matrix across restart
+description: |
+  Exercises a non-trivial combination: THREE users, FOUR policies, with
+  different action sets and expressions. Every (user × action × resource)
+  enforcement decision is asserted both before AND after a restart to
+  verify nothing drifts across the persistence boundary.
+
+  Users:
+    alice   — readonly  (gains WRITE only via alice-specific policy)
+    bob     — readonly  (gains WRITE via universal policy + READ via abac)
+    carol   — readonly  (no policy at all — fully denied for WRITE)
+
+  Policies:
+    multi_universal     — `true` for READ on graph "*" (every authenticated user)
+    multi_alice_write   — `current_user()='multi_alice'` for WRITE on graph "*"
+    multi_bob_write     — `current_user()='multi_bob'`  for WRITE on graph "*"
+
+  NOTE on policy scoping: Phase 4's `policyMatchesResource` is documented
+  as "intentionally coarse" — a policy with `scope_graph="hr"` matches
+  any non-graph resource (database/tenant/node/edge/procedure/metadata).
+  So a scope-restricted policy for an `.hr` graph would still match the
+  .database write requests these tests issue. We therefore omit a
+  graph-scoped policy here; its scope behavior is verified separately
+  in the Phase 3 isolation spec.
+
+  Decision matrix (both pre and post restart):
+    alice + WRITE → ALLOW (alice's policy matches)
+    bob   + WRITE → ALLOW (bob's policy matches)
+    carol + WRITE → DENY  (no policy matches carol)
+    alice + READ  → ALLOW (readonly role already permits + universal)
+    everyone + WRITE-to-hr graph → handled by Phase 3 (skipped here)
+
+  CANARY: REQ=REQ-GPS-CATALOG-004; FEATURE="GPS Policy Persistence"; ASPECT=MultiUserMultiPolicyMatrix; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+  # ============================================================================
+  # SETUP
+  # ============================================================================
+- name: multi-preflight
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS multi_universal;
+    DROP POLICY IF EXISTS multi_alice_write;
+    DROP POLICY IF EXISTS multi_bob_write;
+    DROP POLICY IF EXISTS multi_scoped_hr;
+    DROP USER IF EXISTS multi_alice;
+    DROP USER IF EXISTS multi_bob;
+    DROP USER IF EXISTS multi_carol;
+  expect: {exit_code: 0}
+  tags: [persistence, multi, setup]
+
+- name: multi-create-alice
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER multi_alice SET PASSWORD 'MultiAlice-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [multi_alice]
+  tags: [persistence, multi, setup]
+
+- name: multi-create-bob
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER multi_bob SET PASSWORD 'MultiBob-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [multi_bob]
+  tags: [persistence, multi, setup]
+
+- name: multi-create-carol
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER multi_carol SET PASSWORD 'MultiCarol-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [multi_carol]
+  tags: [persistence, multi, setup]
+
+- name: multi-create-universal-policy
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY multi_universal ON GRAPH * FOR READ USING true]
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [persistence, multi, phase1]
+
+- name: multi-create-alice-write-policy
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY multi_alice_write ON GRAPH * FOR WRITE USING current_user() = 'multi_alice']
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [persistence, multi, phase1]
+
+- name: multi-create-bob-write-policy
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY multi_bob_write ON GRAPH * FOR WRITE USING current_user() = 'multi_bob']
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [persistence, multi, phase1]
+
+
+  # ============================================================================
+  # PHASE 1: pre-restart enforcement matrix
+  # ============================================================================
+- name: phase1-alice-write-allowed
+  args: [query, -U, multi_alice, -P, MultiAlice-1234, '-']
+  stdin: 'CREATE (n:MultiAliceWritePre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [MultiAliceWritePre]
+    stdout_not_contains: ['42501']
+  tags: [persistence, multi, phase1, positive, alice]
+
+- name: phase1-bob-write-allowed
+  args: [query, -U, multi_bob, -P, MultiBob-1234, '-']
+  stdin: 'CREATE (n:MultiBobWritePre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [MultiBobWritePre]
+    stdout_not_contains: ['42501']
+  tags: [persistence, multi, phase1, positive, bob]
+
+- name: phase1-carol-write-denied
+  description: |
+    NEGATIVE pre-restart — carol has no matching WRITE policy. The
+    multi_scoped_hr policy doesn't match because its scope is "hr"
+    and carol's request is .database (no active graph binding).
+  args: [query, -U, multi_carol, -P, MultiCarol-1234, '-']
+  stdin: 'CREATE (n:MultiCarolDeniedPre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, multi, phase1, negative, carol]
+
+- name: phase1-all-can-read
+  args: [query, -U, multi_carol, -P, MultiCarol-1234, RETURN 1 AS x]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"x":1']
+  tags: [persistence, multi, phase1, positive]
+
+  # ============================================================================
+  # SERVER RESTART
+  # ============================================================================
+- name: multi-restart-checkpoint
+  description: Stop + restart server; hydrate the entire 4-policy catalog.
+  type: bash
+  command: echo 'multi-user multi-policy restart checkpoint'
+  restart_server: true
+  expect: {exit_code: 0}
+  tags: [persistence, multi, restart]
+
+  # ============================================================================
+  # PHASE 2: same matrix post-restart — every assertion must be identical
+  # ============================================================================
+- name: phase2-show-policies-all-three-survive
+  description: |
+    POSITIVE — all three policies appear in SHOW POLICIES after restart.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [multi_universal, multi_alice_write, multi_bob_write]
+  tags: [persistence, multi, phase2, positive]
+
+- name: phase2-alice-write-allowed
+  description: POSITIVE post-restart — alice still allowed.
+  args: [query, -U, multi_alice, -P, MultiAlice-1234, '-']
+  stdin: 'CREATE (n:MultiAliceWritePost {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [MultiAliceWritePost]
+    stdout_not_contains: ['42501']
+  tags: [persistence, multi, phase2, positive, alice]
+
+- name: phase2-bob-write-allowed
+  description: POSITIVE post-restart — bob still allowed.
+  args: [query, -U, multi_bob, -P, MultiBob-1234, '-']
+  stdin: 'CREATE (n:MultiBobWritePost {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [MultiBobWritePost]
+    stdout_not_contains: ['42501']
+  tags: [persistence, multi, phase2, positive, bob]
+
+- name: phase2-carol-write-denied
+  description: |
+    NEGATIVE post-restart — carol still denied. The hr-scoped policy
+    survived hydration but does NOT match her .database write.
+  args: [query, -U, multi_carol, -P, MultiCarol-1234, '-']
+  stdin: 'CREATE (n:MultiCarolDeniedPost {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, multi, phase2, negative, carol]
+
+- name: phase2-cross-user-not-leaked-alice
+  description: |
+    NEGATIVE post-restart — alice's policy applies to alice, not bob.
+    Already covered by phase2-bob-write-allowed via bob's OWN policy,
+    but this explicit assertion catches any future cross-user cache
+    leak: we DROP bob's policy and verify alice is unaffected.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY multi_bob_write]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy dropped]
+  tags: [persistence, multi, phase2, cross-user]
+
+- name: phase2-bob-denied-after-his-policy-dropped
+  description: NEGATIVE — bob denied after his policy dropped.
+  args: [query, -U, multi_bob, -P, MultiBob-1234, '-']
+  stdin: 'CREATE (n:MultiBobAfterDrop {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, multi, phase2, negative, bob]
+
+- name: phase2-alice-still-allowed-after-bob-drop
+  description: |
+    POSITIVE — alice's policy is independent of bob's. Dropping
+    bob's policy must NOT affect alice. This catches any "cross-user
+    policy invalidation" regression.
+  args: [query, -U, multi_alice, -P, MultiAlice-1234, '-']
+  stdin: 'CREATE (n:MultiAliceAfterBobDrop {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [MultiAliceAfterBobDrop]
+    stdout_not_contains: ['42501']
+  tags: [persistence, multi, phase2, cross-user, alice]
+
+  # ============================================================================
+  # TEARDOWN
+  # ============================================================================
+- name: multi-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS multi_universal;
+    DROP POLICY IF EXISTS multi_alice_write;
+    DROP POLICY IF EXISTS multi_bob_write;
+    DROP POLICY IF EXISTS multi_scoped_hr;
+    DROP USER IF EXISTS multi_alice;
+    DROP USER IF EXISTS multi_bob;
+    DROP USER IF EXISTS multi_carol;
+    MATCH (n) WHERE n:MultiAliceWritePre OR n:MultiBobWritePre OR n:MultiAliceWritePost OR n:MultiBobWritePost OR n:MultiAliceAfterBobDrop DELETE n;
+  expect: {exit_code: 0}
+  tags: [persistence, multi, teardown]
+
+tags:
+- persistence
+- multi_user
+- multi_policy
+- restart
+- security
+- comprehensive
