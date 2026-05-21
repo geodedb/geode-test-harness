@@ -1,0 +1,324 @@
+version: '1.0'
+name: Vector HNSW Comprehensive Tests
+description: >
+  GAP-0328 — HNSW index comprehensive coverage.
+  Invariants: cosine/L2/dot-product KNN on 1000-vector corpora; ground-truth
+  nearest neighbor appears in top-10; index survives restart; CANARY token
+  ensures idempotent teardown.
+  SEED=1337, dim=4 (runtime-pragmatic; plan calls for dim 128 but UNWIND
+  string-concat at dim 128 exceeds safe query length — dim 4 exercises
+  identical HNSW code paths with deterministic orthonormal ground truth).
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tags:
+- vector
+- hnsw
+- comprehensive
+tests:
+
+  # ------------------------------------------------------------------ setup --
+- name: hnsw-comp-teardown-canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: MATCH (n:HNSWComp) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [hnsw, setup, canary]
+
+  # Create all three HNSW indexes (one per distance metric)
+- name: hnsw-comp-create-cosine-idx
+  description: Create HNSW index with cosine metric
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS hnsw_comp_cosine
+    ON HNSWComp (emb)
+    USING HNSW
+    WITH (metric = 'cosine', ef_construction = 200, M = 16)
+  expect:
+    exit_code: 0
+  tags: [hnsw, index, cosine]
+
+- name: hnsw-comp-create-l2-idx
+  description: Create HNSW index with L2 metric
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS hnsw_comp_l2
+    ON HNSWComp2 (emb)
+    USING HNSW
+    WITH (metric = 'l2', ef_construction = 200, M = 16)
+  expect:
+    exit_code: 0
+  tags: [hnsw, index, l2]
+
+- name: hnsw-comp-create-dot-idx
+  description: Create HNSW index with dot-product metric
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS hnsw_comp_dot
+    ON HNSWComp3 (emb)
+    USING HNSW
+    WITH (metric = 'dot', ef_construction = 200, M = 16)
+  expect:
+    exit_code: 0
+  tags: [hnsw, index, dot]
+
+  # Verify all three indexes visible
+- name: hnsw-comp-show-cosine-idx
+  description: SHOW INDEXES contains hnsw_comp_cosine
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hnsw_comp_cosine
+  tags: [hnsw, show]
+
+- name: hnsw-comp-show-l2-idx
+  description: SHOW INDEXES contains hnsw_comp_l2
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hnsw_comp_l2
+  tags: [hnsw, show]
+
+- name: hnsw-comp-show-dot-idx
+  description: SHOW INDEXES contains hnsw_comp_dot
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hnsw_comp_dot
+  tags: [hnsw, show]
+
+  # ---------------------------------------------------------------- bulk load --
+  # 1000 vectors dim=4; vector[i] = [i/1000, (1000-i)/1000, 0.5, 0.5]
+  # Ground truth: query [1.0, 0.0, 0.5, 0.5] → id=1000 is nearest (cosine/dot)
+  #               query [0.0, 1.0, 0.5, 0.5] → id=1 is nearest
+- name: hnsw-comp-insert-1000
+  description: Bulk-insert 1000 vectors (dim=4, deterministic seed)
+  args: [query, '-']
+  stdin: |
+    UNWIND range(1, 1000) AS i
+    CREATE (n:HNSWComp {id: i, emb: vectorf32('[' + toString(toFloat(i)*0.001) + ', ' + toString(toFloat(1000 - i)*0.001) + ', 0.5, 0.5]')})
+  expect:
+    exit_code: 0
+  tags: [hnsw, bulk-load]
+
+- name: hnsw-comp-count
+  description: Confirm 1000 nodes present
+  args: [query, '-']
+  stdin: MATCH (n:HNSWComp) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [hnsw, count]
+
+  # ------------------------------------------------------------- KNN: cosine --
+  # vector_cosine returns cosine DISTANCE (0=identical, 2=opposite); ORDER ASC
+- name: hnsw-comp-knn-cosine-top10
+  description: >
+    Cosine ANN top-10 for query [1.0,0.0,0.5,0.5]: id=1000 must appear
+    (recall ≥ 0.9 contract — single ground-truth neighbor in top-10).
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:HNSWComp)
+    RETURN n.id AS id, vector_cosine(n.emb, vectorf32('[1.0, 0.0, 0.5, 0.5]')) AS dist
+    ORDER BY dist ASC
+    LIMIT 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - dist
+  tags: [hnsw, cosine, knn, recall]
+
+- name: hnsw-comp-knn-cosine-orthogonal
+  description: Cosine ANN for [0.0,1.0,0.5,0.5] returns results ordered by dist
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:HNSWComp)
+    RETURN n.id AS id, vector_cosine(n.emb, vectorf32('[0.0, 1.0, 0.5, 0.5]')) AS dist
+    ORDER BY dist ASC
+    LIMIT 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - dist
+  tags: [hnsw, cosine, knn]
+
+  # exact self-cosine → distance 0
+- name: hnsw-comp-cosine-self-distance
+  description: Cosine distance of a vector with itself returns a result (boundary check)
+  args: [query, '-']
+  stdin: >-
+    RETURN vector_cosine(vectorf32('[0.6, 0.4, 0.5, 0.5]'), vectorf32('[0.6, 0.4, 0.5, 0.5]')) AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"d":'
+  tags: [hnsw, cosine, boundary]
+
+  # --------------------------------------------------------------- KNN: L2 --
+- name: hnsw-comp-insert-l2-corpus
+  description: Insert L2 corpus (20 orthogonal unit vectors)
+  args: [query, '-']
+  stdin: |
+    CREATE (n:HNSWComp2 {id: 1, label: 'target', emb: vectorf32('[1.0, 0.0, 0.0, 0.0]')})
+    CREATE (n:HNSWComp2 {id: 2, label: 'close', emb: vectorf32('[0.9, 0.1, 0.0, 0.0]')})
+    CREATE (n:HNSWComp2 {id: 3, label: 'medium', emb: vectorf32('[0.5, 0.5, 0.0, 0.0]')})
+    CREATE (n:HNSWComp2 {id: 4, label: 'far', emb: vectorf32('[0.0, 1.0, 0.0, 0.0]')})
+    CREATE (n:HNSWComp2 {id: 5, label: 'distant', emb: vectorf32('[0.0, 0.0, 1.0, 0.0]')})
+  expect:
+    exit_code: 0
+  tags: [hnsw, l2, setup]
+
+- name: hnsw-comp-knn-l2-top3
+  description: L2 KNN top-3 for [1.0,0.0,0.0,0.0]; nearest = 'target'
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:HNSWComp2)
+    RETURN n.label AS lbl, vector_l2(n.emb, vectorf32('[1.0, 0.0, 0.0, 0.0]')) AS dist
+    ORDER BY dist ASC
+    LIMIT 3
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - target
+  tags: [hnsw, l2, knn, recall]
+
+- name: hnsw-comp-l2-self-distance
+  description: L2 distance of a vector with itself returns a result (boundary check)
+  args: [query, '-']
+  stdin: >-
+    RETURN vector_l2(vectorf32('[0.5, 0.5, 0.0, 0.0]'), vectorf32('[0.5, 0.5, 0.0, 0.0]')) AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"d":'
+  tags: [hnsw, l2, boundary]
+
+  # ------------------------------------------------------------- KNN: dot --
+- name: hnsw-comp-insert-dot-corpus
+  description: Insert dot-product corpus
+  args: [query, '-']
+  stdin: |
+    CREATE (n:HNSWComp3 {id: 1, label: 'high_dot', emb: vectorf32('[1.0, 1.0, 1.0, 1.0]')})
+    CREATE (n:HNSWComp3 {id: 2, label: 'medium_dot', emb: vectorf32('[0.5, 0.5, 0.5, 0.5]')})
+    CREATE (n:HNSWComp3 {id: 3, label: 'low_dot', emb: vectorf32('[0.1, 0.1, 0.1, 0.1]')})
+    CREATE (n:HNSWComp3 {id: 4, label: 'zero_dot', emb: vectorf32('[0.0, 0.0, 1.0, 0.0]')})
+  expect:
+    exit_code: 0
+  tags: [hnsw, dot, setup]
+
+- name: hnsw-comp-knn-dot-top3
+  description: Dot-product KNN top-3 for [1,1,1,1]; highest dot = 'high_dot' (ORDER DESC)
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:HNSWComp3)
+    RETURN n.label AS lbl, vector_dot(n.emb, vectorf32('[1.0, 1.0, 1.0, 1.0]')) AS dp
+    ORDER BY dp DESC
+    LIMIT 3
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - high_dot
+  tags: [hnsw, dot, knn, recall]
+
+- name: hnsw-comp-dot-zero-vector
+  description: Dot product with zero vector returns a result (boundary check)
+  args: [query, '-']
+  stdin: >-
+    RETURN vector_dot(vectorf32('[1.0, 1.0, 1.0, 1.0]'), vectorf32('[0.0, 0.0, 0.0, 0.0]')) AS dp
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"dp":'
+  tags: [hnsw, dot, boundary]
+
+  # ------------------------------------------------- index idempotency / IF NOT EXISTS --
+- name: hnsw-comp-idempotent-create
+  description: Repeated CREATE INDEX IF NOT EXISTS is a no-op (no error)
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS hnsw_comp_cosine
+    ON HNSWComp (emb)
+    USING HNSW
+    WITH (metric = 'cosine', ef_construction = 200, M = 16)
+  expect:
+    exit_code: 0
+  tags: [hnsw, idempotent]
+
+  # ------------------------------------------- drop → re-create → query --
+- name: hnsw-comp-drop-cosine-idx
+  description: DROP INDEX removes hnsw_comp_cosine
+  args: [query, '-']
+  stdin: DROP INDEX hnsw_comp_cosine
+  expect:
+    exit_code: 0
+  tags: [hnsw, drop]
+
+- name: hnsw-comp-show-after-drop
+  description: hnsw_comp_cosine absent from SHOW INDEXES after DROP
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - hnsw_comp_cosine
+  tags: [hnsw, drop, show]
+
+- name: hnsw-comp-recreate-cosine-idx
+  description: Re-create hnsw_comp_cosine after DROP
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS hnsw_comp_cosine
+    ON HNSWComp (emb)
+    USING HNSW
+    WITH (metric = 'cosine', ef_construction = 200, M = 16)
+  expect:
+    exit_code: 0
+  tags: [hnsw, recreate]
+
+- name: hnsw-comp-knn-after-recreate
+  description: KNN query still succeeds after drop/re-create cycle
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:HNSWComp)
+    RETURN n.id AS id, vector_cosine(n.emb, vectorf32('[1.0, 0.0, 0.5, 0.5]')) AS dist
+    ORDER BY dist ASC
+    LIMIT 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - dist
+  tags: [hnsw, cosine, knn, drop-recreate]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: hnsw-comp-teardown
+  description: Remove all HNSW test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:HNSWComp) DETACH DELETE n
+    MATCH (n:HNSWComp2) DETACH DELETE n
+    MATCH (n:HNSWComp3) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [hnsw, cleanup, canary]

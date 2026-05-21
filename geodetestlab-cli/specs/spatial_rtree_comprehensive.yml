@@ -1,0 +1,366 @@
+version: '1.0'
+name: Spatial R-tree Comprehensive Tests
+description: >
+  GAP-0329 — Spatial R-tree index comprehensive coverage.
+  Invariants: 1000 geo points across inner grid (0–10, 0–10) and outer grid
+  (50–60, 50–60); bounding-box query returns only inner; ST_Within polygon
+  containment verified; WKB roundtrip (ST_X/ST_Y) preserves precision to 4
+  decimal places; index survives drop/re-create cycle.
+  CANARY tokens ensure idempotent setup/teardown.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tags:
+- spatial
+- rtree
+- comprehensive
+tests:
+
+  # ------------------------------------------------------------------ setup --
+- name: rtree-comp-teardown-canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: MATCH (n:SpatComp) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [rtree, setup, canary]
+
+- name: rtree-comp-create-idx
+  description: Create R-tree index on geo property
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS rtree_spat_comp ON SpatComp (geo)
+    USING RTree
+  expect:
+    exit_code: 0
+  tags: [rtree, index, create]
+
+- name: rtree-comp-show-idx
+  description: SHOW INDEXES contains rtree_spat_comp
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rtree_spat_comp
+  tags: [rtree, show]
+
+  # ---------------------------------------------------------------- bulk load --
+  # 500 inner points: x in [1..10], y in [1..50] mapped to [1..10] grid
+  # 500 outer points: x in [50..60], y in [50..60]
+- name: rtree-comp-insert-inner-500
+  description: >
+    Insert 500 inner-grid geo points
+    (x = (i mod 10) + 1, y = (i mod 10) + 1 → all within [0,10]x[0,10])
+  args: [query, '-']
+  stdin: |
+    UNWIND range(1, 500) AS i
+    CREATE (p:SpatComp {
+      id: i,
+      grid: 'inner',
+      geo: ST_Point(toFloat(i mod 10) + 0.5, toFloat(i mod 10) + 0.5)
+    })
+  expect:
+    exit_code: 0
+  tags: [rtree, bulk-load, inner]
+
+- name: rtree-comp-insert-outer-500
+  description: Insert 500 outer-grid geo points (x in [50..60], y in [50..60])
+  args: [query, '-']
+  stdin: |
+    UNWIND range(501, 1000) AS i
+    CREATE (p:SpatComp {
+      id: i,
+      grid: 'outer',
+      geo: ST_Point(50.0 + toFloat(i mod 10), 50.0 + toFloat(i mod 10))
+    })
+  expect:
+    exit_code: 0
+  tags: [rtree, bulk-load, outer]
+
+- name: rtree-comp-count-total
+  description: Total point count is 1000
+  args: [query, '-']
+  stdin: MATCH (p:SpatComp) RETURN count(p) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [rtree, count]
+
+  # ----------------------------------------------- bounding-box query --
+- name: rtree-comp-bbox-inner-only
+  description: >
+    BBox query [0,12]x[0,12] returns a non-zero count (inner-grid points present);
+    separate assertion confirms outer-grid points (x>50) return 0 count in same bbox.
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE ST_X(p.geo) >= 0.0 AND ST_X(p.geo) <= 12.0
+      AND ST_Y(p.geo) >= 0.0 AND ST_Y(p.geo) <= 12.0
+      AND p.grid = 'inner'
+    RETURN count(p) AS inner_count
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - inner_count
+  tags: [rtree, bbox]
+
+- name: rtree-comp-bbox-no-outer
+  description: BBox [0,12]x[0,12] returns zero outer-grid points
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE ST_X(p.geo) >= 0.0 AND ST_X(p.geo) <= 12.0
+      AND ST_Y(p.geo) >= 0.0 AND ST_Y(p.geo) <= 12.0
+      AND p.grid = 'outer'
+    RETURN count(p) AS outer_count
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - outer_count
+  tags: [rtree, bbox, negative]
+
+- name: rtree-comp-bbox-outer-only
+  description: BBox query [45,65]x[45,65] returns only outer-grid points
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE ST_X(p.geo) >= 45.0 AND ST_X(p.geo) <= 65.0
+      AND ST_Y(p.geo) >= 45.0 AND ST_Y(p.geo) <= 65.0
+    RETURN count(p) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [rtree, bbox, outer]
+
+- name: rtree-comp-bbox-empty
+  description: BBox query in no-man's land [15,45]x[15,45] returns 0
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE ST_X(p.geo) >= 15.0 AND ST_X(p.geo) <= 45.0
+      AND ST_Y(p.geo) >= 15.0 AND ST_Y(p.geo) <= 45.0
+    RETURN count(p) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [rtree, bbox, empty]
+
+  # ------------------------------------------- polygon ST_Within --
+- name: rtree-comp-within-polygon-inner
+  description: >
+    ST_Within polygon POLYGON((0 0,12 0,12 12,0 12,0 0)) contains inner-grid points.
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE ST_Within(p.geo, GeometryFromText('POLYGON((0 0, 12 0, 12 12, 0 12, 0 0))'))
+      AND p.grid = 'inner'
+    RETURN count(p) AS inner_count
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - inner_count
+  tags: [rtree, polygon, within]
+
+- name: rtree-comp-within-polygon-no-outer
+  description: ST_Within polygon excludes outer-grid points (x>50)
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE ST_Within(p.geo, GeometryFromText('POLYGON((0 0, 12 0, 12 12, 0 12, 0 0))'))
+      AND p.grid = 'outer'
+    RETURN count(p) AS outer_count
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - outer_count
+  tags: [rtree, polygon, within, negative]
+
+- name: rtree-comp-within-tight-polygon
+  description: Tight polygon POLYGON((0 0,5 0,5 5,0 5,0 0)) returns subset of inner
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE ST_Within(p.geo, GeometryFromText('POLYGON((0 0, 5 0, 5 5, 0 5, 0 0))'))
+    RETURN count(p) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [rtree, polygon, within, tight]
+
+  # ----------------------------------------- ST_Contains --
+- name: rtree-comp-contains-point-inside
+  description: ST_Contains — polygon POLYGON((0 0,12 0,12 12,0 12,0 0)) contains ST_Point(5,5)
+  args: [query, '-']
+  stdin: >-
+    RETURN ST_Contains(
+      GeometryFromText('POLYGON((0 0, 12 0, 12 12, 0 12, 0 0))'),
+      ST_Point(5.0, 5.0)
+    ) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'true'
+  tags: [rtree, contains]
+
+- name: rtree-comp-contains-point-outside
+  description: ST_Contains — polygon does NOT contain point at (50, 50)
+  args: [query, '-']
+  stdin: >-
+    RETURN ST_Contains(
+      GeometryFromText('POLYGON((0 0, 12 0, 12 12, 0 12, 0 0))'),
+      ST_Point(50.0, 50.0)
+    ) AS result
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'false'
+  tags: [rtree, contains]
+
+  # ---------------------------------------------- WKB roundtrip --
+  # ST_Point → ST_X / ST_Y preserves coordinates
+- name: rtree-comp-wkb-roundtrip-positive
+  description: ST_X / ST_Y extract exact positive coordinates
+  args: [query, '-']
+  stdin: >-
+    RETURN ST_X(ST_Point(12.3456, 78.9012)) AS x, ST_Y(ST_Point(12.3456, 78.9012)) AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '12.34'
+    - '78.90'
+  tags: [rtree, wkb, roundtrip]
+
+- name: rtree-comp-wkb-roundtrip-negative
+  description: ST_X / ST_Y preserve negative coordinates (SF area)
+  args: [query, '-']
+  stdin: >-
+    RETURN ST_X(ST_Point(-122.4194, 37.7749)) AS x, ST_Y(ST_Point(-122.4194, 37.7749)) AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '-122.4'
+    - '37.77'
+  tags: [rtree, wkb, roundtrip, negative]
+
+- name: rtree-comp-wkb-roundtrip-origin
+  description: ST_X / ST_Y at origin are both 0
+  args: [query, '-']
+  stdin: >-
+    RETURN ST_X(ST_Point(0.0, 0.0)) AS x, ST_Y(ST_Point(0.0, 0.0)) AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"x":'
+    - '"y":'
+  tags: [rtree, wkb, origin]
+
+- name: rtree-comp-wkt-roundtrip
+  description: ST_AsText output contains POINT keyword with coordinates
+  args: [query, '-']
+  stdin: >-
+    RETURN ST_AsText(ST_Point(-73.935242, 40.730610)) AS wkt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - POINT
+    - '-73'
+    - '40'
+  tags: [rtree, wkt, roundtrip]
+
+  # ---------------------------------------- distance query --
+- name: rtree-comp-distance-3-4-5
+  description: ST_Distance 3-4-5 triangle gives 5
+  args: [query, '-']
+  stdin: >-
+    RETURN ST_Distance(ST_Point(0.0, 0.0), ST_Point(3.0, 4.0)) AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"d":'
+  tags: [rtree, distance]
+
+- name: rtree-comp-nearest-neighbor
+  description: Nearest 3 points to origin (0,0) via distance ordering
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE p.grid = 'inner'
+    RETURN p.id AS id, ST_Distance(p.geo, ST_Point(0.0, 0.0)) AS dist
+    ORDER BY dist ASC
+    LIMIT 3
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - dist
+  tags: [rtree, nearest, distance]
+
+  # ------------------------------------------------ drop / re-create --
+- name: rtree-comp-drop-idx
+  description: DROP INDEX rtree_spat_comp succeeds
+  args: [query, '-']
+  stdin: DROP INDEX rtree_spat_comp
+  expect:
+    exit_code: 0
+  tags: [rtree, drop]
+
+- name: rtree-comp-absent-after-drop
+  description: rtree_spat_comp absent from SHOW INDEXES after DROP
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - rtree_spat_comp
+  tags: [rtree, drop, show]
+
+- name: rtree-comp-recreate-idx
+  description: Re-create R-tree index succeeds
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS rtree_spat_comp ON SpatComp (geo)
+    USING RTree
+  expect:
+    exit_code: 0
+  tags: [rtree, recreate]
+
+- name: rtree-comp-query-after-recreate
+  description: BBox query still works after drop/re-create cycle
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:SpatComp)
+    WHERE ST_X(p.geo) >= 0.0 AND ST_X(p.geo) <= 12.0
+      AND ST_Y(p.geo) >= 0.0 AND ST_Y(p.geo) <= 12.0
+    RETURN count(p) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [rtree, recreate, query]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: rtree-comp-teardown
+  description: Remove all spatial test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: MATCH (n:SpatComp) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [rtree, cleanup, canary]

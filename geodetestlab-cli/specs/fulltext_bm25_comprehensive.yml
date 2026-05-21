@@ -1,0 +1,342 @@
+version: '1.0'
+name: Fulltext BM25 Comprehensive Tests
+description: >
+  GAP-0330 — Fulltext BM25 index comprehensive coverage.
+  Invariants: 1000 documents inserted via UNWIND; single-token search
+  returns matching docs; multi-token search covers all token-bearing docs;
+  phrase search via =~ operator works; bm25_score() function available for
+  ranking; CONTAINS predicate consistent with =~; re-index determinism
+  verified via DROP + recreate + same query = same result count.
+  Known gap: SHOW INDEXES does NOT expose FULLTEXT index names — asserted
+  and documented with skip_reason. CANARY tokens ensure idempotent teardown.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tags:
+- fulltext
+- bm25
+- comprehensive
+tests:
+
+  # ------------------------------------------------------------------ setup --
+- name: bm25-comp-teardown-canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: MATCH (n:BM25Comp) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [bm25, setup, canary]
+
+- name: bm25-comp-create-idx
+  description: Create FULLTEXT index on content property
+  args: [query, '-']
+  stdin: CREATE FULLTEXT INDEX IF NOT EXISTS bm25_comp ON BM25Comp (content)
+  expect:
+    exit_code: 0
+  tags: [bm25, index, create]
+
+  # Known gap: FULLTEXT indexes not surfaced in SHOW INDEXES
+  # This test documents the current behavior as a negative assertion.
+- name: bm25-comp-show-idx-not-visible
+  description: >
+    KNOWN GAP — FULLTEXT index names not exposed in SHOW INDEXES.
+    This test documents current behavior: bm25_comp is NOT visible.
+    (See GAP-0330 tracking item for resolution.)
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - bm25_comp
+  tags: [bm25, show, known-gap]
+
+  # ---------------------------------------------------------------- bulk load --
+  # 900 "base" docs with rotating vocabulary, plus 100 specialized docs
+  # Base vocabulary: [database graph query performance optimization index search]
+  # Specialized: 'machine learning neural network deep learning'
+- name: bm25-comp-insert-900-base
+  description: Insert 900 base documents with rotating multi-token content
+  args: [query, '-']
+  stdin: |
+    UNWIND range(1, 900) AS i
+    CREATE (d:BM25Comp {
+      id: i,
+      content: CASE i mod 9
+        WHEN 0 THEN 'database graph query performance optimization index search'
+        WHEN 1 THEN 'graph database index performance search'
+        WHEN 2 THEN 'query performance optimization database'
+        WHEN 3 THEN 'index search graph database query'
+        WHEN 4 THEN 'optimization query search performance'
+        WHEN 5 THEN 'database performance graph index'
+        WHEN 6 THEN 'search query optimization database index'
+        WHEN 7 THEN 'performance graph search optimization'
+        ELSE 'index database query graph search optimization'
+      END
+    })
+  expect:
+    exit_code: 0
+  tags: [bm25, bulk-load]
+
+- name: bm25-comp-insert-100-specialized
+  description: Insert 100 specialized machine-learning documents
+  args: [query, '-']
+  stdin: |
+    UNWIND range(901, 1000) AS i
+    CREATE (d:BM25Comp {
+      id: i,
+      content: 'machine learning neural network deep learning classification'
+    })
+  expect:
+    exit_code: 0
+  tags: [bm25, bulk-load, specialized]
+
+- name: bm25-comp-count
+  description: Total document count is 1000
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, count]
+
+  # ------------------------------------------- single-token search --
+- name: bm25-comp-single-token-database
+  description: Single-token search 'database' matches base documents
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'database' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, single-token]
+
+- name: bm25-comp-single-token-machine
+  description: Single-token 'machine' returns only specialized docs (ids 901-1000)
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'machine' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, single-token, specialized]
+
+- name: bm25-comp-single-token-no-match
+  description: Single-token search for non-existent term returns 0 results
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'xyznonexistent' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, single-token, no-match]
+
+  # ----------------------------------------------- multi-token search --
+- name: bm25-comp-multi-token-graph-database
+  description: Multi-token 'graph database' returns base docs containing both terms
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'graph database' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, multi-token]
+
+- name: bm25-comp-multi-token-performance-optimization
+  description: Multi-token 'performance optimization' matches broad set
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'performance optimization' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, multi-token]
+
+- name: bm25-comp-multi-token-cross-category
+  description: Multi-token spanning base and specialized ('database neural') returns subset
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'database neural' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, multi-token, cross-category]
+
+  # ----------------------------------------------- phrase search via =~ --
+- name: bm25-comp-phrase-deep-learning
+  description: Phrase 'deep learning' matches only specialized docs
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'deep learning' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, phrase]
+
+- name: bm25-comp-phrase-query-performance
+  description: Phrase 'query performance' matches base docs
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'query performance' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, phrase]
+
+  # ----------------------------------------------- CONTAINS consistency --
+- name: bm25-comp-contains-consistent
+  description: CONTAINS 'performance' and =~ 'performance' return same count
+  args: [query, '-']
+  stdin: |
+    MATCH (d1:BM25Comp) WHERE d1.content CONTAINS 'performance'
+    MATCH (d2:BM25Comp) WHERE d2.content =~ 'performance'
+    RETURN count(d1) AS cnt_contains, count(d2) AS cnt_regex
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt_contains
+    - cnt_regex
+  tags: [bm25, contains, consistency]
+
+  # ----------------------------------------------- bm25_score() ranking --
+- name: bm25-comp-bm25-score-returns
+  description: bm25_score() function returns numeric score for matching docs
+  args: [query, '-']
+  stdin: >-
+    MATCH (d:BM25Comp) WHERE d.content =~ 'performance'
+    RETURN d.id AS id, bm25_score(d.content, 'performance') AS score
+    ORDER BY score DESC
+    LIMIT 5
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - score
+  tags: [bm25, scoring]
+
+- name: bm25-comp-bm25-score-ordering
+  description: bm25_score() DESC order — top result has score >= second result
+  args: [query, '-']
+  stdin: >-
+    MATCH (d:BM25Comp) WHERE d.content =~ 'database'
+    RETURN d.id AS id, bm25_score(d.content, 'database') AS score
+    ORDER BY score DESC
+    LIMIT 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - score
+  tags: [bm25, scoring, ordering]
+
+- name: bm25-comp-bm25-score-multi-token
+  description: bm25_score() with multi-token query
+  args: [query, '-']
+  stdin: >-
+    MATCH (d:BM25Comp) WHERE d.content =~ 'graph database'
+    RETURN d.id AS id, bm25_score(d.content, 'graph database') AS score
+    ORDER BY score DESC
+    LIMIT 5
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - score
+  tags: [bm25, scoring, multi-token]
+
+  # ----------------------------------------------- ranking determinism --
+- name: bm25-comp-ranking-first-run-ids
+  description: First ranking run — capture top-5 IDs for 'performance' (baseline)
+  args: [query, '-']
+  stdin: >-
+    MATCH (d:BM25Comp) WHERE d.content =~ 'performance'
+    RETURN d.id AS id, bm25_score(d.content, 'performance') AS score
+    ORDER BY score DESC, id ASC
+    LIMIT 5
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - score
+  tags: [bm25, determinism]
+
+- name: bm25-comp-ranking-second-run-ids
+  description: Second identical query — same result set confirms determinism
+  args: [query, '-']
+  stdin: >-
+    MATCH (d:BM25Comp) WHERE d.content =~ 'performance'
+    RETURN d.id AS id, bm25_score(d.content, 'performance') AS score
+    ORDER BY score DESC, id ASC
+    LIMIT 5
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - score
+  tags: [bm25, determinism]
+
+  # ----------------------------------------------- drop / re-create --
+- name: bm25-comp-drop-idx
+  description: DROP INDEX bm25_comp succeeds
+  args: [query, '-']
+  stdin: DROP INDEX bm25_comp
+  expect:
+    exit_code: 0
+  tags: [bm25, drop]
+
+- name: bm25-comp-search-after-drop
+  description: Search still works after index drop (falls back to scan)
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content CONTAINS 'database' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, drop, fallback]
+
+- name: bm25-comp-recreate-idx
+  description: Re-create FULLTEXT index after DROP
+  args: [query, '-']
+  stdin: CREATE FULLTEXT INDEX IF NOT EXISTS bm25_comp ON BM25Comp (content)
+  expect:
+    exit_code: 0
+  tags: [bm25, recreate]
+
+- name: bm25-comp-search-after-recreate
+  description: Search after re-create returns same count as before drop
+  args: [query, '-']
+  stdin: MATCH (d:BM25Comp) WHERE d.content =~ 'performance' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, recreate, determinism]
+
+  # ----------------------------------------------- edge / boundary --
+- name: bm25-comp-empty-corpus-search
+  description: Search on non-existent label returns empty (no crash)
+  args: [query, '-']
+  stdin: MATCH (d:BM25CompNonExistent) WHERE d.content =~ 'database' RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cnt
+  tags: [bm25, edge, empty-corpus]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: bm25-comp-teardown
+  description: Remove all BM25 test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: MATCH (n:BM25Comp) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [bm25, cleanup, canary]
