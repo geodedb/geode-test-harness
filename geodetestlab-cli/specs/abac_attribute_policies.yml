@@ -1,0 +1,188 @@
+version: '1.0'
+name: ABAC attribute-based policies — end-to-end enforcement
+description: |
+  Intended to verify that GPS ABAC policies using the
+  `principal.attributes.<key> = '<value>'` predicate correctly match
+  users based on their stored attribute map, so that alice (dept=eng)
+  sees only :Doc {dept:'eng'} nodes and bob (dept=sales) sees only
+  :Doc {dept:'sales'} nodes.
+
+  BLOCKED — The geode GQL parser (src/gql/parser.zig:6437) only
+  supports `ALTER USER ... SET PASSWORD` and `ALTER USER ... SET ROLE`.
+  There is no `ALTER USER ... SET ATTRIBUTE` DDL command exposed via the
+  CLI or GQL interface. User attributes (principal.AttributeMap) are
+  populated internally via the auth library at user-creation time through
+  the SecurityContext.session_attributes path, but no public DDL surface
+  allows setting `dept=eng` or any other arbitrary attribute key on an
+  existing user.
+
+  Without the ability to set `principal.attributes.department`, the
+  policy expression `principal.attributes.department = 'engineering'`
+  will never match any user (the attribute slice is always empty for CLI-
+  created users), so the spec cannot demonstrate the positive enforcement
+  path. The test is therefore skipped to avoid a false-positive
+  (the policy would compile and be stored, but no user would ever match
+  it, making the positive case vacuously pass while the actual feature
+  remains untestable).
+
+  Remediation required before this spec can be enabled:
+    1. Add `ALTER USER <name> SET ATTRIBUTE <key> = '<value>'` to the GQL
+       parser (src/gql/parser.zig handler near line 6437).
+    2. Wire the attribute into the persistent user record so it survives
+       restart (src/security/auth_graph_manager.zig user hydration path).
+    3. Confirm principal.attributes is populated on connection from the
+       persisted store (src/security/geode_auth_lib.zig evaluateAttributeConditions
+       path, line 691).
+
+  Filed as known_limitation. Close GAP-0284 remains Blocked.
+
+  CANARY: REQ=REQ-ABAC-E2E-001; FEATURE="ABAC end-to-end enforcement"; ASPECT=DeptAttributePolicyMatrix; STATUS=BLOCKED; OWNER=security; UPDATED=2026-05-21
+
+skip: true
+skip_reason: |
+  ALTER USER SET ATTRIBUTE not yet exposed via CLI/GQL DDL.
+  geode parser (src/gql/parser.zig:6437) only handles SET PASSWORD and
+  SET ROLE. Cannot set principal.attributes.department for ABAC enforcement
+  test until DDL surface is added. See spec description for remediation steps.
+
+known_limitation: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+# All tests below are unreachable because skip: true above causes the
+# runner to skip the entire spec. They are retained for documentation
+# purposes so the intended test plan is preserved.
+
+- name: abac-preflight-cleanup
+  description: Drop leftovers from prior run.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS abac_alice;
+    DROP USER IF EXISTS abac_bob;
+    DROP GRAPH IF EXISTS abac_g;
+    DROP POLICY IF EXISTS abac_eng_policy;
+    DROP POLICY IF EXISTS abac_sales_policy;
+  expect: {exit_code: 0}
+  tags: [abac, setup]
+
+- name: abac-create-graph-and-users
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE GRAPH abac_g;
+    CREATE USER abac_alice SET PASSWORD 'Abac-Alice-1234' ROLE readwrite;
+    CREATE USER abac_bob SET PASSWORD 'Abac-Bob-1234' ROLE readwrite;
+  expect: {exit_code: 0}
+  tags: [abac, setup]
+
+- name: abac-set-alice-attr-BLOCKED
+  description: |
+    BLOCKED — this step requires ALTER USER ... SET ATTRIBUTE which is
+    not yet implemented in the GQL parser.
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER abac_alice SET ATTRIBUTE department = 'engineering']
+  expect: {exit_code: 0}
+  tags: [abac, setup, blocked]
+
+- name: abac-set-bob-attr-BLOCKED
+  description: BLOCKED — same limitation as above.
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER abac_bob SET ATTRIBUTE department = 'sales']
+  expect: {exit_code: 0}
+  tags: [abac, setup, blocked]
+
+- name: abac-seed-docs
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH abac_g;
+    CREATE (:Doc {id: 1, dept: 'engineering', payload: 'eng-data'});
+    CREATE (:Doc {id: 2, dept: 'sales', payload: 'sales-data'});
+  expect: {exit_code: 0}
+  tags: [abac, setup]
+
+- name: abac-create-eng-policy
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY abac_eng_policy ON GRAPH * FOR READ USING principal.attributes.department = 'engineering']
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [abac, policy]
+
+- name: abac-create-sales-policy
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY abac_sales_policy ON GRAPH * FOR READ USING principal.attributes.department = 'sales']
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [abac, policy]
+
+- name: abac-alice-sees-eng-only
+  description: |
+    POSITIVE — alice (dept=eng) must see only :Doc {dept:'engineering'}.
+    BLOCKED until ALTER USER SET ATTRIBUTE is implemented.
+  args: [query, -U, abac_alice, -P, Abac-Alice-1234, '-']
+  stdin: |
+    USE GRAPH abac_g;
+    MATCH (d:Doc) RETURN d.dept AS dept ORDER BY d.id
+  expect:
+    exit_code: 0
+    stdout_contains: [engineering]
+    stdout_not_contains: [sales]
+  tags: [abac, alice, positive, blocked]
+
+- name: abac-bob-sees-sales-only
+  description: |
+    POSITIVE — bob (dept=sales) must see only :Doc {dept:'sales'}.
+    BLOCKED until ALTER USER SET ATTRIBUTE is implemented.
+  args: [query, -U, abac_bob, -P, Abac-Bob-1234, '-']
+  stdin: |
+    USE GRAPH abac_g;
+    MATCH (d:Doc) RETURN d.dept AS dept ORDER BY d.id
+  expect:
+    exit_code: 0
+    stdout_contains: [sales]
+    stdout_not_contains: [engineering]
+  tags: [abac, bob, positive, blocked]
+
+- name: abac-admin-sees-all
+  description: POSITIVE — admin sees all docs.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH abac_g;
+    MATCH (d:Doc) RETURN count(d) AS c
+  expect: {exit_code: 0, stdout_contains: ['"c":2']}
+  tags: [abac, admin, positive]
+
+- name: abac-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP GRAPH IF EXISTS abac_g;
+    DROP USER IF EXISTS abac_alice;
+    DROP USER IF EXISTS abac_bob;
+    DROP POLICY IF EXISTS abac_eng_policy;
+    DROP POLICY IF EXISTS abac_sales_policy;
+  expect: {exit_code: 0}
+  tags: [abac, teardown]
+
+tags:
+- abac
+- attribute-based-access-control
+- security
+- gps
+- blocked
+- known_limitation

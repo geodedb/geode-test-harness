@@ -1,0 +1,73 @@
+version: '1.0'
+name: RLS — cross-tenant SELECT blocked across all query shapes
+skip: true
+skip_reason: |
+  BLOCKED — rls_filter.RLSFilterEngine.addDenyPolicy() (src/server/rls_filter.zig)
+  has no public CLI/GQL DDL surface. The 'policy create --table --condition' CLI
+  command translates to CALL geode.auth.policy_create(...) via executor.py:205-210,
+  which calls handlePolicyCreate (auth_dispatch.zig:939-965). That handler ignores
+  the table/condition args and adds a GPS ALLOW policy (effect=.allow,
+  expression_source="true") — NOT a label-level deny for rls_filter.
+  Therefore the negative assertions (bob sees c:0) can never pass via CLI.
+  Remediation: expose a CALL geode.rls.add_deny_policy(graph, label, username)
+  server procedure, or add GQL DDL syntax like DENY POLICY ... FOR USER.
+description: |
+  Exhaustively verify the RLS filter at src/server/rls_filter.zig removes
+  every :TenantA row from a restricted user's result set, across every query
+  shape geode supports: MATCH/WHERE, multi-hop, OPTIONAL MATCH, WHERE EXISTS,
+  WITH/CTE, UNION, COLLECT/UNWIND, EXPLAIN.
+
+  The policy is registered via `policy create --table TenantA --condition
+  rls_xt_bob`, which exercises the label-level deny path in rls_filter.zig.
+  Alice (no deny) and admin (super) are used as positive-control witnesses
+  to confirm the filter is per-user, not destructive.
+
+  CANARY: REQ=REQ-RLS-XTENANT-001; FEATURE="RLS cross-tenant filter"; ASPECT=QueryShapeMatrix; STATUS=BLOCKED; OWNER=security; UPDATED=2026-05-21
+
+known_limitation: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+# Tests list is empty because skip: true above marks this spec as pending.
+# The intended test plan (once label-level deny DDL surface is available):
+#   preflight-cleanup, create-graph, create-users (alice/bob), seed (3 TenantA + 3 TenantB),
+#   seed-verify, create-deny-policy (policy create --table TenantA --condition rls_xt_bob),
+#   shape1-bob-simple-match (count=0), shape2-bob-multi-hop (count=0),
+#   shape3-bob-optional-match (count=0), shape4-bob-with-cte (count=0),
+#   shape5-bob-union (sees TenantB, not TenantA), shape6-bob-collect-unwind (count=0),
+#   shape7-bob-where-id (count=0), shape8-bob-explain-no-leak (no 'alice' in output),
+#   alice-sees-tenant-a (count=3, deny scoped to bob only),
+#   admin-sees-all (count=3), cleanup.
+tests: []
+
+tags:
+- rls
+- cross-tenant
+- security
+- query-shapes
+- comprehensive
+- blocked
+- known_limitation

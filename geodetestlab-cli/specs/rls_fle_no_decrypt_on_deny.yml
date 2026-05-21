@@ -1,0 +1,96 @@
+version: '1.0'
+name: RLS × FLE — no decrypt occurs when RLS denies the row
+skip: true
+skip_reason: |
+  BLOCKED — rls_filter.RLSFilterEngine.addDenyPolicy() (src/server/rls_filter.zig)
+  has no public CLI/GQL DDL surface. The 'policy create --table --condition' CLI
+  command translates to CALL geode.auth.policy_create(...) via executor.py:205-210,
+  which calls handlePolicyCreate (auth_dispatch.zig:939-965). That handler ignores
+  the table/condition args and adds a GPS ALLOW policy — NOT a label-level deny.
+  Without label-level deny, bob is not filtered from :FleDoc rows, so the
+  "bob sees 0 rows not [REDACTED]" assertion can never pass.
+  Remediation: expose CALL geode.rls.add_deny_policy(graph, label, username), then
+  re-enable this spec to verify RLS fires before FLE decrypt.
+description: |
+  Verifies the interaction between the RLS post-result-filter
+  (src/server/rls_filter.zig) and Field-Level Encryption hooks
+  (src/execution/fle_hooks.zig).
+
+  The expected order of operations is:
+  1. Query executor returns candidate rows.
+  2. rls_filter.zig evaluates label-level policies and removes denied rows
+     from the result set BEFORE they are projected to the caller.
+  3. FLE decrypt hooks (fle_hooks.zig) only fire for rows that survive the
+     RLS filter.
+
+  If RLS fires FIRST (correct behaviour), the FLE decrypt hook for
+  a denied row is never called, meaning:
+  - The denied user never receives any field value — not even [REDACTED].
+  - The row is simply absent from the result.
+
+  If RLS fires AFTER FLE decrypt (incorrect behaviour / regression), the
+  decrypt hook would fire and return [REDACTED] for denied users, leaking
+  the fact that encrypted data exists for that row.
+
+  Test strategy:
+  - Create an FLE-configured :FleDoc node with an encrypted secret_value.
+  - Apply an RLS deny policy for rls_fle_bob on :FleDoc.
+  - Admin sees count=1 + decrypted value.
+  - Bob sees count=0 (RLS removes the row; FLE decrypt never fires).
+  - Alice (no deny, not in FLE visibility list) sees count=1 but [REDACTED].
+
+  This ensures that [REDACTED] in bob's result is a test FAILURE
+  (it would mean FLE decryption ran before RLS filtering).
+
+  CANARY: REQ=REQ-RLS-FLE-001; FEATURE="RLS x FLE no-decrypt-on-deny"; ASPECT=RlsBeforeFleDecrypt; STATUS=BLOCKED; OWNER=security; UPDATED=2026-05-21
+
+known_limitation: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn, --enable-fle]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_FLE_ENABLED: 'true'
+      GEODE_MASTER_KEY: rls-fle-test-master-key-32bytes!!
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+# Tests list is empty because skip: true marks this spec as pending.
+# The intended test plan (once label-level deny DDL surface is available):
+#   preflight-cleanup, create-graph, create-users (bob readwrite, alice readwrite),
+#   configure-fle-field (CALL geode.fle.configureField 'FleDoc','secret_value',visibility=admin),
+#   seed (CREATE (:FleDoc {id:1, secret_value:'TOP_SECRET_DATA', category:'classified'})),
+#   admin-can-read-doc (count=1),
+#   create-rls-deny-for-bob (policy create --table FleDoc --condition rls_fle_bob),
+#   bob-gets-zero-rows-not-redacted (count=0 AND no [REDACTED] in output — KEY ASSERTION),
+#   alice-sees-row-but-redacted (count=1, no plaintext, FLE RBAC enforcement),
+#   admin-still-sees-doc-after-policy (count=1), cleanup.
+tests: []
+
+tags:
+- rls
+- fle
+- field-level-encryption
+- security
+- rls-fle-interaction
+- comprehensive
+- blocked
+- known_limitation
