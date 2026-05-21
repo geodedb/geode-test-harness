@@ -1,0 +1,137 @@
+version: '1.0'
+name: RBAC — GRANT WRITE auth chain corruption pin (GAP-0289 trip-wire)
+description: |
+  TRIP-WIRE PIN for the documented GRANT WRITE chain-corruption bug.
+  Source: rbac_users_roles_grants_audit.yml gap #1.
+
+  Reproducer:
+    GRANT WRITE ON GRAPH g TO u  ->  restart  ->  AuthChainTampered /
+    RecordHmacMismatch at auth_graph_manager.zig:1158 verifyGraphGrantRecords.
+
+  What this spec pins:
+    1. GRANT WRITE currently SUCCEEDS at the SQL level (exit 0, "Granted WRITE").
+       This is wrong -- it should be rejected if it cannot be safely persisted.
+       When the bug is fixed, GRANT WRITE will either succeed AND survive restart
+       OR be explicitly rejected. Both outcomes flip this assertion.
+    2. GRANT READ on the same graph also succeeds without chain corruption.
+       (This is the SAFE path; the canonical spec uses GRANT READ exclusively.)
+    3. Post-GRANT-WRITE queries to the live server still work (the corruption
+       is latent, only triggered at the next server restart).
+
+  The restart-fails-with-AuthChainTampered aspect is documented here but
+  NOT asserted in this spec because spinning up an isolated server in the
+  harness's 30s bash timeout is unreliable. The restart verification is
+  performed manually (reproducer: run this spec, then restart the server
+  against the same data dir and observe AuthChainTampered).
+
+  TRIP-WIRE: When geode rejects GRANT WRITE before writing the corrupted
+  record, the step 'chain-issue-grant-write-succeeds-silently' will FAIL
+  (exit 0 but stdout_contains "Granted WRITE" will not match) -- that is
+  the regression-of-fix detector.
+
+  CANARY: REQ=GAP-0289; FEATURE="RBAC GRANT WRITE chain integrity"; ASPECT=KnownLimitationPin; STATUS=PIN; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+
+- name: chain-preflight-cleanup
+  description: Idempotent pre-flight cleanup.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rbac_chain_eve;
+    DROP GRAPH IF EXISTS rbac_chain_graph;
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: chain-create-target-graph
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH rbac_chain_graph]
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: chain-create-user-eve
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_chain_eve SET PASSWORD 'RbacChain-Eve-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_chain_eve]
+  tags: [rbac, setup]
+
+- name: chain-grant-read-safe-baseline
+  description: |
+    POSITIVE baseline -- GRANT READ succeeds and does not corrupt the chain
+    (only GRANT WRITE / GRANT SCHEMA / GRANT ALL trigger the bug).
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT READ ON GRAPH rbac_chain_graph TO rbac_chain_eve]
+  expect:
+    exit_code: 0
+    stdout_contains: [Granted]
+  tags: [rbac, positive, baseline]
+
+- name: chain-issue-grant-write-succeeds-silently
+  description: |
+    TRIP-WIRE / KNOWN LIMITATION -- GRANT WRITE currently SUCCEEDS at
+    the SQL layer (returns "Granted WRITE ...") but writes a corrupted
+    HMAC record to the auth chain. The corruption is latent: the live
+    server continues functioning, but the next restart will fail with
+    AuthChainTampered.
+    When the bug is fixed (GRANT WRITE either succeeds+survives-restart
+    OR is explicitly rejected), this assertion will FAIL -- flip it.
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT WRITE ON GRAPH rbac_chain_graph TO rbac_chain_eve]
+  expect:
+    exit_code: 0
+    stdout_contains: [Granted]
+  tags: [rbac, pin, trip_wire, known_limitation, gap0289]
+
+- name: chain-post-grant-write-server-still-alive
+  description: |
+    POSITIVE -- after issuing the corrupting GRANT WRITE, the live server
+    continues to serve queries normally. The corruption is latent. When the
+    bug is fixed (GRANT WRITE rejected or properly fixed), this assertion
+    remains valid (the server is still alive) but the previous step will
+    have changed.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW USERS]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_chain_eve]
+  tags: [rbac, positive, gap0289]
+
+- name: chain-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rbac_chain_eve;
+    DROP GRAPH IF EXISTS rbac_chain_graph;
+  expect: {exit_code: 0}
+  tags: [rbac, teardown]
+
+tags:
+- rbac
+- pin
+- known_limitation
+- trip_wire
+- security
+- chain_integrity
+- grant_write
+- gap0289

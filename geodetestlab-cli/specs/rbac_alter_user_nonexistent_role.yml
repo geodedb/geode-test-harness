@@ -1,0 +1,147 @@
+version: '1.0'
+name: RBAC — ALTER USER nonexistent role silent fallback (GAP-0291)
+description: |
+  Pins the current behavior of ALTER USER SET ROLE when the target role
+  does not exist: the server accepts the command (exit 0) and the user
+  KEEPS their existing role (the unknown role name is silently ignored —
+  it is NOT a silent fallback to .User as initially assumed; the current
+  role is preserved).
+
+  ACTUAL BEHAVIOR (verified 2026-05-21):
+    1. ALTER USER bob SET ROLE this_role_dne exits 0 (no error surfaced).
+    2. Bob RETAINS his previous role (readwrite in this test) — write succeeds.
+    3. SHOW USERS shows bob; the nonexistent role name was silently dropped.
+
+  The dangerous consequence: if an operator intends to DOWNGRADE a user by
+  setting an unknown/misspelled role name, the downgrade SILENTLY FAILS and
+  the user keeps elevated permissions — a security-relevant silent no-op.
+
+  When geode is fixed to reject unknown roles explicitly (error 42704 or
+  similar), this spec will FAIL — flip the exit expectation to assert error.
+
+  CANARY: REQ=GAP-0291; FEATURE="RBAC ALTER USER role validation"; ASPECT=NonexistentRoleSilentFallback; STATUS=PIN; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+
+- name: nonexistent-preflight-cleanup
+  description: Idempotent pre-flight cleanup.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rbac_nolerole_bob;
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: nonexistent-create-bob-readwrite
+  description: Create bob with 'readwrite' so we have a known-good baseline.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_nolerole_bob SET PASSWORD 'RbacNoRole-Bob-1234' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_nolerole_bob]
+  tags: [rbac, setup]
+
+- name: nonexistent-bob-can-write-with-readwrite
+  description: POSITIVE baseline — bob (readwrite) can write before the bad ALTER USER.
+  args: [query, -U, rbac_nolerole_bob, -P, RbacNoRole-Bob-1234, '-']
+  stdin: 'CREATE (n:RbacNoRolePre {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [RbacNoRolePre]
+    stdout_not_contains: ['42501']
+  tags: [rbac, positive, baseline]
+
+- name: nonexistent-alter-bob-to-nonexistent-role
+  description: |
+    TRIP-WIRE / KNOWN LIMITATION — ALTER USER SET ROLE to a role name
+    that does not exist. The server currently accepts this silently
+    (exit 0). When geode is fixed to reject unknown roles, this step
+    will return a non-zero exit code or an error string and the test
+    will fail, signalling the known limitation has been resolved.
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER rbac_nolerole_bob SET ROLE this_role_dne_xyz]
+  expect:
+    exit_code: 0
+  tags: [rbac, pin, known_limitation, gap0291]
+
+- name: nonexistent-bob-write-still-allowed-after-silent-ignore
+  description: |
+    POSITIVE / KNOWN LIMITATION — after ALTER USER to a nonexistent role,
+    bob RETAINS his previous 'readwrite' role (the unknown role name is
+    silently ignored, not applied). This is the security-relevant finding:
+    a misspelled role downgrade silently fails and the user keeps elevated
+    permissions. When geode is fixed to reject unknown roles, this test
+    will FAIL (write will be denied after the role change errors).
+  args: [query, -U, rbac_nolerole_bob, -P, RbacNoRole-Bob-1234, '-']
+  stdin: 'CREATE (n:RbacNoRolePost {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [RbacNoRolePost]
+    stdout_not_contains: ['42501']
+  tags: [rbac, pin, positive, known_limitation, gap0291]
+
+- name: nonexistent-show-users-bob-present
+  description: |
+    POSITIVE — bob still exists in SHOW USERS after the silent fallback;
+    the ALTER USER did not drop the user account.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW USERS]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_nolerole_bob]
+  tags: [rbac, positive]
+
+- name: nonexistent-alter-bob-back-to-readwrite
+  description: |
+    Verify that a subsequent valid ALTER USER can restore the original
+    role — the silent fallback did not permanently corrupt the user record.
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER rbac_nolerole_bob SET ROLE readwrite]
+  expect: {exit_code: 0}
+  tags: [rbac, recovery]
+
+- name: nonexistent-bob-write-restored
+  description: POSITIVE — after restoring to readwrite, bob can write again.
+  args: [query, -U, rbac_nolerole_bob, -P, RbacNoRole-Bob-1234, '-']
+  stdin: 'CREATE (n:RbacNoRoleRestored {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [RbacNoRoleRestored]
+    stdout_not_contains: ['42501']
+  tags: [rbac, positive, recovery]
+
+- name: nonexistent-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rbac_nolerole_bob;
+  expect: {exit_code: 0}
+  tags: [rbac, teardown]
+
+tags:
+- rbac
+- alter_user
+- known_limitation
+- pin
+- security
+- gap0291

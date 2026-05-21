@@ -1,0 +1,116 @@
+version: '1.0'
+name: RBAC — custom role binding pin (GAP-0288 trip-wire)
+description: |
+  PIN test for the documented limitation in rbac_users_roles_grants_audit.yml
+  header gap #3: CREATE USER ... ROLE custom_role silently maps the user to
+  the .User built-in (no privileges from custom_role are conferred).
+
+  This spec ASSERTS the CURRENT BROKEN behavior. When the underlying server
+  bug is fixed, this spec MUST fail — that is the regression-of-fix detector.
+  At that point, flip the 'pin-write-denied-because-fallback-to-user' assertion
+  to expect write success (remove stdout_contains ['42501']).
+
+  Source reference: src/security/user_manager.zig handleUserAssignRole —
+  accepts custom_role name in g_custom_roles but does not bind it to the
+  user's Role enum; the user remains .User.
+
+  CANARY: REQ=GAP-0288; FEATURE="RBAC custom role binding"; ASPECT=KnownLimitationPin; STATUS=PIN; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+
+- name: pin-preflight-cleanup
+  description: Idempotent pre-flight cleanup before binding test.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rbac_pin_dan;
+    DROP ROLE IF EXISTS rbac_pin_writer;
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: pin-create-custom-role
+  description: Create the custom role that will be (incorrectly) bound.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE ROLE rbac_pin_writer]
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: pin-show-roles-includes-custom
+  description: POSITIVE — custom role is visible in SHOW ROLES.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW ROLES]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_pin_writer]
+  tags: [rbac, positive, setup]
+
+- name: pin-create-user-with-custom-role
+  description: Create dan, requesting rbac_pin_writer as his role.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_pin_dan SET PASSWORD 'RbacPin-Dan-1234' ROLE rbac_pin_writer]
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: pin-write-denied-because-fallback-to-user
+  description: |
+    TRIP-WIRE / KNOWN LIMITATION — custom role does not actually bind.
+    Dan is silently placed on the .User built-in and CANNOT write.
+    This assertion pins the BROKEN behavior. When handleUserAssignRole
+    is fixed to actually bind the custom role, this test will FAIL —
+    that is the expected signal. Flip exit expectation to assert write
+    succeeds when the bug is resolved.
+  args: [query, -U, rbac_pin_dan, -P, RbacPin-Dan-1234, '-']
+  stdin: 'CREATE (n:RbacPinNode {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [rbac, pin, negative, known_limitation, trip_wire, gap0288]
+
+- name: pin-verify-user-is-not-admin
+  description: |
+    NEGATIVE — dan (non-admin) cannot create users. An admin-only DDL
+    (CREATE USER) must return 42501 for a .User role caller.
+  args: [query, -U, rbac_pin_dan, -P, RbacPin-Dan-1234, CREATE USER rbac_pin_should_not_exist SET PASSWORD 'X' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [rbac, negative, security]
+
+- name: pin-cleanup-final
+  description: Teardown — drop test user and custom role.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rbac_pin_dan;
+    DROP ROLE IF EXISTS rbac_pin_writer;
+  expect: {exit_code: 0}
+  tags: [rbac, teardown]
+
+tags:
+- rbac
+- pin
+- known_limitation
+- trip_wire
+- security
+- gap0288

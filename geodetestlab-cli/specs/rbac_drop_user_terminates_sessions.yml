@@ -1,0 +1,162 @@
+version: '1.0'
+name: RBAC — DROP USER terminates subsequent queries (GAP-0292)
+description: |
+  Verifies that after an admin issues DROP USER, the dropped user's
+  subsequent queries are rejected with an authentication or authorization
+  error (28000 invalid authorization / 42501 permission denied).
+
+  Session isolation caveat: same as GAP-0290 — the harness issues each
+  step as a short-lived `geode query` invocation, not a persistent held
+  session. This tests the "new connection after DROP USER" model. A user
+  who had an active QUIC session open at the time of DROP USER being
+  processed mid-flight cannot be tested without the interactive shell runner
+  (see documentation note below).
+
+  What is tested:
+    1. bob can authenticate and query before DROP USER.
+    2. Admin issues DROP USER bob.
+    3. bob's next fresh connection attempt fails — either the binary returns
+       a non-zero exit or the output contains a 28000 / 42501 / auth error.
+    4. SHOW USERS no longer lists bob (DROP is persistent).
+    5. DROP USER IF EXISTS for an already-dropped user is a safe no-op.
+
+  Mid-flight invalidation limitation: if bob has an active QUIC session at
+  DROP USER time, the current server implementation may or may not immediately
+  terminate that connection. Testing this requires the interactive shell runner
+  pattern which the harness does not support for interleaved sessions. Marked
+  in a comment below with skip rationale.
+
+  CANARY: REQ=GAP-0292; FEATURE="RBAC DROP USER session termination"; ASPECT=PostDropDenial; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_AUDIT_LOG_PATH: /tmp/rbac-drop-user-audit.jsonl
+      GEODE_DISABLE_AUDIT: '0'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+
+- name: drop-audit-truncate
+  type: bash
+  command: ': > /tmp/rbac-drop-user-audit.jsonl 2>/dev/null || true'
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: drop-preflight-cleanup
+  description: Idempotent pre-flight cleanup.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rbac_drop_bob;
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: drop-create-bob
+  description: Create the user who will be dropped.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_drop_bob SET PASSWORD 'RbacDrop-Bob-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [rbac_drop_bob]
+  tags: [rbac, setup]
+
+- name: drop-bob-can-query-before-drop
+  description: |
+    POSITIVE baseline — bob authenticates and runs a simple query
+    before being dropped. Confirms credentials are valid.
+  args: [query, -U, rbac_drop_bob, -P, RbacDrop-Bob-1234, RETURN 1 AS alive]
+  expect:
+    exit_code: 0
+    stdout_contains: [alive]
+    stdout_not_contains: ['28000', '42501']
+  tags: [rbac, positive, pre_drop]
+
+- name: drop-admin-drops-bob
+  description: Admin drops bob.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP USER rbac_drop_bob]
+  expect:
+    exit_code: 0
+  tags: [rbac, drop_user]
+
+- name: drop-bob-cannot-query-after-drop
+  description: |
+    NEGATIVE — bob's next fresh connection must fail with 28000
+    (invalid authorization / user does not exist) or 42501.
+    We use a bash step to accept EITHER a non-zero exit code from
+    the binary OR an auth error string in the output, since the
+    exact error surface depends on where the server rejects the
+    dropped user's credentials.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    OUT=$("$BIN" query -U rbac_drop_bob -P 'RbacDrop-Bob-1234' --server "$ADDR" "RETURN 1 AS x" 2>&1)
+    RC=$?
+    echo "exit_code=$RC"
+    echo "output=$OUT"
+    if [ $RC -ne 0 ]; then
+      echo "PASS: dropped user query rejected (exit $RC)"
+      exit 0
+    fi
+    if echo "$OUT" | grep -qiE '28000|42501|does not exist|invalid.*auth|auth.*invalid|user.*not.*found|permission denied'; then
+      echo "PASS: dropped user got expected auth/permission error"
+      exit 0
+    fi
+    echo "FAIL: dropped user rbac_drop_bob queried successfully — DROP USER did not invalidate new connections"
+    exit 1
+  expect: {exit_code: 0}
+  tags: [rbac, negative, post_drop, gap0292]
+
+- name: drop-show-users-bob-absent
+  description: POSITIVE — SHOW USERS no longer lists bob after DROP USER.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW USERS]
+  expect:
+    exit_code: 0
+    stdout_not_contains: [rbac_drop_bob]
+  tags: [rbac, positive, post_drop]
+
+- name: drop-idempotent-drop-if-exists
+  description: |
+    POSITIVE — DROP USER IF EXISTS for an already-dropped user is a
+    safe no-op (exit 0, no error).
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP USER IF EXISTS rbac_drop_bob]
+  expect: {exit_code: 0}
+  tags: [rbac, positive, idempotent]
+
+# Mid-flight session note:
+# Testing DROP USER while bob has an active QUIC session held open requires
+# the interactive shell runner (geode shell) with two interleaved streams:
+#   1. bob connects and holds the session
+#   2. admin DROP USER bob (separate connection)
+#   3. bob sends next command on held session → expect 28000/42501
+# The geodetestlab-cli harness cannot reliably interleave two parallel session
+# streams within a single spec. This is a documented limitation of GAP-0292.
+# Reference: shell_session_stability.yml for the interactive shell pattern.
+
+tags:
+- rbac
+- drop_user
+- session_termination
+- security
+- gap0292
