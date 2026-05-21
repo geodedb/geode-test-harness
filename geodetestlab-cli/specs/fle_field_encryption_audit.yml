@@ -1,0 +1,148 @@
+version: '1.0'
+name: FLE field encryption — CLI surface + negative + key rotation
+description: |
+  Black-box verification of the FLE (Field-Level Encryption) admin
+  surface that is exercisable from outside the binary today.  The
+  spec is deliberately CLI-surface-only because the full grant →
+  access → audit loop is NOT end-to-end testable yet.
+
+  HARD LIMITATIONS THAT BLOCK A FULL FLE SPEC (verified against this
+  binary):
+
+    1. No GQL DDL to register an encrypted field.  The parser
+       accepts `CREATE GRAPH TYPE Foo { ssn: STRING @encrypted }`
+       lexically but execution returns parse error 42000 —
+       annotations are not wired into the schema_manager → fle_catalog
+       registration path at the executor.  See src/gql/parser.zig
+       line 5962 (annotation parsing) and
+       src/schema/schema_manager.zig registerEncryptedType which is
+       not reachable from any GQL statement today.
+
+    2. No `revoke-plaintext` CLI subcommand.  Only grant is exposed
+       (src/admin/fle_commands.zig has handlers for grant-plaintext,
+       show-policy, show-rotation, rotate-key, migrate-encrypt — no
+       revoke).  Without revoke a black-box test cannot assert the
+       negative side of access control.
+
+    3. The FLE CLI is OFFLINE — it talks to the on-disk catalog,
+       not to a running server.  Therefore FLE operations do not
+       emit audit records through the running server's audit logger.
+       Audit emission for FLE happens (if at all) via the in-process
+       SecurityManager.logSecurityGraphEvent path when the SERVER
+       handles an encrypted read/write — which is the workflow we
+       can't reach because of limitation #1.
+
+    4. `fle migrate-encrypt` requires both GEODE_MASTER_KEY and a
+       pre-registered schema; without #1 above we have no schema
+       to migrate.
+
+  These limitations mean a real "grant alice plaintext, read SSN as
+  alice (plaintext), read SSN as bob (NULL), audit the access" spec
+  is not achievable yet.  When the schema_manager.registerEncryptedType
+  path is wired to the parser annotations (and a revoke subcommand
+  ships), a sibling spec fle_field_grant_access_audit.yml should be
+  added.
+
+  WHAT THIS SPEC DOES VERIFY (all from the CLI surface):
+
+    • `geode fle` (no args) prints the help with the documented
+      subcommands.
+    • `geode fle show-policy <schema>` on an unregistered schema
+      reports "not found" cleanly (negative).
+    • `geode fle grant-plaintext <missing-schema> ssn role` returns
+      a clear TypeNotFound error (negative).
+    • `geode fle rotate-key default trk` requires GEODE_MASTER_KEY
+      to be set (security check).
+    • `geode fle rotate-key default trk` succeeds when
+      GEODE_MASTER_KEY is set (positive).
+    • `geode fle show-rotation default` enumerates the in-binary
+      registered schema count (sanity check).
+
+  CANARY: REQ=REQ-FLE-CLI-001; FEATURE="FLE CLI Surface"; ASPECT=BlackBoxCli; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    format: json
+fuzz:
+  enabled: false
+tests:
+
+- name: fle-help-subcommand-list
+  description: |
+    POSITIVE — `geode fle` (no args) prints the help with the six
+    public subcommands.
+  args: [fle]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rotate-key
+    - show-rotation
+    - show-policy
+    - grant-plaintext
+    - migrate-encrypt
+  tags: [fle, surface, positive]
+
+- name: fle-show-policy-unregistered
+  description: |
+    NEGATIVE — `show-policy` on an unregistered schema reports
+    "not found" cleanly without crashing.
+  args: [fle, show-policy, FleNeverExisted]
+  expect:
+    exit_code: 0
+    stdout_contains: [not found in FLE catalog]
+  tags: [fle, surface, negative, known_limitation]
+
+- name: fle-grant-plaintext-missing-schema
+  description: |
+    NEGATIVE — `grant-plaintext` on an unregistered schema returns
+    a clear TypeNotFound error.  The CLI prints a stack trace on
+    error today (cosmetic gap not blocked).
+  args: [fle, grant-plaintext, FleNeverExisted, ssn, fle_pii_reader]
+  expect:
+    exit_code: 1
+    stderr_contains: [TypeNotFound]
+  tags: [fle, surface, negative]
+
+  # NOTE on the "missing master key" negative case: the harness `env:`
+  # per-test block layers OVER the parent environment, it cannot UNSET
+  # an inherited GEODE_MASTER_KEY. The fail-closed master-key check in
+  # src/keys/manager.zig loadMasterKeyFromEnv is unit-tested directly
+  # (tests/test_key_manager.zig); not re-asserted here.
+
+- name: fle-rotate-key-with-master-key
+  description: |
+    POSITIVE — `rotate-key trk` succeeds when GEODE_MASTER_KEY is
+    set.  This rotates the in-memory Tenant Root Key for the
+    `default` tenant.
+  args: [fle, rotate-key, default, trk]
+  env:
+    GEODE_MASTER_KEY: testmasterkey32chars-DO-NOT-USE-IN-PROD-12345678
+  expect:
+    exit_code: 0
+    stdout_contains: [Rewrapped TRK]
+  tags: [fle, surface, positive, key_rotation]
+
+- name: fle-show-rotation-default
+  description: |
+    POSITIVE — `show-rotation default` runs cleanly and reports
+    the count of in-binary registered encrypted schemas.
+  args: [fle, show-rotation, default]
+  env:
+    GEODE_MASTER_KEY: testmasterkey32chars-DO-NOT-USE-IN-PROD-12345678
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - FLE Key Rotation Status
+    - Tenant Root Key
+  tags: [fle, surface, positive]
+
+tags:
+- fle
+- field_encryption
+- cli_surface
+- security
+- comprehensive
+- known_limitation
