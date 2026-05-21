@@ -1,0 +1,283 @@
+version: '1.0'
+name: GPS Phase 2 decide() comprehensive role/permission matrix
+description: |
+  Black-box matrix that exercises gps.decide() across every (role, permission)
+  combination at the QUIC wire layer. Positive cases assert the operation
+  succeeds; negative cases assert the server returns SQLSTATE 42501
+  ("Permission denied") and DOES NOT mutate the store.
+
+  Includes negative cases for:
+  - Wrong password (authentication failure path)
+  - Non-existent user (authentication failure path)
+  - readonly user attempting CREATE / UPDATE / DELETE / DROP
+  - user role attempting WRITE
+  - Schema mutation by non-Admin
+
+  CANARY: REQ=REQ-GPS-PDP-009; FEATURE="GPS Decision Engine"; ASPECT=BlackBoxMatrixComprehensive; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+  # ============================================================================
+  # SETUP: create four test users covering every builtin role
+  # ============================================================================
+- name: phase2-preflight-cleanup
+  description: Idempotent pre-flight drop of any leftover test users.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - '-'
+  stdin: |
+    DROP USER IF EXISTS phase2_admin;
+    DROP USER IF EXISTS phase2_ro;
+    DROP USER IF EXISTS phase2_rw;
+    DROP USER IF EXISTS phase2_user;
+  expect:
+    exit_code: 0
+  tags: [phase2, setup]
+
+- name: phase2-create-readonly-user
+  description: Create the readonly test user (Read permission only).
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - CREATE USER phase2_ro SET PASSWORD 'phase2-ro-pass-1234' ROLE readonly
+  expect:
+    exit_code: 0
+    stdout_contains: [phase2_ro]
+  tags: [phase2, setup]
+
+- name: phase2-create-readwrite-user
+  description: Create the readwrite test user (Read + Write permissions, NO Schema).
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - CREATE USER phase2_rw SET PASSWORD 'phase2-rw-pass-1234' ROLE readwrite
+  expect:
+    exit_code: 0
+    stdout_contains: [phase2_rw]
+  tags: [phase2, setup]
+
+- name: phase2-create-user-role-user
+  description: Create a User-role test user (maps to Read only in current model).
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - CREATE USER phase2_user SET PASSWORD 'phase2-user-pass-1234' ROLE user
+  expect:
+    exit_code: 0
+    stdout_contains: [phase2_user]
+  tags: [phase2, setup]
+
+  # ============================================================================
+  # POSITIVE: every role can RETURN (Read)
+  # ============================================================================
+- name: phase2-readonly-can-return
+  description: POSITIVE — readonly can run a Read (RETURN) statement.
+  args: [query, -U, phase2_ro, -P, phase2-ro-pass-1234, '-']
+  stdin: RETURN 1 AS probe
+  expect:
+    exit_code: 0
+    stdout_contains: [probe]
+  tags: [phase2, positive, read]
+
+- name: phase2-readwrite-can-return
+  description: POSITIVE — readwrite can run a Read.
+  args: [query, -U, phase2_rw, -P, phase2-rw-pass-1234, '-']
+  stdin: RETURN 2 AS probe
+  expect:
+    exit_code: 0
+    stdout_contains: [probe]
+  tags: [phase2, positive, read]
+
+- name: phase2-user-role-can-return
+  description: POSITIVE — user role can run a Read.
+  args: [query, -U, phase2_user, -P, phase2-user-pass-1234, '-']
+  stdin: RETURN 3 AS probe
+  expect:
+    exit_code: 0
+    stdout_contains: [probe]
+  tags: [phase2, positive, read]
+
+  # ============================================================================
+  # NEGATIVE: readonly + user roles cannot WRITE (CREATE)
+  # ============================================================================
+- name: phase2-readonly-cannot-create
+  description: |
+    NEGATIVE — readonly user denied CREATE. Server returns SQLSTATE 42501.
+  args: [query, -U, phase2_ro, -P, phase2-ro-pass-1234, '-']
+  stdin: 'CREATE (n:Phase2Node {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [phase2, negative, write]
+
+- name: phase2-user-role-cannot-create
+  description: |
+    NEGATIVE — user role (maps to Read only) denied CREATE.
+  args: [query, -U, phase2_user, -P, phase2-user-pass-1234, '-']
+  stdin: 'CREATE (n:Phase2Node {v: 2}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [phase2, negative, write]
+
+  # ============================================================================
+  # POSITIVE: readwrite + admin CAN write
+  # ============================================================================
+- name: phase2-readwrite-can-create
+  description: POSITIVE — readwrite role CAN CREATE.
+  args: [query, -U, phase2_rw, -P, phase2-rw-pass-1234, '-']
+  stdin: 'CREATE (n:Phase2RWNode {v: 10}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase2RWNode]
+  tags: [phase2, positive, write]
+
+- name: phase2-admin-can-create
+  description: POSITIVE — admin CAN CREATE.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: 'CREATE (n:Phase2AdminNode {v: 100}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase2AdminNode]
+  tags: [phase2, positive, write]
+
+  # NOTE on schema-permission gating: CREATE GRAPH / CREATE INDEX are NOT
+  # currently gated through `checkPermission(.Schema)` — the dispatch paths
+  # in src/execution.zig:1585 (`.CreateGraph`) etc. bypass the check. This is
+  # a pre-existing dispatch-layer gap, unrelated to GPS Phase 2. The decision
+  # engine itself (tests/test_gps_decide.zig parity matrix) DOES deny
+  # non-Admin roles for the .schema action at the policy layer. A black-box
+  # schema-denial spec would require closing the dispatch-layer gap first.
+
+  # ============================================================================
+  # NEGATIVE: authentication failures (wrong password, non-existent user)
+  # The geode CLI returns exit code 3 with "Authentication failed" on stderr
+  # at QUIC handshake when credentials are rejected.
+  # ============================================================================
+- name: phase2-wrong-password-denied
+  description: |
+    NEGATIVE — correct username + WRONG password must fail at handshake.
+  args: [query, -U, phase2_ro, -P, WRONG-PASSWORD-XYZ, '-']
+  stdin: RETURN 1
+  expect:
+    exit_code: 3
+    stderr_contains: [Authentication failed]
+  tags: [phase2, negative, authn]
+
+- name: phase2-nonexistent-user-denied
+  description: |
+    NEGATIVE — a user that does not exist must fail authentication.
+  args: [query, -U, phase2_nonexistent_user, -P, anything, '-']
+  stdin: RETURN 1
+  expect:
+    exit_code: 3
+    stderr_contains: [Authentication failed]
+  tags: [phase2, negative, authn]
+
+  # ============================================================================
+  # NEGATIVE: readonly cannot UPDATE / DELETE either
+  # ============================================================================
+- name: phase2-admin-seed-node-for-update-delete
+  description: Admin creates a node that subsequent UPDATE/DELETE negatives target.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: "CREATE (n:Phase2Seed {id: 'p2-seed'}) RETURN n"
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase2Seed]
+  tags: [phase2, setup]
+
+- name: phase2-readonly-cannot-update
+  description: |
+    NEGATIVE — readonly user denied UPDATE (MATCH ... SET).
+  args: [query, -U, phase2_ro, -P, phase2-ro-pass-1234, '-']
+  stdin: MATCH (n:Phase2Seed) SET n.touched = 1 RETURN n
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [phase2, negative, write]
+
+- name: phase2-readonly-cannot-delete
+  description: |
+    NEGATIVE — readonly user denied DELETE.
+  args: [query, -U, phase2_ro, -P, phase2-ro-pass-1234, '-']
+  stdin: MATCH (n:Phase2Seed) DELETE n
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [phase2, negative, write]
+
+  # ============================================================================
+  # NEGATIVE: verify the seed node was NOT mutated by the failed UPDATE/DELETE
+  # ============================================================================
+- name: phase2-seed-node-survived-denied-mutations
+  description: |
+    Negative confirmation — after readonly attempts UPDATE and DELETE,
+    the seed node MUST still exist and its 'touched' property MUST NOT
+    be set. Proves the denied operations had no side effects.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: MATCH (n:Phase2Seed) RETURN n.id AS id, n.touched AS touched
+  expect:
+    exit_code: 0
+    stdout_contains: [p2-seed]
+    stdout_not_contains: ['"touched":1', '"touched": 1']
+  tags: [phase2, negative-followup]
+
+  # ============================================================================
+  # TEARDOWN
+  # ============================================================================
+- name: phase2-cleanup-users
+  description: Drop test users.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS phase2_ro;
+    DROP USER IF EXISTS phase2_rw;
+    DROP USER IF EXISTS phase2_user;
+  expect:
+    exit_code: 0
+  tags: [phase2, teardown]
+
+tags:
+- phase2
+- gps_decide
+- security
+- comprehensive

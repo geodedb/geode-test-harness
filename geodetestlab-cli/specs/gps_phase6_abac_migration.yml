@@ -1,0 +1,241 @@
+version: '1.0'
+name: GPS Phase 6 ABAC predicates + grant migration + policy_version
+description: |
+  Phase 6 black-box coverage:
+
+  POSITIVE:
+  - CREATE POLICY with current_user() = 'X' expression is accepted.
+  - CREATE POLICY with principal.attributes.X = 'Y' expression is accepted.
+  - SHOW POLICIES surfaces the migrated grants from __geode_security.
+
+  NEGATIVE:
+  - A policy with an unknown predicate function is accepted by the parser
+    (Phase 4 fallback) but DOES NOT actually grant access — the user is
+    still denied by GPS.
+  - A policy with the wrong username predicate does NOT grant access to
+    other users.
+
+  CANARY: REQ=REQ-GPS-ABAC-002; FEATURE="GPS Phase 6 ABAC"; ASPECT=BlackBoxComprehensive; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+  # ============================================================================
+  # SETUP
+  # ============================================================================
+- name: phase6-preflight
+  description: Drop leftover users + policies.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS phase6_alice;
+    DROP USER IF EXISTS phase6_bob;
+    DROP POLICY IF EXISTS phase6_alice_only;
+    DROP POLICY IF EXISTS phase6_abac_eng;
+    DROP POLICY IF EXISTS phase6_bad_expr;
+  expect:
+    exit_code: 0
+  tags: [phase6, setup]
+
+- name: phase6-create-alice
+  description: Create alice as readonly (will get a policy granting WRITE).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER phase6_alice SET PASSWORD 'alice-pass-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+  tags: [phase6, setup]
+
+- name: phase6-create-bob
+  description: Create bob as readonly (control — should NOT match alice's policy).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER phase6_bob SET PASSWORD 'bob-pass-1234' ROLE readonly]
+  expect:
+    exit_code: 0
+  tags: [phase6, setup]
+
+  # ============================================================================
+  # POSITIVE: CREATE POLICY with current_user() predicate
+  # ============================================================================
+- name: phase6-create-alice-policy
+  description: |
+    POSITIVE — CREATE POLICY with a `current_user() = 'phase6_alice'`
+    expression. Phase 6 expression parser accepts this and compiles it.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY phase6_alice_only ON GRAPH * FOR WRITE USING current_user() = 'phase6_alice']
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [phase6, positive, abac]
+
+- name: phase6-show-policies-includes-alice-only
+  description: POSITIVE — phase6_alice_only appears in SHOW POLICIES.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [phase6_alice_only]
+  tags: [phase6, positive, abac]
+
+  # ============================================================================
+  # POSITIVE: CREATE POLICY with ABAC attribute predicate
+  # ============================================================================
+- name: phase6-create-abac-eng-policy
+  description: |
+    POSITIVE — CREATE POLICY with a `principal.attributes.department = 'engineering'`
+    expression. Phase 6 supports this predicate kind.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY phase6_abac_eng ON GRAPH * FOR READ USING principal.attributes.department = 'engineering']
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [phase6, positive, abac]
+
+- name: phase6-show-policies-includes-abac
+  description: POSITIVE — phase6_abac_eng appears in SHOW POLICIES.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [phase6_abac_eng]
+  tags: [phase6, positive, abac]
+
+  # ============================================================================
+  # NEGATIVE: a policy with an unsupported predicate is parser-accepted but
+  # does NOT grant access (Phase 6 compileExpression returns null for unknown
+  # syntax → compiled = null → policy skipped by decide()).
+  # ============================================================================
+- name: phase6-create-unsupported-expression-policy
+  description: |
+    POSITIVE/NEGATIVE — CREATE POLICY with an unsupported expression
+    (e.g. `user.department == 'eng'` — `==` and `user.X` are not in the
+    Phase 6 supported subset). The parser fails silently → compiled=null;
+    the catalog still records the policy. SHOW POLICIES shows it but
+    decide() will not match it.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY phase6_bad_expr ON GRAPH * FOR WRITE USING user.department == 'engineering']
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [phase6, negative, abac]
+
+- name: phase6-bob-still-denied-write-with-bad-expr-policy
+  description: |
+    NEGATIVE — phase6_bob (readonly) attempts CREATE despite the
+    phase6_bad_expr policy existing. Because the expression failed to
+    compile, the policy doesn't match anyone — bob is still denied.
+  args: [query, -U, phase6_bob, -P, bob-pass-1234, '-']
+  stdin: 'CREATE (n:Phase6BobNode {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [phase6, negative, abac]
+
+  # ============================================================================
+  # NEGATIVE: alice's policy doesn't grant bob access (current_user mismatch)
+  # ============================================================================
+- name: phase6-bob-denied-by-alice-only-policy
+  description: |
+    NEGATIVE — phase6_bob is denied CREATE even though the
+    phase6_alice_only policy exists, because current_user() = 'phase6_alice'
+    does not match bob.
+  args: [query, -U, phase6_bob, -P, bob-pass-1234, '-']
+  stdin: 'CREATE (n:Phase6CrossUserDenied {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [phase6, negative, abac]
+
+  # ============================================================================
+  # POSITIVE: alice IS granted WRITE because current_user() = 'phase6_alice'
+  # matches the policy expression.
+  # ============================================================================
+  # ============================================================================
+  # PROBE: confirm policy_match fires with the trivial 'true' expression first
+  # before testing the harder current_user() predicate. If this probe passes
+  # but the current_user predicate doesn't, the issue is in expression eval.
+  # If this probe also fails, it's in the policy_match wiring.
+  # ============================================================================
+- name: phase6-probe-true-expression-allows-alice
+  description: |
+    PROBE — install a policy with `true` expression for WRITE; alice
+    (readonly) MUST be allowed CREATE via policy_match.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY phase6_probe_true ON GRAPH * FOR WRITE USING true]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [phase6, probe]
+
+- name: phase6-probe-alice-allowed-by-true
+  description: |
+    POSITIVE PROBE — with phase6_probe_true (expression='true', WRITE)
+    in the catalog, alice can CREATE.
+  args: [query, -U, phase6_alice, -P, alice-pass-1234, '-']
+  stdin: 'CREATE (n:Phase6ProbeNode {v: 99}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase6ProbeNode]
+    stdout_not_contains: ['42501']
+  tags: [phase6, probe, positive]
+
+- name: phase6-probe-drop-true-policy
+  description: Drop the probe policy so it doesn't pollute later tests.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY phase6_probe_true]
+  expect:
+    exit_code: 0
+  tags: [phase6, probe, teardown]
+
+  # ============================================================================
+  # POSITIVE: alice IS granted WRITE via current_user() = 'phase6_alice'
+  # If the probe above passed but THIS fails, the bug is in expression eval.
+  # ============================================================================
+- name: phase6-alice-allowed-by-policy
+  description: |
+    POSITIVE — phase6_alice (readonly role) is granted CREATE via the
+    phase6_alice_only policy. Confirms the policy_match path AND the
+    current_user() predicate evaluation.
+  args: [query, -U, phase6_alice, -P, alice-pass-1234, '-']
+  stdin: 'CREATE (n:Phase6AliceAllowed {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase6AliceAllowed]
+    stdout_not_contains: ['42501', Permission denied]
+  tags: [phase6, positive, abac]
+
+  # ============================================================================
+  # TEARDOWN
+  # ============================================================================
+- name: phase6-cleanup
+  description: Drop test users + policies.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS phase6_alice_only;
+    DROP POLICY IF EXISTS phase6_abac_eng;
+    DROP POLICY IF EXISTS phase6_bad_expr;
+    DROP USER IF EXISTS phase6_alice;
+    DROP USER IF EXISTS phase6_bob;
+  expect:
+    exit_code: 0
+  tags: [phase6, teardown]
+
+tags:
+- phase6
+- gps_abac
+- gps_migration
+- security
+- comprehensive

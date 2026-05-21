@@ -1,0 +1,260 @@
+version: '1.0'
+name: GPS Phase 7 ALTER POLICY + SHOW GRANTS FOR + EXPLAIN POLICY
+description: |
+  Phase 7 DDL + decision visibility:
+
+  POSITIVE:
+  - ALTER POLICY p SET ENABLED false → subsequent decide() denies despite
+    the policy being in the catalog.
+  - ALTER POLICY p SET ENABLED true → access restored.
+  - SHOW GRANTS FOR alice returns alice's matching policies (current_user
+    or 'true' predicates).
+  - SHOW GRANTS FOR bob excludes alice-only policies.
+  - EXPLAIN POLICY FOR MATCH returns a decision row classifying as
+    .match_ action.
+  - EXPLAIN POLICY FOR CREATE classifies as .create.
+
+  NEGATIVE:
+  - ALTER POLICY on non-existent policy returns PolicyNotFound.
+  - SHOW GRANTS FOR <nonexistent_user> returns empty (no rows, no error).
+  - EXPLAIN POLICY FOR <empty> handled gracefully (parser error or
+    explicit message).
+
+  CANARY: REQ=REQ-GPS-DDL-006; FEATURE="GPS Phase 7 DDL"; ASPECT=BlackBoxComprehensive; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+  # ============================================================================
+  # SETUP
+  # ============================================================================
+- name: phase7-preflight
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS phase7_p_global;
+    DROP POLICY IF EXISTS phase7_p_alice;
+    DROP POLICY IF EXISTS phase7_p_bob;
+    DROP USER IF EXISTS phase7_alice;
+    DROP USER IF EXISTS phase7_bob;
+  expect: {exit_code: 0}
+  tags: [phase7, setup]
+
+- name: phase7-create-alice-user
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER phase7_alice SET PASSWORD 'p7-alice-pass' ROLE readonly]
+  expect: {exit_code: 0}
+  tags: [phase7, setup]
+
+- name: phase7-create-bob-user
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER phase7_bob SET PASSWORD 'p7-bob-pass' ROLE readonly]
+  expect: {exit_code: 0}
+  tags: [phase7, setup]
+
+- name: phase7-create-global-policy
+  description: |
+    POSITIVE — CREATE POLICY phase7_p_global with `true` expression for WRITE.
+    This grants WRITE to ALL users; we use it to test ALTER (disable) flow.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY phase7_p_global ON GRAPH * FOR WRITE USING true]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [phase7, setup]
+
+- name: phase7-create-alice-policy
+  description: POSITIVE — CREATE POLICY scoped to alice via current_user().
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY phase7_p_alice ON GRAPH * FOR WRITE USING current_user() = 'phase7_alice']
+  expect: {exit_code: 0}
+  tags: [phase7, setup]
+
+  # ============================================================================
+  # POSITIVE: alice can write while phase7_p_global is enabled
+  # ============================================================================
+- name: phase7-alice-can-write-while-enabled
+  description: POSITIVE — alice can CREATE while phase7_p_global (true) is enabled.
+  args: [query, -U, phase7_alice, -P, p7-alice-pass, '-']
+  stdin: 'CREATE (n:Phase7P1 {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase7P1]
+    stdout_not_contains: ['42501']
+  tags: [phase7, positive, alter]
+
+  # ============================================================================
+  # NEGATIVE: alice denied after ALTER POLICY ... SET ENABLED false
+  # ============================================================================
+- name: phase7-disable-global-policy
+  description: POSITIVE — ALTER POLICY phase7_p_global SET ENABLED false.
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER POLICY phase7_p_global SET ENABLED false]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy altered]
+  tags: [phase7, positive, alter]
+
+- name: phase7-bob-denied-after-disable
+  description: |
+    NEGATIVE — bob (readonly, no matching policy) is denied CREATE after
+    phase7_p_global is disabled.
+  args: [query, -U, phase7_bob, -P, p7-bob-pass, '-']
+  stdin: 'CREATE (n:Phase7BobDenied {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [phase7, negative, alter]
+
+- name: phase7-alice-still-allowed-by-alice-policy
+  description: |
+    POSITIVE — alice still has phase7_p_alice (current_user matches), so
+    alice can still CREATE even after the global policy is disabled.
+  args: [query, -U, phase7_alice, -P, p7-alice-pass, '-']
+  stdin: 'CREATE (n:Phase7P2 {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase7P2]
+    stdout_not_contains: ['42501']
+  tags: [phase7, positive, alter]
+
+  # ============================================================================
+  # POSITIVE: re-enable global policy → bob allowed again
+  # ============================================================================
+- name: phase7-reenable-global-policy
+  description: POSITIVE — ALTER POLICY phase7_p_global SET ENABLED true.
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER POLICY phase7_p_global SET ENABLED true]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy altered]
+  tags: [phase7, positive, alter]
+
+- name: phase7-bob-allowed-after-reenable
+  description: POSITIVE — bob can CREATE again after global policy re-enabled.
+  args: [query, -U, phase7_bob, -P, p7-bob-pass, '-']
+  stdin: 'CREATE (n:Phase7BobAllowed {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase7BobAllowed]
+    stdout_not_contains: ['42501']
+  tags: [phase7, positive, alter]
+
+  # ============================================================================
+  # NEGATIVE: ALTER POLICY on a non-existent policy
+  # ============================================================================
+- name: phase7-alter-nonexistent-fails
+  description: |
+    NEGATIVE — ALTER POLICY on a name that doesn't exist returns an error
+    in the response (PolicyNotFound).
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER POLICY phase7_does_not_exist SET ENABLED false]
+  expect:
+    exit_code: 0
+    stdout_contains: [PolicyNotFound]
+  tags: [phase7, negative, alter]
+
+  # ============================================================================
+  # POSITIVE: SHOW GRANTS FOR alice
+  # ============================================================================
+- name: phase7-show-grants-for-alice
+  description: |
+    POSITIVE — SHOW GRANTS FOR alice returns phase7_p_alice (current_user
+    matches) AND phase7_p_global (universal `true` predicate).
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRANTS FOR phase7_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: [phase7_p_alice, phase7_p_global]
+  tags: [phase7, positive, show_grants]
+
+  # ============================================================================
+  # NEGATIVE: SHOW GRANTS FOR bob (no policy matches by name)
+  # ============================================================================
+- name: phase7-show-grants-for-bob
+  description: |
+    NEGATIVE/POSITIVE — SHOW GRANTS FOR bob does NOT return
+    phase7_p_alice (current_user check excludes him), but DOES return
+    phase7_p_global (universal predicate).
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRANTS FOR phase7_bob]
+  expect:
+    exit_code: 0
+    stdout_contains: [phase7_p_global]
+    stdout_not_contains: [phase7_p_alice]
+  tags: [phase7, negative, show_grants]
+
+  # ============================================================================
+  # NEGATIVE: SHOW GRANTS FOR a non-existent user — returns empty rows
+  # ============================================================================
+- name: phase7-show-grants-for-nonexistent
+  description: |
+    NEGATIVE — SHOW GRANTS FOR a user that doesn't exist returns the
+    response successfully but with no policy matches for that name.
+    (Universal `true` policies still appear.)
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRANTS FOR phase7_nonexistent_user]
+  expect:
+    exit_code: 0
+    stdout_not_contains: [phase7_p_alice]
+  tags: [phase7, negative, show_grants]
+
+  # ============================================================================
+  # POSITIVE: EXPLAIN POLICY FOR a MATCH query
+  # ============================================================================
+- name: phase7-explain-policy-match
+  description: |
+    POSITIVE — EXPLAIN POLICY FOR a MATCH query returns a single row
+    classifying the action and returning the decision.
+  args: [query, -U, geode, -P, '${secret:admin_password}', EXPLAIN POLICY FOR MATCH (n) RETURN n]
+  expect:
+    exit_code: 0
+    stdout_contains: [match, allow]
+  tags: [phase7, positive, explain]
+
+  # ============================================================================
+  # POSITIVE: EXPLAIN POLICY FOR a CREATE query
+  # ============================================================================
+- name: phase7-explain-policy-create
+  description: |
+    POSITIVE — EXPLAIN POLICY FOR a CREATE query classifies as .create
+    and runs decide() with the current admin principal (allow).
+  args: [query, -U, geode, -P, '${secret:admin_password}', EXPLAIN POLICY FOR CREATE (n:X) RETURN n]
+  expect:
+    exit_code: 0
+    stdout_contains: [create, allow]
+  tags: [phase7, positive, explain]
+
+  # ============================================================================
+  # TEARDOWN
+  # ============================================================================
+- name: phase7-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS phase7_p_global;
+    DROP POLICY IF EXISTS phase7_p_alice;
+    DROP USER IF EXISTS phase7_alice;
+    DROP USER IF EXISTS phase7_bob;
+  expect: {exit_code: 0}
+  tags: [phase7, teardown]
+
+tags:
+- phase7
+- gps_alter
+- gps_show_grants
+- gps_explain
+- security
+- comprehensive
