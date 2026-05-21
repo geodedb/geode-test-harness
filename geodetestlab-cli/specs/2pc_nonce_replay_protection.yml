@@ -1,0 +1,79 @@
+version: '1.0'
+name: 2PC Nonce Replay Rejection (GAP-0319)
+description: |
+  GAP-0319: Verifies that the 2PC coordinator's nonce tracker (SEC-D009,
+  distributed/nonce_tracker.zig) rejects a replayed 2PC PREPARE message
+  carrying a previously-seen nonce, and that the original transaction
+  is unaffected.
+
+  CANARY: REQ=GAP-0319; FEATURE="2PC nonce replay protection"; ASPECT=NonceRejection; STATUS=BLOCKED; OWNER=security; UPDATED=2026-05-21
+
+  Architecture note
+  -----------------
+  The nonce check in twophase.zig:1311-1316 fires at the coordinator's
+  incoming-message processing loop when it receives an ACK/PREPARE from a
+  participant that carries a nonce it has already recorded:
+
+    if (!self.twophase_nonce_tracker.checkAndRecord(msg.nonce)) {
+        log.warn("2PC message rejected: replay or missing nonce", ...);
+        return error.NonceReplay;
+    }
+
+  To test this from a black-box harness, one of the following is required:
+
+  Option A — Wire-level packet replay
+  ------------------------------------
+  Capture the raw QUIC/protobuf frame of a PREPARE message (e.g., with
+  tcpdump + tshark), then re-inject it via a custom Go/Python tool that
+  opens a second QUIC connection to the coordinator's federation port and
+  replays the raw bytes. The coordinator must log "replay or missing nonce"
+  and return an error on the replayed stream while the original transaction
+  commits normally.
+
+  Limitations:
+  - Requires a compiled replay tool (not present in the harness).
+  - QUIC encrypts frames end-to-end; replaying captured UDP datagrams does
+    not work — the injector must establish a new QUIC connection and send a
+    valid protobuf message with an already-seen nonce field set explicitly.
+  - No geode CLI command exposes "send a 2PC PREPARE with nonce=N".
+
+  Option B — Test-only CLI hook
+  ------------------------------
+  Add a `geode admin 2pc-test-replay <txn-id> <nonce>` command that
+  serializes a PREPARE frame with the given nonce and sends it to the
+  coordinator. The coordinator rejects it, and the command prints the error.
+
+  Why this is Blocked
+  -------------------
+  Neither wire-level replay tooling nor a test-only CLI hook exists in the
+  current codebase. The nonce uniqueness property IS tested at the unit
+  level (twophase.zig:1783 "2PC nonce generation produces nonzero distinct
+  values") but has no black-box integration coverage.
+
+  Path forward
+  ------------
+  1. Implement `geode admin 2pc-nonce-probe --server <addr> --nonce <N>` that
+     sends a minimal 2PC PREPARE with a caller-supplied nonce to the server's
+     federation port.
+  2. Run it twice with the same nonce; second invocation must return a
+     non-zero exit code and print "NONCE_REUSED" or "NonceReplay" to stderr.
+  3. Run the original transaction normally; confirm it commits.
+  4. Remove the skip once the command is implemented.
+
+  Alternatively, the distributed integration tests (src/distributed/
+  test_federation_auth.zig) can be extended with a Zig-level test that
+  directly calls CoordinatorState.processIncoming() with a replayed nonce
+  — this would give unit-level black-box coverage without a CLI change.
+
+skip: 'GAP-0319: nonce replay test requires wire-level injection tooling or a geode admin 2pc-nonce-probe CLI command (neither exists). The nonce tracker is exercised at the Zig unit level (twophase.zig:1783) but lacks integration coverage. See description for two implementation paths.'
+
+tests: []
+
+tags:
+- distributed
+- 2pc
+- nonce-replay
+- security
+- sec-d009
+- gap-0319
+- blocked

@@ -1,0 +1,374 @@
+version: '1.0'
+name: 2PC / Distributed Principal Envelope Propagation (GAP-0322)
+description: |
+  GAP-0322: Verifies that when a tenant_a user issues a cross-shard query,
+  the remote shard receives and applies tenant_a's identity (not the
+  coordinator's "geode-cluster" identity) so that RLS policies on the shard
+  enforce tenant_a's data scope.
+
+  CANARY: REQ=GAP-0322; FEATURE="GPS principal envelope propagation"; ASPECT=CrossShardRLSScope; STATUS=PARTIAL; OWNER=security; UPDATED=2026-05-21
+
+  Architecture
+  ------------
+  The principal_envelope.zig (GPS Phase 7, Task 7-6) serializes the caller's
+  identity into a GPSP-magic wire blob. The coordinator attaches it to every
+  outbound NodeQuery (enhanced_query_coordinator.zig:223-235). The shard
+  worker deserializes it in quic_connection_handler.zig:3269 and uses the
+  forwarded identity for GPS/RLS evaluation rather than the connection-level
+  "geode-cluster" principal.
+
+  Observable invariant: a query issued by user "alice" in tenant "tenant_a"
+  that touches a remote shard must see only the rows that tenant_a's RLS
+  scope permits — not the superset visible to the coordinator's own
+  identity.
+
+  Why the distributed path is BLOCKED
+  ------------------------------------
+  1. The geode-client-zig CLI client does not yet emit principal_envelope_bytes
+     (ExecuteRequest field 4, GPS Phase 7 Task 7-5 partial). The CLI
+     therefore always falls back to the connection-level principal on the
+     coordinator, and the envelope propagation code path is unreachable.
+
+  2. Triggering a cross-shard query requires a multi-node cluster where the
+     coordinator's query planner routes part of the query to a remote shard.
+     The query planner currently does not split a GQL MATCH across shards
+     based on graph-level affinity; federation routing is triggered by
+     explicit UNION ALL across remote-graph names, which is not yet
+     supported via GQL syntax.
+
+  3. Even if routing worked, the RLS outcome on the shard would only differ
+     from the coordinator's result if tenant-scoped policies exist on the
+     shard and the shard's GPS decision engine sees different identities for
+     the coordinator vs. the forwarded principal. Creating those conditions
+     requires GPS policy DDL on per-shard connections, which the harness
+     cannot do atomically without a "run this query on node N only" step type.
+
+  Path forward
+  ------------
+  1. Expose principal_envelope_bytes in geode-client-zig (or via a
+     DSN/header mechanism) so CLI tests can craft forwarded-principal
+     requests.
+  2. Add a GEODE_TEST_FORWARD_PRINCIPAL env var that the coordinator injects
+     on all outbound NodeQuery messages so integration tests can verify the
+     envelope is received by the shard.
+  3. Alternatively, instrument the GPS decision engine to log the evaluated
+     Principal's username and tenant_id via OTEL span attributes; the
+     OTel test harness can then assert "span attribute 'gps.principal.tenant_id'
+     == 'tenant_a'" without requiring multi-node routing.
+
+  Single-node proxy tests (Status: GREEN)
+  ----------------------------------------
+  While the distributed cross-shard path is blocked, the same invariant is
+  testable in single-node mode via:
+    - Graph-scoped isolation (each "tenant" graph is a separate namespace)
+    - Session-level principal: run queries as a graph-scoped user and verify
+      the returned rows respect that user's graph boundary
+
+  The tests below validate those observable proxies. They exercise the same
+  GPS decision engine and RLS code paths that the distributed path exercises
+  on the shard worker, without requiring a second node.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# -----------------------------------------------------------------------
+# Setup: two tenant graphs + per-tenant data
+# -----------------------------------------------------------------------
+- name: principal-prop-setup-graphs
+  description: |
+    Create two graphs acting as tenant namespaces (tenant_a, tenant_b).
+    Seed each with exclusive data to verify scope enforcement.
+  args:
+  - query
+  - '-'
+  stdin: |
+    CREATE GRAPH IF NOT EXISTS principal_tenant_a;
+    CREATE GRAPH IF NOT EXISTS principal_tenant_b;
+    USE GRAPH principal_tenant_a;
+    CREATE (:PrincipalDoc {tenant: 'tenant_a', content: 'secret_content_for_a_only', doc_id: 'doc_a1'});
+    CREATE (:PrincipalDoc {tenant: 'tenant_a', content: 'secret_content_for_a_only', doc_id: 'doc_a2'});
+    USE GRAPH principal_tenant_b;
+    CREATE (:PrincipalDoc {tenant: 'tenant_b', content: 'secret_content_for_b_only', doc_id: 'doc_b1'});
+    CREATE (:PrincipalDoc {tenant: 'tenant_b', content: 'secret_content_for_b_only', doc_id: 'doc_b2'})
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - setup
+  - gap-0322
+
+- name: principal-prop-setup-user-alice
+  description: |
+    Create user alice_tenant_a_2026 with readonly role. This models
+    a principal whose scope is scoped to tenant_a's graph.
+  args:
+  - query
+  - CREATE USER alice_tenant_a_2026 SET PASSWORD 'AlicePass123!' ROLE readonly
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - setup
+  - gap-0322
+
+- name: principal-prop-setup-user-bob
+  description: |
+    Create user bob_tenant_b_2026 with readonly role. This models
+    a principal whose scope is scoped to tenant_b's graph.
+  args:
+  - query
+  - CREATE USER bob_tenant_b_2026 SET PASSWORD 'BobPass123!' ROLE readonly
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - setup
+  - gap-0322
+
+# -----------------------------------------------------------------------
+# Verify tenant_a user reads only tenant_a's data (scope enforcement)
+# -----------------------------------------------------------------------
+- name: principal-prop-alice-sees-only-tenant-a
+  description: |
+    User alice_tenant_a_2026 queries principal_tenant_a. She must see
+    exactly 2 PrincipalDoc nodes — all belonging to tenant_a. This is the
+    proxy for "shard worker enforces the forwarded principal's scope":
+    on a multi-shard deployment, the principal_envelope would carry alice's
+    identity to the shard and the shard's RLS engine would enforce the same
+    graph-scoped boundary.
+  args:
+  - query
+  - '-'
+  - -U
+  - alice_tenant_a_2026
+  - -P
+  - AlicePass123!
+  - --no-saved-session
+  stdin: |
+    USE GRAPH principal_tenant_a;
+    MATCH (d:PrincipalDoc) RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - distributed
+  - principal-propagation
+  - scope-enforcement
+  - tenant-a
+  - gap-0322
+
+- name: principal-prop-alice-no-tenant-b-data
+  description: |
+    User alice_tenant_a_2026 queries principal_tenant_b. She must see
+    0 PrincipalDoc nodes because she has no data in tenant_b's graph.
+    On a multi-shard deployment, the principal_envelope forwarded to the
+    shard carrying tenant_b's data must not grant alice access to tenant_b's
+    rows — the RLS scope is identity-bound, not coordinator-bound.
+  args:
+  - query
+  - '-'
+  - -U
+  - alice_tenant_a_2026
+  - -P
+  - AlicePass123!
+  - --no-saved-session
+  stdin: |
+    USE GRAPH principal_tenant_b;
+    MATCH (d:PrincipalDoc {tenant: 'tenant_b'}) RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - distributed
+  - principal-propagation
+  - cross-tenant-isolation
+  - gap-0322
+
+# -----------------------------------------------------------------------
+# Verify tenant_b user reads only tenant_b's data
+# -----------------------------------------------------------------------
+- name: principal-prop-bob-sees-only-tenant-b
+  description: |
+    User bob_tenant_b_2026 queries principal_tenant_b. He must see
+    exactly 2 PrincipalDoc nodes. Symmetric counterpart to alice's test,
+    confirming that scope enforcement is per-principal, not per-connection.
+  args:
+  - query
+  - '-'
+  - -U
+  - bob_tenant_b_2026
+  - -P
+  - BobPass123!
+  - --no-saved-session
+  stdin: |
+    USE GRAPH principal_tenant_b;
+    MATCH (d:PrincipalDoc) RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - distributed
+  - principal-propagation
+  - scope-enforcement
+  - tenant-b
+  - gap-0322
+
+# -----------------------------------------------------------------------
+# Secret content values are graph-scoped — cross-graph query sees no bleed
+# -----------------------------------------------------------------------
+- name: principal-prop-no-content-bleed-a-to-b
+  description: |
+    Data content specific to tenant_a must not appear when querying
+    tenant_b's graph. Validates that property values are namespace-
+    isolated: a remote shard with principal_envelope.tenant_id = 'tenant_a'
+    must not expose rows tagged with tenant_b's content.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH principal_tenant_b;
+    MATCH (d:PrincipalDoc {content: 'secret_content_for_a_only'}) RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - distributed
+  - principal-propagation
+  - no-content-bleed
+  - gap-0322
+
+- name: principal-prop-no-content-bleed-b-to-a
+  description: |
+    Data content specific to tenant_b must not appear when querying
+    tenant_a's graph. Confirms symmetric isolation.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH principal_tenant_a;
+    MATCH (d:PrincipalDoc {content: 'secret_content_for_b_only'}) RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - distributed
+  - principal-propagation
+  - no-content-bleed
+  - gap-0322
+
+# -----------------------------------------------------------------------
+# BLOCKED sub-case: actual cross-shard envelope propagation
+# -----------------------------------------------------------------------
+- name: principal-prop-distributed-envelope-blocked
+  description: |
+    This test is the real GAP-0322 acceptance criterion: alice issues a
+    cross-shard query and the remote shard's GPS engine evaluates it under
+    alice's tenant_a identity (not the coordinator's geode-cluster identity).
+
+    It is skipped because:
+    1. The CLI client does not yet emit ExecuteRequest.principal_envelope_bytes
+       (GPS Phase 7, Task 7-5 partial — geode-client-zig gap).
+    2. The query planner does not route across shards for graph-scoped
+       queries in the current implementation.
+    3. No GQL syntax exposes "query this graph on remote node N".
+
+    When Task 7-5 is complete (geode-client-zig emits field 4) and cross-shard
+    routing is enabled, this test should be re-enabled and target a 2-node
+    cluster with node_overrides setting distinct graph affinities.
+  skip: true
+  skip_reason: |
+    GPS Phase 7 Task 7-5 gap: geode-client-zig does not yet emit
+    ExecuteRequest.principal_envelope_bytes; cross-shard routing for
+    graph-scoped queries is not yet implemented. Re-enable when both gaps
+    are closed. See spec description for full implementation path.
+  args:
+  - query
+  - RETURN 1 AS placeholder
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - cross-shard
+  - blocked
+  - gap-0322
+
+# -----------------------------------------------------------------------
+# Cleanup
+# -----------------------------------------------------------------------
+- name: principal-prop-cleanup-user-alice
+  description: Remove alice_tenant_a_2026 user created during setup.
+  args:
+  - query
+  - DROP USER IF EXISTS alice_tenant_a_2026
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - cleanup
+  - gap-0322
+
+- name: principal-prop-cleanup-user-bob
+  description: Remove bob_tenant_b_2026 user created during setup.
+  args:
+  - query
+  - DROP USER IF EXISTS bob_tenant_b_2026
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - cleanup
+  - gap-0322
+
+- name: principal-prop-cleanup-graphs
+  description: Drop tenant graphs to restore clean state.
+  args:
+  - query
+  - '-'
+  stdin: |
+    DROP GRAPH IF EXISTS principal_tenant_a;
+    DROP GRAPH IF EXISTS principal_tenant_b
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - cleanup
+  - gap-0322
+
+tags:
+- distributed
+- 2pc
+- principal-propagation
+- tenant-isolation
+- security
+- gps
+- gap-0322

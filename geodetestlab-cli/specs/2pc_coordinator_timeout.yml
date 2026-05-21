@@ -1,0 +1,60 @@
+version: '1.0'
+name: 2PC Coordinator Timeout — Participant Rollback (GAP-0317)
+description: |
+  GAP-0317: Verifies that 2PC participants roll back their prepared
+  transactions when the coordinator stops responding (simulated by SIGSTOP)
+  and the participant-side timeout expires.
+
+  CANARY: REQ=GAP-0317; FEATURE="2PC coordinator timeout"; ASPECT=ParticipantRollback; STATUS=BLOCKED; OWNER=distributed; UPDATED=2026-05-21
+
+  Architecture note
+  -----------------
+  The 2PC coordinator timeout is 30 000 ms (hardcoded in
+  distributed/twophase.zig:166 — default_timeout_ms = 30_000). There is no
+  GEODE_2PC_TIMEOUT environment variable or CLI flag to shorten it for
+  testing. Waiting 30+ seconds per test is outside the MAX_TEST_RUNTIME
+  budget and makes the suite brittle under CI.
+
+  Additionally, SIGSTOP on the coordinator process requires the test harness
+  to:
+    1. Start a coordinator and >=2 participant nodes on separate ports.
+    2. Begin a distributed transaction that spans all participants.
+    3. SIGSTOP the coordinator PID between PREPARE-ACK and COMMIT.
+    4. Wait for participant timeout (30 s minimum).
+    5. SIGCONT the coordinator; verify it sees ABORT.
+    6. Query each participant to confirm zero rows.
+
+  The harness cluster mode (cluster.py:start_cluster) allocates ports and
+  starts nodes, but test steps currently have no mechanism to send Unix
+  signals to a specific cluster node process (ClusterNodeState.process) mid-
+  test, nor to pause execution for 30 s without a hardcoded sleep that would
+  violate the suite-level time budget.
+
+  Path forward
+  ------------
+  1. Add GEODE_2PC_TIMEOUT_MS env var to distributed/twophase.zig so tests
+     can shorten the coordinator timeout to ~2 s.
+  2. Extend the harness executor to support a "signal" step type:
+       type: signal
+       target: node       # "node:0", "node:1", etc. from cluster state
+       sig: SIGSTOP       # or SIGCONT, SIGKILL
+  3. Add a "wait_ms" step type for deterministic delays without shell sleep:
+       type: wait_ms
+       value: 3000
+  4. With those primitives, the spec becomes straightforwardly expressible
+     in the existing cluster: YAML block.
+
+  Until those changes land, this spec is marked skip so it registers as a
+  known Blocked gap rather than a silent hole.
+
+skip: 'GAP-0317: coordinator timeout test requires configurable 2PC timeout (GEODE_2PC_TIMEOUT_MS env var, not yet wired) and a harness signal-step (type: signal) to SIGSTOP the coordinator node mid-transaction. See description for implementation path.'
+
+tests: []
+
+tags:
+- distributed
+- 2pc
+- coordinator-timeout
+- rollback
+- gap-0317
+- blocked

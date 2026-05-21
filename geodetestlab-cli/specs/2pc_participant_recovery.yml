@@ -1,0 +1,67 @@
+version: '1.0'
+name: 2PC Participant Crash Post-Prepare — Replay Recovery (GAP-0318)
+description: |
+  GAP-0318: Verifies that a participant which crashes after durably writing
+  PREPARE to its WAL recovers correctly on restart: it queries the coordinator
+  for the final decision, applies COMMIT if the coordinator committed on other
+  participants, and makes the data visible after restart.
+
+  CANARY: REQ=GAP-0318; FEATURE="2PC participant crash recovery"; ASPECT=WALReplayDecision; STATUS=BLOCKED; OWNER=distributed; UPDATED=2026-05-21
+
+  Architecture note
+  -----------------
+  Validating WAL-replay-driven decision recovery requires:
+
+    1. A coordinator (node 0) and two participants (node 1, node 2) started
+       via the harness cluster mode.
+    2. A distributed transaction that PREPAREs on both participants and
+       ACKs back to the coordinator.
+    3. The harness kills node 1 (SIGKILL) precisely after PREPARE is
+       durably flushed to its WAL but before the COMMIT message arrives.
+       This is a race window, not a deterministic injection point.
+    4. The coordinator sends COMMIT to node 2 (which succeeds) and to node 1
+       (which fails — node 1 is dead).
+    5. Node 1 is restarted by the harness on the same port / data directory.
+    6. On restart, node 1's WAL replay re-reads the PREPARE record, discovers
+       the transaction ID, calls the coordinator's recovery endpoint, learns
+       COMMIT, and applies the undo-log-absent path (keeps the data).
+    7. A query on node 1 confirms the rows are visible.
+
+  Why this is Blocked
+  -------------------
+  a) The harness has no "kill node N mid-transaction" primitive. Step type
+     `signal` (with SIGKILL) on a named cluster node does not exist yet.
+  b) The crash window (after fsync of PREPARE, before COMMIT delivery) has
+     no deterministic injection point from outside the process. A test-only
+     GEODE_2PC_CRASH_AFTER_PREPARE=1 env var in twophase_participant.zig
+     would create a controlled crash point.
+  c) Node restart on the same data directory requires the harness to:
+       - stop the node (it's already dead from SIGKILL),
+       - call start_server() with data_dir=<original node 1 data dir>,
+       - update GEODE_SERVER_ADDRESS for subsequent test steps.
+     The harness restart_cluster_node() helper does not yet exist.
+  d) The coordinator recovery thread (twophase.zig:~L1083) polls with the
+     configured default_timeout_ms (30 s), making deterministic recovery
+     timing impossible without a shortened GEODE_2PC_TIMEOUT_MS.
+
+  Path forward
+  ------------
+  1. Add GEODE_2PC_CRASH_AFTER_PREPARE=1 env var to participant code so the
+     process exits (std.process.exit(1)) immediately after fsyncing PREPARE
+     — gives deterministic crash point without a race window.
+  2. Add GEODE_2PC_TIMEOUT_MS env var to shorten recovery polling to ~2 s.
+  3. Add harness restart_cluster_node(node_id, data_dir) that re-spawns a
+     node on its existing data directory and updates cluster state.
+  4. Add signal step type (see GAP-0317 description).
+
+skip: 'GAP-0318: participant crash-recovery test requires GEODE_2PC_CRASH_AFTER_PREPARE env hook (deterministic crash point), GEODE_2PC_TIMEOUT_MS (configurable recovery timeout), and harness restart_cluster_node() primitive. See description for implementation path.'
+
+tests: []
+
+tags:
+- distributed
+- 2pc
+- participant-recovery
+- wal-replay
+- gap-0318
+- blocked

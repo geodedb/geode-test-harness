@@ -1,0 +1,79 @@
+version: '1.0'
+name: 2PC / Distributed Frame Size Limit 16 MiB (GAP-0320)
+description: |
+  GAP-0320: Verifies that the 16 MiB frame-size guard (SEC-D008 /
+  PERF-D012-D013, distributed/twophase.zig:60) rejects oversized 2PC
+  messages before they are deserialized, preventing allocation-bomb
+  attacks, while the server remains stable for subsequent queries.
+
+  CANARY: REQ=GAP-0320; FEATURE="2PC frame size limit"; ASPECT=AllocationBombRejection; STATUS=BLOCKED; OWNER=security; UPDATED=2026-05-21
+
+  Architecture note
+  -----------------
+  The 16 MiB guard lives in the internal 2PC / distributed messaging layer,
+  not in the GQL query result path:
+
+    distributed/twophase.zig:399
+      if (len > MAX_FRAME_SIZE) return error.FrameTooLarge;
+
+    distributed/twophase.zig:1162
+      if (msg_len > MAX_FRAME_SIZE) return error.FrameTooLarge;
+
+    distributed/query_transport.zig:849
+      if (msg_len > 16 * 1024 * 1024) return error.FrameTooLarge;
+
+  The GQL query result streaming path uses a pull-paging protocol
+  (page_size=128 rows per page, client/quic_query_runner.zig:5). Large
+  result sets are returned in pages and never form a single 16 MiB frame.
+  A `UNWIND range(1, 1000000) AS i RETURN i` query produces many small
+  QUIC stream chunks, each well under 16 MiB. The FrameTooLarge guard is
+  therefore NOT reachable via normal GQL queries.
+
+  To trigger FrameTooLarge from outside the process, an attacker or a test
+  must:
+    1. Establish a raw QUIC connection to the federation/2PC listener port.
+    2. Send a length-prefixed protobuf frame with the 4-byte length field
+       set to > 16 777 216 (0x01000001 or higher).
+    3. Observe that the server closes the stream with an error, logs
+       "FrameTooLarge", and accepts subsequent legitimate connections.
+
+  Why this is Blocked
+  -------------------
+  The harness has no "raw frame injection" step. The GQL query path does not
+  route through the 16 MiB guard. There is no `geode admin inject-frame`
+  CLI command. Implementing this test requires a small Go or Python binary
+  that:
+    - Opens a QUIC connection to the federation port.
+    - Writes a 4-byte big-endian length > 16 MiB followed by exactly that
+      many bytes of payload.
+    - Asserts the connection or stream is rejected.
+    - Opens a second clean connection and sends a valid query; asserts
+      exit_code == 0.
+
+  The Zig unit tests (twophase.zig) do not yet have a direct unit test for
+  the FrameTooLarge path either.
+
+  Path forward
+  ------------
+  1. Add a Zig unit test in distributed/twophase.zig that calls
+     readLengthPrefixedMessage() with a synthetic oversized length header
+     and asserts error.FrameTooLarge.
+  2. Implement a harness "raw-quic-frame" runner (e.g., runners/frame_probe/)
+     that accepts --server, --length, --payload-file and sends a single
+     oversized frame, then exits 0 if the server rejects it.
+  3. Add a spec test using that runner to confirm rejection + server stability.
+
+skip: 'GAP-0320: frame limit test requires raw-protocol injection tooling. The 16 MiB guard is in the distributed/2PC framing layer; GQL queries use paged streaming and never produce a single 16 MiB frame. No CLI path reaches the guard. See description for Zig unit test and runner approach.'
+
+tests: []
+
+tags:
+- distributed
+- 2pc
+- frame-limit
+- allocation-bomb
+- security
+- sec-d008
+- perf-d012
+- gap-0320
+- blocked
