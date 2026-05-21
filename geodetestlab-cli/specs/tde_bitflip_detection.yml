@@ -1,0 +1,235 @@
+version: '1.0'
+name: TDE — single-byte flip in encrypted page detected at read time (AES-GCM auth tag)
+description: |
+  Verifies that AES-256-GCM's authentication tag causes Geode to detect and
+  reject a page whose ciphertext has been tampered with. A single-byte flip
+  via dd in any encrypted data file invalidates the GCM tag; the subsequent
+  read must return an error, not silently return corrupt (or plaintext) data.
+
+  Scenario:
+  1. Insert a sentinel node (BITFLIP_SENTINEL_NODE_XYZ).
+  2. Identify the data files created/modified during the insert (via mtime
+     marker placed before the write).
+  3. Stop the server cleanly via restart_server: true.
+  4. In a bash step (cwd = Geode source, but we use env vars for paths):
+     a. Find the newest .dat or graph-store file under data dir.
+     b. Flip one byte at offset 64 (past the GEOTDEFL magic header, into
+        the ciphertext body) using dd conv=notrunc.
+  5. The harness restarts the server (same data dir, post-flip).
+  6. Query for the sentinel node: expect non-zero exit or error output.
+
+  The spec accepts two outcomes from the post-flip read:
+  - exit_code != 0 (server rejects the corrupted page and returns error), OR
+  - exit_code == 0 but stdout does NOT contain the sentinel value
+    (corruption detected, row silently absent — acceptable if the error is
+    logged; the critical invariant is no silent ciphertext→plaintext fallback).
+
+  IMPORTANT: If AES-GCM tag enforcement is not yet wired to the page reader,
+  the spec will catch this: the query will succeed AND return the sentinel,
+  which violates the stdout_not_contains assertion on the roundtrip check.
+
+  CANARY: REQ=REQ-TDE-BITFLIP-001; FEATURE="TDE bit-flip detection"; ASPECT=AEADTagVerification; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --enable-tde
+    - --enable-wal-encryption
+    - --tde-provider
+    - MockKms
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+env:
+  GEODE_TDE_KEY: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  GEODE_WAL_KEY: cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe
+  GEODE_TDE_ENABLED: 'true'
+  GEODE_WAL_ENCRYPTION_ENABLED: 'true'
+
+tests:
+- name: tde-bitflip-seed
+  description: Insert the sentinel node whose page we will corrupt.
+  args:
+  - query
+  - "CREATE (n:BitflipTest {sentinel: 'BITFLIP_SENTINEL_NODE_XYZ', created: 1}) RETURN n.sentinel AS s"
+  expect:
+    exit_code: 0
+    stdout_contains: [BITFLIP_SENTINEL_NODE_XYZ]
+  tags: [tde, bitflip, setup]
+
+- name: tde-bitflip-plaintext-absent-before-flip
+  description: 'CRITICAL: Sentinel absent from disk before flip.'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - BITFLIP_SENTINEL_NODE_XYZ
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [tde, bitflip, grep]
+
+- name: tde-bitflip-trigger-restart-pre-flip
+  description: |
+    Force a clean checkpoint + WAL flush before the file flip so pages are
+    fully committed to disk and the WAL does not replay over our corruption.
+  type: bash
+  command: echo 'tde-bitflip pre-flip checkpoint'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [tde, bitflip, restart]
+
+- name: tde-bitflip-verify-still-readable-before-flip
+  description: Data readable after clean restart (baseline before corruption).
+  args:
+  - query
+  - MATCH (n:BitflipTest) RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [tde, bitflip, baseline]
+
+- name: tde-bitflip-apply-and-restart
+  description: |
+    Stop the server (via restart_server), flip one byte in the newest
+    data file, then let the harness bring the server back up.
+
+    The bash step runs in the Geode source directory; it reads
+    GEODE_DATA_DIR from env (injected by harness). If GEODE_DATA_DIR is
+    not set, the test skips the flip and exits 0 (documented gap in env
+    injection for bash steps).
+
+    Byte offset 64 is chosen because:
+    - Offsets 0-7: GEOTDEFL magic header (ASCII, skip to avoid format errors
+      that mask AEAD errors)
+    - Offsets 8-11: version/flags
+    - Offset 64: safely inside the ciphertext body of the first page
+  type: bash
+  command: |
+    DATA_DIR="${GEODE_DATA_DIR:-}"
+    if [ -z "$DATA_DIR" ] || [ ! -d "$DATA_DIR" ]; then
+      echo "SKIP: GEODE_DATA_DIR not available in bash step environment (got: '${DATA_DIR}')"
+      echo "This is a known harness limitation: bash steps run with cwd=geode_source"
+      echo "and do not receive the dynamic data_dir substitution that CLI steps do."
+      echo "bitflip_skip"
+      exit 0
+    fi
+
+    # Find the most recently modified binary data file
+    TARGET=$(find "$DATA_DIR" -type f \( -name "*.dat" -o -name "*.gdb" -o -name "graph_store*" \) \
+      ! -name "*.jsonl" ! -name "*.log" ! -name "*.yml" \
+      -newer "$DATA_DIR" 2>/dev/null | sort -t/ -k1 | tail -1)
+
+    if [ -z "$TARGET" ]; then
+      # Fallback: any file in the data dir, not a log
+      TARGET=$(find "$DATA_DIR" -maxdepth 2 -type f ! -name "*.jsonl" \
+        ! -name "*.log" ! -name "*.yml" ! -name "*.pem" ! -name "*.crt" \
+        2>/dev/null | head -1)
+    fi
+
+    if [ -z "$TARGET" ]; then
+      echo "SKIP: no data files found under $DATA_DIR to flip"
+      echo "bitflip_skip"
+      exit 0
+    fi
+
+    FILE_SIZE=$(stat -c%s "$TARGET" 2>/dev/null || stat -f%z "$TARGET" 2>/dev/null || echo 0)
+    if [ "$FILE_SIZE" -lt 128 ]; then
+      echo "SKIP: target file $TARGET is too small ($FILE_SIZE bytes) for offset-64 flip"
+      echo "bitflip_skip"
+      exit 0
+    fi
+
+    # Flip byte at offset 64 (XOR with 0xFF via urandom, single byte)
+    dd if=/dev/urandom of="$TARGET" bs=1 count=1 seek=64 conv=notrunc 2>/dev/null
+    RC=$?
+    if [ $RC -eq 0 ]; then
+      echo "bitflip_applied to $TARGET at offset 64"
+    else
+      echo "ERROR: dd failed with rc=$RC on $TARGET"
+      exit 1
+    fi
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [tde, bitflip, corrupt]
+
+- name: tde-bitflip-read-after-corruption
+  description: |
+    Read the sentinel node after the byte-flip. The server must either:
+    (a) exit non-zero — AES-GCM tag rejection propagated to client, OR
+    (b) exit 0 but NOT return BITFLIP_SENTINEL_NODE_XYZ in plaintext.
+    Returning the corrupted row as if it were valid is a critical failure.
+  args:
+  - query
+  - MATCH (n:BitflipTest) RETURN n.sentinel AS s
+  expect:
+    exit_code:
+    - 0
+    - 1
+    stdout_not_contains: [BITFLIP_SENTINEL_NODE_XYZ]
+  tags: [tde, bitflip, detection, critical]
+
+- name: tde-bitflip-plaintext-absent-after-flip
+  description: 'CRITICAL: Sentinel must still not appear in plaintext on disk (no fallback write).'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - BITFLIP_SENTINEL_NODE_XYZ
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [tde, bitflip, grep, critical]
+
+- name: tde-bitflip-cleanup
+  description: |
+    Best-effort cleanup; may fail if the data dir is in an unrecoverable state
+    due to the intentional corruption — that is expected and acceptable.
+  args:
+  - query
+  - MATCH (n:BitflipTest) DETACH DELETE n RETURN count(*) AS deleted
+  expect:
+    exit_code:
+    - 0
+    - 1
+  tags: [tde, teardown]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  patterns:
+  - BITFLIP_SENTINEL_NODE_XYZ
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags:
+- tde
+- bitflip-detection
+- aes-gcm
+- auth-tag
+- security
+- critical
+- gap-0298

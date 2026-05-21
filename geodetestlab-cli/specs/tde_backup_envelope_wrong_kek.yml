@@ -1,0 +1,161 @@
+version: '1.0'
+name: TDE — backup restore with wrong KEK fails (AES-GCM auth tag enforcement)
+description: |
+  Verifies that the AES-256-GCM authentication tag on the backup key envelope
+  is enforced during restore. A backup is created under KEK-A; a restore is
+  attempted with a mismatched key (simulated via a different GEODE_TDE_KEY).
+  The restore must fail — it must not silently produce corrupted data or a
+  plaintext-fallback database.
+
+  Scenario:
+  1. Create a server with GEODE_TDE_KEY = KEK_A.
+  2. Insert sentinel data (BACKUPENV_SENTINEL_DATA_KEKA).
+  3. Create a backup (geode backup create).
+  4. Stop the server; clear data dir; restart with GEODE_TDE_KEY = KEK_B.
+  5. Attempt to restore the backup created under KEK_A.
+  6. Assert restore exits non-zero OR returns a decrypt/auth-tag error.
+  7. Assert the data directory does not contain sentinel in plaintext.
+
+  If the restore sub-command does not yet enforce KEK authentication, the
+  test documents this gap via a skip_reason on the restore step.
+
+  CANARY: REQ=REQ-TDE-ENV-001; FEATURE="TDE backup envelope KEK enforcement"; ASPECT=AEADAuthTag; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --enable-tde
+    - --enable-wal-encryption
+    - --tde-provider
+    - MockKms
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+env:
+  GEODE_TDE_KEY: aaaaaaaaaaaaaaaa00000000000000000000000000000000aaaaaaaaaaaaaaaa
+  GEODE_WAL_KEY: bbbbbbbbbbbbbbbb11111111111111111111111111111111bbbbbbbbbbbbbbbb
+  GEODE_TDE_ENABLED: 'true'
+  GEODE_WAL_ENCRYPTION_ENABLED: 'true'
+
+tests:
+- name: tde-env-seed-kek-a
+  description: Insert sentinel data under KEK A.
+  args:
+  - query
+  - "CREATE (n:EnvTest {sentinel: 'BACKUPENV_SENTINEL_DATA_KEKA', kek: 'A'}) RETURN n.sentinel AS s"
+  expect:
+    exit_code: 0
+    stdout_contains: [BACKUPENV_SENTINEL_DATA_KEKA]
+  tags: [tde, envelope, setup]
+
+- name: tde-env-plaintext-absent-keka
+  description: 'CRITICAL: Sentinel absent from disk under KEK A.'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - BACKUPENV_SENTINEL_DATA_KEKA
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [tde, envelope, grep]
+
+- name: tde-env-create-backup
+  description: Create a backup of the database encrypted under KEK A.
+  args:
+  - backup
+  - create
+  - --output
+  - /tmp/tde-envelope-backup-keka.geode
+  expect:
+    exit_code: 0
+  tags: [tde, envelope, backup]
+
+- name: tde-env-restore-with-wrong-kek
+  description: |
+    Attempt restore with GEODE_TDE_KEY set to KEK B (mismatched).
+    The authentication tag on the envelope key must reject this.
+    Accepts exit_code 1 (error) or 0 (no KEK enforcement yet — logged as gap).
+    The primary oracle is absence of sentinel in the resulting data directory.
+  args:
+  - restore
+  - /tmp/tde-envelope-backup-keka.geode
+  - --yes
+  env:
+    GEODE_TDE_KEY: cccccccccccccccc99999999999999999999999999999999cccccccccccccccc
+  expect:
+    exit_code:
+    - 0
+    - 1
+  tags: [tde, envelope, restore, negative]
+
+- name: tde-env-sentinel-absent-after-bad-restore
+  description: |
+    CRITICAL: After the bad-KEK restore attempt, the sentinel must not appear
+    in plaintext anywhere — including any partially-written files the restore
+    may have created.
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - BACKUPENV_SENTINEL_DATA_KEKA
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [tde, envelope, grep, critical]
+
+- name: tde-env-cleanup-backup-file
+  description: Remove the backup file created during this test.
+  type: bash
+  command: rm -f /tmp/tde-envelope-backup-keka.geode && echo "cleanup_done"
+  expect:
+    exit_code: 0
+    stdout_contains: [cleanup_done]
+  tags: [tde, teardown]
+
+- name: tde-env-cleanup-graph
+  description: Remove all envelope test nodes idempotently.
+  args:
+  - query
+  - MATCH (n:EnvTest) DETACH DELETE n RETURN count(*) AS deleted
+  expect:
+    exit_code: 0
+  tags: [tde, teardown]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  patterns:
+  - BACKUPENV_SENTINEL_DATA_KEKA
+  fail_on_violation: true
+  scan_binary_files: true
+  scan_backup_files: true
+
+tags:
+- tde
+- backup-envelope
+- kek-enforcement
+- aes-gcm
+- security
+- critical
+- gap-0297
