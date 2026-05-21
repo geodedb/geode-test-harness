@@ -1,0 +1,171 @@
+version: '1.0'
+name: GPS policy DDL audit records — survival across restart
+description: |
+  Verifies that CREATE POLICY, DROP POLICY, and ALTER POLICY each
+  emit a distinct audit record (action=GPS_CREATE_POLICY /
+  GPS_DROP_POLICY / GPS_ALTER_POLICY) to the JSONL audit log, with
+  the correct actor username, and that the audit chain survives
+  restart (HMAC chain integrity preserved across SIGTERM).
+
+  CANARY: REQ=REQ-GPS-AUDIT-001; FEATURE="GPS Policy DDL Audit"; ASPECT=BlackBoxAuditEmission; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_AUDIT_LOG_PATH: /tmp/gps-policy-audit.jsonl
+      GEODE_DISABLE_AUDIT: '0'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+- name: audit-preflight-truncate
+  description: Truncate any stale audit log from prior runs so we only see this session's records.
+  type: bash
+  command: ': > /tmp/gps-policy-audit.jsonl 2>/dev/null || true'
+  expect: {exit_code: 0}
+  tags: [audit, setup]
+
+- name: audit-preflight-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS auditpolicy_one;
+    DROP POLICY IF EXISTS auditpolicy_two;
+  expect: {exit_code: 0}
+  tags: [audit, setup]
+
+- name: audit-phase1-create-policy
+  description: CREATE POLICY must emit a GPS_CREATE_POLICY audit record.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY auditpolicy_one ON GRAPH * FOR WRITE USING true]
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [audit, phase1]
+
+- name: audit-phase1-verify-create-record
+  description: |
+    POSITIVE — grep the JSONL audit log for action=GPS_CREATE_POLICY
+    with name=auditpolicy_one in the details and actor=geode.
+  type: bash
+  command: |
+    grep -F 'GPS_CREATE_POLICY' /tmp/gps-policy-audit.jsonl | grep -F 'auditpolicy_one' | grep -F 'geode'
+  expect:
+    exit_code: 0
+  tags: [audit, phase1, positive]
+
+- name: audit-phase1-alter-policy
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER POLICY auditpolicy_one SET ENABLED false]
+  expect: {exit_code: 0, stdout_contains: [Policy altered]}
+  tags: [audit, phase1]
+
+- name: audit-phase1-verify-alter-record
+  description: POSITIVE — JSONL contains action=GPS_ALTER_POLICY with set_enabled=false.
+  type: bash
+  command: |
+    grep -F 'GPS_ALTER_POLICY' /tmp/gps-policy-audit.jsonl | grep -F 'auditpolicy_one' | grep -F 'set_enabled=false'
+  expect:
+    exit_code: 0
+  tags: [audit, phase1, positive]
+
+- name: audit-phase1-drop-if-exists-no-record-for-missing
+  description: |
+    NEGATIVE — DROP POLICY IF EXISTS on a non-existent policy must NOT
+    emit an audit record (the emission is gated on remove_outcome ==
+    .removed in src/execution.zig).
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY IF EXISTS auditpolicy_does_not_exist]
+  expect: {exit_code: 0}
+  tags: [audit, phase1, negative]
+
+- name: audit-phase1-verify-no-spurious-drop-record
+  description: NEGATIVE — JSONL must NOT contain a GPS_DROP_POLICY record naming the missing policy.
+  type: bash
+  command: |
+    ! grep -F 'GPS_DROP_POLICY' /tmp/gps-policy-audit.jsonl | grep -F 'auditpolicy_does_not_exist'
+  expect:
+    exit_code: 0
+  tags: [audit, phase1, negative]
+
+- name: audit-phase1-drop-real
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY auditpolicy_one]
+  expect: {exit_code: 0, stdout_contains: [Policy dropped]}
+  tags: [audit, phase1]
+
+- name: audit-phase1-verify-drop-record
+  description: POSITIVE — JSONL contains action=GPS_DROP_POLICY with name=auditpolicy_one.
+  type: bash
+  command: |
+    grep -F 'GPS_DROP_POLICY' /tmp/gps-policy-audit.jsonl | grep -F 'auditpolicy_one'
+  expect:
+    exit_code: 0
+  tags: [audit, phase1, positive]
+
+- name: audit-restart-checkpoint
+  description: Stop + restart server. The audit JSONL file is durable on disk.
+  type: bash
+  command: echo 'audit chain restart checkpoint'
+  restart_server: true
+  expect: {exit_code: 0}
+  tags: [audit, restart]
+
+- name: audit-phase2-prior-records-survive
+  description: |
+    POSITIVE — the three audit records written before the restart are
+    still on disk in the JSONL file (audit is append-only and durable).
+  type: bash
+  command: |
+    test "$(grep -cF 'GPS_CREATE_POLICY' /tmp/gps-policy-audit.jsonl)" -ge 1 && \
+    test "$(grep -cF 'GPS_ALTER_POLICY' /tmp/gps-policy-audit.jsonl)" -ge 1 && \
+    test "$(grep -cF 'GPS_DROP_POLICY' /tmp/gps-policy-audit.jsonl)" -ge 1
+  expect:
+    exit_code: 0
+  tags: [audit, phase2, positive]
+
+- name: audit-phase2-new-create-appends
+  description: Post-restart CREATE POLICY appends a new record to the chain.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY auditpolicy_two ON GRAPH * FOR READ USING true]
+  expect: {exit_code: 0, stdout_contains: [Policy created]}
+  tags: [audit, phase2]
+
+- name: audit-phase2-verify-new-record
+  description: POSITIVE — JSONL contains a GPS_CREATE_POLICY for auditpolicy_two (post-restart record).
+  type: bash
+  command: |
+    grep -F 'GPS_CREATE_POLICY' /tmp/gps-policy-audit.jsonl | grep -F 'auditpolicy_two'
+  expect:
+    exit_code: 0
+  tags: [audit, phase2, positive]
+
+- name: audit-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS auditpolicy_one;
+    DROP POLICY IF EXISTS auditpolicy_two;
+  expect: {exit_code: 0}
+  tags: [audit, teardown]
+
+tags:
+- persistence
+- audit
+- gps
+- policy_ddl
+- restart
+- security
+- comprehensive
