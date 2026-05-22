@@ -1,64 +1,26 @@
 version: '1.0'
-name: ABAC attribute-based policies — end-to-end enforcement
+name: ABAC attribute-based policies — end-to-end row-level enforcement
 description: |
-  Intended to verify that GPS ABAC policies using the
-  `principal.attributes.<key> = '<value>'` predicate correctly match
-  users based on their stored attribute map, so that alice (dept=eng)
-  sees only :Doc {dept:'eng'} nodes and bob (dept=sales) sees only
-  :Doc {dept:'sales'} nodes.
+  Verifies real per-row ABAC enforcement: a row-level RLS expression policy
+  compares each :Doc row's `dept` property against the querying principal's
+  `department` attribute, so alice (department=engineering) sees ONLY
+  :Doc {dept:'engineering'} and bob (department=sales) sees ONLY
+  :Doc {dept:'sales'}. Admin (BYPASSRLS) sees every row.
 
-  BLOCKED — The geode GQL parser (src/gql/parser.zig:6437) only
-  supports `ALTER USER ... SET PASSWORD` and `ALTER USER ... SET ROLE`.
-  There is no `ALTER USER ... SET ATTRIBUTE` DDL command exposed via the
-  CLI or GQL interface. User attributes (principal.AttributeMap) are
-  populated internally via the auth library at user-creation time through
-  the SecurityContext.session_attributes path, but no public DDL surface
-  allows setting `dept=eng` or any other arbitrary attribute key on an
-  existing user.
+  Mechanism:
+    1. `ALTER USER <name> SET ATTRIBUTE department = '<value>'` stores the
+       attribute in the process-global ABAC side-table
+       (src/security/user_attribute_store.zig).
+    2. `CALL geode.rls.add_attribute_policy('abac_g','Doc','dept','department')`
+       installs a restrictive expression policy on (graph=abac_g, label=Doc)
+       whose `using_expr` is `row.dept = principal.attribute.department`
+       (src/execution/rls_dispatch.zig).
+    3. The RLS bytecode VM resolves `principal.attribute.<key>` per row
+       against the attribute store for the querying username — opcode
+       load_attr (0x13) in src/security/rls_core.zig — and the match loop
+       enforces it via passesRLSExprFilter (src/execution/match_operations.zig).
 
-  Without the ability to set `principal.attributes.department`, the
-  policy expression `principal.attributes.department = 'engineering'`
-  will never match any user (the attribute slice is always empty for CLI-
-  created users), so the spec cannot demonstrate the positive enforcement
-  path. The test is therefore skipped to avoid a false-positive
-  (the policy would compile and be stored, but no user would ever match
-  it, making the positive case vacuously pass while the actual feature
-  remains untestable).
-
-  Remediation required before this spec can be enabled:
-    1. Add `ALTER USER <name> SET ATTRIBUTE <key> = '<value>'` to the GQL
-       parser (src/gql/parser.zig handler near line 6437).
-    2. Wire the attribute into the persistent user record so it survives
-       restart (src/security/auth_graph_manager.zig user hydration path).
-    3. Confirm principal.attributes is populated on connection from the
-       persisted store (src/security/geode_auth_lib.zig evaluateAttributeConditions
-       path, line 691).
-
-  Filed as known_limitation. Close GAP-0284 remains Blocked.
-
-  CANARY: REQ=REQ-ABAC-E2E-001; FEATURE="ABAC end-to-end enforcement"; ASPECT=DeptAttributePolicyMatrix; STATUS=BLOCKED; OWNER=security; UPDATED=2026-05-21
-
-skip: true
-skip_reason: |
-  GAP-0284 partial: ALTER USER SET ATTRIBUTE is now wired (parser + handler
-  + user_attribute_store + gps.decide reads from store). But this spec
-  expects per-row filtering: alice (dept=eng) should see only docs where
-  doc.dept='engineering'. GPS policies are allow/deny gates against an
-  (action, resource) pair — `ON GRAPH * FOR READ USING
-  principal.attributes.department = 'engineering'` evaluates once per query
-  and either allows or denies the entire MATCH. With the policy returning
-  allow for alice, she sees ALL :Doc rows, not just dept=eng rows.
-
-  To make this spec pass, we need ROW-level RLS that can compare
-  principal.attributes.department against the row's d.dept property. That
-  is RLS expression engine work, not GPS work. The attribute store is in
-  place; the row-evaluation predicate (`row.<prop> = principal.attributes.<key>`)
-  is the missing piece in src/security/policy_expression.zig and the
-  row-filter integration in src/execution/match_operations.zig.
-
-  Tracking under GAP-0509 (RLS expression engine wiring extensions).
-
-known_limitation: true
+  CANARY: REQ=GAP-0284; FEATURE="ABAC end-to-end row-level enforcement"; ASPECT=DeptAttributePolicyMatrix; STATUS=TESTED; OWNER=security; UPDATED=2026-05-22
 
 cli:
   binary: ./zig-out/bin/geode
@@ -86,10 +48,6 @@ fuzz:
   enabled: false
 
 tests:
-# All tests below are unreachable because skip: true above causes the
-# runner to skip the entire spec. They are retained for documentation
-# purposes so the intended test plan is preserved.
-
 - name: abac-preflight-cleanup
   description: Drop leftovers from prior run.
   args: [query, -U, geode, -P, '${secret:admin_password}', '-']
@@ -97,8 +55,6 @@ tests:
     DROP USER IF EXISTS abac_alice;
     DROP USER IF EXISTS abac_bob;
     DROP GRAPH IF EXISTS abac_g;
-    DROP POLICY IF EXISTS abac_eng_policy;
-    DROP POLICY IF EXISTS abac_sales_policy;
   expect: {exit_code: 0}
   tags: [abac, setup]
 
@@ -111,19 +67,17 @@ tests:
   expect: {exit_code: 0}
   tags: [abac, setup]
 
-- name: abac-set-alice-attr-BLOCKED
-  description: |
-    BLOCKED — this step requires ALTER USER ... SET ATTRIBUTE which is
-    not yet implemented in the GQL parser.
+- name: abac-set-alice-attr
+  description: Set alice's department attribute in the ABAC side-table.
   args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER abac_alice SET ATTRIBUTE department = 'engineering']
   expect: {exit_code: 0}
-  tags: [abac, setup, blocked]
+  tags: [abac, setup]
 
-- name: abac-set-bob-attr-BLOCKED
-  description: BLOCKED — same limitation as above.
+- name: abac-set-bob-attr
+  description: Set bob's department attribute in the ABAC side-table.
   args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER abac_bob SET ATTRIBUTE department = 'sales']
   expect: {exit_code: 0}
-  tags: [abac, setup, blocked]
+  tags: [abac, setup]
 
 - name: abac-seed-docs
   args: [query, -U, geode, -P, '${secret:admin_password}', '-']
@@ -134,20 +88,18 @@ tests:
   expect: {exit_code: 0}
   tags: [abac, setup]
 
-- name: abac-create-eng-policy
-  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY abac_eng_policy ON GRAPH * FOR READ USING principal.attributes.department = 'engineering']
-  expect: {exit_code: 0, stdout_contains: [Policy created]}
-  tags: [abac, policy]
-
-- name: abac-create-sales-policy
-  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY abac_sales_policy ON GRAPH * FOR READ USING principal.attributes.department = 'sales']
-  expect: {exit_code: 0, stdout_contains: [Policy created]}
+- name: abac-install-attribute-policy
+  description: |
+    Install the row-level ABAC policy: each :Doc row is visible only when
+    row.dept equals the querying principal's `department` attribute.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_attribute_policy('abac_g', 'Doc', 'dept', 'department')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [attribute policy added]
   tags: [abac, policy]
 
 - name: abac-alice-sees-eng-only
-  description: |
-    POSITIVE — alice (dept=eng) must see only :Doc {dept:'engineering'}.
-    BLOCKED until ALTER USER SET ATTRIBUTE is implemented.
+  description: POSITIVE — alice (department=engineering) sees only engineering docs.
   args: [query, -U, abac_alice, -P, Abac-Alice-1234, '-']
   stdin: |
     USE GRAPH abac_g;
@@ -156,12 +108,19 @@ tests:
     exit_code: 0
     stdout_contains: [engineering]
     stdout_not_contains: [sales]
-  tags: [abac, alice, positive, blocked]
+  tags: [abac, alice, positive]
+
+- name: abac-alice-count-is-one
+  description: POSITIVE — alice's row count is exactly 1 (engineering doc only).
+  args: [query, -U, abac_alice, -P, Abac-Alice-1234, '-']
+  stdin: |
+    USE GRAPH abac_g;
+    MATCH (d:Doc) RETURN count(d) AS c
+  expect: {exit_code: 0, stdout_contains: ['"c":1']}
+  tags: [abac, alice, positive]
 
 - name: abac-bob-sees-sales-only
-  description: |
-    POSITIVE — bob (dept=sales) must see only :Doc {dept:'sales'}.
-    BLOCKED until ALTER USER SET ATTRIBUTE is implemented.
+  description: POSITIVE — bob (department=sales) sees only sales docs.
   args: [query, -U, abac_bob, -P, Abac-Bob-1234, '-']
   stdin: |
     USE GRAPH abac_g;
@@ -170,10 +129,19 @@ tests:
     exit_code: 0
     stdout_contains: [sales]
     stdout_not_contains: [engineering]
-  tags: [abac, bob, positive, blocked]
+  tags: [abac, bob, positive]
+
+- name: abac-bob-count-is-one
+  description: POSITIVE — bob's row count is exactly 1 (sales doc only).
+  args: [query, -U, abac_bob, -P, Abac-Bob-1234, '-']
+  stdin: |
+    USE GRAPH abac_g;
+    MATCH (d:Doc) RETURN count(d) AS c
+  expect: {exit_code: 0, stdout_contains: ['"c":1']}
+  tags: [abac, bob, positive]
 
 - name: abac-admin-sees-all
-  description: POSITIVE — admin sees all docs.
+  description: POSITIVE — admin (BYPASSRLS) sees all docs.
   args: [query, -U, geode, -P, '${secret:admin_password}', '-']
   stdin: |
     USE GRAPH abac_g;
@@ -181,14 +149,29 @@ tests:
   expect: {exit_code: 0, stdout_contains: ['"c":2']}
   tags: [abac, admin, positive]
 
+- name: abac-remove-attribute-policy
+  description: remove_attribute_policy tears down the row-level ABAC policy.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.remove_attribute_policy('abac_g', 'Doc', 'dept', 'department')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [attribute policy removed, removed=true]
+  tags: [abac, policy]
+
+- name: abac-alice-sees-all-after-removal
+  description: POSITIVE — with the policy removed, alice sees both docs again.
+  args: [query, -U, abac_alice, -P, Abac-Alice-1234, '-']
+  stdin: |
+    USE GRAPH abac_g;
+    MATCH (d:Doc) RETURN count(d) AS c
+  expect: {exit_code: 0, stdout_contains: ['"c":2']}
+  tags: [abac, alice, positive]
+
 - name: abac-cleanup
   args: [query, -U, geode, -P, '${secret:admin_password}', '-']
   stdin: |
     DROP GRAPH IF EXISTS abac_g;
     DROP USER IF EXISTS abac_alice;
     DROP USER IF EXISTS abac_bob;
-    DROP POLICY IF EXISTS abac_eng_policy;
-    DROP POLICY IF EXISTS abac_sales_policy;
   expect: {exit_code: 0}
   tags: [abac, teardown]
 
@@ -196,6 +179,4 @@ tags:
 - abac
 - attribute-based-access-control
 - security
-- gps
-- blocked
-- known_limitation
+- rls
