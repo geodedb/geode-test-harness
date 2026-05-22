@@ -1,249 +1,124 @@
 # GAP-0181: Incremental Backup LSN Tracking Tests
 # CANARY: REQ=REQ-BACKUP-LSN-TRACKING-001; FEATURE="BackupLSNTracking"; ASPECT=GeodeTestlab; STATUS=TESTED; TEST=geodetestlab/specs/gap_0181_backup_lsn_tracking.yml; OWNER=backup; UPDATED=2026-01-14
 
-version: "1.0"
-name: "GAP-0181 Backup LSN Tracking Tests"
-description: "Tests for incremental backup chain continuity with real LSN metadata"
+version: '1.0'
+name: GAP-0181 Backup LSN Tracking Tests
+description: Tests for incremental backup chain continuity with real LSN metadata
 
 metadata:
   gap_ids:
-    - GAP-0181
+  - GAP-0181
   gitlab_issues:
-    - "#310"
+  - '#310'
   requirements:
-    - REQ-DOC-SERVER_FEATURES
-    - REQ-BACKUP-LSN-TRACKING-001
-    - REQ-BACKUP-INCR-LSN-002
+  - REQ-DOC-SERVER_FEATURES
+  - REQ-BACKUP-LSN-TRACKING-001
+  - REQ-BACKUP-INCR-LSN-002
 
 # =============================================================================
 # GAP-0181: Backup and Restore Infrastructure Verification
 # Tests verify that backup/restore APIs work correctly with LSN chain
 # =============================================================================
 tests:
-  - name: "GAP-0181-001: Basic data creation for backup test"
-    description: "Creates data that will be backed up to verify LSN tracking"
-    query: |
-      CREATE (n:BackupTestNode {
-        id: 1,
-        name: 'Test Node for Backup',
-        created_at: datetime()
-      })
-      RETURN n.id AS id, n.name AS name
-    expected:
-      columns: ["id", "name"]
-      rows:
-        - [1, "Test Node for Backup"]
-    tags: ["gap-0181", "backup", "data-setup"]
+- name: 'GAP-0181-001: Basic data creation for backup test'
+  description: Creates data that will be backed up to verify LSN tracking
+  query: |
+    CREATE (n:BackupTestNode {
+      id: 1,
+      name: 'Test Node for Backup',
+      created_at: datetime()
+    })
+    RETURN n.id AS id, n.name AS name
+  expected:
+    columns: [id, name]
+    rows:
+    - [1, Test Node for Backup]
+  tags: [gap-0181, backup, data-setup]
 
-  - name: "GAP-0181-002: Multiple nodes for incremental backup"
-    description: "Creates additional data to capture in incremental backup"
-    query: |
-      UNWIND range(2, 5) AS i
-      CREATE (n:BackupTestNode {id: i, name: 'Node ' || toString(i)})
-      RETURN COUNT(*) AS created_count
-    expected:
-      columns: ["created_count"]
-      rows:
-        - [4]
-    tags: ["gap-0181", "backup", "incremental-data"]
+- name: 'GAP-0181-002: Multiple nodes for incremental backup'
+  description: Creates additional data to capture in incremental backup
+  query: |
+    CREATE (n2:BackupTestNode {id: 2, name: 'Node 2'}),
+           (n3:BackupTestNode {id: 3, name: 'Node 3'}),
+           (n4:BackupTestNode {id: 4, name: 'Node 4'}),
+           (n5:BackupTestNode {id: 5, name: 'Node 5'})
+    RETURN COUNT(*) AS created_count
+  expected:
+    columns: [created_count]
+    rows:
+    - [4]
+  tags: [gap-0181, backup, incremental-data]
 
-  - name: "GAP-0181-003: Verify data exists for backup"
-    description: "Confirms data is ready for backup operations"
-    query: |
-      MATCH (n:BackupTestNode)
-      RETURN COUNT(n) AS node_count, MIN(n.id) AS min_id, MAX(n.id) AS max_id
-    expected:
-      columns: ["node_count", "min_id", "max_id"]
-      rows:
-        - [5, 1, 5]
-    tags: ["gap-0181", "backup", "verification"]
+- name: 'GAP-0181-003: Verify data exists for backup'
+  description: Confirms data is ready for backup operations
+  query: |
+    MATCH (n:BackupTestNode)
+    RETURN COUNT(n) AS node_count, MIN(n.id) AS min_id, MAX(n.id) AS max_id
+  expected:
+    columns: [node_count, min_id, max_id]
+    rows:
+    - [5, 1, 5]
+  tags: [gap-0181, backup, verification]
 
 # =============================================================================
 # LSN Metadata Verification Tests
 # These tests verify the LSN values are properly tracked
 # =============================================================================
+# removed: GAP-0181-004 (LSN monotonicity), GAP-0181-005 (chain continuity)
+# relied on Cypher list-iteration over inline list-of-maps simulating backup metadata.
+# These synthetic patterns cannot be expressed in ISO GQL;
+# real LSN/chain coverage is in the Zig backup unit tests.
 
-  - name: "GAP-0181-004: LSN monotonicity verification pattern"
-    description: "Tests that LSN values increase monotonically (simulated with sequence)"
-    query: |
-      WITH [
-        {backup_id: 1, type: 'full', start_lsn: 0, end_lsn: 100},
-        {backup_id: 2, type: 'incr', start_lsn: 100, end_lsn: 150},
-        {backup_id: 3, type: 'incr', start_lsn: 150, end_lsn: 200}
-      ] AS backups
-      UNWIND backups AS b
-      RETURN
-        b.backup_id AS id,
-        b.type AS backup_type,
-        b.start_lsn AS start_lsn,
-        b.end_lsn AS end_lsn,
-        b.end_lsn >= b.start_lsn AS valid_range
-      ORDER BY b.backup_id
-    expected:
-      columns: ["id", "backup_type", "start_lsn", "end_lsn", "valid_range"]
-      rows:
-        - [1, "full", 0, 100, true]
-        - [2, "incr", 100, 150, true]
-        - [3, "incr", 150, 200, true]
-    tags: ["gap-0181", "lsn", "monotonicity"]
-
-  - name: "GAP-0181-005: Chain continuity verification pattern"
-    description: "Verifies incremental backup chains have continuous LSN coverage"
-    query: |
-      WITH [
-        {id: 1, end_lsn: 100, parent_id: null},
-        {id: 2, start_lsn: 100, end_lsn: 200, parent_id: 1},
-        {id: 3, start_lsn: 200, end_lsn: 300, parent_id: 2}
-      ] AS chain
-      UNWIND chain AS c
-      WITH c, chain
-      WHERE c.parent_id IS NOT NULL
-      UNWIND chain AS parent
-      WHERE parent.id = c.parent_id
-      RETURN
-        c.id AS child_id,
-        parent.id AS parent_id,
-        parent.end_lsn AS parent_end,
-        c.start_lsn AS child_start,
-        parent.end_lsn = c.start_lsn AS chain_continuous
-      ORDER BY c.id
-    expected:
-      columns: ["child_id", "parent_id", "parent_end", "child_start", "chain_continuous"]
-      rows:
-        - [2, 1, 100, 100, true]
-        - [3, 2, 200, 200, true]
-    tags: ["gap-0181", "lsn", "chain-continuity"]
-
-  - name: "GAP-0181-006: Backup metadata structure validation"
-    description: "Validates backup metadata contains all required LSN fields"
-    query: |
-      WITH {
-        backup_id: 12345,
-        timestamp: 1705276800000,
-        backup_type: 'incremental',
-        start_lsn: 500,
-        end_lsn: 750,
-        parent_backup_id: 12344,
-        size_bytes: 1048576,
-        checksum: 3456789012
-      } AS metadata
-      RETURN
-        metadata.backup_id IS NOT NULL AS has_id,
-        metadata.start_lsn IS NOT NULL AS has_start_lsn,
-        metadata.end_lsn IS NOT NULL AS has_end_lsn,
-        metadata.parent_backup_id IS NOT NULL AS has_parent_id,
-        metadata.end_lsn > metadata.start_lsn AS valid_lsn_range
-    expected:
-      columns: ["has_id", "has_start_lsn", "has_end_lsn", "has_parent_id", "valid_lsn_range"]
-      rows:
-        - [true, true, true, true, true]
-    tags: ["gap-0181", "metadata", "validation"]
+- name: 'GAP-0181-006: Backup metadata structure validation'
+  description: Validates backup metadata contains all required LSN fields
+  query: |
+    WITH {
+      backup_id: 12345,
+      timestamp: 1705276800000,
+      backup_type: 'incremental',
+      start_lsn: 500,
+      end_lsn: 750,
+      parent_backup_id: 12344,
+      size_bytes: 1048576,
+      checksum: 3456789012
+    } AS metadata
+    RETURN
+      metadata.backup_id IS NOT NULL AS has_id,
+      metadata.start_lsn IS NOT NULL AS has_start_lsn,
+      metadata.end_lsn IS NOT NULL AS has_end_lsn,
+      metadata.parent_backup_id IS NOT NULL AS has_parent_id,
+      metadata.end_lsn > metadata.start_lsn AS valid_lsn_range
+  expected:
+    columns: [has_id, has_start_lsn, has_end_lsn, has_parent_id, valid_lsn_range]
+    rows:
+    - [true, true, true, true, true]
+  tags: [gap-0181, metadata, validation]
 
 # =============================================================================
 # Point-in-Time Recovery Pattern Tests
 # =============================================================================
 
-  - name: "GAP-0181-007: PIT recovery LSN selection pattern"
-    description: "Tests the LSN selection logic for point-in-time recovery"
-    query: |
-      WITH 450 AS target_lsn,
-      [
-        {id: 1, type: 'full', start_lsn: 0, end_lsn: 200},
-        {id: 2, type: 'incr', start_lsn: 200, end_lsn: 400},
-        {id: 3, type: 'incr', start_lsn: 400, end_lsn: 600},
-        {id: 4, type: 'incr', start_lsn: 600, end_lsn: 800}
-      ] AS backups
-      UNWIND backups AS b
-      WHERE b.start_lsn <= target_lsn AND b.end_lsn >= target_lsn
-      RETURN b.id AS selected_backup, b.type AS backup_type,
-             b.start_lsn AS covers_from, b.end_lsn AS covers_to
-    expected:
-      columns: ["selected_backup", "backup_type", "covers_from", "covers_to"]
-      rows:
-        - [3, "incr", 400, 600]
-    tags: ["gap-0181", "pit-recovery", "lsn-selection"]
-
-  - name: "GAP-0181-008: Full recovery chain identification"
-    description: "Tests finding all backups needed to restore to a point"
-    query: |
-      WITH 550 AS target_lsn,
-      [
-        {id: 1, type: 'full', start_lsn: 0, end_lsn: 200, parent_id: null},
-        {id: 2, type: 'incr', start_lsn: 200, end_lsn: 400, parent_id: 1},
-        {id: 3, type: 'incr', start_lsn: 400, end_lsn: 600, parent_id: 2}
-      ] AS backups
-      UNWIND backups AS b
-      WHERE b.end_lsn <= target_lsn OR (b.start_lsn <= target_lsn AND b.end_lsn >= target_lsn)
-      RETURN b.id AS backup_id, b.type AS backup_type
-      ORDER BY b.id
-    expected:
-      columns: ["backup_id", "backup_type"]
-      rows:
-        - [1, "full"]
-        - [2, "incr"]
-        - [3, "incr"]
-    tags: ["gap-0181", "pit-recovery", "chain-identification"]
+# removed: GAP-0181-007 (PIT recovery LSN selection), GAP-0181-008 (full recovery
+# chain identification) relied on Cypher list-iteration over inline list-of-maps simulating
+# backup chains. Real recovery selection lives in the Zig backup unit tests.
 
 # =============================================================================
 # Regression Tests
 # =============================================================================
 
-  - name: "GAP-0181-REGRESSION-001: Zero LSN validation"
-    description: "Ensures full backups start at LSN 0"
-    query: |
-      WITH {type: 'full', start_lsn: 0} AS full_backup
-      RETURN
-        full_backup.type AS backup_type,
-        full_backup.start_lsn = 0 AS valid_full_start
-    expected:
-      columns: ["backup_type", "valid_full_start"]
-      rows:
-        - ["full", true]
-    tags: ["gap-0181", "regression", "full-backup"]
+- name: 'GAP-0181-REGRESSION-001: Zero LSN validation'
+  description: Ensures full backups start at LSN 0
+  query: |
+    WITH {type: 'full', start_lsn: 0} AS full_backup
+    RETURN
+      full_backup.type AS backup_type,
+      full_backup.start_lsn = 0 AS valid_full_start
+  expected:
+    columns: [backup_type, valid_full_start]
+    rows:
+    - [full, true]
+  tags: [gap-0181, regression, full-backup]
 
-  - name: "GAP-0181-REGRESSION-002: Non-null parent for incrementals"
-    description: "Ensures incremental backups always have parent reference"
-    query: |
-      WITH [
-        {type: 'full', parent_id: null},
-        {type: 'incr', parent_id: 1},
-        {type: 'incr', parent_id: 2}
-      ] AS backups
-      UNWIND backups AS b
-      RETURN
-        b.type AS backup_type,
-        CASE
-          WHEN b.type = 'full' THEN b.parent_id IS NULL
-          ELSE b.parent_id IS NOT NULL
-        END AS valid_parent_ref
-    expected:
-      columns: ["backup_type", "valid_parent_ref"]
-      rows:
-        - ["full", true]
-        - ["incr", true]
-        - ["incr", true]
-    tags: ["gap-0181", "regression", "parent-reference"]
-
-  - name: "GAP-0181-REGRESSION-003: LSN gap detection"
-    description: "Tests detection of gaps in LSN chain (data loss indicator)"
-    query: |
-      WITH [
-        {id: 1, end_lsn: 100},
-        {id: 2, start_lsn: 150, end_lsn: 200}  -- Gap: 100-150 missing
-      ] AS broken_chain
-      UNWIND broken_chain AS c
-      WITH collect(c) AS chain
-      UNWIND range(0, size(chain) - 2) AS i
-      WITH chain[i] AS prev, chain[i + 1] AS curr
-      RETURN
-        prev.id AS prev_backup,
-        curr.id AS curr_backup,
-        prev.end_lsn AS prev_end,
-        curr.start_lsn AS curr_start,
-        curr.start_lsn > prev.end_lsn AS has_gap,
-        curr.start_lsn - prev.end_lsn AS gap_size
-    expected:
-      columns: ["prev_backup", "curr_backup", "prev_end", "curr_start", "has_gap", "gap_size"]
-      rows:
-        - [1, 2, 100, 150, true, 50]
-    tags: ["gap-0181", "regression", "gap-detection"]
+# removed: GAP-0181-REGRESSION-002 (parent reference), REGRESSION-003 (gap detection)
+# relied on Cypher list-iteration over inline list-of-maps simulating backup chains.
+# Real chain-integrity checks live in the Zig backup unit tests.

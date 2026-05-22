@@ -866,13 +866,23 @@ def _run_shell_test(
     test_env = env.copy()
     test_env.update(test_case.env)
 
+    # Honor per-test timeout_ms if it exceeds the default shell timeout. Long-
+    # running stress/perf shell tests (e.g. GAP-0343-LOOP-001) specify their own
+    # timeout in milliseconds and the harness must respect it -- otherwise every
+    # bash-driven sustained-load spec would be killed at 30s regardless of the
+    # spec's declared budget.
+    if test_case.timeout_ms and test_case.timeout_ms > 0:
+        timeout_s = max(DEFAULT_SHELL_TIMEOUT_S, test_case.timeout_ms / 1000.0)
+    else:
+        timeout_s = DEFAULT_SHELL_TIMEOUT_S
+
     try:
         result = subprocess.run(
             ["bash", "-c", command],
             env=test_env,
             capture_output=True,
             text=True,
-            timeout=DEFAULT_SHELL_TIMEOUT_S,
+            timeout=timeout_s,
             cwd=str(geode_source),  # Run from Geode source directory
         )
 
@@ -909,7 +919,7 @@ def _run_shell_test(
             name=test_case.name,
             passed=False,
             duration_ms=(time.time() - start_time) * 1000,
-            error="Shell test timed out after 30 seconds",
+            error=f"Shell test timed out after {timeout_s:.0f} seconds",
         )
     except Exception as e:
         return TestResult(
