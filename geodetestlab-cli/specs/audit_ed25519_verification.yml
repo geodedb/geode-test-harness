@@ -127,21 +127,16 @@ tests:
   tags: [audit, ed25519, positive, keys]
 
 # ============================================================================
-# KNOWN BUG — hash chain verifier exits 3 on fresh logs (pinned failure)
+# POSITIVE — hash chain verifier accepts a well-formed fresh log
 # ============================================================================
-- name: ed25519-chain-verify-bug-pinned
+- name: ed25519-chain-verify-full
   description: |
-    BUG PINNED (GAP-0305) — `geode audit verify` exits 3 on any fresh audit
-    log with the error:
-      PREV_HASH_MISMATCH expected=0000...0000 got=66687aad...
-    Root cause: the writer computes prev_hash = sha256([0]*32) for the first
-    record, producing 0x66687aad..., but the verifier starts its tracker with
-    [0]*32 and expects prev_hash == [0]*32 for record 1 — a mismatch by design.
-    This is a genuine geode audit verifier bug discovered during GAP-0305 testing.
-    The tamper-detection test (ed25519-tamper-detection) still correctly exercises
-    the verifier's ability to catch actual tampering. This test pins the current
-    broken behaviour so a future fix is immediately visible as a test change.
-    BUG: geode verifier/writer prev_hash mismatch on first record; exit 3 on fresh logs.
+    GAP-0305 / geode#828 RESOLVED — the verifier now reproduces the writer's
+    SHA256(last_hash) step so `geode audit verify` correctly accepts a
+    well-formed audit log.  Previously the first record always tripped
+    PREV_HASH_MISMATCH (expected=0000...0000 got=66687aad...) because the
+    writer stores prev_hash = sha256(last_hash) but the verifier compared
+    against bare last_hash.  See geode commit fixing src/cli/geode_audit_verify.zig.
   type: bash
   command: |
     AUDIT="${GEODE_STATE_DIR}/audit.jsonl"
@@ -155,28 +150,22 @@ tests:
       if [ -x "$p" ]; then GEODE_BIN="$p"; break; fi
     done
     if [ -z "$GEODE_BIN" ]; then
-      echo "BUG_PINNED_SKIPPED (binary not found)"
-      echo "CHAIN_VERIFY_BUG_PINNED"
+      echo "SKIP: geode binary not found"
       exit 0
     fi
-    OUTPUT=$("$GEODE_BIN" audit verify --file "$AUDIT" 2>&1 || true)
+    OUTPUT=$("$GEODE_BIN" audit verify --file "$AUDIT" 2>&1)
+    EXIT=$?
     echo "$OUTPUT"
-    "$GEODE_BIN" audit verify --file "$AUDIT" >/dev/null 2>&1; VERIFY_EXIT=$?
-    echo "Verifier exit: $VERIFY_EXIT"
-    # Bug: exit 3 = TAMPER on fresh logs due to prev_hash mismatch on first record
-    # When the bug is fixed this test will need updating (expected exit 0, "OK chain")
-    if [ "$VERIFY_EXIT" -eq 3 ]; then
-      echo "BUG_CONFIRMED: verifier exits 3 on fresh log (prev_hash mismatch first record)"
-    elif [ "$VERIFY_EXIT" -eq 0 ]; then
-      echo "BUG_FIXED: verifier now exits 0 — update this test to assert OK chain"
-    else
-      echo "UNEXPECTED_EXIT: $VERIFY_EXIT"
+    if [ "$EXIT" -ne 0 ]; then
+      echo "FAIL: expected exit 0, got $EXIT (verifier should accept a fresh, well-formed log)"
+      exit 1
     fi
-    echo "CHAIN_VERIFY_BUG_PINNED"
+    echo "$OUTPUT" | grep -q "OK chain" || { echo "FAIL: missing 'OK chain' in verifier output"; exit 1; }
+    echo "CHAIN_VERIFY_OK"
   expect:
     exit_code: 0
-    stdout_contains: [CHAIN_VERIFY_BUG_PINNED]
-  tags: [audit, ed25519, bug-pinned, chain, gap-0305]
+    stdout_contains: [CHAIN_VERIFY_OK]
+  tags: [audit, ed25519, chain, gap-0305-resolved]
 
 # ============================================================================
 # POSITIVE — pubkey check (conditional on key file presence)

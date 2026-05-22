@@ -183,13 +183,10 @@ tests:
 # ============================================================================
 - name: hmac-phase2-chain-verify-full
   description: |
-    BUG PINNED — `geode audit verify` exits 3 on fresh logs due to
-    PREV_HASH_MISMATCH on the first record (same bug as GAP-0305).
-    The seq_no continuity check above verifies that initFromTail correctly
-    resumed last_seq after restart — that is the primary invariant for GAP-0308.
-    Full hash-chain verification across a restart is blocked by the upstream
-    geode verifier/writer prev_hash mismatch bug.
-    BUG: geode verifier/writer prev_hash mismatch on first record; exit 3 on fresh logs.
+    GAP-0305 / geode#828 RESOLVED — full hash-chain verification across the
+    pre+post-restart log now passes. Both initFromTail (writer recovery)
+    AND the verifier are consistent about prev_hash = SHA256(previous_event_hash).
+    See geode commit fixing src/cli/geode_audit_verify.zig.
   type: bash
   command: |
     LOG="${GEODE_STATE_DIR}/audit.jsonl"
@@ -202,22 +199,22 @@ tests:
       if [ -x "$p" ]; then GEODE_BIN="$p"; break; fi
     done
     if [ -z "$GEODE_BIN" ]; then
-      echo "HMAC_CHAIN_VERIFY_BUG_PINNED (binary not found, skipped)"
+      echo "SKIP: geode binary not found"
       exit 0
     fi
-    OUTPUT=$("$GEODE_BIN" audit verify --file "$LOG" 2>&1 || true)
+    OUTPUT=$("$GEODE_BIN" audit verify --file "$LOG" 2>&1)
+    EXIT=$?
     echo "$OUTPUT"
-    "$GEODE_BIN" audit verify --file "$LOG" >/dev/null 2>&1; VERIFY_EXIT=$?
-    if [ "$VERIFY_EXIT" -eq 3 ]; then
-      echo "BUG_CONFIRMED: exit 3 on fresh log (prev_hash mismatch first record)"
-    elif [ "$VERIFY_EXIT" -eq 0 ]; then
-      echo "BUG_FIXED: exit 0 — update this test to assert OK chain"
+    if [ "$EXIT" -ne 0 ]; then
+      echo "FAIL: expected exit 0, got $EXIT (chain should be valid across restart)"
+      exit 1
     fi
-    echo "HMAC_CHAIN_VERIFY_BUG_PINNED"
+    echo "$OUTPUT" | grep -q "OK chain" || { echo "FAIL: missing 'OK chain' in verifier output"; exit 1; }
+    echo "HMAC_CHAIN_VERIFY_OK"
   expect:
     exit_code: 0
-    stdout_contains: [HMAC_CHAIN_VERIFY_BUG_PINNED]
-  tags: [audit, hmac, phase2, bug-pinned, chain, gap-0305]
+    stdout_contains: [HMAC_CHAIN_VERIFY_OK]
+  tags: [audit, hmac, phase2, chain, gap-0305-resolved]
 
 # ============================================================================
 # NEGATIVE — delete a middle record and verify chain break is detected
