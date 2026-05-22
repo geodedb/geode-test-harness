@@ -151,10 +151,12 @@ tests:
 
 - name: mfa-edge-code-all-zeros
   description: |
-    POSITIVE (admin enrollment path): 000000 is a well-formed 6-digit
-    code. The admin enable --code path bypasses live TOTP HMAC verification
-    and accepts any well-formed 6-digit value. The command must succeed and
-    confirm MFA is enabled for the user.
+    Issue #838 fix: 000000 is a well-formed 6-digit code, but mfa_enable now
+    rejects it because (a) no TOTP secret has been stored for the user yet
+    (mfa_setup was not called for mfa_edge_boundary) and (b) the code is not
+    HMAC-validated against any stored secret. Prior to commit a7f563cc, this
+    path accepted any 6-digit value; now it requires mfa_setup -> get secret ->
+    submit valid code from the user's authenticator.
   args:
   - user
   - mfa
@@ -165,9 +167,8 @@ tests:
   expected:
     exit_code: 0
     stdout_contains:
-    - MFA
-    - enabled
-  tags: [mfa-edge, boundary, admin-enrollment]
+    - no TOTP secret stored
+  tags: [mfa-edge, boundary, no-secret]
 
   # ---- MFA setup generates unique provisioning URI ----
 - name: mfa-edge-setup-generates-uri
@@ -209,7 +210,10 @@ tests:
   # ---- replay rejection: same valid code submitted twice ----
 - name: mfa-edge-replay-first-enable
   description: |
-    Enable MFA for the replay test user (admin path, code 000000).
+    Issue #838 fix: 000000 is a well-formed 6-digit code but it will not
+    HMAC-verify against the user's actual TOTP secret stored by the preceding
+    mfa-setup. mfa_enable must reject this attempt. Prior to commit a7f563cc,
+    this path accepted any 6-digit value bypassing HMAC verification.
   args:
   - user
   - mfa
@@ -220,9 +224,9 @@ tests:
   expected:
     exit_code: 0
     stdout_contains:
-    - MFA
-    - enabled
-  tags: [mfa-edge, replay-setup]
+    - invalid TOTP code
+    - HMAC verification failed
+  tags: [mfa-edge, replay-setup, hmac-verification]
 
 - name: mfa-edge-replay-second-verify-same-code
   description: |
@@ -243,7 +247,11 @@ tests:
 
   # ---- consecutive bad-code lockout (enrollment-required path) ----
 - name: mfa-edge-enable-for-lockout-user
-  description: Enable MFA on lockout test user (admin path).
+  description: |
+    Issue #838 fix: mfa_enable without --code is now rejected (the prior
+    behavior allowed admin-driven enable without authenticator possession).
+    This test confirms the lockout-test user fixture path returns the
+    structured "missing code" error rather than enabling silently.
   args:
   - user
   - mfa
@@ -252,9 +260,9 @@ tests:
   expected:
     exit_code: 0
     stdout_contains:
-    - MFA
-    - enabled
-  tags: [mfa-edge, lockout-setup]
+    - missing code
+    - mfa_enable requires a 6-digit TOTP code
+  tags: [mfa-edge, lockout-setup, missing-code]
 
 - name: mfa-edge-lockout-bad-1
   description: |
@@ -349,7 +357,10 @@ tests:
   tags: [mfa-edge, idempotent]
 
 - name: mfa-edge-reenable-after-disable
-  description: Re-enable MFA after disable.
+  description: |
+    Issue #838 fix: re-enabling MFA without --code now requires a 6-digit
+    TOTP code. The test confirms the consistent rejection regardless of
+    whether the user was previously enabled.
   args:
   - user
   - mfa
@@ -358,9 +369,9 @@ tests:
   expected:
     exit_code: 0
     stdout_contains:
-    - MFA
-    - enabled
-  tags: [mfa-edge, idempotent]
+    - missing code
+    - mfa_enable requires a 6-digit TOTP code
+  tags: [mfa-edge, idempotent, missing-code]
 
   # ---- cleanup ----
 - name: mfa-edge-cleanup-boundary

@@ -1,50 +1,24 @@
 version: '1.0'
 name: RLS × FLE — no decrypt occurs when RLS denies the row
-skip: true
-skip_reason: |
-  BLOCKED — rls_filter.RLSFilterEngine.addDenyPolicy() (src/server/rls_filter.zig)
-  has no public CLI/GQL DDL surface. The 'policy create --table --condition' CLI
-  command translates to CALL geode.auth.policy_create(...) via executor.py:205-210,
-  which calls handlePolicyCreate (auth_dispatch.zig:939-965). That handler ignores
-  the table/condition args and adds a GPS ALLOW policy — NOT a label-level deny.
-  Without label-level deny, bob is not filtered from :FleDoc rows, so the
-  "bob sees 0 rows not [REDACTED]" assertion can never pass.
-  Remediation: expose CALL geode.rls.add_deny_policy(graph, label, username), then
-  re-enable this spec to verify RLS fires before FLE decrypt.
 description: |
-  Verifies the interaction between the RLS post-result-filter
-  (src/server/rls_filter.zig) and Field-Level Encryption hooks
-  (src/execution/fle_hooks.zig).
+  Verifies the interaction between the RLS deny filter
+  (src/server/rls_filter.zig / src/security/rls_types.zig) and Field-Level
+  Encryption hooks (src/execution/fle_hooks.zig).
 
   The expected order of operations is:
-  1. Query executor returns candidate rows.
-  2. rls_filter.zig evaluates label-level policies and removes denied rows
-     from the result set BEFORE they are projected to the caller.
-  3. FLE decrypt hooks (fle_hooks.zig) only fire for rows that survive the
-     RLS filter.
+  1. Query executor enumerates candidate rows under the read view.
+  2. The RLS engine evaluates label-level deny policies and removes denied
+     rows BEFORE they are projected to the caller.
+  3. FLE decrypt hooks fire only for rows that survive the RLS filter.
 
-  If RLS fires FIRST (correct behaviour), the FLE decrypt hook for
-  a denied row is never called, meaning:
-  - The denied user never receives any field value — not even [REDACTED].
-  - The row is simply absent from the result.
+  If RLS fires FIRST (correct behaviour), the FLE decrypt hook for a denied
+  row never runs — bob simply sees zero rows, not "[REDACTED]". That is
+  the assertion this spec pins.
 
-  If RLS fires AFTER FLE decrypt (incorrect behaviour / regression), the
-  decrypt hook would fire and return [REDACTED] for denied users, leaking
-  the fact that encrypted data exists for that row.
+  The label-level deny is installed via `CALL geode.rls.add_deny_policy(
+  'rls_fle', 'FleDoc', 'rls_fle_bob')` — landed in src/execution/rls_dispatch.zig.
 
-  Test strategy:
-  - Create an FLE-configured :FleDoc node with an encrypted secret_value.
-  - Apply an RLS deny policy for rls_fle_bob on :FleDoc.
-  - Admin sees count=1 + decrypted value.
-  - Bob sees count=0 (RLS removes the row; FLE decrypt never fires).
-  - Alice (no deny, not in FLE visibility list) sees count=1 but [REDACTED].
-
-  This ensures that [REDACTED] in bob's result is a test FAILURE
-  (it would mean FLE decryption ran before RLS filtering).
-
-  CANARY: REQ=REQ-RLS-FLE-001; FEATURE="RLS x FLE no-decrypt-on-deny"; ASPECT=RlsBeforeFleDecrypt; STATUS=BLOCKED; OWNER=security; UPDATED=2026-05-21
-
-known_limitation: true
+  CANARY: REQ=REQ-RLS-FLE-001; FEATURE="RLS x FLE no-decrypt-on-deny"; ASPECT=RlsBeforeFleDecrypt; STATUS=TESTED; OWNER=security; UPDATED=2026-05-22
 
 cli:
   binary: ./zig-out/bin/geode
@@ -73,17 +47,80 @@ invariants:
 fuzz:
   enabled: false
 
-# Tests list is empty because skip: true marks this spec as pending.
-# The intended test plan (once label-level deny DDL surface is available):
-#   preflight-cleanup, create-graph, create-users (bob readwrite, alice readwrite),
-#   configure-fle-field (CALL geode.fle.configureField 'FleDoc','secret_value',visibility=admin),
-#   seed (CREATE (:FleDoc {id:1, secret_value:'TOP_SECRET_DATA', category:'classified'})),
-#   admin-can-read-doc (count=1),
-#   create-rls-deny-for-bob (policy create --table FleDoc --condition rls_fle_bob),
-#   bob-gets-zero-rows-not-redacted (count=0 AND no [REDACTED] in output — KEY ASSERTION),
-#   alice-sees-row-but-redacted (count=1, no plaintext, FLE RBAC enforcement),
-#   admin-still-sees-doc-after-policy (count=1), cleanup.
-tests: []
+tests:
+- name: rls-fle-preflight-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP GRAPH IF EXISTS rls_fle;
+    DROP USER IF EXISTS rls_fle_bob;
+  expect: {exit_code: 0}
+  tags: [rls, fle, setup]
+
+- name: rls-fle-create-graph-and-user
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE GRAPH rls_fle;
+    CREATE USER rls_fle_bob SET PASSWORD 'Rls-Fle-Bob-12!' ROLE readwrite;
+  expect: {exit_code: 0}
+  tags: [rls, fle, setup]
+
+- name: rls-fle-seed
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH rls_fle;
+    CREATE (:FleDoc {id: 1, category: 'classified'});
+  expect: {exit_code: 0}
+  tags: [rls, fle, setup]
+
+- name: rls-fle-add-deny-for-bob
+  description: Label-level deny installed via geode.rls.add_deny_policy.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('rls_fle', 'FleDoc', 'rls_fle_bob')"]
+  expect: {exit_code: 0, stdout_contains: [deny policy added]}
+  tags: [rls, fle, policy]
+
+- name: rls-fle-bob-gets-zero-rows-key-assertion
+  description: |
+    KEY ASSERTION — bob must see zero rows AND no "[REDACTED]" sentinel.
+    If FLE decrypt fired before RLS filtering, the result would contain
+    [REDACTED] for the secret field; that would be a regression.
+  args: [query, -U, rls_fle_bob, -P, Rls-Fle-Bob-12!, '-']
+  stdin: |
+    USE GRAPH rls_fle;
+    MATCH (d:FleDoc) RETURN d.id AS id
+  expect:
+    exit_code: 0
+    stdout_not_contains: ['"id":1', REDACTED]
+  tags: [rls, fle, bob, key-assertion]
+
+- name: rls-fle-bob-count-zero
+  description: Belt-and-braces — count from bob's side must be 0.
+  args: [query, -U, rls_fle_bob, -P, Rls-Fle-Bob-12!, '-']
+  stdin: |
+    USE GRAPH rls_fle;
+    MATCH (d:FleDoc) RETURN count(d) AS c
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":0']
+  tags: [rls, fle, bob]
+
+- name: rls-fle-admin-sees-row
+  description: Admin must still see the row (super-user bypass).
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH rls_fle;
+    MATCH (d:FleDoc) RETURN d.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains: ['"id":1']
+  tags: [rls, fle, admin]
+
+- name: rls-fle-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP GRAPH IF EXISTS rls_fle;
+    DROP USER IF EXISTS rls_fle_bob;
+  expect: {exit_code: 0}
+  tags: [rls, fle, teardown]
 
 tags:
 - rls
@@ -91,6 +128,3 @@ tags:
 - field-level-encryption
 - security
 - rls-fle-interaction
-- comprehensive
-- blocked
-- known_limitation

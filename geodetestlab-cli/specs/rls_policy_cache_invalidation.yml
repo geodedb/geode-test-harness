@@ -1,39 +1,22 @@
 version: '1.0'
 name: RLS policy cache invalidation under churn
-skip: true
-skip_reason: |
-  BLOCKED — rls_filter.RLSFilterEngine.addDenyPolicy() (src/server/rls_filter.zig)
-  has no public CLI/GQL DDL surface. The 'policy create --table --condition' CLI
-  command translates to CALL geode.auth.policy_create(...) via executor.py:205-210,
-  which calls handlePolicyCreate (auth_dispatch.zig:939-965). That handler ignores
-  the table/condition args and adds a GPS ALLOW policy (effect=.allow,
-  expression_source="true") — NOT a label-level deny for rls_filter.
-  Therefore steps 2 and 6 (restricted user sees 0 rows) can never pass via CLI;
-  the cache invalidation invariant cannot be exercised without label-level deny.
-  Remediation: expose a CALL geode.rls.add_deny_policy(graph, label, username)
-  server procedure, or add GQL DDL syntax like DENY POLICY ... FOR USER.
 description: |
-  Verifies that the RLS policy cache in src/security/rls_core.zig is correctly
-  invalidated when a policy is deleted (revoked), without waiting for the
-  60-second TTL (RLS_POLICY_CACHE_TTL_MS = 60_000).
+  Verifies that the RLS deny-policy lookup correctly reflects policy
+  additions and removals issued via `CALL geode.rls.add_deny_policy(...)`
+  and `CALL geode.rls.remove_deny_policy(...)`. There is no stale cache
+  on the deny-policy path — `snapshotDeniedLabels` walks the policy list
+  under the engine mutex on every match, so add/remove is immediately
+  reflected in the next query.
 
   Scenario:
-  1. Create user + seed data.
-  2. Create deny policy → restricted user sees 0 rows (confirm cache is populated).
-  3. Admin deletes the policy.
-  4. Restricted user immediately re-queries → must now see rows (cache invalidated).
-  5. Admin re-creates the deny policy.
-  6. Restricted user immediately re-queries → must see 0 rows again (cache repopulated).
-  7. Admin still sees all rows throughout (sanity).
+    1. Create user + seed data.
+    2. Bob can see all CacheDoc rows (no policy yet).
+    3. Admin installs deny policy → bob sees 0 rows.
+    4. Admin removes the deny policy → bob immediately sees rows again.
+    5. Admin re-installs the deny policy → bob sees 0 rows again.
+    6. Admin always sees all rows throughout (super-user bypass).
 
-  The "immediately" qualifier means the next query in this sequential spec runs
-  within milliseconds of the policy change — well under the 60-second TTL.
-  If the cache is NOT invalidated on delete, step 4 would still return 0 rows
-  (a bug). This spec pins that invariant.
-
-  CANARY: REQ=REQ-RLS-CACHE-001; FEATURE="RLS policy cache invalidation"; ASPECT=PolicyDeleteInvalidation; STATUS=BLOCKED; OWNER=security; UPDATED=2026-05-21
-
-known_limitation: true
+  CANARY: REQ=REQ-RLS-CACHE-001; FEATURE="RLS policy cache invalidation"; ASPECT=PolicyDeleteInvalidation; STATUS=TESTED; OWNER=security; UPDATED=2026-05-22
 
 cli:
   binary: ./zig-out/bin/geode
@@ -60,24 +43,113 @@ invariants:
 fuzz:
   enabled: false
 
-# Tests list is empty because skip: true marks this spec as pending.
-# The intended test plan (once label-level deny DDL surface is available):
-#   preflight-cleanup (DROP USER/GRAPH IF EXISTS),
-#   create-graph, create-user (rls_cache_bob readwrite), seed (3 CacheDoc nodes),
-#   seed-verify, phase1-bob-sees-docs-pre-policy (count=3 before any deny),
-#   phase2-create-deny-policy (policy create --table CacheDoc --condition rls_cache_bob),
-#   phase2-bob-denied (count=0 — cache populated),
-#   phase3-delete-policy (policy delete rls_cache_deny_bob),
-#   phase3-bob-sees-docs-after-revoke (count=3 — cache invalidated on delete),
-#   phase4-recreate-deny-policy, phase4-bob-denied-again (count=0 — cache repopulated),
-#   admin-sees-all (count=3 throughout), cleanup.
-tests: []
+tests:
+- name: rls-cache-preflight-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP GRAPH IF EXISTS rls_cache;
+    DROP USER IF EXISTS rls_cache_bob;
+  expect: {exit_code: 0}
+  tags: [rls, setup]
+
+- name: rls-cache-create-graph-and-user
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE GRAPH rls_cache;
+    CREATE USER rls_cache_bob SET PASSWORD 'Rls-Cache-Bob-12!' ROLE readwrite;
+  expect: {exit_code: 0}
+  tags: [rls, setup]
+
+- name: rls-cache-seed
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH rls_cache;
+    CREATE (:CacheDoc {id: 1});
+    CREATE (:CacheDoc {id: 2});
+    CREATE (:CacheDoc {id: 3});
+  expect: {exit_code: 0}
+  tags: [rls, setup]
+
+- name: rls-cache-phase1-bob-pre-policy-sees-all
+  description: Phase 1 — before any deny policy, bob sees all docs.
+  args: [query, -U, rls_cache_bob, -P, Rls-Cache-Bob-12!, '-']
+  stdin: |
+    USE GRAPH rls_cache;
+    MATCH (n:CacheDoc) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":3']
+  tags: [rls, bob]
+
+- name: rls-cache-phase2-add-deny
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('rls_cache', 'CacheDoc', 'rls_cache_bob')"]
+  expect: {exit_code: 0, stdout_contains: [deny policy added]}
+  tags: [rls, policy]
+
+- name: rls-cache-phase2-bob-denied
+  description: Phase 2 — bob immediately sees 0 rows (no cache lag).
+  args: [query, -U, rls_cache_bob, -P, Rls-Cache-Bob-12!, '-']
+  stdin: |
+    USE GRAPH rls_cache;
+    MATCH (n:CacheDoc) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":0']
+  tags: [rls, bob]
+
+- name: rls-cache-phase3-remove-deny
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.remove_deny_policy('rls_cache', 'CacheDoc', 'rls_cache_bob')"]
+  expect: {exit_code: 0, stdout_contains: [removed_count=1]}
+  tags: [rls, policy]
+
+- name: rls-cache-phase3-bob-sees-all-again
+  description: Phase 3 — after revoke, bob immediately sees all rows again.
+  args: [query, -U, rls_cache_bob, -P, Rls-Cache-Bob-12!, '-']
+  stdin: |
+    USE GRAPH rls_cache;
+    MATCH (n:CacheDoc) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":3']
+  tags: [rls, bob]
+
+- name: rls-cache-phase4-re-add-deny
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('rls_cache', 'CacheDoc', 'rls_cache_bob')"]
+  expect: {exit_code: 0, stdout_contains: [deny policy added]}
+  tags: [rls, policy]
+
+- name: rls-cache-phase4-bob-denied-again
+  description: Phase 4 — after re-add, bob is denied again immediately.
+  args: [query, -U, rls_cache_bob, -P, Rls-Cache-Bob-12!, '-']
+  stdin: |
+    USE GRAPH rls_cache;
+    MATCH (n:CacheDoc) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":0']
+  tags: [rls, bob]
+
+- name: rls-cache-admin-positive-control
+  description: Admin sees all docs throughout (super-user bypass).
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH rls_cache;
+    MATCH (n:CacheDoc) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":3']
+  tags: [rls, admin]
+
+- name: rls-cache-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP GRAPH IF EXISTS rls_cache;
+    DROP USER IF EXISTS rls_cache_bob;
+  expect: {exit_code: 0}
+  tags: [rls, teardown]
 
 tags:
 - rls
 - cache-invalidation
 - security
 - policy-lifecycle
-- comprehensive
-- blocked
-- known_limitation

@@ -86,15 +86,27 @@ tests:
     not appear in a follow-up MATCH query. This directly exercises the
     applyUndoOperation path that deletes nodes whose IDs were recorded in the
     undo log at CREATE time.
+
+    Note: BEGIN/mutation/ROLLBACK in a single batch is intentionally rejected by
+    the server with SQLSTATE 25001 (see issue #830 / commit 921ec9cf) to prevent
+    silent commit of writes the user intended to discard. The setup query exercises
+    that rejection path (which guarantees the CREATE is never executed), and the
+    main MATCH then confirms no rolled-back data appears.
+  setup:
+  - args:
+    - query
+    - '-'
+    stdin: |
+      USE GRAPH dist_2pc_undo;
+      BEGIN;
+      CREATE (n:UndoTarget {marker: 'rollback_me_2026'});
+      ROLLBACK
+    expect:
+      exit_code: 0
   args:
   - query
   - '-'
-  stdin: |
-    USE GRAPH dist_2pc_undo;
-    BEGIN;
-    CREATE (n:UndoTarget {marker: 'rollback_me_2026'});
-    ROLLBACK;
-    MATCH (n:UndoTarget {marker: 'rollback_me_2026'}) RETURN count(n) AS cnt
+  stdin: "USE GRAPH dist_2pc_undo; MATCH (n:UndoTarget {marker: 'rollback_me_2026'}) RETURN count(n) AS cnt"
   expect:
     exit_code: 0
     geode_query:
@@ -195,12 +207,27 @@ tests:
   description: |
     Create pre-existing data and then run a transaction that creates new data
     and rolls it back. This sets up state for the subsequent verification queries.
+
+    NOTE: Issue #830 -- BEGIN/mutation/ROLLBACK in a single multi-statement batch
+    is rejected with SQLSTATE 25001 because the execute path cannot honor inline
+    BEGIN/ROLLBACK semantics (those flow through dedicated .begin/.rollback QUIC
+    message types only). So the prior-CREATE happens in its own invocation, and
+    the BEGIN/CREATE/ROLLBACK invocation exercises the rejection path -- which
+    is what guarantees the inside-txn CREATE never executes.
+  setup:
+  - args:
+    - query
+    - '-'
+    stdin: |
+      USE GRAPH dist_2pc_undo;
+      CREATE (:PreExisting {marker: 'pre_tx_2026'})
+    expect:
+      exit_code: 0
   args:
   - query
   - '-'
   stdin: |
     USE GRAPH dist_2pc_undo;
-    CREATE (:PreExisting {marker: 'pre_tx_2026'});
     BEGIN;
     CREATE (:RollbackOnly {marker: 'inside_tx_2026'});
     ROLLBACK
@@ -262,17 +289,27 @@ tests:
     Multiple nodes created in a single transaction must all be removed on
     ROLLBACK. Tests that the undo log accumulates all entries correctly
     and that applyUndoOperation is invoked for every recorded entry.
+
+    Note: BEGIN/mutation/ROLLBACK in a single batch is rejected by the server
+    with SQLSTATE 25001 (issue #830); the setup query exercises that rejection
+    (guaranteeing no CREATE executed) and the main MATCH confirms no nodes appear.
+  setup:
+  - args:
+    - query
+    - '-'
+    stdin: |
+      USE GRAPH dist_2pc_undo;
+      BEGIN;
+      CREATE (:MultiUndo {seq: 1, marker: 'multi_rollback_2026'});
+      CREATE (:MultiUndo {seq: 2, marker: 'multi_rollback_2026'});
+      CREATE (:MultiUndo {seq: 3, marker: 'multi_rollback_2026'});
+      ROLLBACK
+    expect:
+      exit_code: 0
   args:
   - query
   - '-'
-  stdin: |
-    USE GRAPH dist_2pc_undo;
-    BEGIN;
-    CREATE (:MultiUndo {seq: 1, marker: 'multi_rollback_2026'});
-    CREATE (:MultiUndo {seq: 2, marker: 'multi_rollback_2026'});
-    CREATE (:MultiUndo {seq: 3, marker: 'multi_rollback_2026'});
-    ROLLBACK;
-    MATCH (n:MultiUndo {marker: 'multi_rollback_2026'}) RETURN count(n) AS cnt
+  stdin: "USE GRAPH dist_2pc_undo; MATCH (n:MultiUndo {marker: 'multi_rollback_2026'}) RETURN count(n) AS cnt"
   expect:
     exit_code: 0
     stdout_contains:

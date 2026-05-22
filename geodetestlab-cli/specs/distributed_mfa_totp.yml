@@ -250,11 +250,11 @@ tests:
 
 - name: mfa-totp-known-invalid-code-rejected
   description: |
-    A well-formed 6-digit code (000000) submitted via the admin --code flag
-    exercises the code validation path. The admin enrollment flow accepts
-    any well-formed 6-digit code as it bypasses TOTP HMAC verification
-    (admin-controlled enrollment). This test confirms that the code format
-    validation passes and MFA is enabled via the admin path.
+    Issue #838 fix: a well-formed 6-digit code (000000) that doesn't HMAC-verify
+    against the user's stored TOTP secret must be REJECTED by mfa_enable. Prior
+    to commit a7f563cc, mfa_enable accepted any 6-digit code which allowed
+    enabling MFA without proving authenticator possession. Now enable requires
+    HMAC verification against the secret previously stored by mfa_setup.
   args:
   - user
   - mfa
@@ -265,23 +265,25 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
-    - MFA
-    - enabled
+    - invalid TOTP code
+    - HMAC verification failed
   tags:
   - distributed
   - mfa
   - totp
   - admin-enable
-  - code-format-validation
+  - hmac-verification
 
 # -----------------------------------------------------------------------
 # Admin enable/disable without code succeeds (admin-controlled enrollment)
 # -----------------------------------------------------------------------
 - name: mfa-totp-admin-enable-no-code
   description: |
-    An administrator can enable MFA for a user without supplying a TOTP
-    code. This is the enrollment workflow: the admin grants the capability,
-    the user confirms with their authenticator during next login.
+    Issue #838 fix: mfa_enable without a --code argument must be REJECTED.
+    Prior to commit a7f563cc, the admin enrollment workflow allowed enabling MFA
+    without supplying a TOTP code, which broke the authenticator-possession
+    invariant. Now the user must first run mfa_setup, then provide a valid
+    HMAC-verifiable 6-digit code to mfa_enable.
   args:
   - user
   - mfa
@@ -290,13 +292,14 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
-    - MFA
-    - enabled
+    - missing code
+    - mfa_enable requires a 6-digit TOTP code
   tags:
   - distributed
   - mfa
   - totp
   - admin-enable
+  - missing-code
 
 - name: mfa-totp-admin-disable
   description: |
