@@ -1,0 +1,136 @@
+version: '1.0'
+name: 'GAP-0327: --max-connections admission control'
+description: |
+  Companion to connection_pool_exhaustion.yml. That spec saturates the
+  pool without a configurable cap; this spec drives the explicit
+  `--max-connections` server flag (src/server/cli_args.zig → QUIC
+  transport config).
+
+  IMPORTANT — geode's admission-control SEMANTICS:
+    geode does NOT reject the (cap+1)-th connection with a hard
+    "POOL_EXHAUSTED" error. The QUIC accept loop applies BACKPRESSURE:
+    when getConnectionCount() >= max_connections it parks (futex wait on
+    connection_slot_freed_gen) until destroyConnection frees a slot, then
+    admits the waiting connection. So an over-cap connection is QUEUED
+    and eventually SERVED — never hard-rejected, never hung indefinitely,
+    never crashed. That bounded-backpressure invariant is what this spec
+    pins. (The earlier GAP-0327-HARD-001/002 placeholders asserted a
+    POOL_EXHAUSTED error that geode architecturally never emits; they are
+    replaced by the correct-behaviour tests below.)
+
+  Server is started with --max-connections 4.
+
+  CANARY: REQ=REQ-TRANSPORT-POOL-EXHAUST-001; FEATURE="Connection Pool Exhaustion"; ASPECT=MaxConnectionsFlag; STATUS=TESTED; OWNER=transport; UPDATED=2026-05-22
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    - --idle-timeout
+    - '8000'
+    - --max-connections
+    - '4'
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 90000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: 'GAP-0327-MAXCONN-001: server starts and serves under a cap of 4'
+  description: |
+    A single query succeeds against a server capped at 4 connections —
+    the cap does not break normal operation.
+  args:
+  - query
+  - RETURN 'capped_server_ok' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - capped_server_ok
+  tags: [gap-0327, quic, max-connections]
+
+- name: 'GAP-0327-MAXCONN-002: staggered over-cap load is admitted, server survives'
+  description: |
+    Drive 12 queries at a server capped at 4 connections, launched with a
+    250 ms stagger so each completes its QUIC handshake cleanly (a fully
+    simultaneous burst would instead exercise handshake-storm contention,
+    which is unrelated to the connection cap). As each connection finishes
+    its slot is freed back to the accept loop, so the cap of 4 is a
+    rolling window, not a hard ceiling on total throughput.
+
+    INVARIANT: with --max-connections 4 every one of the 12 staggered
+    queries is admitted and served (exit 0), the server never crashes or
+    hangs, and the run completes well within the timeout.
+  type: bash
+  command: |
+    SERVER="${GEODE_SERVER_ADDRESS}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    TMPDIR=$(mktemp -d)
+    N=12
+
+    for i in $(seq 1 $N); do
+      (
+        OUT=$(geode query --server "${SERVER}" --insecure-tls-skip-verify \
+              -U geode -P "${PW}" --timeout 30 \
+              "RETURN ${i} AS burst_idx" 2>&1)
+        EC=$?
+        echo "conn_${i} ec=${EC}" > "${TMPDIR}/${i}.r"
+      ) &
+      sleep 0.25
+    done
+    wait
+
+    OK=$(grep -l "ec=0" "${TMPDIR}"/*.r 2>/dev/null | wc -l)
+    ERR=$(grep -l "ec=[^0]" "${TMPDIR}"/*.r 2>/dev/null | wc -l)
+    rm -rf "${TMPDIR}"
+
+    echo "maxconn_ok=${OK} maxconn_err=${ERR} total=${N}"
+
+    HEALTH=$(geode query --server "${SERVER}" --insecure-tls-skip-verify \
+             -U geode -P "${PW}" --timeout 15 \
+             "RETURN 'alive_post_burst' AS s" 2>&1)
+    echo "$HEALTH" | grep -q "alive_post_burst" && echo "server_alive=true" || echo "server_alive=false"
+
+    echo "$HEALTH" | grep -q "alive_post_burst" || exit 1
+    [ "${OK}" -eq "${N}" ] && echo "all_admitted=true" || echo "all_admitted=false"
+    [ "${OK}" -eq "${N}" ]
+  timeout_ms: 80000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - server_alive=true
+    - all_admitted=true
+  tags: [gap-0327, quic, max-connections, backpressure]
+
+- name: 'GAP-0327-MAXCONN-003: slots are reusable after the burst drains'
+  description: |
+    After the 12-connection burst drains, the connection slots are
+    released and a fresh query is served immediately — confirming
+    destroyConnection frees slots back to the accept loop.
+  args:
+  - query
+  - RETURN 'slots_reusable_after_drain' AS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - slots_reusable_after_drain
+  tags: [gap-0327, quic, max-connections, recovery]
+
+tags:
+- gap-0327
+- quic
+- max-connections
+- transport
+- admission-control
