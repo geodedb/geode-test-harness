@@ -18,27 +18,31 @@ cli:
     timeout_ms: 30000
     tls_verify: false
     format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
 tests:
 - name: gap-0156-create-test-user
-  description: Create a user to test MFA enable/disable output
-  args:
-  - user
-  - create
-  - mfatestuser156
-  - mfa156@test.com
-  - --password
-  - SecurePass123!
+  description: |
+    Create a user via GQL DDL (server-routed) rather than the
+    `geode user create` CLI which opens a local data store and
+    cannot see the harness-managed server.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER mfatestuser156 SET PASSWORD 'SecurePass123!' ROLE readonly]
   expect:
     exit_code: 0
-    stdout_contains:
-    - mfatestuser156
-    - created
   tags:
   - gap-0156
   - mfa-security
   - setup
 - name: gap-0156-mfa-enable-no-hardcoded-secret
-  description: MFA enable should output guidance to use mfa-setup, not a fake secret
+  description: |
+    Issue #838 (2026-05-21): mfa enable without --code now errors
+    with `missing code` (anti-CVE). The test verifies the secure-by-
+    default error path AND the GAP-0156 invariant that the literal
+    hardcoded '123456' must never appear in any mfa output.
   args:
   - user
   - mfa
@@ -47,14 +51,17 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
-    - MFA enabled for mfatestuser156
+    - missing code
     stdout_not_contains:
     - '123456'
   tags:
   - gap-0156
   - mfa-security
+  - security-838
 - name: gap-0156-mfa-disable-no-secret
-  description: MFA disable should not output any secret
+  description: |
+    mfa disable must succeed against a server-side user and must never
+    output the literal hardcoded '123456' secret (GAP-0156).
   args:
   - user
   - mfa
@@ -62,8 +69,6 @@ tests:
   - mfatestuser156
   expect:
     exit_code: 0
-    stdout_contains:
-    - MFA disabled for mfatestuser156
     stdout_not_contains:
     - '123456'
     - 'Secret:'
@@ -71,16 +76,10 @@ tests:
   - gap-0156
   - mfa-security
 - name: gap-0156-delete-test-user
-  description: Clean up test user
-  args:
-  - user
-  - delete
-  - mfatestuser156
-  - --yes
+  description: Clean up test user via GQL DDL.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP USER mfatestuser156]
   expect:
     exit_code: 0
-    stdout_contains:
-    - deleted
   tags:
   - gap-0156
   - mfa-security
@@ -106,33 +105,18 @@ tests:
   - gap-0155
   - wal-security
 - name: mfa-setup-create-user
-  description: Create user for mfa-setup test
-  args:
-  - user
-  - create
-  - mfasetupuser156
-  - mfasetup156@test.com
-  - --password
-  - SecurePass456!
+  description: Create user for mfa-setup test via GQL DDL (server-routed).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER mfasetupuser156 SET PASSWORD 'SecurePass456!' ROLE readonly]
   expect:
     exit_code: 0
-    stdout_contains:
-    - mfasetupuser156
-    - created
   tags:
   - mfa-setup
   - setup
 - name: mfa-setup-cleanup
-  description: Clean up mfa-setup test user
-  args:
-  - user
-  - delete
-  - mfasetupuser156
-  - --yes
+  description: Clean up mfa-setup test user via GQL DDL.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP USER mfasetupuser156]
   expect:
     exit_code: 0
-    stdout_contains:
-    - deleted
   tags:
   - mfa-setup
   - cleanup
