@@ -1,0 +1,169 @@
+version: '1.0'
+name: Authn Rate Limiter — lockout expiry (GAP-0315)
+description: |
+  Exercises the auth rate-limiter lockout-EXPIRY path end-to-end, which the
+  sibling spec authn_rate_limiter.yml deliberately does not (waiting the
+  production 60 s window exceeds the suite time budget).
+
+  This spec sets GEODE_AUTH_RATE_LOCKOUT_SECS=2 on the server so the
+  lockout window is short enough to wait out within a single test run.
+  The override is read by AuthRateLimiter.initFromEnv
+  (src/server/auth_rate_limiter.zig) — it is a test-only knob; production
+  deployments leave it unset and get the OWASP-aligned 60 s default.
+
+  Scenario:
+    1. Create the target user.
+    2. 10 consecutive wrong-password logins → counter reaches max_attempts.
+    3. 11th attempt with the CORRECT password → still rejected ("Too many
+       failed authentication attempts") — lockout is active.
+    4. Sleep 4 s (> 2 s lockout window).
+    5. Login with the correct password → succeeds. Lockout has expired and
+       the per-IP failure counter is cleared.
+
+  CANARY: REQ=REQ-SEC-RATE-LIMIT-EXPIRY-001; FEATURE="AuthRateLimiting"; ASPECT=LockoutExpiry; STATUS=TESTED; TEST=geodetestlab/specs/authn_rate_limiter_expiry.yml; OWNER=security; UPDATED=2026-05-22
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_AUTH_RATE_LOCKOUT_SECS: '2'
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: expiry-create-target-user
+  description: Create the target user for the expiry scenario.
+  args:
+  - user
+  - create
+  - rate_expiry_target
+  - rate_expiry@test.example.com
+  - --password
+  - RateExpiry_Target_Pass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - rate_expiry_target
+    - created
+  tags: [rate-limiter, expiry, setup]
+
+- name: expiry-positive-baseline
+  description: Correct password succeeds before any failures.
+  args:
+  - auth
+  - login
+  - --user
+  - rate_expiry_target
+  - --password
+  - RateExpiry_Target_Pass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [rate-limiter, expiry, positive-baseline]
+
+- name: expiry-fail-01
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_01!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-02
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_02!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-03
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_03!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-04
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_04!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-05
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_05!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-06
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_06!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-07
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_07!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-08
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_08!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-09
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_09!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt]
+- name: expiry-fail-10
+  description: 10th wrong-password attempt — counter reaches max_attempts.
+  args: [auth, login, --user, rate_expiry_target, --password, WrongExpiry_10!]
+  expected: {exit_code: 3, stderr_contains: [Invalid username or password]}
+  tags: [rate-limiter, expiry, failed-attempt, threshold]
+
+- name: expiry-locked-out-correct-password-blocked
+  description: |
+    11th attempt with the CORRECT password — must still be rejected
+    because the IP lockout is active.
+  args:
+  - auth
+  - login
+  - --user
+  - rate_expiry_target
+  - --password
+  - RateExpiry_Target_Pass_2026!
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Too many
+  tags: [rate-limiter, expiry, locked-out, negative]
+
+- name: expiry-wait-for-lockout-window
+  description: Sleep past the 2 s lockout window (GEODE_AUTH_RATE_LOCKOUT_SECS=2).
+  type: bash
+  command: sleep 4 && echo LOCKOUT_WINDOW_ELAPSED
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - LOCKOUT_WINDOW_ELAPSED
+  tags: [rate-limiter, expiry, wait]
+
+- name: expiry-login-succeeds-after-window
+  description: |
+    KEY ASSERTION — after the lockout window expires the correct password
+    succeeds again and the per-IP failure counter is cleared.
+  args:
+  - auth
+  - login
+  - --user
+  - rate_expiry_target
+  - --password
+  - RateExpiry_Target_Pass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [rate-limiter, expiry, positive, key-assertion]
+
+tags:
+- rate-limiter
+- expiry
+- security
+- authn

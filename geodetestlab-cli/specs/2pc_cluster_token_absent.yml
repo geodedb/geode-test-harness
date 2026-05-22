@@ -1,0 +1,105 @@
+version: '1.0'
+name: 2PC / Federation Cluster Token Absent — geode-cluster rejected (GAP-0321)
+description: |
+  GAP-0321 companion to 2pc_cluster_token_required.yml.
+
+  That spec runs the server WITH GEODE_CLUSTER_TOKEN set and proves the
+  correct token is accepted / wrong + empty tokens are rejected. This spec
+  covers the remaining sub-case: a server started WITHOUT any
+  GEODE_CLUSTER_TOKEN must reject every "geode-cluster" federation HELLO,
+  because validateFederationAuth (quic_connection_handler.zig, GAP-0490)
+  returns false when the server-side expected token is null.
+
+  Splitting this into its own spec file is the clean way to exercise the
+  "no server token" configuration — the harness manages one server env per
+  spec, so a token-absent server simply gets its own spec.
+
+  Sub-cases:
+    A. geode-cluster + any password → HELLO rejected (exit 3).
+    B. geode-cluster + empty password → HELLO rejected (exit 3).
+    C. Legitimate geode admin user → still accepted; server stable (exit 0).
+
+  CANARY: REQ=GAP-0321; FEATURE="Cluster token enforcement"; ASPECT=FederationHandshakeNoToken; STATUS=TESTED; OWNER=security; UPDATED=2026-05-22
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      # Deliberately NO GEODE_CLUSTER_TOKEN — this is the whole point.
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+
+tests:
+- name: cluster-token-absent-rejects-geode-cluster
+  description: |
+    Sub-case A — server has no GEODE_CLUSTER_TOKEN. A client presenting
+    username "geode-cluster" with a plausible-looking token must be
+    rejected: validateFederationAuth has no expected token to match, and
+    "geode-cluster" is not a provisioned regular user either.
+  args:
+  - query
+  - -U
+  - geode-cluster
+  - -P
+  - geode-cluster-token-2026
+  - RETURN 1 AS v
+  expect:
+    exit_code: 3
+  tags: [distributed, 2pc, cluster-token, no-server-token]
+
+- name: cluster-token-absent-rejects-empty-password
+  description: |
+    Sub-case B — same server, "geode-cluster" with an empty password is
+    likewise rejected.
+  args:
+  - query
+  - -U
+  - geode-cluster
+  - -P
+  - ''
+  - RETURN 1 AS v
+  expect:
+    exit_code: 3
+  tags: [distributed, 2pc, cluster-token, no-server-token]
+
+- name: cluster-token-absent-admin-still-works
+  description: |
+    Sub-case C — the legitimate geode admin user still authenticates and
+    the server is stable after the rejected federation attempts.
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - ${secret:admin_password}
+  - RETURN 'server_stable_no_cluster_token' AS health_check
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - server_stable_no_cluster_token
+  tags: [distributed, 2pc, cluster-token, stability]
+
+tags:
+- distributed
+- 2pc
+- cluster-token
+- gap-0321
+- security
