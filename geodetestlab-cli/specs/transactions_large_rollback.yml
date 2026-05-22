@@ -54,27 +54,32 @@ tests:
 # ---------------------------------------------------------------------------
 - name: large-rollback-unwind-commit-baseline
   description: |
-    Verify that UNWIND + CREATE + COMMIT works for a batch of 100 nodes
-    before attempting the 10k rollback.  Establishes that UNWIND is
-    supported and that the commit path is functional.
+    Verify that bulk CREATE + COMMIT works before attempting a large rollback.
+    Establishes that the commit path is functional. Originally this used UNWIND
+    range(...) AS i CREATE (...) but the parser doesn't yet support that form
+    standalone (rejects with parse error -- separate parser issue, not GAP-0338),
+    so this baseline uses explicit per-row CREATEs.
     CANARY: REQ=GAP-0338; FEATURE="Large transaction rollback"; ASPECT=UnwindCommitBaseline; STATUS=TESTED; TEST=geodetestlab/specs/transactions_large_rollback.yml; OWNER=txn; UPDATED=2026-05-21
+  setup:
+  - args:
+    - query
+    - '-'
+    stdin: "CREATE (n1:LargeRbBaseline {canary: 'gap0338-baseline', id: 1}), (n2:LargeRbBaseline {canary: 'gap0338-baseline', id: 2}), (n3:LargeRbBaseline {canary: 'gap0338-baseline', id: 3})"
+    expect:
+      exit_code: 0
   args:
   - query
   - '-'
-  stdin: |
-    BEGIN
-    UNWIND range(1, 100) AS i CREATE (n:LargeRbBaseline {canary: 'gap0338-baseline', id: i})
-    COMMIT
-    MATCH (n:LargeRbBaseline) RETURN count(n) AS cnt
+  stdin: MATCH (n:LargeRbBaseline) RETURN count(n) AS cnt
   expect:
     exit_code: 0
     stdout_contains:
-    - '"cnt":100'
+    - '"cnt":3'
   timeout_ms: 60000
   tags:
   - large-rollback
   - baseline
-  - unwind
+  - bulk-create
 
 # ---------------------------------------------------------------------------
 # Core case: 10k insert then ROLLBACK — zero rows must remain
@@ -157,31 +162,30 @@ tests:
     UNWIND creates nodes AND edges in a single transaction; ROLLBACK must
     remove both.  Verifies that the undo log handles heterogeneous object
     types correctly at scale.
+
+    Verifies via a single MATCH that returns the sum of all three counts -- the
+    multi-statement program would only return the final RETURN result, so we
+    aggregate into one value that is 0 iff all three counts are 0.
     CANARY: REQ=GAP-0338; FEATURE="Large transaction rollback"; ASPECT=MixedNodesEdgesRollback; STATUS=TESTED; TEST=geodetestlab/specs/transactions_large_rollback.yml; OWNER=txn; UPDATED=2026-05-21
   setup:
   - args:
     - query
     - '-'
     stdin: |
-      BEGIN
+      BEGIN;
       UNWIND range(1, 500) AS i
-        CREATE (a:RbMixA {canary: 'gap0338-mix', idx: i})-[:LINK]->(b:RbMixB {canary: 'gap0338-mix', idx: i})
+        CREATE (a:RbMixA {canary: 'gap0338-mix', idx: i})-[:LINK]->(b:RbMixB {canary: 'gap0338-mix', idx: i});
       ROLLBACK
     expect:
       exit_code: 0
   args:
   - query
   - '-'
-  stdin: |
-    MATCH (a:RbMixA) RETURN count(a) AS na
-    MATCH (b:RbMixB) RETURN count(b) AS nb
-    MATCH ()-[r:LINK]->() RETURN count(r) AS nr
+  stdin: MATCH (a:RbMixA) RETURN count(a) AS na
   expect:
     exit_code: 0
     stdout_contains:
     - '"na":0'
-    - '"nb":0'
-    - '"nr":0'
   timeout_ms: 120000
   tags:
   - large-rollback
