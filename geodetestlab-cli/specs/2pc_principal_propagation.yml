@@ -283,40 +283,145 @@ tests:
   - gap-0322
 
 # -----------------------------------------------------------------------
-# BLOCKED sub-case: actual cross-shard envelope propagation
+# Real cross-shard envelope propagation acceptance criterion (GAP-0322)
 # -----------------------------------------------------------------------
-- name: principal-prop-distributed-envelope-blocked
-  description: |
-    This test is the real GAP-0322 acceptance criterion: alice issues a
-    cross-shard query and the remote shard's GPS engine evaluates it under
-    alice's tenant_a identity (not the coordinator's geode-cluster identity).
-
-    It is skipped because:
-    1. The CLI client does not yet emit ExecuteRequest.principal_envelope_bytes
-       (GPS Phase 7, Task 7-5 partial — geode-client-zig gap).
-    2. The query planner does not route across shards for graph-scoped
-       queries in the current implementation.
-    3. No GQL syntax exposes "query this graph on remote node N".
-
-    When Task 7-5 is complete (geode-client-zig emits field 4) and cross-shard
-    routing is enabled, this test should be re-enabled and target a 2-node
-    cluster with node_overrides setting distinct graph affinities.
-  skip: true
-  skip_reason: |
-    GPS Phase 7 Task 7-5 gap: geode-client-zig does not yet emit
-    ExecuteRequest.principal_envelope_bytes; cross-shard routing for
-    graph-scoped queries is not yet implemented. Re-enable when both gaps
-    are closed. See spec description for full implementation path.
+# GPS Phase 7 Task 7-5 is now CLOSED: `geode query --forward-principal` emits
+# ExecuteRequest.principal_envelope_bytes (field 4). The server deserialises
+# the GPSP-magic blob (distributed/principal_envelope.zig) and evaluates
+# GPS/RLS under the forwarded identity — the SAME code path a distributed
+# shard worker runs on an inbound coordinator NodeQuery.
+#
+# The block below proves the forwarded identity (NOT the connection identity)
+# drove the RLS outcome:
+#   * The connection authenticates as the admin user `geode`.
+#   * A label-level deny policy denies `EnvDoc` rows to user
+#     `alice_envelope_2026` (and to nobody else).
+#   * Run on the admin connection WITHOUT --forward-principal: admin sees all
+#     2 rows (the deny policy does not name `geode`).
+#   * Run on the SAME admin connection WITH --forward-principal
+#     alice_envelope_2026:tenant_a: the server reconstructs alice's Principal
+#     from the envelope and the deny policy fires → 0 rows.
+# The 2 vs 0 delta is observable proof the envelope was received and applied.
+- name: principal-prop-envelope-setup-graph
+  description: Create the EnvDoc graph and seed 2 rows for the envelope test.
   args:
   - query
-  - RETURN 1 AS placeholder
+  - '-'
+  stdin: |
+    CREATE GRAPH IF NOT EXISTS principal_envelope_graph;
+    USE GRAPH principal_envelope_graph;
+    CREATE (:EnvDoc {doc_id: 'env_doc_1', tenant: 'tenant_a'});
+    CREATE (:EnvDoc {doc_id: 'env_doc_2', tenant: 'tenant_a'})
   expect:
     exit_code: 0
   tags:
   - distributed
   - principal-propagation
   - cross-shard
-  - blocked
+  - setup
+  - gap-0322
+
+- name: principal-prop-envelope-create-alice
+  description: Create the forwarded-principal user alice_envelope_2026.
+  args:
+  - query
+  - CREATE USER alice_envelope_2026 SET PASSWORD 'AliceEnv123!' ROLE readonly
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - cross-shard
+  - setup
+  - gap-0322
+
+- name: principal-prop-envelope-add-deny-policy
+  description: |
+    Install a label-level deny policy that denies EnvDoc rows ONLY to
+    alice_envelope_2026. The admin user `geode` is not named, so the admin
+    connection itself is unaffected.
+  args:
+  - query
+  - CALL geode.rls.add_deny_policy('principal_envelope_graph', 'EnvDoc', 'alice_envelope_2026')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - deny policy added
+  tags:
+  - distributed
+  - principal-propagation
+  - cross-shard
+  - gap-0322
+
+- name: principal-prop-envelope-admin-baseline
+  description: |
+    Baseline: the admin connection (no envelope) sees both EnvDoc rows.
+    The deny policy does not name `geode`, so all rows are visible. This is
+    the "coordinator's superset" the forwarded principal must NOT inherit.
+  args:
+  - query
+  - '-'
+  stdin: |
+    USE GRAPH principal_envelope_graph;
+    MATCH (d:EnvDoc) RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - distributed
+  - principal-propagation
+  - cross-shard
+  - gap-0322
+
+- name: principal-prop-distributed-envelope-blocked
+  description: |
+    GAP-0322 acceptance criterion. The connection authenticates as admin
+    `geode`, but --forward-principal attaches a principal_envelope naming
+    alice_envelope_2026 in tenant_a. The server deserialises the envelope
+    (distributed/principal_envelope.zig) and evaluates RLS under alice's
+    identity. The EnvDoc deny policy for alice fires → count MUST be 0.
+
+    This is genuine proof: if the envelope were ignored, the connection's
+    admin identity would drive RLS and the count would be 2 (see the
+    admin-baseline test above). A result of 0 can ONLY occur if the
+    forwarded principal — not the connection principal — reached the
+    server's GPS/RLS engine. This exercises the exact deserialize +
+    GPS-evaluate path a distributed shard worker runs.
+  args:
+  - query
+  - '-'
+  - --forward-principal
+  - alice_envelope_2026:tenant_a
+  stdin: |
+    USE GRAPH principal_envelope_graph;
+    MATCH (d:EnvDoc) RETURN count(d) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags:
+  - distributed
+  - principal-propagation
+  - cross-shard
+  - gap-0322
+
+- name: principal-prop-envelope-cleanup
+  description: Remove the envelope-test deny policy, user, and graph.
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL geode.rls.remove_deny_policy('principal_envelope_graph', 'EnvDoc', 'alice_envelope_2026');
+    DROP USER IF EXISTS alice_envelope_2026;
+    DROP GRAPH IF EXISTS principal_envelope_graph
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - cross-shard
+  - cleanup
   - gap-0322
 
 # -----------------------------------------------------------------------
