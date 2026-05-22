@@ -40,10 +40,23 @@ description: |
 
 skip: true
 skip_reason: |
-  ALTER USER SET ATTRIBUTE not yet exposed via CLI/GQL DDL.
-  geode parser (src/gql/parser.zig:6437) only handles SET PASSWORD and
-  SET ROLE. Cannot set principal.attributes.department for ABAC enforcement
-  test until DDL surface is added. See spec description for remediation steps.
+  GAP-0284 partial: ALTER USER SET ATTRIBUTE is now wired (parser + handler
+  + user_attribute_store + gps.decide reads from store). But this spec
+  expects per-row filtering: alice (dept=eng) should see only docs where
+  doc.dept='engineering'. GPS policies are allow/deny gates against an
+  (action, resource) pair — `ON GRAPH * FOR READ USING
+  principal.attributes.department = 'engineering'` evaluates once per query
+  and either allows or denies the entire MATCH. With the policy returning
+  allow for alice, she sees ALL :Doc rows, not just dept=eng rows.
+
+  To make this spec pass, we need ROW-level RLS that can compare
+  principal.attributes.department against the row's d.dept property. That
+  is RLS expression engine work, not GPS work. The attribute store is in
+  place; the row-evaluation predicate (`row.<prop> = principal.attributes.<key>`)
+  is the missing piece in src/security/policy_expression.zig and the
+  row-filter integration in src/execution/match_operations.zig.
+
+  Tracking under GAP-0509 (RLS expression engine wiring extensions).
 
 known_limitation: true
 
