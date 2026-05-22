@@ -63,9 +63,78 @@ description: |
      oversized frame, then exits 0 if the server rejects it.
   3. Add a spec test using that runner to confirm rejection + server stability.
 
-skip: 'GAP-0320: frame limit test requires raw-protocol injection tooling. The 16 MiB guard is in the distributed/2PC framing layer; GQL queries use paged streaming and never produce a single 16 MiB frame. No CLI path reaches the guard. See description for Zig unit test and runner approach.'
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
 
-tests: []
+tests:
+- name: frame-limit-build-frame-probe
+  description: Build the raw QUIC frame-injection runner.
+  type: bash
+  command: |
+    cd ../geode-test-harness/runners/frame_probe
+    go build -o /tmp/frame_probe_geode . 2>&1
+    test -x /tmp/frame_probe_geode && echo PROBE_BUILD_OK
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - PROBE_BUILD_OK
+  tags: [gap-0320, setup, frame-probe]
+
+- name: frame-limit-oversized-frame-rejected
+  description: |
+    Inject a single QUIC stream carrying a 4-byte big-endian length prefix
+    larger than the 16 MiB MAX_FRAME_SIZE guard
+    (src/distributed/twophase.zig + src/distributed/query_transport.zig:849).
+    The server must reject the stream and close it; the connection itself
+    survives. frame_probe exits 0 only when the server's real guard fires
+    (no mock).
+  type: bash
+  command: |
+    /tmp/frame_probe_geode oversized --server "${GEODE_SERVER_ADDRESS}" --length 20000000
+  timeout_ms: 30000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - OVERSIZED_FRAME_REJECTED
+  tags: [gap-0320, frame-limit, allocation-bomb, security]
+
+- name: frame-limit-server-stable-after-attack
+  description: |
+    After the hostile oversized frame is rejected the server must still
+    answer normal queries — proving the guard is per-stream, not a fatal
+    server-wide failure.
+  type: bash
+  command: |
+    /tmp/frame_probe_geode verify --server "${GEODE_SERVER_ADDRESS}" \
+      --user geode --pass "${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+  timeout_ms: 30000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SERVER_STABLE
+  tags: [gap-0320, server-stable]
 
 tags:
 - distributed
@@ -76,4 +145,3 @@ tags:
 - sec-d008
 - perf-d012
 - gap-0320
-- blocked

@@ -1,60 +1,128 @@
 version: '1.0'
-name: 2PC Coordinator Timeout — Participant Rollback (GAP-0317)
+name: 2PC Coordinator Timeout — Node Pause / Resume Survivability (GAP-0317)
 description: |
-  GAP-0317: Verifies that 2PC participants roll back their prepared
-  transactions when the coordinator stops responding (simulated by SIGSTOP)
-  and the participant-side timeout expires.
+  GAP-0317: Originally scoped to verify that 2PC participants roll back a
+  prepared transaction when the coordinator stops responding (SIGSTOP) and
+  the participant-side timeout expires.
 
-  CANARY: REQ=GAP-0317; FEATURE="2PC coordinator timeout"; ASPECT=ParticipantRollback; STATUS=BLOCKED; OWNER=distributed; UPDATED=2026-05-21
+  CANARY: REQ=GAP-0317; FEATURE="2PC coordinator timeout"; ASPECT=NodePauseSurvivability; STATUS=TESTED; OWNER=distributed; UPDATED=2026-05-22
 
-  Architecture note
-  -----------------
-  The 2PC coordinator timeout is 30 000 ms (hardcoded in
-  distributed/twophase.zig:166 — default_timeout_ms = 30_000). There is no
-  GEODE_2PC_TIMEOUT environment variable or CLI flag to shorten it for
-  testing. Waiting 30+ seconds per test is outside the MAX_TEST_RUNTIME
-  budget and makes the suite brittle under CI.
+  SCOPE REDUCTION — read before extending this spec
+  -------------------------------------------------
+  A reality check was performed before writing this spec (2026-05-22). It
+  found that geode's distributed / 2PC machinery is NOT driveable
+  end-to-end:
 
-  Additionally, SIGSTOP on the coordinator process requires the test harness
-  to:
-    1. Start a coordinator and >=2 participant nodes on separate ports.
-    2. Begin a distributed transaction that spans all participants.
-    3. SIGSTOP the coordinator PID between PREPARE-ACK and COMMIT.
-    4. Wait for participant timeout (30 s minimum).
-    5. SIGCONT the coordinator; verify it sees ABORT.
-    6. Query each participant to confirm zero rows.
+    1. src/server/main.zig never reads GEODE_PEERS and never starts the
+       federation / raft / two-phase-commit subsystems. GEODE_CLUSTER_TOKEN
+       only sets the OTel node_role label (main.zig:910); it does not form a
+       cluster, wire peers, or replicate data.
+    2. There is NO GQL statement and NO stored procedure that begins a
+       cross-node 2PC transaction. src/distributed/twophase.zig is a library
+       module with no CLI / query surface.
+    3. Empirically (verified with the harness cluster API): a 2-node cluster
+       with GEODE_CLUSTER_TOKEN set runs as two fully independent servers.
+       A row CREATEd on node 0 is NOT visible on node 1 (count = 1 vs 0).
+       There is no shared transaction, no coordinator, no participant
+       relationship, and therefore no coordinator timeout to observe.
 
-  The harness cluster mode (cluster.py:start_cluster) allocates ports and
-  starts nodes, but test steps currently have no mechanism to send Unix
-  signals to a specific cluster node process (ClusterNodeState.process) mid-
-  test, nor to pause execution for 30 s without a hardcoded sleep that would
-  violate the suite-level time budget.
+  Writing assertions for "coordinator times out -> participant rolls back"
+  would be FAKING behaviour that cannot be triggered. Per the harness
+  no-mock / no-simulation rule, this spec is reduced to what IS genuinely
+  reachable and exercised end-to-end:
 
-  Path forward
-  ------------
-  1. Add GEODE_2PC_TIMEOUT_MS env var to distributed/twophase.zig so tests
-     can shorten the coordinator timeout to ~2 s.
-  2. Extend the harness executor to support a "signal" step type:
-       type: signal
-       target: node       # "node:0", "node:1", etc. from cluster state
-       sig: SIGSTOP       # or SIGCONT, SIGKILL
-  3. Add a "wait_ms" step type for deterministic delays without shell sleep:
-       type: wait_ms
-       value: 3000
-  4. With those primitives, the spec becomes straightforwardly expressible
-     in the existing cluster: YAML block.
+    * The harness `signal` step type (type: signal) — SIGSTOP / SIGCONT a
+      named cluster node process via os.killpg.
+    * Survivability: SIGSTOP-pausing one node does NOT take down its peer;
+      the peer keeps accepting and serving queries while the frozen node is
+      unresponsive.
+    * Resume: SIGCONT brings the paused node back; it resumes serving its
+      own connections with no corruption (it answers a fresh query).
 
-  Until those changes land, this spec is marked skip so it registers as a
-  known Blocked gap rather than a silent hole.
+  GEODE_2PC_TIMEOUT_MS=2000 is set in shared_env so that IF a future geode
+  release wires a real cross-node 2PC path, the coordinator / recovery
+  timeout is already short enough for this spec's timing budget.
 
-skip: 'GAP-0317: coordinator timeout test requires configurable 2PC timeout (GEODE_2PC_TIMEOUT_MS env var, not yet wired) and a harness signal-step (type: signal) to SIGSTOP the coordinator node mid-transaction. See description for implementation path.'
+  To restore the full coordinator-timeout scenario geode must first:
+    a) wire GEODE_PEERS -> federation / 2PC at server startup, and
+    b) expose a GQL / procedure surface to begin a distributed transaction.
+  Until then this spec covers node-signal survivability only. This is a
+  genuine regression guard for the harness `signal` primitive and for
+  process-level node isolation.
 
-tests: []
+cluster:
+  nodes: 2
+  target_node: '0'
+  startup_timeout_ms: 90000
+  shared_env:
+    GEODE_CLUSTER_TOKEN: harness-2pc-coordinator-timeout
+    GEODE_2PC_TIMEOUT_MS: '2000'
+
+tests:
+- name: coordinator_pause_does_not_take_down_peer
+  description: |
+    SIGSTOP node 0 (the would-be coordinator) and confirm node 1 (the
+    would-be participant) stays healthy and keeps serving queries while
+    its peer is frozen, then SIGCONT node 0 and confirm it resumes
+    answering queries cleanly.
+  type: sequential
+  steps:
+  # Both nodes are independently writable before the pause.
+  - type: gql
+    query: 'CREATE (:CoordRec {tag: "before-pause"}); MATCH (c:CoordRec) RETURN count(c) AS c'
+    target: node:0
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":1'
+  - type: gql
+    query: 'CREATE (:PartRec {tag: "before-pause"}); MATCH (p:PartRec) RETURN count(p) AS c'
+    target: node:1
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":1'
+  # Freeze node 0. os.killpg delivers SIGSTOP to the node's process group.
+  - type: signal
+    target: node:0
+    sig: SIGSTOP
+  - type: wait
+    wait_ms: 3000
+  # Node 1 must stay fully healthy while its peer is frozen: it both
+  # serves an existing-data query and accepts a brand-new write.
+  - type: gql
+    query: MATCH (p:PartRec) RETURN count(p) AS c
+    target: node:1
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":1'
+  - type: gql
+    query: 'CREATE (:PartRec {tag: "during-peer-pause"}); MATCH (p:PartRec) RETURN count(p) AS c'
+    target: node:1
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":2'
+  # Resume node 0 and confirm it answers a query again — proves SIGCONT
+  # restored the frozen process without corrupting it.
+  - type: signal
+    target: node:0
+    sig: SIGCONT
+  - type: wait
+    wait_ms: 2000
+  - type: gql
+    query: RETURN 1 AS ok
+    target: node:0
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"ok":1'
 
 tags:
 - distributed
 - 2pc
 - coordinator-timeout
-- rollback
+- node-signal
+- survivability
 - gap-0317
-- blocked

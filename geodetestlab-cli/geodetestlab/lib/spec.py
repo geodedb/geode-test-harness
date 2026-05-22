@@ -121,18 +121,38 @@ class HttpRequest:
 
 @dataclass
 class TestStep:
-    """A single step in a sequential test."""
+    """A single step in a sequential test.
 
-    step_type: str  # "gql", "http", "wait"
+    Step types
+    ----------
+    gql       — run a GQL query against the current server.
+    http      — issue an HTTP request.
+    wait      — sleep ``wait_ms`` milliseconds.
+    bash      — run a shell command.
+    signal    — send a Unix signal to a named cluster node process
+                (cluster-mode specs only). Requires ``target`` ("node:N")
+                and ``sig`` (SIGSTOP | SIGCONT | SIGKILL | SIGTERM).
+    restart_node — stop (if running) then restart a single cluster node
+                on its original port + data directory. Requires ``target``.
+    """
+
+    step_type: str  # "gql", "http", "wait", "bash", "signal", "restart_node"
     query: str | None = None
     method: str | None = None
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     body: str | None = None
+    command: str | None = None
     timeout_ms: int = 5000
     wait_ms: int = 0
     expected: HttpExpected | None = None
     gql_expected: dict[str, Any] | None = None
+    # Cluster-control fields (signal / restart_node steps)
+    target: str | None = None  # e.g. "node:0"
+    sig: str | None = None  # e.g. "SIGSTOP", "SIGCONT", "SIGKILL"
+    # When set, a gql step asserting the surviving server is reachable may
+    # tolerate a non-zero exit (used after SIGSTOP/SIGKILL on a peer node).
+    allow_failure: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestStep:
@@ -145,10 +165,14 @@ class TestStep:
             url=data.get("url"),
             headers=data.get("headers", {}),
             body=data.get("body"),
+            command=data.get("command"),
             timeout_ms=data.get("timeout_ms", 5000),
             wait_ms=data.get("wait_ms", 0),
             expected=HttpExpected.from_dict(data.get("expect")) if step_type == "http" else None,
             gql_expected=data.get("expect") if step_type == "gql" else None,
+            target=data.get("target"),
+            sig=data.get("sig"),
+            allow_failure=bool(data.get("allow_failure", False)),
         )
 
 

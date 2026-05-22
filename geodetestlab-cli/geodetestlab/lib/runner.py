@@ -29,7 +29,7 @@ from typing import Any
 import httpx
 
 from .cluster import start_cluster, stop_cluster
-from .cluster_types import ClusterState
+from .cluster_types import ClusterControlContext, ClusterState
 from .executor import (
     DEFAULT_HTTP_TIMEOUT_S,
     SSL_VERIFY,
@@ -509,6 +509,7 @@ def _execute_one_test(
     secrets: dict[str, str],
     timeout_ms: int,
     shared_http: httpx.Client | None,
+    cluster_ctx: ClusterControlContext | None = None,
 ) -> TestResult:
     if test_case.skip:
         return TestResult(
@@ -555,6 +556,7 @@ def _execute_one_test(
         data_dir=data_dir,
         verbose=verbose,
         http_client=shared_http,
+        cluster_ctx=cluster_ctx,
     )
 
     result = _retry_transient_failures(
@@ -693,6 +695,7 @@ def run_tests(
     data_dir = None
     server_state = ServerState(process=None, port=0, grpc_port=None)
     cluster_state: ClusterState | None = None
+    cluster_ctx: ClusterControlContext | None = None
 
     if spec.mode == "server":
         data_dir = Path(tempfile.mkdtemp(prefix="geode-test-"))
@@ -763,6 +766,18 @@ def run_tests(
                 grpc_port=target.grpc_port,
             )
 
+            # Cluster-control context — lets `signal` / `restart_node` steps
+            # reach individual node processes from inside a sequential test.
+            cluster_ctx = ClusterControlContext(
+                cluster_state=cluster_state,
+                cluster_config=cluster_config,
+                binary=binary,
+                base_env=env,
+                spec_server_args=spec.server_args,
+                verbose=verbose,
+                transport=transport,
+            )
+
     interrupted = False
 
     def _worker_signal_handler(signum: int, frame: Any) -> None:
@@ -821,6 +836,7 @@ def run_tests(
                             secrets,
                             timeout_ms,
                             _shared_http,
+                            cluster_ctx,
                         )
                     ] = tc
 
@@ -859,6 +875,7 @@ def run_tests(
                             secrets,
                             timeout_ms,
                             _shared_http,
+                            cluster_ctx,
                         )
                         result.cluster_node = node.node_id
                         _record_result(test_case, result)
@@ -892,6 +909,7 @@ def run_tests(
                         secrets,
                         timeout_ms,
                         _shared_http,
+                        cluster_ctx,
                     )
                     _record_result(test_case, result)
 

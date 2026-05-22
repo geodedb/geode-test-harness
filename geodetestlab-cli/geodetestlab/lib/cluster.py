@@ -217,6 +217,73 @@ def check_cluster_health(
     return alive, dead
 
 
+def restart_cluster_node(
+    cluster_state: ClusterState,
+    config: ClusterConfig,
+    node_id: int,
+    *,
+    binary: str,
+    base_env: dict[str, str],
+    spec_server_args: list[str],
+    verbose: bool,
+    transport: str = "quic",
+) -> ClusterNodeState:
+    """Stop (if still running) and restart a single cluster node.
+
+    The node is re-spawned on its **original port and data directory** so a
+    restart exercises WAL replay against the existing on-disk state.  Used by
+    the harness ``restart_node`` step type.
+
+    Returns the (mutated) ``ClusterNodeState`` for the restarted node.
+    Raises ``ValueError`` for an out-of-range ``node_id`` and ``RuntimeError``
+    if the node fails to come back up.
+    """
+    if node_id < 0 or node_id >= len(cluster_state.nodes):
+        msg = f"restart_cluster_node: node_id {node_id} out of range ({len(cluster_state.nodes)} nodes)"
+        raise ValueError(msg)
+
+    node = cluster_state.nodes[node_id]
+
+    # Stop the node if its process is still alive (a SIGKILLed node is
+    # already gone — poll() returns non-None — and stop_server is a no-op).
+    if node.process is not None and node.process.poll() is None:
+        try:
+            stop_server(node.process, verbose=verbose)
+        except Exception:
+            logger.warning("Error stopping node %d before restart", node_id, exc_info=True)
+
+    all_ports = [n.port for n in cluster_state.nodes]
+    node_env = _build_node_env(
+        config,
+        node_id=node_id,
+        base_env=base_env,
+        port=node.port,
+        grpc_port=node.grpc_port,
+        data_dir=node.data_dir,
+        all_ports=all_ports,
+    )
+    node_args = _build_node_args(config, node_id=node_id, spec_server_args=spec_server_args)
+
+    try:
+        process = start_server(
+            binary=binary,
+            data_dir=Path(node.data_dir),
+            port=node.port,
+            env=node_env,
+            args=node_args,
+            timeout_ms=config.startup_timeout_ms,
+            verbose=verbose,
+            grpc_port=node.grpc_port,
+        )
+    except Exception as exc:
+        logger.error("Failed to restart cluster node %d: %s", node_id, exc)
+        msg = f"restart_cluster_node: node {node_id} failed to restart: {exc}"
+        raise RuntimeError(msg) from exc
+
+    node.process = process
+    return node
+
+
 def restart_dead_nodes(
     cluster_state: ClusterState,
     config: ClusterConfig,

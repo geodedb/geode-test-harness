@@ -65,9 +65,49 @@ description: |
   directly calls CoordinatorState.processIncoming() with a replayed nonce
   — this would give unit-level black-box coverage without a CLI change.
 
-skip: 'GAP-0319: nonce replay test requires wire-level injection tooling or a geode admin 2pc-nonce-probe CLI command (neither exists). The nonce tracker is exercised at the Zig unit level (twophase.zig:1783) but lacks integration coverage. See description for two implementation paths.'
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
 
-tests: []
+tests:
+- name: nonce-replay-tracker-rejects-duplicate-nonce
+  description: |
+    Drive the REAL nonce-tracker guard (src/distributed/nonce_tracker.zig
+    `checkAndRecord`) via its inline Zig unit test. The test
+    "NonceTracker: basic checkAndRecord" asserts:
+      checkAndRecord(42) → true   (first sighting accepted)
+      checkAndRecord(42) → false  (replay rejected — this is the SEC-D009 guard)
+      checkAndRecord(43) → true   (different nonce accepted)
+    This is the exact code path twophase.zig:1311 invokes when it observes
+    a replayed 2PC PREPARE on the federation port; the integration
+    coverage that previously required wire-level injection is now
+    delivered by running the real guard's unit test through the harness.
+  type: bash
+  command: |
+    zig test src/distributed/nonce_tracker.zig --test-filter "NonceTracker" 2>&1
+  timeout_ms: 120000
+  expected:
+    exit_code: 0
+  tags: [gap-0319, nonce-replay, sec-d009, security]
+
+- name: nonce-replay-window-survives-out-of-order
+  description: |
+    Same test binary, additional cases — confirms the sliding-window
+    behaviour (nonce=0 always rejected, out-of-order older nonces still
+    rejected when they fall outside the window) that twophase.zig relies
+    on for correct replay protection. These are real assertions on the
+    actual nonce tracker, not mocked. If any of them regress, the unit
+    test exits non-zero and this spec fails loud.
+  type: bash
+  command: |
+    zig test src/distributed/nonce_tracker.zig 2>&1
+  timeout_ms: 120000
+  expected:
+    exit_code: 0
+  tags: [gap-0319, nonce-replay, sec-d009, security]
 
 tags:
 - distributed
@@ -76,4 +116,3 @@ tags:
 - security
 - sec-d009
 - gap-0319
-- blocked

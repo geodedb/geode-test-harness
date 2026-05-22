@@ -91,6 +91,22 @@ class ClusterState:
     nodes: list[ClusterNodeState] = field(default_factory=list)
     _round_robin_index: int = 0
 
+    def node_by_target(self, target: str) -> ClusterNodeState:
+        """Resolve a ``node:N`` target string to its ClusterNodeState.
+
+        Accepts both ``"node:0"`` and a bare ``"0"``.  Raises ``ValueError``
+        for malformed or out-of-range targets so callers can surface a
+        clear failure rather than an IndexError.
+        """
+        raw = target.split(":", 1)[1] if target.startswith("node:") else target
+        try:
+            idx = int(raw)
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise ValueError(f"invalid signal target {target!r}: expected 'node:N'") from exc
+        if idx < 0 or idx >= len(self.nodes):
+            raise ValueError(f"signal target {target!r} out of range (cluster has {len(self.nodes)} nodes)")
+        return self.nodes[idx]
+
     @property
     def leader_node(self) -> ClusterNodeState:
         """Node 0 is always treated as the leader."""
@@ -111,3 +127,21 @@ class ClusterState:
         node = self.nodes[self._round_robin_index % len(self.nodes)]
         self._round_robin_index += 1
         return node
+
+
+@dataclass
+class ClusterControlContext:
+    """Everything a cluster-control test step (signal / restart_node) needs.
+
+    Threaded from the runner through ``run_single_test`` into the sequential
+    executor so a step can resolve a named node, send it a Unix signal, or
+    restart it on its original port + data directory.
+    """
+
+    cluster_state: ClusterState
+    cluster_config: ClusterConfig
+    binary: str
+    base_env: dict[str, str]
+    spec_server_args: list[str] = field(default_factory=list)
+    verbose: bool = False
+    transport: str = "quic"

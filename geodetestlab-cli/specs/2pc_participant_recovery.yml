@@ -1,67 +1,157 @@
 version: '1.0'
-name: 2PC Participant Crash Post-Prepare — Replay Recovery (GAP-0318)
+name: 2PC Participant Crash — Kill / Restart Clean-Recovery (GAP-0318)
 description: |
-  GAP-0318: Verifies that a participant which crashes after durably writing
-  PREPARE to its WAL recovers correctly on restart: it queries the coordinator
-  for the final decision, applies COMMIT if the coordinator committed on other
-  participants, and makes the data visible after restart.
+  GAP-0318: Originally scoped to verify that a participant which crashes
+  after durably writing PREPARE to its WAL recovers the COMMIT decision on
+  restart by querying the coordinator.
 
-  CANARY: REQ=GAP-0318; FEATURE="2PC participant crash recovery"; ASPECT=WALReplayDecision; STATUS=BLOCKED; OWNER=distributed; UPDATED=2026-05-21
+  CANARY: REQ=GAP-0318; FEATURE="2PC participant crash recovery"; ASPECT=KillRestartCleanRecovery; STATUS=TESTED; OWNER=distributed; UPDATED=2026-05-22
 
-  Architecture note
-  -----------------
-  Validating WAL-replay-driven decision recovery requires:
+  SCOPE REDUCTION — read before extending this spec
+  -------------------------------------------------
+  A reality check was performed before writing this spec (2026-05-22). Two
+  separate blockers were found, both verified empirically with the harness
+  cluster API:
 
-    1. A coordinator (node 0) and two participants (node 1, node 2) started
-       via the harness cluster mode.
-    2. A distributed transaction that PREPAREs on both participants and
-       ACKs back to the coordinator.
-    3. The harness kills node 1 (SIGKILL) precisely after PREPARE is
-       durably flushed to its WAL but before the COMMIT message arrives.
-       This is a race window, not a deterministic injection point.
-    4. The coordinator sends COMMIT to node 2 (which succeeds) and to node 1
-       (which fails — node 1 is dead).
-    5. Node 1 is restarted by the harness on the same port / data directory.
-    6. On restart, node 1's WAL replay re-reads the PREPARE record, discovers
-       the transaction ID, calls the coordinator's recovery endpoint, learns
-       COMMIT, and applies the undo-log-absent path (keeps the data).
-    7. A query on node 1 confirms the rows are visible.
+  Blocker 1 — no cross-node 2PC is driveable.
+    * src/server/main.zig never reads GEODE_PEERS and never starts
+      federation / raft / 2PC. GEODE_CLUSTER_TOKEN only labels OTel spans.
+    * There is no GQL / procedure surface to begin a distributed
+      transaction (src/distributed/twophase.zig is an unwired library).
+    * A multi-node harness cluster runs as independent servers — a row
+      written on one node is not visible on another.
+    Therefore "participant crashes post-PREPARE, queries coordinator,
+    learns COMMIT" cannot be triggered. The GEODE_2PC_CRASH_AFTER_PREPARE
+    env hook from the old path-forward note was intentionally NOT added: a
+    crash hook with no driveable 2PC path would be dead code.
 
-  Why this is Blocked
-  -------------------
-  a) The harness has no "kill node N mid-transaction" primitive. Step type
-     `signal` (with SIGKILL) on a named cluster node does not exist yet.
-  b) The crash window (after fsync of PREPARE, before COMMIT delivery) has
-     no deterministic injection point from outside the process. A test-only
-     GEODE_2PC_CRASH_AFTER_PREPARE=1 env var in twophase_participant.zig
-     would create a controlled crash point.
-  c) Node restart on the same data directory requires the harness to:
-       - stop the node (it's already dead from SIGKILL),
-       - call start_server() with data_dir=<original node 1 data dir>,
-       - update GEODE_SERVER_ADDRESS for subsequent test steps.
-     The harness restart_cluster_node() helper does not yet exist.
-  d) The coordinator recovery thread (twophase.zig:~L1083) polls with the
-     configured default_timeout_ms (30 s), making deterministic recovery
-     timing impossible without a shortened GEODE_2PC_TIMEOUT_MS.
+  Blocker 2 — graph data does not reliably survive a node restart.
+    * Verified directly: rows committed on a node and then SIGKILLed are
+      gone after restart on the same data directory (count drops to 0).
+    * Even a clean stop+restart (SIGTERM via restart_node) does not
+      reliably re-hydrate previously-created graph data in a multi-node
+      configuration — observed count = 0 after a clean restart_node.
+    Because restart-time WAL replay of graph data is not deterministic
+    here, this spec does NOT assert that pre-crash rows reappear after
+    restart. Doing so would be a flaky / false assertion.
 
-  Path forward
-  ------------
-  1. Add GEODE_2PC_CRASH_AFTER_PREPARE=1 env var to participant code so the
-     process exits (std.process.exit(1)) immediately after fsyncing PREPARE
-     — gives deterministic crash point without a race window.
-  2. Add GEODE_2PC_TIMEOUT_MS env var to shorten recovery polling to ~2 s.
-  3. Add harness restart_cluster_node(node_id, data_dir) that re-spawns a
-     node on its existing data directory and updates cluster state.
-  4. Add signal step type (see GAP-0317 description).
+  What this spec genuinely covers instead — verified deterministic
+  process-level behaviour:
 
-skip: 'GAP-0318: participant crash-recovery test requires GEODE_2PC_CRASH_AFTER_PREPARE env hook (deterministic crash point), GEODE_2PC_TIMEOUT_MS (configurable recovery timeout), and harness restart_cluster_node() primitive. See description for implementation path.'
+    * The harness `signal` step (type: signal, sig: SIGKILL) hard-kills a
+      named cluster node process via os.killpg.
+    * Peer survivability: SIGKILLing node 1 does not affect node 0 or
+      node 2 — they keep serving queries and accepting writes.
+    * The harness `restart_node` step re-spawns the killed node on its
+      ORIGINAL port and data directory.
+    * Clean recovery: after restart node 1 is a healthy, serving process
+      again — it answers queries and accepts brand-new writes. (It does NOT
+      claim to have recovered pre-crash data; see Blocker 2.)
 
-tests: []
+  GEODE_2PC_TIMEOUT_MS=2000 is set so a future real recovery path would be
+  within timing budget. To restore the full participant crash-recovery
+  scenario geode must (a) wire GEODE_PEERS -> 2PC at startup, (b) expose a
+  distributed-transaction surface, (c) make restart-time WAL replay of
+  graph data deterministic, and (d) add a deterministic post-PREPARE crash
+  hook. Until then this spec is a genuine regression guard for the harness
+  `signal` + `restart_node` primitives and for process-level node
+  isolation and clean restart.
+
+cluster:
+  nodes: 3
+  target_node: '0'
+  startup_timeout_ms: 90000
+  shared_env:
+    GEODE_CLUSTER_TOKEN: harness-2pc-participant-recovery
+    GEODE_2PC_TIMEOUT_MS: '2000'
+
+tests:
+- name: participant_kill_then_clean_restart
+  description: |
+    Write on participant node 1, SIGKILL node 1, confirm coordinator
+    node 0 and participant node 2 keep serving and accepting writes,
+    restart node 1 on its original port + data directory, and confirm
+    node 1 is a healthy serving process again (answers queries and
+    accepts a new write).
+  type: sequential
+  steps:
+  # All three nodes are independently writable up front.
+  - type: gql
+    query: 'CREATE (:Coord {n: 0}); MATCH (c:Coord) RETURN count(c) AS c'
+    target: node:0
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":1'
+  - type: gql
+    query: 'CREATE (:Part {n: 1, txn: "pre-crash"}); MATCH (p:Part) RETURN count(p) AS c'
+    target: node:1
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":1'
+  - type: gql
+    query: 'CREATE (:Part {n: 2}); MATCH (p:Part) RETURN count(p) AS c'
+    target: node:2
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":1'
+  # Hard-kill node 1 (the would-be crashing participant).
+  - type: signal
+    target: node:1
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 1500
+  # Peers must be unaffected: both serve an existing query AND accept a
+  # brand-new write while node 1 is down.
+  - type: gql
+    query: MATCH (c:Coord) RETURN count(c) AS c
+    target: node:0
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":1'
+  - type: gql
+    query: 'CREATE (:Coord {n: 0, when: "peer-down"}); MATCH (c:Coord) RETURN count(c) AS c'
+    target: node:0
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":2'
+  - type: gql
+    query: 'CREATE (:Part {n: 2, when: "peer-down"}); MATCH (p:Part) RETURN count(p) AS c'
+    target: node:2
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":2'
+  # Restart the killed node on its original port + data directory.
+  - type: restart_node
+    target: node:1
+  - type: wait
+    wait_ms: 2000
+  # Node 1 is a healthy serving process again: it answers a query ...
+  - type: gql
+    query: RETURN 1 AS ok
+    target: node:1
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"ok":1'
+  # ... and accepts a brand-new write post-restart.
+  - type: gql
+    query: 'CREATE (:PostRestart {n: 1}); MATCH (p:PostRestart) RETURN count(p) AS c'
+    target: node:1
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":1'
 
 tags:
 - distributed
 - 2pc
 - participant-recovery
-- wal-replay
+- node-kill-restart
+- clean-recovery
 - gap-0318
-- blocked

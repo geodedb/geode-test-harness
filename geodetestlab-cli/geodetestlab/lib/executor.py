@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import shlex
+import signal as _signal
 import subprocess
 import time
 from pathlib import Path
@@ -18,8 +19,10 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from .checks import check_expectations, check_http_expectations
+from .cluster import restart_cluster_node
+from .cluster_types import ClusterControlContext
 from .runner_types import DEFAULT_ADMIN_PASSWORD, DEFAULT_GRPC_PORT, DEFAULT_QUIC_PORT, TestResult
-from .spec import PlaintextCheck, TestCase
+from .spec import PlaintextCheck, TestCase, TestStep
 from .utils import is_valid_gql, sanitize_args
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,15 @@ if not SSL_VERIFY:
         "SSL verification disabled (GEODE_VERIFY_SSL=%s). Set GEODE_VERIFY_SSL=1 to enable certificate verification.",
         os.environ.get("GEODE_VERIFY_SSL", "0"),
     )
+
+
+def _as_list(value: object) -> list[str]:
+    """Normalize a scalar-or-list expectation field to a list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    return [str(value)]
 
 
 def _escape_gql_string(s: str) -> str:
@@ -240,6 +252,7 @@ def run_single_test(
     data_dir: Path | None,
     verbose: bool,
     http_client: httpx.Client | None = None,
+    cluster_ctx: ClusterControlContext | None = None,
 ) -> TestResult:
     """Run a single test case, dispatching by test type.
 
@@ -248,12 +261,23 @@ def run_single_test(
     http_client : httpx.Client | None
         Optional shared HTTP client for connection reuse across tests
         within the same spec (PERF-007).
+    cluster_ctx : ClusterControlContext | None
+        Present for cluster-mode specs.  Required for ``signal`` and
+        ``restart_node`` steps inside a sequential test.
     """
     if test_case.test_type == "http":
         return _run_http_test(test_case, env, verbose, http_client=http_client)
     elif test_case.test_type == "sequential":
         return _run_sequential_test(
-            test_case, binary, env, secrets, timeout_ms, data_dir, verbose, http_client=http_client
+            test_case,
+            binary,
+            env,
+            secrets,
+            timeout_ms,
+            data_dir,
+            verbose,
+            http_client=http_client,
+            cluster_ctx=cluster_ctx,
         )
     elif test_case.test_type == "bash":
         return _run_shell_test(test_case, env, verbose)
@@ -930,6 +954,92 @@ def _run_shell_test(
         )
 
 
+# ---------------------------------------------------------------------------
+# Cluster-control step handlers (signal / restart_node)
+# ---------------------------------------------------------------------------
+
+# Signals a `signal` step is permitted to deliver to a cluster node.
+_ALLOWED_SIGNALS = {
+    "SIGSTOP": _signal.SIGSTOP,
+    "SIGCONT": _signal.SIGCONT,
+    "SIGKILL": _signal.SIGKILL,
+    "SIGTERM": _signal.SIGTERM,
+}
+
+
+def _run_signal_step(step: TestStep, cluster_ctx: ClusterControlContext | None) -> tuple[bool, str]:
+    """Send a Unix signal to a named cluster node process.
+
+    Each cluster node is started with ``start_new_session=True`` (its own
+    process group), so the signal is delivered to the whole group via
+    ``os.killpg`` — this reliably reaches the server even if it spawned
+    children.  Returns ``(ok, message)``.
+    """
+    if cluster_ctx is None:
+        return False, "signal step requires cluster mode (no cluster context available)"
+    if not step.target:
+        return False, "signal step missing 'target' (expected 'node:N')"
+    if not step.sig:
+        return False, "signal step missing 'sig' (expected SIGSTOP/SIGCONT/SIGKILL/SIGTERM)"
+
+    sig_name = step.sig.strip().upper()
+    sig = _ALLOWED_SIGNALS.get(sig_name)
+    if sig is None:
+        return False, f"signal step: unsupported signal {step.sig!r} (allowed: {sorted(_ALLOWED_SIGNALS)})"
+
+    try:
+        node = cluster_ctx.cluster_state.node_by_target(step.target)
+    except ValueError as exc:
+        return False, str(exc)
+
+    if node.process is None:
+        return False, f"signal step: node {step.target} has no process (already stopped?)"
+
+    pid = node.process.pid
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        # The process is already gone. SIGKILL/SIGTERM on a dead node is a
+        # benign no-op; treat it as success. SIGSTOP/SIGCONT cannot apply.
+        if sig_name in ("SIGKILL", "SIGTERM"):
+            return True, f"node {step.target} (pid {pid}) already exited; {sig_name} no-op"
+        return False, f"signal step: node {step.target} (pid {pid}) is not running, cannot {sig_name}"
+    except PermissionError as exc:  # pragma: no cover - environment dependent
+        return False, f"signal step: not permitted to {sig_name} node {step.target}: {exc}"
+
+    return True, f"sent {sig_name} to node {step.target} (pid {pid})"
+
+
+def _run_restart_node_step(step: TestStep, cluster_ctx: ClusterControlContext | None) -> tuple[bool, str]:
+    """Restart a single cluster node on its original port + data directory."""
+    if cluster_ctx is None:
+        return False, "restart_node step requires cluster mode (no cluster context available)"
+    if not step.target:
+        return False, "restart_node step missing 'target' (expected 'node:N')"
+
+    try:
+        node = cluster_ctx.cluster_state.node_by_target(step.target)
+    except ValueError as exc:
+        return False, str(exc)
+
+    try:
+        restart_cluster_node(
+            cluster_ctx.cluster_state,
+            cluster_ctx.cluster_config,
+            node.node_id,
+            binary=cluster_ctx.binary,
+            base_env=cluster_ctx.base_env,
+            spec_server_args=cluster_ctx.spec_server_args,
+            verbose=cluster_ctx.verbose,
+            transport=cluster_ctx.transport,
+        )
+    except (ValueError, RuntimeError) as exc:
+        return False, f"restart_node step failed for {step.target}: {exc}"
+
+    return True, f"restarted node {step.target} on port {node.port} (data_dir {node.data_dir})"
+
+
 def _run_sequential_test(
     test_case: TestCase,
     binary: str,
@@ -940,6 +1050,7 @@ def _run_sequential_test(
     verbose: bool,
     *,
     http_client: httpx.Client | None = None,
+    cluster_ctx: ClusterControlContext | None = None,
 ) -> TestResult:
     """Run a sequential test case with multiple steps."""
     start_time = time.time()
@@ -964,6 +1075,32 @@ def _run_sequential_test(
                 if step.step_type == "wait":
                     time.sleep(step.wait_ms / 1000.0)
                     outputs.append(f"Step {i + 1}: waited {step.wait_ms}ms")
+
+                elif step.step_type == "signal":
+                    ok, message = _run_signal_step(step, cluster_ctx)
+                    if not ok:
+                        errors.append(f"Step {i + 1} failed: {message}")
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs),
+                            error="\n".join(errors),
+                        )
+                    outputs.append(f"Step {i + 1}: signal — {message}")
+
+                elif step.step_type == "restart_node":
+                    ok, message = _run_restart_node_step(step, cluster_ctx)
+                    if not ok:
+                        errors.append(f"Step {i + 1} failed: {message}")
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs),
+                            error="\n".join(errors),
+                        )
+                    outputs.append(f"Step {i + 1}: restart_node — {message}")
 
                 elif step.step_type == "http":
                     # Execute HTTP step
@@ -992,28 +1129,16 @@ def _run_sequential_test(
                     outputs.append(f"Step {i + 1}: HTTP {response.status_code} OK")
 
                 elif step.step_type == "gql":
-                    # Execute GQL query step
-                    cmd = [binary, "query", step.query or ""]
-                    cmd.extend(["--server", server_addr])
-                    if use_grpc:
-                        cmd.append("--grpc")
-                    else:
-                        cmd.extend(["--insecure-tls-skip-verify"])
-                    cmd.extend(["-U", "geode", "-P", admin_password])
-
-                    result = subprocess.run(
-                        cmd,
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        timeout=step.timeout_ms / 1000.0,
-                    )
-
-                    if step.gql_expected:
-                        # Check GQL expectations
-                        expected_status = step.gql_expected.get("status_class")
-                        if expected_status and expected_status not in result.stdout:
-                            errors.append(f"Step {i + 1} failed: expected status {expected_status}")
+                    # Execute GQL query step.  ``target`` may redirect the
+                    # query at a specific cluster node ("node:N"); otherwise
+                    # the spec-level target node is used.
+                    step_server_addr = server_addr
+                    if step.target and cluster_ctx is not None:
+                        try:
+                            tnode = cluster_ctx.cluster_state.node_by_target(step.target)
+                            step_server_addr = tnode.address
+                        except ValueError as exc:
+                            errors.append(f"Step {i + 1} failed: {exc}")
                             return TestResult(
                                 name=test_case.name,
                                 passed=False,
@@ -1022,7 +1147,67 @@ def _run_sequential_test(
                                 error="\n".join(errors),
                             )
 
-                    outputs.append(f"Step {i + 1}: GQL OK")
+                    cmd = [binary, "query", step.query or ""]
+                    cmd.extend(["--server", step_server_addr])
+                    if use_grpc:
+                        cmd.append("--grpc")
+                    else:
+                        cmd.extend(["--insecure-tls-skip-verify"])
+                    cmd.extend(["-U", "geode", "-P", admin_password])
+
+                    try:
+                        result = subprocess.run(
+                            cmd,
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            timeout=step.timeout_ms / 1000.0,
+                        )
+                    except subprocess.TimeoutExpired:
+                        if step.allow_failure:
+                            outputs.append(f"Step {i + 1}: GQL timed out (allow_failure)")
+                            continue
+                        errors.append(f"Step {i + 1} failed: GQL query timed out")
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs),
+                            error="\n".join(errors),
+                        )
+
+                    step_failed = result.returncode != 0
+                    failure_detail = ""
+
+                    if step.gql_expected:
+                        expected_status = step.gql_expected.get("status_class")
+                        if expected_status and expected_status not in result.stdout:
+                            step_failed = True
+                            failure_detail = f"expected status {expected_status}"
+
+                        for needle in _as_list(step.gql_expected.get("stdout_contains")):
+                            if needle not in result.stdout:
+                                step_failed = True
+                                failure_detail = f"stdout missing {needle!r}"
+
+                        for needle in _as_list(step.gql_expected.get("stdout_not_contains")):
+                            if needle in result.stdout:
+                                step_failed = True
+                                failure_detail = f"stdout unexpectedly contains {needle!r}"
+
+                    if step_failed and not step.allow_failure:
+                        detail = failure_detail or (result.stderr.strip() or "non-zero exit")
+                        errors.append(f"Step {i + 1} failed: GQL {detail}")
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs) + "\n" + result.stdout,
+                            error="\n".join(errors),
+                        )
+
+                    suffix = " (allow_failure)" if step_failed else ""
+                    outputs.append(f"Step {i + 1}: GQL OK{suffix} :: {result.stdout.strip()[:160]}")
 
         finally:
             if _owned_seq:
