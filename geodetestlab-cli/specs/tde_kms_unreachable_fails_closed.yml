@@ -22,7 +22,68 @@ description: |
 
   CANARY: REQ=REQ-TDE-KMS-001; FEATURE="TDE KMS fail-closed"; ASPECT=KMSUnreachable; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
 
-skip: 'GAP-0296: KMS external provider flag (--kms-url / GEODE_KMS_URL) not yet wired into the geode serve CLI. The serve command does not accept a --kms-url flag as of 2026-05-21. When the flag is added, remove this skip and validate that exit_code != 0 with a KMS-error message on stderr.'
+# GAP-0296 UNSKIPPED 2026-05-22:
+#   - GEODE_KMS_URL env var is wired in src/server/main.zig:751.
+#   - tde_key_manager.configureKMS now TCP-probes IP-literal endpoints
+#     (e.g. 127.0.0.1:1) and returns configured=false when unreachable.
+#   - main.zig refuses to start (error.KmsUnreachable) when
+#     configured=false, satisfying the fail-closed contract.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants: []
+fuzz:
+  enabled: false
+
+tests:
+- name: kms-unreachable-fails-closed
+  description: |
+    Launch `geode serve` with GEODE_KMS_URL pointing at 127.0.0.1:1 (unreachable).
+    Server must exit non-zero with a KMS error message.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    GEODE_BIN=""
+    for p in \
+      "${GEODE_STATE_DIR}/../../zig-out/bin/geode" \
+      "$(dirname "$(dirname "$(dirname "$PWD")")")/geode/zig-out/bin/geode" \
+      "../../../geode/zig-out/bin/geode" \
+      "$(command -v geode 2>/dev/null)"; do
+      if [ -x "$p" ]; then GEODE_BIN="$p"; break; fi
+    done
+    if [ -z "$GEODE_BIN" ]; then
+      echo "SKIP: geode binary not found"
+      exit 0
+    fi
+    DATA_DIR=$(mktemp -d /tmp/geode-kms-unreachable.XXXXXX)
+    OUT=$(GEODE_KMS_URL=127.0.0.1:1 \
+          GEODE_ALLOW_TEST_AUDIT_KEYS=1 \
+          timeout 15 "$GEODE_BIN" serve --listen 127.0.0.1:0 \
+            --data-dir "$DATA_DIR" --log-level warn --no-cluster 2>&1)
+    EXIT=$?
+    rm -rf "$DATA_DIR"
+    echo "$OUT" | tail -10
+    echo "EXIT=$EXIT"
+    if [ "$EXIT" -eq 0 ]; then
+      echo "FAIL: server started despite unreachable KMS"
+      exit 1
+    fi
+    echo "$OUT" | grep -i -q "kms\|KmsUnreachable\|unreachable" || {
+      echo "FAIL: stderr lacks KMS-error keyword"
+      exit 1
+    }
+    echo "KMS_FAIL_CLOSED_OK"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - KMS_FAIL_CLOSED_OK
+  tags: [tde, kms, fail-closed, gap-0296]
 
 tags:
 - tde
