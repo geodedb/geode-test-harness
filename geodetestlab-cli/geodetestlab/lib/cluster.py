@@ -10,7 +10,9 @@ from __future__ import annotations
 import logging
 import secrets
 import shutil
+import socket
 import tempfile
+import time
 from pathlib import Path
 
 from .cluster_types import ClusterConfig, ClusterNodeState, ClusterState
@@ -24,6 +26,38 @@ logger = logging.getLogger(__name__)
 # distinct intra-cluster QUIC listener while preserving the client port for
 # the spec runner.
 CLUSTER_PORT_OFFSET = 1000
+
+
+def _udp_port_bound(port: int) -> bool:
+    """Return True iff the given UDP port is bound by another process.
+
+    QUIC uses UDP; geode's intra-cluster QUIC listener binds the cluster_port.
+    The bind-probe pattern matches server._port_is_bound: try to bind, OSError
+    means the port is in use (= listener is up).
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.bind(("127.0.0.1", port))
+            return False
+    except OSError:
+        return True
+
+
+def _wait_for_cluster_port(port: int, deadline_s: float = 15.0) -> bool:
+    """Wait until ``port`` is bound (i.e. the cluster's intra-cluster QUIC
+    listener is up). Returns True on success, False on timeout.
+
+    Without this gate, ``start_cluster`` proceeds to start node N+1 before
+    node N's cluster_port is listening, which under simultaneous mutual
+    dialing can cause asymmetric handshake failures (one direction of one
+    peer pair fails permanently while others succeed).
+    """
+    start = time.monotonic()
+    while time.monotonic() - start < deadline_s:
+        if _udp_port_bound(port):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _build_node_env(
@@ -208,6 +242,19 @@ def start_cluster(
                 process=process,
             )
         )
+
+        # Wait for this node's intra-cluster QUIC listener to come up before
+        # starting the next node. Otherwise the next node would immediately
+        # try to dial all peers (including this one) while this one's
+        # cluster_port is still binding, producing asymmetric handshake
+        # failures under simultaneous startup.
+        cluster_port = ports[i] + CLUSTER_PORT_OFFSET
+        if not _wait_for_cluster_port(cluster_port, deadline_s=15.0):
+            logger.warning(
+                "Node %d cluster_port %d did not bind within 15s; continuing anyway",
+                i,
+                cluster_port,
+            )
 
     # Per-process QUIC listeners are up — now wait for raft to elect a leader
     # and for every node to agree on the membership view. This is the real
