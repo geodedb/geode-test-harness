@@ -183,8 +183,18 @@ def start_cluster(
     # this, _build_node_env's per-node auto-generation gave each of the N
     # nodes a different token, and they rejected each other's raft frames
     # ("Raft frame rejected: invalid or missing cluster token from=X").
-    if "GEODE_CLUSTER_TOKEN" not in config.shared_env:
+    #
+    # Check both config.shared_env AND base_env so specs that explicitly
+    # set GEODE_CLUSTER_TOKEN via spec.env (e.g. the 2pc cluster-token
+    # enforcement test) keep their declared value when the harness promotes
+    # them to cluster mode via --force-cluster-size.
+    if "GEODE_CLUSTER_TOKEN" not in config.shared_env and "GEODE_CLUSTER_TOKEN" not in base_env:
         config.shared_env["GEODE_CLUSTER_TOKEN"] = secrets.token_hex(16)
+    elif "GEODE_CLUSTER_TOKEN" in base_env and "GEODE_CLUSTER_TOKEN" not in config.shared_env:
+        # Promote the spec-supplied token from base_env into shared_env so
+        # _build_node_env's shared_env-wins-over-base_env layering doesn't
+        # accidentally lose it when another shared_env key is set.
+        config.shared_env["GEODE_CLUSTER_TOKEN"] = base_env["GEODE_CLUSTER_TOKEN"]
 
     # Pre-allocate ports
     ports: list[int] = []
