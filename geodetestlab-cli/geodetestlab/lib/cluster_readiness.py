@@ -59,17 +59,26 @@ def _probe_node(
         )
         if result.returncode != 0:
             return None
-        # `geode query --format json` outputs JSONL: one row per line.
+        # `geode query --format json` emits a single JSON object per query
+        # with a `rows` array containing the actual result rows. Older code
+        # mistakenly treated each output line as one row (which gave
+        # member_count=1 for any cluster). Parse the object and extract rows.
         rows: list[dict] = []
         for line in result.stdout.splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                obj = json.loads(line)
             except json.JSONDecodeError:
-                # Tolerate non-JSON log noise on stdout; only count parseable rows.
                 continue
+            inner = obj.get("rows")
+            if isinstance(inner, list):
+                rows.extend(r for r in inner if isinstance(r, dict))
+            elif isinstance(obj, dict) and "node_id" in obj:
+                # Defensive: if the harness ever switches to JSONL-of-rows,
+                # this branch still works.
+                rows.append(obj)
         if not rows:
             return None
         leader_ids = {r.get("leader_id") for r in rows if "leader_id" in r}
