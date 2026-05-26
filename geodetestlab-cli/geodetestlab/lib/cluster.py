@@ -178,6 +178,14 @@ def start_cluster(
     Returns a ``ClusterState`` describing the running cluster.
     Raises ``RuntimeError`` if any node fails to start.
     """
+    # Pre-generate ONE GEODE_CLUSTER_TOKEN for the whole cluster and inject
+    # it into config.shared_env so every node sees the same token. Without
+    # this, _build_node_env's per-node auto-generation gave each of the N
+    # nodes a different token, and they rejected each other's raft frames
+    # ("Raft frame rejected: invalid or missing cluster token from=X").
+    if "GEODE_CLUSTER_TOKEN" not in config.shared_env:
+        config.shared_env["GEODE_CLUSTER_TOKEN"] = secrets.token_hex(16)
+
     # Pre-allocate ports
     ports: list[int] = []
     grpc_ports: list[int | None] = []
