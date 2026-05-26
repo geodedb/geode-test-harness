@@ -8,6 +8,7 @@ from ``server.py``.
 from __future__ import annotations
 
 import logging
+import secrets
 import shutil
 import tempfile
 from pathlib import Path
@@ -18,6 +19,11 @@ from .server import start_server, stop_server
 from .utils import get_free_port
 
 logger = logging.getLogger(__name__)
+
+# Convention: cluster_port = client_port + 1000. Lets each cluster node bind a
+# distinct intra-cluster QUIC listener while preserving the client port for
+# the spec runner.
+CLUSTER_PORT_OFFSET = 1000
 
 
 def _build_node_env(
@@ -51,15 +57,49 @@ def _build_node_env(
     env["PORT"] = str(port)
     env["GEODE_STATE_DIR"] = data_dir
     env["GEODE_ADMIN_PASSWORD"] = env.get("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
-    env["GEODE_NODE_ID"] = str(node_id)
+    # Raft (raft-0.1.3) rejects node_id=0 as InvalidId. Harness counters
+    # are 0-indexed for cluster_state.nodes lookups, so we remap to 1-indexed
+    # when injecting into geode's env. The geode-side subprocess smoke test
+    # (tests/test_cluster_3node_subprocess.zig) uses the same 1-indexed
+    # convention.
+    env["GEODE_NODE_ID"] = str(node_id + 1)
 
     if grpc_port is not None:
         env["GEODE_GRPC_ADDRESS"] = f"127.0.0.1:{grpc_port}"
 
-    # Build peer list (all ports except this node's port)
+    # Inject the intra-cluster Raft QUIC port. Convention: client_port + 1000.
+    # Geode's cluster_bootstrap reads GEODE_CLUSTER_PORT to bind the
+    # intra-cluster listener separately from the client-facing QUIC port.
+    cluster_port = port + CLUSTER_PORT_OFFSET
+    env["GEODE_CLUSTER_PORT"] = str(cluster_port)
+
+    # Auto-generate a per-spec cluster token if the spec did not set one.
+    # All nodes in this start_cluster() invocation share the same env source
+    # so they get the same token. The token authenticates intra-cluster RPC.
+    if "GEODE_CLUSTER_TOKEN" not in env:
+        env["GEODE_CLUSTER_TOKEN"] = secrets.token_hex(16)
+
+    # Loopback cluster traffic still goes through QUIC+TLS but with
+    # self-signed certs, so we must opt the test harness into the debug-only
+    # insecure-TLS path. Specs can override by setting the env to "0".
+    if "GEODE_CLUSTER_INSECURE" not in env:
+        env["GEODE_CLUSTER_INSECURE"] = "1"
+
+    # Build peer list using CLUSTER ports, not client ports. The intra-cluster
+    # listener binds to cluster_port, so peers must dial that port to reach
+    # the raft transport. Before this fix, peers pointed at client ports and
+    # raft RPC silently dropped.
+    #
+    # We emit ALL nodes in the cluster (including self) in a stable order
+    # so each geode bootstrap can derive a peer's node_id directly from its
+    # position in the list (idx+1). The bootstrap skips the self entry by
+    # matching the cluster port. This keeps node_id assignment globally
+    # consistent — without it, when node N has self_id=N, peer position
+    # collisions cause node N's view of the cluster to be smaller than
+    # peers' views, which breaks Raft quorum.
     if all_ports is not None:
-        peers = [f"127.0.0.1:{p}" for p in all_ports if p != port]
-        env["GEODE_PEERS"] = ",".join(peers)
+        all_cluster_ports = [p + CLUSTER_PORT_OFFSET for p in all_ports]
+        env["GEODE_PEERS"] = ",".join(f"127.0.0.1:{cp}" for cp in all_cluster_ports)
 
     return env
 
@@ -169,7 +209,25 @@ def start_cluster(
             )
         )
 
-    return ClusterState(nodes=nodes)
+    # Per-process QUIC listeners are up — now wait for raft to elect a leader
+    # and for every node to agree on the membership view. This is the real
+    # readiness gate; without it, specs that query the cluster right after
+    # start_cluster would race the election window.
+    from .cluster_readiness import wait_for_cluster_ready
+
+    final_state = ClusterState(nodes=nodes)
+    deadline_s = max(60.0, config.startup_timeout_ms / 1000.0)
+    if not wait_for_cluster_ready(
+        final_state,
+        binary=binary,
+        admin_password=base_env.get("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
+        deadline_s=deadline_s,
+    ):
+        stop_cluster(final_state, verbose=verbose, cleanup_data=True)
+        msg = f"Cluster of {config.node_count} nodes failed to reach READY within {deadline_s:.0f}s"
+        raise RuntimeError(msg)
+
+    return final_state
 
 
 def stop_cluster(
