@@ -22,6 +22,7 @@ def _run_single_spec(
     server_port: int | None,
     verbose: bool,
     transport: str = "quic",
+    force_cluster_size: int = 1,
 ) -> dict[str, Any]:
     """Run tests for a single spec file.
 
@@ -76,6 +77,7 @@ def _run_single_spec(
             server_port=server_port,
             verbose=verbose,
             transport=transport,
+            force_cluster_size=force_cluster_size,
         )
         result["exit_code"] = exit_code
         if "results" in summary:

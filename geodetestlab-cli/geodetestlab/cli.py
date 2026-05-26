@@ -231,6 +231,18 @@ def run(
         "quic",
         help="Transport protocol: quic, grpc, or both",
     ),
+    force_cluster_size: int = typer.Option(
+        1,
+        "--force-cluster-size",
+        min=1,
+        max=10,
+        help=(
+            "Promote specs lacking a `cluster:` block to N-node clusters. "
+            "Specs with `single_node_only: true` opt out. Default 1 = no "
+            "promotion (single-node behavior). Use 3/5/10 to run the full "
+            "suite against multi-node deployments."
+        ),
+    ),
 ) -> None:
     """Execute all tests defined in a specification file or directory.
 
@@ -370,6 +382,7 @@ def run(
                         None,  # server_port=None to auto-allocate unique ports
                         verbose,
                         current_transport,
+                        force_cluster_size,
                     ): spec_file
                     for spec_file in spec_files
                 }
@@ -461,6 +474,7 @@ def run(
                             None,
                             verbose,
                             current_transport,
+                            force_cluster_size,
                         )
 
                         retry_summary = retry_result["summary"]
@@ -564,6 +578,7 @@ def run(
                         "server_port": server_port,
                         "verbose": verbose,
                         "transport": current_transport,
+                        "force_cluster_size": force_cluster_size,
                     }
                     exit_code, summary = run_tests(**run_kwargs)
                     failed_count = summary.get("failed", 0)

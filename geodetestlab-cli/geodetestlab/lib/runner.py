@@ -658,6 +658,35 @@ def _generate_report(
             json.dump(report, f, indent=2)
 
 
+def _apply_force_cluster_size(spec: TestSpec, size: int) -> None:
+    """Promote a spec without a ``cluster:`` block to an N-node cluster.
+
+    Used by the harness's ``--force-cluster-size N`` flag (Task B3 of the
+    2026-05-25 distributed cluster testing plan). The harness needs a way
+    to run the full single-node spec suite against 1-, 3-, 5-, 10-node
+    deployments without modifying every spec.
+
+    Semantics:
+      - size <= 1: no-op (cluster mode not requested)
+      - spec.cluster_config already set: no-op (spec wins over CLI flag)
+      - spec has ``single_node_only`` set truthy: opt-out, no-op
+      - otherwise: synthesize ClusterConfig.from_size(size) and switch
+        spec.mode to ``"cluster"`` so run_tests takes the cluster path.
+
+    Idempotent. Mutates ``spec`` in place.
+    """
+    if size <= 1:
+        return
+    if spec.cluster_config is not None:
+        return
+    if getattr(spec, "single_node_only", False):
+        return
+    from .cluster_types import ClusterConfig
+
+    spec.cluster_config = ClusterConfig.from_size(size)
+    spec.mode = "cluster"
+
+
 def run_tests(
     spec: TestSpec,
     secrets: dict[str, str],
@@ -676,9 +705,14 @@ def run_tests(
     server_port: int | None = None,
     verbose: bool = False,
     transport: str = "quic",
+    force_cluster_size: int = 1,
 ) -> tuple[int, dict[str, Any]]:
     summary = RunSummary()
     start_time = time.time()
+
+    # Apply --force-cluster-size CLI override before the rest of the runner
+    # branches on spec.mode. The helper is idempotent and a no-op for size<=1.
+    _apply_force_cluster_size(spec, force_cluster_size)
 
     if spec.default_timeout_ms > 0:
         timeout_ms = max(timeout_ms, spec.default_timeout_ms)
