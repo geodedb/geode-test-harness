@@ -144,4 +144,18 @@ def wait_for_cluster_ready(
         last_obs_count,
         expected_count,
     )
+    # One more probe + dump for triage. The deadline window collected
+    # observations but never matched all three conditions; record the
+    # final state so the next iteration of A6f investigation can see
+    # exactly what disagreed.
+    final = []
+    for node in cluster_state.nodes:
+        obs = _probe_node(binary, node.port, admin_password)
+        final.append((node.port, obs))
+    for port, obs in final:
+        logger.error(
+            "Final probe port=%d obs=%r",
+            port,
+            obs,
+        )
     return False
