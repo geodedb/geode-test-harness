@@ -465,6 +465,11 @@ class TestSpec:
         None  # Top-level skip directive (free-text reason). When set, the spec is pending and contributes 0 cases to the run.
     )
     cluster_config: ClusterConfig | None = None
+    # When true, the spec opts out of `--force-cluster-size N` promotion
+    # (the harness will not synthesize a ClusterConfig). Useful for specs
+    # that exercise filesystem-local state or single-process invariants
+    # that don't translate to multi-node deployments.
+    single_node_only: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestSpec:
@@ -525,6 +530,7 @@ class TestSpec:
             default_timeout_ms=data.get("default_timeout_ms", 0),
             skip=(str(data["skip"]) if data.get("skip") else None),
             cluster_config=cluster_config,
+            single_node_only=bool(data.get("single_node_only", False)),
         )
 
 

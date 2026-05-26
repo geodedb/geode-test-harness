@@ -15,6 +15,7 @@
 .PHONY: test-full test-full-parallel test-everything
 .PHONY: test-unit test-unit-verbose
 .PHONY: test-quic test-grpc test-all-transports
+.PHONY: test-cluster-1 test-cluster-3 test-cluster-5 test-cluster-10 test-cluster-matrix
 .PHONY: lint format type-check security-check quality
 .PHONY: loadtest loadtest-go loadtest-python loadtest-cli loadtest-build loadtest-scenario loadtest-scenarios
 
@@ -411,6 +412,56 @@ test-grep: .check-geodetestlab
 test-shell: .check-geodetestlab
 	@echo "Running shell stability tests..."
 	$(GEODETESTLAB) run --spec $(SPECS_DIR)/shell_session_stability.yml -v
+
+# --- Cluster matrix testing (Task B4 of 2026-05-25 distributed plan) ---
+#
+# Runs the full spec suite against 1-, 3-, 5-, and 10-node deployments.
+# `--force-cluster-size N` promotes specs without a `cluster:` block to
+# N-node clusters; specs that set `single_node_only: true` opt out.
+#
+# Each size writes its report to reports/cluster-N.json so test-cluster-matrix
+# can aggregate them at the end.
+
+test-cluster-1: .check-geodetestlab
+	@echo "Running full spec suite against 1-node deployment..."
+	@mkdir -p reports
+	$(GEODETESTLAB) run --specs $(SPECS_DIR) \
+		--force-cluster-size 1 \
+		--output reports/cluster-1.json \
+		-j $(PARALLEL_WORKERS)
+
+test-cluster-3: .check-geodetestlab
+	@echo "Running full spec suite against 3-node deployment..."
+	@mkdir -p reports
+	$(GEODETESTLAB) run --specs $(SPECS_DIR) \
+		--force-cluster-size 3 \
+		--output reports/cluster-3.json \
+		-j $(PARALLEL_WORKERS)
+
+test-cluster-5: .check-geodetestlab
+	@echo "Running full spec suite against 5-node deployment..."
+	@mkdir -p reports
+	$(GEODETESTLAB) run --specs $(SPECS_DIR) \
+		--force-cluster-size 5 \
+		--output reports/cluster-5.json \
+		-j $(PARALLEL_WORKERS)
+
+test-cluster-10: .check-geodetestlab
+	@echo "Running full spec suite against 10-node deployment..."
+	@mkdir -p reports
+	$(GEODETESTLAB) run --specs $(SPECS_DIR) \
+		--force-cluster-size 10 \
+		--output reports/cluster-10.json \
+		-j $(PARALLEL_WORKERS)
+
+test-cluster-matrix: test-cluster-1 test-cluster-3 test-cluster-5 test-cluster-10
+	@echo "--- Cluster matrix summary ---"
+	@for n in 1 3 5 10; do \
+		if [ -f reports/cluster-$$n.json ]; then \
+			echo "Size $$n:"; \
+			python3 -c "import json; r=json.load(open('reports/cluster-$$n.json'))['summary']; print('  passed=%s failed=%s skipped=%s total=%s' % (r.get('passed',0), r.get('failed',0), r.get('skipped',0), r.get('total',0)))"; \
+		fi; \
+	done
 
 # Run per-graph storage tests
 test-per-graph: .check-geodetestlab
