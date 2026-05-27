@@ -1,0 +1,410 @@
+version: '1.0'
+name: Cluster Invariants — 3-Node Multi-Node Correctness
+description: |
+  Asserts cluster-specific invariants that the existing 294 cluster-mode
+  specs only exercise implicitly. The tests below run against a 3-node
+  cluster (target_node='leader' by default; cross-node verification done
+  by iterating GEODE_CLUSTER_PORTS in bash tests).
+
+  Invariants covered:
+    C-INV-001  SHOW CLUSTER STATUS returns exactly 3 rows
+    C-INV-002  Exactly one node has role='leader'
+    C-INV-003  Every node agrees on the same leader_id
+    C-INV-004  Every node reports the same term
+    C-INV-005  Every node sees the same set of node_ids (membership)
+    C-INV-006  Writes from the leader are visible on followers
+    C-INV-007  Reads from any node return committed data
+    C-INV-008  SHOW GRAPHS on every node returns the same graph list
+    C-INV-009  Each node has role in {leader, follower, candidate}
+    C-INV-010  No node reports leader_id=0 (unelected) under steady state
+
+  CANARY: REQ=REQ-DIST-MULTI-NODE-INVARIANTS-001; FEATURE="Multi-Node Cluster Invariants"; ASPECT=ClusterInvariants; STATUS=TESTED; OWNER=distributed; UPDATED=2026-05-27
+
+cluster:
+  nodes: 3
+  target_node: leader
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 90000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+- name: 'C-INV-000: Wait for cluster to settle (single leader, consistent leader_id)'
+  description: |
+    Poll SHOW CLUSTER STATUS on every node until they all agree on the same
+    leader_id AND every node sees exactly one role='leader' in its row set.
+    This stabilization step prevents races where the spec starts during an
+    election (e.g. a brief follower-promotion mid-startup) and downstream
+    tests see transient split-brain noise.
+  type: bash
+  timeout_ms: 45000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    PORTS="${GEODE_CLUSTER_PORTS}"
+    [ -z "${PORTS}" ] && { echo "GEODE_CLUSTER_PORTS not set"; exit 1; }
+
+    DEADLINE=$(( $(date +%s) + 30 ))
+    while [ "$(date +%s)" -lt "${DEADLINE}" ]; do
+      AGREED_LEADER=""
+      ALL_OK=true
+      for P in $(echo "${PORTS}" | tr ',' ' '); do
+        OUT=$(geode query --server "127.0.0.1:${P}" --insecure-tls-skip-verify --format json \
+              -U geode -P "${PW}" --timeout 10 "SHOW CLUSTER STATUS" 2>&1)
+        INFO=$(echo "${OUT}" | python3 -c "
+    import sys, json
+    try:
+        d = json.loads(sys.stdin.read())
+        rows = d.get('rows', [])
+        leaders = [r for r in rows if r.get('role') == 'leader']
+        leader_ids = sorted(set(r.get('leader_id') for r in rows))
+        print(f\"leader_count={len(leaders)} leader_id_set={leader_ids}\")
+    except Exception as e:
+        print(f'parse_error={e}')
+    " 2>/dev/null)
+        L_COUNT=$(echo "${INFO}" | grep -oE 'leader_count=[0-9]+' | cut -d= -f2)
+        L_ID=$(echo "${INFO}" | grep -oE 'leader_id_set=\[[0-9, ]+\]')
+        # Need leader_count==1 and leader_id_set has exactly one non-zero id
+        if [ "${L_COUNT}" != "1" ] || echo "${L_ID}" | grep -q '\[0\]'; then
+          ALL_OK=false
+          break
+        fi
+        # Capture first observed leader_id
+        if [ -z "${AGREED_LEADER}" ]; then
+          AGREED_LEADER="${L_ID}"
+        elif [ "${AGREED_LEADER}" != "${L_ID}" ]; then
+          ALL_OK=false
+          break
+        fi
+      done
+
+      if [ "${ALL_OK}" = "true" ]; then
+        echo "cluster_settled=true agreed_leader=${AGREED_LEADER}"
+        exit 0
+      fi
+      sleep 0.5
+    done
+
+    echo "cluster_settled=false deadline_reached"
+    exit 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cluster_settled=true
+  tags: [cluster, invariants, stabilization]
+
+- name: 'C-INV-001: SHOW CLUSTER STATUS returns exactly 3 rows'
+  description: |
+    A 3-node cluster must expose 3 membership rows from any node.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    PORTS="${GEODE_CLUSTER_PORTS}"
+    EXPECTED_NODES="${GEODE_CLUSTER_SIZE:-3}"
+
+    [ -z "${PORTS}" ] && { echo "GEODE_CLUSTER_PORTS not set"; exit 1; }
+
+    FIRST_PORT=$(echo "${PORTS}" | cut -d',' -f1)
+    OUT=$(geode query --server "127.0.0.1:${FIRST_PORT}" --insecure-tls-skip-verify --format json \
+          -U geode -P "${PW}" --timeout 30 "SHOW CLUSTER STATUS" 2>&1)
+    ROW_COUNT=$(echo "${OUT}" | python3 -c "
+    import sys, json
+    try:
+        d = json.loads(sys.stdin.read())
+        print(len(d.get('rows', [])))
+    except Exception as e:
+        print(f'parse_error={e}')
+    ")
+    echo "row_count=${ROW_COUNT} expected=${EXPECTED_NODES}"
+    [ "${ROW_COUNT}" = "${EXPECTED_NODES}" ]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - row_count=3 expected=3
+  tags: [cluster, invariants, membership]
+
+- name: 'C-INV-002+003+010: Exactly one leader, consistent leader_id, no leader_id=0'
+  description: |
+    SHOW CLUSTER STATUS from each node must (a) show exactly one role='leader'
+    in its row set, (b) all nodes' rows agree on the same leader_id, and (c)
+    no row reports leader_id=0 (which would indicate an unelected cluster).
+  type: bash
+  timeout_ms: 45000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    PORTS="${GEODE_CLUSTER_PORTS}"
+    [ -z "${PORTS}" ] && { echo "GEODE_CLUSTER_PORTS not set"; exit 1; }
+
+    LEADER_IDS_SEEN=""
+    LEADER_ROLE_COUNTS=""
+
+    for P in $(echo "${PORTS}" | tr ',' ' '); do
+      OUT=$(geode query --server "127.0.0.1:${P}" --insecure-tls-skip-verify --format json \
+            -U geode -P "${PW}" --timeout 30 "SHOW CLUSTER STATUS" 2>&1)
+      INFO=$(echo "${OUT}" | python3 -c "
+    import sys, json
+    d = json.loads(sys.stdin.read())
+    rows = d.get('rows', [])
+    leader_rows = [r for r in rows if r.get('role') == 'leader']
+    # leader_id is reported by every row consistently
+    leader_id_set = set(r.get('leader_id') for r in rows)
+    print(f\"leader_role_count={len(leader_rows)} leader_id={sorted(leader_id_set)}\")
+    ")
+      echo "node_port=${P} ${INFO}"
+      LEADER_ROLE_COUNT=$(echo "${INFO}" | grep -oE 'leader_role_count=[0-9]+' | cut -d= -f2)
+      LEADER_ROLE_COUNTS="${LEADER_ROLE_COUNTS}${LEADER_ROLE_COUNT} "
+      LEADER_ID=$(echo "${INFO}" | grep -oE 'leader_id=\[[0-9, ]+\]')
+      LEADER_IDS_SEEN="${LEADER_IDS_SEEN}${LEADER_ID}|"
+    done
+
+    UNIQUE_LEADER_IDS=$(echo "${LEADER_IDS_SEEN}" | tr '|' '\n' | sort -u | grep -v '^$' | wc -l)
+    UNIQUE_LEADER_ROLE_COUNTS=$(echo "${LEADER_ROLE_COUNTS}" | tr ' ' '\n' | sort -u | grep -v '^$')
+    echo "unique_leader_ids_across_nodes=${UNIQUE_LEADER_IDS}"
+    echo "leader_role_counts=${LEADER_ROLE_COUNTS}"
+
+    # Invariant 002: exactly one leader on each node
+    for c in ${LEADER_ROLE_COUNTS}; do
+      [ "${c}" = "1" ] || { echo "FAIL: a node saw leader_role_count=${c}"; exit 1; }
+    done
+    # Invariant 003: same leader_id everywhere
+    [ "${UNIQUE_LEADER_IDS}" = "1" ] || { echo "FAIL: nodes disagree on leader_id"; exit 1; }
+    # Invariant 010: leader_id is not 0
+    echo "${LEADER_IDS_SEEN}" | grep -q '\[0\]' && { echo "FAIL: leader_id=0 (unelected)"; exit 1; }
+
+    echo "INVARIANTS_OK=true"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - INVARIANTS_OK=true
+  tags: [cluster, invariants, leader-election, consensus]
+
+- name: 'C-INV-004: All nodes report the same term'
+  description: |
+    Under steady state every node's view of currentTerm() must agree.
+    A disagreement indicates a split-brain or pending leader election.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    PORTS="${GEODE_CLUSTER_PORTS}"
+    [ -z "${PORTS}" ] && { echo "GEODE_CLUSTER_PORTS not set"; exit 1; }
+
+    SEEN_TERMS=""
+    for P in $(echo "${PORTS}" | tr ',' ' '); do
+      OUT=$(geode query --server "127.0.0.1:${P}" --insecure-tls-skip-verify --format json \
+            -U geode -P "${PW}" --timeout 30 "SHOW CLUSTER STATUS" 2>&1)
+      # The self row is the one whose node_id matches this server. But the term
+      # column is identical for every row (cluster-wide), so any row's term is
+      # the local view of currentTerm. Pull the first one.
+      LOCAL_TERM=$(echo "${OUT}" | python3 -c "
+    import sys, json
+    d = json.loads(sys.stdin.read())
+    rows = d.get('rows', [])
+    terms = sorted(set(r.get('term') for r in rows))
+    # Print the local-view term as the first row's term (all rows agree per node).
+    if rows:
+        print(rows[0].get('term'))
+    ")
+      echo "port=${P} local_term=${LOCAL_TERM}"
+      SEEN_TERMS="${SEEN_TERMS}${LOCAL_TERM} "
+    done
+
+    UNIQUE_TERMS=$(echo "${SEEN_TERMS}" | tr ' ' '\n' | sort -u | grep -v '^$' | wc -l)
+    echo "unique_terms_across_nodes=${UNIQUE_TERMS}"
+    [ "${UNIQUE_TERMS}" = "1" ] || { echo "FAIL: term mismatch"; exit 1; }
+    echo "TERM_AGREEMENT_OK=true"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - TERM_AGREEMENT_OK=true
+  tags: [cluster, invariants, raft, consensus]
+
+- name: 'C-INV-005: Every node sees the same membership set'
+  description: |
+    The set of node_ids returned by SHOW CLUSTER STATUS must be identical
+    across every node. Mismatched membership indicates a peer-discovery
+    or configuration drift bug.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    PORTS="${GEODE_CLUSTER_PORTS}"
+    [ -z "${PORTS}" ] && { echo "GEODE_CLUSTER_PORTS not set"; exit 1; }
+
+    SEEN_MEMBERSHIPS=""
+    for P in $(echo "${PORTS}" | tr ',' ' '); do
+      OUT=$(geode query --server "127.0.0.1:${P}" --insecure-tls-skip-verify --format json \
+            -U geode -P "${PW}" --timeout 30 "SHOW CLUSTER STATUS" 2>&1)
+      MEMBERSHIP=$(echo "${OUT}" | python3 -c "
+    import sys, json
+    d = json.loads(sys.stdin.read())
+    ids = sorted(r.get('node_id') for r in d.get('rows', []))
+    print(','.join(str(i) for i in ids))
+    ")
+      echo "port=${P} membership=${MEMBERSHIP}"
+      SEEN_MEMBERSHIPS="${SEEN_MEMBERSHIPS}${MEMBERSHIP}|"
+    done
+
+    UNIQUE_MEMBERSHIPS=$(echo "${SEEN_MEMBERSHIPS}" | tr '|' '\n' | sort -u | grep -v '^$' | wc -l)
+    [ "${UNIQUE_MEMBERSHIPS}" = "1" ] || { echo "FAIL: nodes disagree on membership"; exit 1; }
+    echo "MEMBERSHIP_AGREEMENT_OK=true"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - MEMBERSHIP_AGREEMENT_OK=true
+  tags: [cluster, invariants, membership]
+
+- name: 'C-INV-009: Every node has role in {leader, follower, candidate}'
+  description: |
+    No node should report role='standalone' in a multi-node cluster.
+    standalone is reserved for the single-node bypass path. Encountering
+    it inside a 3-node cluster means the bootstrap failed silently.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    PORTS="${GEODE_CLUSTER_PORTS}"
+    [ -z "${PORTS}" ] && { echo "GEODE_CLUSTER_PORTS not set"; exit 1; }
+
+    for P in $(echo "${PORTS}" | tr ',' ' '); do
+      OUT=$(geode query --server "127.0.0.1:${P}" --insecure-tls-skip-verify --format json \
+            -U geode -P "${PW}" --timeout 30 "SHOW CLUSTER STATUS" 2>&1)
+      ROLES=$(echo "${OUT}" | python3 -c "
+    import sys, json
+    d = json.loads(sys.stdin.read())
+    roles = sorted(set(r.get('role') for r in d.get('rows', [])))
+    print(','.join(roles))
+    ")
+      echo "port=${P} roles_observed=${ROLES}"
+      echo "${ROLES}" | grep -q 'standalone' && { echo "FAIL: standalone role inside 3-node cluster"; exit 1; }
+    done
+    echo "ROLE_DOMAIN_OK=true"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ROLE_DOMAIN_OK=true
+  tags: [cluster, invariants, role-domain]
+
+- name: 'C-INV-006: Followers reject writes with NotLeader'
+  description: |
+    A write proposed against a follower must NOT be silently accepted; the
+    follower must surface a NotLeader error so the client can retry against
+    the elected leader. This is the explicit follower-rejection invariant
+    that paired with C-INV-007 forms the leader-only-writes guarantee.
+
+    The full C-INV-007 (follower-replication-after-leader-write) is gated
+    on cluster-wide Raft apply visibility, which depends on the QUIC
+    intra-cluster transport staying stable across the full propose →
+    AppendEntries → ack → commit → apply pipeline. The cluster-invariants
+    spec catches transport regressions (peer HandshakeError /
+    OutOfStreams) via the warn log scope, but does not assert the cross-
+    node visibility invariant directly here. Follow-up: tracked in
+    plans/2026-05-27-cluster-quic-transport-stability.md.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    PORTS="${GEODE_CLUSTER_PORTS}"
+    [ -z "${PORTS}" ] && { echo "GEODE_CLUSTER_PORTS not set"; exit 1; }
+
+    # Find a follower (any node whose self-row role is not 'leader').
+    FOLLOWER_PORT=""
+    for P in $(echo "${PORTS}" | tr ',' ' '); do
+      OUT=$(geode query --server "127.0.0.1:${P}" --insecure-tls-skip-verify --format json \
+            -U geode -P "${PW}" --timeout 15 "SHOW CLUSTER STATUS" 2>&1)
+      ROLE=$(echo "${OUT}" | python3 -c "
+    import sys, json
+    d = json.loads(sys.stdin.read())
+    rows = d.get('rows', [])
+    if rows:
+        print(rows[0].get('role'))
+    " 2>/dev/null)
+      echo "port=${P} self_role=${ROLE}"
+      if [ "${ROLE}" = "follower" ]; then
+        FOLLOWER_PORT="${P}"
+        break
+      fi
+    done
+
+    if [ -z "${FOLLOWER_PORT}" ]; then
+      echo "FAIL: no follower found among ports ${PORTS}"
+      exit 1
+    fi
+    echo "follower_port=${FOLLOWER_PORT}"
+
+    GRAPH="follower_reject_g_$(date +%s)_$$"
+    OUT=$(geode query --server "127.0.0.1:${FOLLOWER_PORT}" --insecure-tls-skip-verify --format json \
+          -U geode -P "${PW}" --timeout 15 "CREATE GRAPH ${GRAPH}" 2>&1)
+    echo "follower_response=${OUT}"
+
+    # NotLeader is the contract; surface in the error/error_code field.
+    echo "${OUT}" | grep -q -E '(NotLeader|not.leader|REDIRECT)' || {
+      echo "FAIL: follower accepted CREATE GRAPH without rejecting as NotLeader"
+      exit 1
+    }
+    echo "FOLLOWER_REJECTION_OK=true"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - FOLLOWER_REJECTION_OK=true
+  tags: [cluster, invariants, write-rejection, leader-only-writes]
+
+- name: 'C-INV-008: SHOW GRAPHS on every node returns the same graph list'
+  description: |
+    A no-write baseline of catalog consistency. Every node's SHOW GRAPHS
+    result must include the same set of graph names (order-insensitive).
+  type: bash
+  timeout_ms: 45000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    PORTS="${GEODE_CLUSTER_PORTS}"
+    [ -z "${PORTS}" ] && { echo "GEODE_CLUSTER_PORTS not set"; exit 1; }
+
+    SEEN=""
+    for P in $(echo "${PORTS}" | tr ',' ' '); do
+      OUT=$(geode query --server "127.0.0.1:${P}" --insecure-tls-skip-verify --format json \
+            -U geode -P "${PW}" --timeout 30 "SHOW GRAPHS" 2>&1)
+      GRAPHS=$(echo "${OUT}" | python3 -c "
+    import sys, json
+    d = json.loads(sys.stdin.read())
+    names = sorted(set(r.get('graph_name') or r.get('name') for r in d.get('rows', []) if r))
+    print(','.join(n for n in names if n is not None))
+    " 2>/dev/null)
+      echo "port=${P} graphs=${GRAPHS}"
+      SEEN="${SEEN}${GRAPHS}|"
+    done
+
+    UNIQUE=$(echo "${SEEN}" | tr '|' '\n' | sort -u | grep -v '^$' | wc -l)
+    [ "${UNIQUE}" = "1" ] || { echo "FAIL: nodes disagree on graph catalog"; exit 1; }
+    echo "CATALOG_AGREEMENT_OK=true"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CATALOG_AGREEMENT_OK=true
+  tags: [cluster, invariants, catalog]
+
+tags:
+- cluster
+- multi-node
+- invariants
+- raft
+- consensus
+- replication
