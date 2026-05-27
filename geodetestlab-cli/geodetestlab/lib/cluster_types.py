@@ -118,6 +118,11 @@ class ClusterState:
             return self.leader_node
         if target == "round-robin":
             return self.next_round_robin_node()
+        if target == "all":
+            # 'all' fans tests out across every node in runner.py's
+            # per-test loop. The 'default' target node used for
+            # GEODE_SERVER_ADDRESS etc. is the leader.
+            return self.leader_node
         # Numeric index
         idx = int(target)
         return self.nodes[idx]
