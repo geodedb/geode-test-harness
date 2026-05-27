@@ -22,9 +22,27 @@ from .utils import get_free_port
 
 logger = logging.getLogger(__name__)
 
-# Convention: cluster_port = client_port + 1000. Lets each cluster node bind a
-# distinct intra-cluster QUIC listener while preserving the client port for
-# the spec runner.
+# Maximum u16 port value. Used to guard against overflow when deriving
+# cluster_port = client_port + CLUSTER_PORT_OFFSET.
+U16_MAX_PORT = 65535
+
+
+def _derive_cluster_port(client_port: int) -> int:
+    """Derive a cluster_port for a given client_port that fits in u16.
+
+    Adds 1000 normally; falls back to subtracting 1000 when the addition
+    would exceed 65535 (geode's port parser rejects u16-overflowing
+    values with InvalidPeerSpec). On Linux the kernel ephemeral port
+    range can extend up to 65535, so `client_port = 65000` from
+    get_free_port() would overflow if we naively added 1000.
+    """
+    if client_port + 1000 <= U16_MAX_PORT:
+        return client_port + 1000
+    # Fall back: subtract 1000 (client_port is always >= 1024 from kernel)
+    return client_port - 1000
+
+
+# Kept for backwards-compat with callers that still reference the constant.
 CLUSTER_PORT_OFFSET = 1000
 
 
@@ -104,7 +122,7 @@ def _build_node_env(
     # Inject the intra-cluster Raft QUIC port. Convention: client_port + 1000.
     # Geode's cluster_bootstrap reads GEODE_CLUSTER_PORT to bind the
     # intra-cluster listener separately from the client-facing QUIC port.
-    cluster_port = port + CLUSTER_PORT_OFFSET
+    cluster_port = _derive_cluster_port(port)
     env["GEODE_CLUSTER_PORT"] = str(cluster_port)
 
     # Auto-generate a per-spec cluster token if the spec did not set one.
@@ -132,7 +150,7 @@ def _build_node_env(
     # collisions cause node N's view of the cluster to be smaller than
     # peers' views, which breaks Raft quorum.
     if all_ports is not None:
-        all_cluster_ports = [p + CLUSTER_PORT_OFFSET for p in all_ports]
+        all_cluster_ports = [_derive_cluster_port(p) for p in all_ports]
         env["GEODE_PEERS"] = ",".join(f"127.0.0.1:{cp}" for cp in all_cluster_ports)
 
     return env
@@ -266,7 +284,7 @@ def start_cluster(
         # try to dial all peers (including this one) while this one's
         # cluster_port is still binding, producing asymmetric handshake
         # failures under simultaneous startup.
-        cluster_port = ports[i] + CLUSTER_PORT_OFFSET
+        cluster_port = _derive_cluster_port(ports[i])
         if not _wait_for_cluster_port(cluster_port, deadline_s=15.0):
             logger.warning(
                 "Node %d cluster_port %d did not bind within 15s; continuing anyway",
