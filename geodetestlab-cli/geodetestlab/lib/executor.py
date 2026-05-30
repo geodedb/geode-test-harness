@@ -280,7 +280,7 @@ def run_single_test(
             cluster_ctx=cluster_ctx,
         )
     elif test_case.test_type == "bash":
-        return _run_shell_test(test_case, env, verbose, data_dir)
+        return _run_shell_test(test_case, env, verbose, data_dir, binary)
 
     # CLI test (default)
     return run_cli_test(test_case, binary, env, secrets, timeout_ms, data_dir, verbose)
@@ -852,6 +852,7 @@ def _run_shell_test(
     env: dict[str, str],
     verbose: bool,
     data_dir: Path | None = None,
+    binary: str | None = None,
 ) -> TestResult:
     """Run a shell test case.
 
@@ -901,6 +902,15 @@ def _run_shell_test(
     # var. test_case.env (below) still wins if the spec sets it explicitly.
     if data_dir is not None:
         test_env["GEODE_DATA_DIR"] = str(data_dir)
+    # Expose the binary under test so bash steps invoke it instead of whatever
+    # `geode` resolves to on PATH (which may be a stale system install). Specs
+    # should call "${GEODE_BINARY}" rather than a bare `geode`. Also prepend its
+    # directory to PATH so existing bare-`geode` steps pick up the right binary.
+    if binary:
+        test_env["GEODE_BINARY"] = str(binary)
+        bin_dir = os.path.dirname(os.path.abspath(str(binary)))
+        if bin_dir:
+            test_env["PATH"] = bin_dir + os.pathsep + test_env.get("PATH", os.environ.get("PATH", ""))
     test_env.update(test_case.env)
 
     # Honor per-test timeout_ms if it exceeds the default shell timeout. Long-
