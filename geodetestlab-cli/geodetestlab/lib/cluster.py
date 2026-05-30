@@ -51,7 +51,14 @@ def _build_node_env(
     env["PORT"] = str(port)
     env["GEODE_STATE_DIR"] = data_dir
     env["GEODE_ADMIN_PASSWORD"] = env.get("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
-    env["GEODE_NODE_ID"] = str(node_id)
+    # Geode + its bundled raft library reserve node id 0 as the invalid
+    # sentinel (raft node.zig: `if (self.id == 0) return InvalidId`), and
+    # geode's bootstrap numbers nodes 1-based to match (see geode's
+    # tests/test_cluster_3node_subprocess.zig which spawns GEODE_NODE_ID=i+1).
+    # `node_id` stays 0-based internally (it indexes ports/overrides); only
+    # the injected env value is shifted to 1-based so node 0 does not exit on
+    # startup with InvalidNodeId.
+    env["GEODE_NODE_ID"] = str(node_id + 1)
 
     if grpc_port is not None:
         env["GEODE_GRPC_ADDRESS"] = f"127.0.0.1:{grpc_port}"

@@ -42,6 +42,21 @@ class TestBuildNodeEnv:
         env = _build_node_env(config, node_id=0, base_env={}, port=3141, grpc_port=50051, data_dir="/tmp/n0")
         assert env["GEODE_GRPC_ADDRESS"] == "127.0.0.1:50051"
 
+    def test_node_id_is_one_based(self) -> None:
+        # Geode + the bundled raft library reserve node id 0 as the invalid
+        # sentinel (zig-pkg/raft-*/src/node.zig: `if (self.id == 0) return
+        # ConfigError.InvalidId`). Geode's own ground-truth 3-node test
+        # (geode/tests/test_cluster_3node_subprocess.zig) spawns nodes with
+        # GEODE_NODE_ID = i + 1. So the harness must inject 1-based ids;
+        # a 0-based id makes node 0 exit on startup with InvalidNodeId.
+        from geodetestlab.lib.cluster import _build_node_env
+
+        config = ClusterConfig.from_size(3)
+        env0 = _build_node_env(config, node_id=0, base_env={}, port=3141, grpc_port=None, data_dir="/tmp/n0")
+        env2 = _build_node_env(config, node_id=2, base_env={}, port=3143, grpc_port=None, data_dir="/tmp/n2")
+        assert env0["GEODE_NODE_ID"] == "1"
+        assert env2["GEODE_NODE_ID"] == "3"
+
     def test_peer_addresses_injected(self) -> None:
         from geodetestlab.lib.cluster import _build_node_env
 
