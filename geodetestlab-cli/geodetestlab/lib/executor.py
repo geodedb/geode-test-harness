@@ -280,7 +280,7 @@ def run_single_test(
             cluster_ctx=cluster_ctx,
         )
     elif test_case.test_type == "bash":
-        return _run_shell_test(test_case, env, verbose)
+        return _run_shell_test(test_case, env, verbose, data_dir)
 
     # CLI test (default)
     return run_cli_test(test_case, binary, env, secrets, timeout_ms, data_dir, verbose)
@@ -851,11 +851,18 @@ def _run_shell_test(
     test_case: TestCase,
     env: dict[str, str],
     verbose: bool,
+    data_dir: Path | None = None,
 ) -> TestResult:
     """Run a shell test case.
 
     Shell tests execute bash commands/scripts, typically used for source code
     verification tests that grep for patterns in the codebase.
+
+    The active server's data directory is exported as ``GEODE_DATA_DIR`` so
+    bash steps can locate the on-disk store files (e.g. the TDE bit-flip
+    corruption specs that flip a byte in a data file before a restart).
+    Without this, those steps cannot find the dynamic per-run data dir and
+    silently skip, which then breaks downstream assertions.
     """
     start_time = time.time()
 
@@ -888,6 +895,12 @@ def _run_shell_test(
 
     # Merge test-specific environment
     test_env = env.copy()
+    # Expose the active server's data directory to bash steps so they can
+    # operate on the on-disk store files (TDE corruption/flip specs rely on
+    # this). CLI steps get ${data_dir} substitution; bash steps need the env
+    # var. test_case.env (below) still wins if the spec sets it explicitly.
+    if data_dir is not None:
+        test_env["GEODE_DATA_DIR"] = str(data_dir)
     test_env.update(test_case.env)
 
     # Honor per-test timeout_ms if it exceeds the default shell timeout. Long-
