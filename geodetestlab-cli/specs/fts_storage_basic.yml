@@ -8,9 +8,12 @@
 #     table/column (single-property and multi-property)
 #   - CREATE a :Doc AFTER the index exists (live maintenance-hook path)
 #   - SEARCH via the ISO GQL procedure
-#       CALL geode.fts.search('idx','term') YIELD node, score RETURN node, score
-#     (the spec-correct set-returning surface; node = matching node id, score =
-#     BM25). Replaces the retired scalar fulltext_search-for-UNWIND form.
+#       CALL geode.fts.search('idx','term')
+#     (the spec-correct set-returning surface; YIELD is OPTIONAL in GQL clause
+#     16.3, so the bare CALL auto-projects the procedure's (node, score) columns
+#     as rows — exactly how CALL geode.schema.indexes() works. node = matching
+#     node id, score = BM25). Replaces the retired scalar
+#     fulltext_search-for-UNWIND form.
 #   - DROP INDEX <fulltext idx> and prove the server SURVIVES (SHOW INDEXES still
 #     answers afterward) -- closes both former bugs (see history note below).
 #
@@ -38,12 +41,12 @@
 #
 # 2. fulltext_search('idx','term') was not usable over the QUIC server: the
 #    scalar `UNWIND fulltext_search(...)` form (UNWIND is Cypher, not ISO GQL)
-#    hung or parse-errored, and `CALL fulltext_search(...) YIELD` returned 42883
+#    hung or parse-errored, and `CALL fulltext_search(...)` returned 42883
 #    "Unknown procedure" because no such procedure was registered. Full-text
 #    search is now the ISO GQL procedure `geode.fts.search(index, query [, max])`
-#    invoked with `CALL … YIELD node, score`; this spec asserts it returns the
-#    matched doc over the wire (a real (node, score) binding table, not a 42000
-#    parse error or a hang).
+#    invoked with a bare `CALL geode.fts.search(...)` (YIELD optional per GQL
+#    16.3); this spec asserts it returns the matched doc over the wire (a real
+#    (node, score) binding table, not a 42000 parse error or a hang).
 #
 # Tests share one server (server.enabled) so CREATEs in earlier tests are
 # visible to later tests.
@@ -203,20 +206,28 @@ tests:
   - storage
   - catalog
 # --- SEARCH over the wire via the ISO GQL procedure (the crux) ---
-- name: fts-storage-search-fox-via-call-yield
-  description: CALL geode.fts.search(...) YIELD node, score returns the fox doc over the wire
+- name: fts-storage-search-fox-via-call
+  description: Bare CALL geode.fts.search(...) auto-projects the (node, score) row for the fox doc over the wire
   args:
   - query
   - '-'
-  stdin: CALL geode.fts.search('doc_body_idx', 'fox') YIELD node, score RETURN node, score
+  stdin: CALL geode.fts.search('doc_body_idx', 'fox')
   expect:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    # The (node, score) binding table flowed over the wire — a real BM25 hit,
-    # not a 42000 parse error / 42883 unknown-procedure / connection hang.
-    - '"score"'
-    - '"node"'
+    # The (node, score) binding table flowed over the wire as a REAL hit — not a
+    # 42000 parse error / 42883 unknown-procedure / connection hang. The columns
+    # are auto-projected from the procedure result (no YIELD): two typed columns
+    # named node and score.
+    - '"name":"node"'
+    - '"name":"score"'
+    stdout_regex:
+    # At least one row object with a real (node id, BM25 score) pair: node id is
+    # an integer, score a positive float. This fails on an empty result set
+    # (rows:[]), proving the fox doc actually matched over the wire.
+    - '"node":[0-9]+'
+    - '"score":[0-9]+(\.[0-9]+)?'
   tags:
   - fts
   - storage
@@ -226,11 +237,13 @@ tests:
   args:
   - query
   - '-'
-  stdin: CALL geode.fts.search('doc_body_idx', 'rhinoceros') YIELD node, score RETURN node, score
+  stdin: CALL geode.fts.search('doc_body_idx', 'rhinoceros')
   expect:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
+    # A successful call with an empty binding table: the rows array is empty.
+    - '"rows":[]'
   tags:
   - fts
   - storage
