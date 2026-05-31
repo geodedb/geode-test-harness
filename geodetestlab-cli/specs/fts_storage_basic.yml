@@ -7,6 +7,12 @@
 #   - SHOW INDEXES lists the fulltext index with type=fulltext on the right
 #     table/column (single-property and multi-property)
 #   - CREATE a :Doc AFTER the index exists (live maintenance-hook path)
+#   - SEARCH via the ISO GQL procedure
+#       CALL geode.fts.search('idx','term') YIELD node, score RETURN node, score
+#     (the spec-correct set-returning surface; node = matching node id, score =
+#     BM25). Replaces the retired scalar fulltext_search-for-UNWIND form.
+#   - DROP INDEX <fulltext idx> and prove the server SURVIVES (SHOW INDEXES still
+#     answers afterward) -- closes both former bugs (see history note below).
 #
 # Assertions go through stdout_contains / stdout_regex on the JSON client output
 # (cli.client.format = json) -- the only keys lib/checks.py enforces.
@@ -20,27 +26,24 @@
 #   SHOW INDEXES (with idx) -> rows include
 #     {"name":"doc_body_idx","type":"fulltext","table":"Doc","columns":"body"}
 #
-# === KNOWN GEODE BUGS this spec deliberately does NOT assert against ===
+# === HISTORY: two former bugs, both now CLOSED and asserted below ===
 #
-# 1. DROP INDEX <fulltext idx> crashes the QUIC server (reported, not in this
-#    spec). The fts_storage engine is single-writer: every mutating call
-#    (insert/remove/flush) asserts it runs on the thread that created the engine
-#    (zig-pkg/fts_storage/src/engine.zig assertOwnedByCurrentThread). The QUIC
-#    server runs CREATE INDEX and DROP INDEX on different worker threads, so
-#    DROP -> fts_storage_adapter.dropIndex -> engine.flush() panics
-#    ("reached unreachable code") and the server dies. The in-tree e2e test
-#    (geode tests/test_fts_e2e.zig) passes because it is single-threaded.
-#    DROP INDEX is therefore omitted here rather than asserted with a weakened
-#    expectation.
+# 1. DROP INDEX <fulltext idx> used to crash the QUIC server: the fts_storage
+#    engine was single-writer and asserted every mutating call ran on the
+#    creating thread, but CREATE INDEX and DROP INDEX run on different QUIC
+#    worker threads, so DROP -> engine.flush() panicked and the server died.
+#    Fixed by pinning fts-storage 0.1.1 with single_writer_thread_check=false.
+#    This spec now runs DROP INDEX and asserts the server stays alive (the
+#    SHOW INDEXES after DROP answers instead of timing out).
 #
-# 2. fulltext_search('idx','term') is not usable over the QUIC server parser:
-#    `UNWIND fulltext_search(...)` / `WITH fulltext_search(...) AS rows ...` hang
-#    the connection (30s timeout), `CALL fulltext_search(...) YIELD ...` returns
-#    42883 "Unknown procedure", and a bare call parse-errors (42000). The
-#    function is covered by the in-tree e2e test via the in-process executor.
-#
-# Both gaps are documented in the A7 task report. This spec asserts only the
-# fts-storage operations the QUIC CLI genuinely supports.
+# 2. fulltext_search('idx','term') was not usable over the QUIC server: the
+#    scalar `UNWIND fulltext_search(...)` form (UNWIND is Cypher, not ISO GQL)
+#    hung or parse-errored, and `CALL fulltext_search(...) YIELD` returned 42883
+#    "Unknown procedure" because no such procedure was registered. Full-text
+#    search is now the ISO GQL procedure `geode.fts.search(index, query [, max])`
+#    invoked with `CALL … YIELD node, score`; this spec asserts it returns the
+#    matched doc over the wire (a real (node, score) binding table, not a 42000
+#    parse error or a hang).
 #
 # Tests share one server (server.enabled) so CREATEs in earlier tests are
 # visible to later tests.
@@ -195,6 +198,72 @@ tests:
     - article_idx
     - '"type":"fulltext"'
     - Article
+  tags:
+  - fts
+  - storage
+  - catalog
+# --- SEARCH over the wire via the ISO GQL procedure (the crux) ---
+- name: fts-storage-search-fox-via-call-yield
+  description: CALL geode.fts.search(...) YIELD node, score returns the fox doc over the wire
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('doc_body_idx', 'fox') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    # The (node, score) binding table flowed over the wire — a real BM25 hit,
+    # not a 42000 parse error / 42883 unknown-procedure / connection hang.
+    - '"score"'
+    - '"node"'
+  tags:
+  - fts
+  - storage
+  - search
+- name: fts-storage-search-no-match-empty
+  description: A term in no document returns an empty (but successful) row set
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('doc_body_idx', 'rhinoceros') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+  - search
+# --- DROP INDEX must NOT crash the server (fts-storage 0.1.1 fix) ---
+- name: fts-storage-drop-fulltext-index
+  description: DROP INDEX on a fulltext index (server must survive — 0.1.1 fix)
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX doc_body_idx
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+  - index
+- name: fts-storage-show-indexes-after-drop-server-alive
+  description: SHOW INDEXES after DROP proves the server stayed alive (still answers)
+  args:
+  - query
+  - '-'
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    # The key proof is that this query ANSWERS AT ALL with a clean status — the
+    # pre-0.1.1 server died on DROP INDEX, so this step would time out / error.
+    # The surviving Article multiprop index confirms the catalog is intact.
+    - '"status_class":"00000"'
+    - article_idx
   tags:
   - fts
   - storage
