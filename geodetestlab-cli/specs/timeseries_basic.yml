@@ -1,0 +1,233 @@
+# Timeseries Storage-Backed Native GQL Spec
+#
+# Exercises the timeseries-storage-backed native GQL surface end-to-end through
+# the real QUIC CLI path — the direct analog of fts_storage_basic.yml. There was
+# NO GQL way to write or richly query timeseries over the wire before this; the
+# `geode.ts.*` procedure family (src/execution/ts_dispatch.zig) is that surface:
+#
+#   - WRITE: CALL geode.ts.insert(device_id, metric, ts, value)        -> YIELD inserted
+#            CALL geode.ts.insert_many(device_id, metric, [[ts,value],...]) -> YIELD inserted
+#   - READ:  CALL geode.ts.range(device_id, metric, start_ts, end_ts)  -> YIELD ts, value
+#            CALL geode.ts.last(device_id, metric)                     -> YIELD ts, value
+#            CALL geode.ts.sample_by(device_id, metric, interval_ms, start_ts, end_ts, agg)
+#                                                                      -> YIELD bucket_ts, value
+#
+# The set-returning surface is the ISO/IEC 39075:2024 `CALL <proc>(args) [YIELD ...]`
+# form (YIELD optional per GQL clause 16.3 — a bare CALL auto-projects the
+# procedure's columns as rows, exactly like CALL geode.fts.search). Values are
+# i64; a series is the (device_id, metric) pair; range bounds are inclusive.
+#
+# Assertions go through stdout_contains / stdout_regex on the JSON client output
+# (cli.client.format = json). Each assertion is a substring that appears ONLY on
+# success:
+#   write  -> {"status_class":"00000", ... rows include {"inserted":N}}
+#   range  -> columns include {"name":"ts"} and {"name":"value"}; rows carry the
+#             stored (ts,value) integer pairs.
+#   empty  -> a successful call with an empty binding table: {"rows":[]}.
+#
+# Tests share one server (server.enabled) so writes in earlier tests are visible
+# to later reads.
+
+version: '1.0'
+name: Timeseries Native GQL Surface
+description: End-to-end timeseries-storage-backed native GQL lifecycle (CALL geode.ts.insert/insert_many/range/last/sample_by over the QUIC wire)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+# --- WRITE: single-point insert (the ingest path that did not exist before) ---
+- name: ts-insert-single-point
+  description: CALL geode.ts.insert writes one point and reports inserted=1 over the wire
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.insert(1, 'cpu.load', 1000, 72)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"inserted"'
+    - '"inserted":1'
+  tags:
+  - timeseries
+  - storage
+  - ingest
+# --- WRITE: batch insert via a nested list literal [[ts,value],...] ---
+- name: ts-insert-many-batch
+  description: CALL geode.ts.insert_many writes a batch and reports inserted=2
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.insert_many(1, 'cpu.load', [[1100, 73], [1200, 74]])
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"inserted"'
+    - '"inserted":2'
+  tags:
+  - timeseries
+  - storage
+  - ingest
+# --- READ: range returns the stored (ts, value) integer rows (the crux) ---
+- name: ts-range-returns-points
+  description: Bare CALL geode.ts.range auto-projects the (ts, value) rows over the wire
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.range(1, 'cpu.load', 0, 2000)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    # The (ts, value) binding table flowed over the wire — two typed columns
+    # auto-projected from the procedure result (no YIELD).
+    - '"name":"ts"'
+    - '"name":"value"'
+    stdout_regex:
+    # The three points written above come back as integer (ts, value) pairs. A
+    # boundary/empty result would fail these (rows:[]).
+    - '"ts":1000'
+    - '"value":72'
+    - '"ts":1200'
+    - '"value":74'
+  tags:
+  - timeseries
+  - storage
+  - query
+# --- READ: range bound is INCLUSIVE of end_ts (B0 bug-2 fix) ---
+- name: ts-range-end-bound-inclusive
+  description: A point exactly at end_ts is returned (range is [start_ts, end_ts] inclusive)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.range(1, 'cpu.load', 1200, 1200)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"ts":1200'
+    - '"value":74'
+  tags:
+  - timeseries
+  - storage
+  - query
+# --- READ: last returns the most-recent point ---
+- name: ts-last-returns-latest
+  description: CALL geode.ts.last returns the most recent (ts, value) for the series
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.last(1, 'cpu.load')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"ts"'
+    - '"name":"value"'
+    stdout_regex:
+    - '"ts":1200'
+    - '"value":74'
+  tags:
+  - timeseries
+  - storage
+  - query
+# --- READ: sample_by aggregates into buckets (avg) ---
+- name: ts-sample-by-avg
+  description: CALL geode.ts.sample_by buckets the series and returns (bucket_ts, value)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.sample_by(1, 'cpu.load', 1000, 0, 3000, 'avg')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"bucket_ts"'
+    - '"name":"value"'
+  tags:
+  - timeseries
+  - storage
+  - aggregation
+# --- multi-series isolation: a different series is independent ---
+- name: ts-multi-series-isolation
+  description: A second series (device 2) is independent of device 1's points
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.insert(2, 'cpu.load', 5000, 99)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"inserted":1'
+  tags:
+  - timeseries
+  - storage
+  - ingest
+- name: ts-multi-series-range-isolated
+  description: Querying device 2 returns only its own point, not device 1's
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.range(2, 'cpu.load', 0, 10000)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"ts":5000'
+    - '"value":99'
+  tags:
+  - timeseries
+  - storage
+  - query
+# --- READ: an unknown series returns an empty (but successful) row set ---
+- name: ts-empty-series-no-rows
+  description: range on a never-written series returns an empty binding table, not an error
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.range(999, 'does.not.exist', 0, 10000)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - timeseries
+  - storage
+  - query
+- name: ts-last-empty-series-no-rows
+  description: last on a never-written series returns an empty binding table, not an error
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.last(999, 'does.not.exist')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - timeseries
+  - storage
+  - query
+tags:
+- timeseries
+- ts-storage
