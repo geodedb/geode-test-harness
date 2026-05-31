@@ -1,0 +1,205 @@
+# FTS Storage-Backed Full-Text Search Spec
+#
+# Exercises the fts-storage-backed full-text-search lifecycle end-to-end through
+# the real QUIC CLI path:
+#   - CREATE :Doc nodes (some BEFORE the index -> backfill coverage)
+#   - CREATE INDEX ... USING fulltext  (ISO FOR-form; backfills pre-existing rows)
+#   - SHOW INDEXES lists the fulltext index with type=fulltext on the right
+#     table/column (single-property and multi-property)
+#   - CREATE a :Doc AFTER the index exists (live maintenance-hook path)
+#
+# Assertions go through stdout_contains / stdout_regex on the JSON client output
+# (cli.client.format = json) -- the only keys lib/checks.py enforces.
+# row_count / values / columns / status_class are silently ignored, so every
+# assertion is a substring that appears ONLY on success.
+#
+# JSON shapes confirmed against a freshly-built geode binary
+# (feat/storage-lib-migration, built 2026-05-31) by driving the exact queries
+# below over the QUIC `geode query -` CLI path:
+#   CREATE / CREATE INDEX -> {"status_class":"00000", ... "rows":[], ...}
+#   SHOW INDEXES (with idx) -> rows include
+#     {"name":"doc_body_idx","type":"fulltext","table":"Doc","columns":"body"}
+#
+# === KNOWN GEODE BUGS this spec deliberately does NOT assert against ===
+#
+# 1. DROP INDEX <fulltext idx> crashes the QUIC server (reported, not in this
+#    spec). The fts_storage engine is single-writer: every mutating call
+#    (insert/remove/flush) asserts it runs on the thread that created the engine
+#    (zig-pkg/fts_storage/src/engine.zig assertOwnedByCurrentThread). The QUIC
+#    server runs CREATE INDEX and DROP INDEX on different worker threads, so
+#    DROP -> fts_storage_adapter.dropIndex -> engine.flush() panics
+#    ("reached unreachable code") and the server dies. The in-tree e2e test
+#    (geode tests/test_fts_e2e.zig) passes because it is single-threaded.
+#    DROP INDEX is therefore omitted here rather than asserted with a weakened
+#    expectation.
+#
+# 2. fulltext_search('idx','term') is not usable over the QUIC server parser:
+#    `UNWIND fulltext_search(...)` / `WITH fulltext_search(...) AS rows ...` hang
+#    the connection (30s timeout), `CALL fulltext_search(...) YIELD ...` returns
+#    42883 "Unknown procedure", and a bare call parse-errors (42000). The
+#    function is covered by the in-tree e2e test via the in-process executor.
+#
+# Both gaps are documented in the A7 task report. This spec asserts only the
+# fts-storage operations the QUIC CLI genuinely supports.
+#
+# Tests share one server (server.enabled) so CREATEs in earlier tests are
+# visible to later tests.
+
+version: '1.0'
+name: FTS Storage Full-Text Search
+description: End-to-end fts-storage-backed full-text-search index lifecycle (CREATE INDEX USING fulltext + backfill + maintenance + SHOW catalog)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+# --- setup: docs created BEFORE the index (exercise backfill) ---
+- name: fts-storage-setup-fox-before-index
+  description: Create the fox doc before the index exists (backfill path)
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {body: 'the quick brown fox jumps'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+  - backfill
+- name: fts-storage-setup-dog-before-index
+  description: Create the lazy-dog doc before the index exists (backfill path)
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {body: 'a lazy sleeping dog'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+- name: fts-storage-setup-whale-before-index
+  description: Create the whale doc before the index exists (backfill path)
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {body: 'a gigantic blue whale swims'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+# --- create the fulltext index (ISO FOR-form; backfills the 3 docs) ---
+- name: fts-storage-create-fulltext-index
+  description: Create a fulltext index on Doc.body (backfills pre-existing rows)
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX doc_body_idx FOR (d:Doc) ON (d.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+  - index
+# --- SHOW INDEXES lists the new fulltext index with the right metadata ---
+- name: fts-storage-show-indexes-lists-fulltext
+  description: SHOW INDEXES lists the fulltext index with type=fulltext on Doc.body
+  args:
+  - query
+  - '-'
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - doc_body_idx
+    - '"type":"fulltext"'
+    stdout_regex:
+    - '"name":"doc_body_idx","type":"fulltext","table":"Doc","columns":"body"'
+  tags:
+  - fts
+  - storage
+  - catalog
+# --- maintenance: a doc created AFTER the index (maintenance-hook path) ---
+- name: fts-storage-maintenance-create-after-index
+  description: Create a doc after the index exists (live maintenance hook path)
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {body: 'a rare pangolin forages at dusk'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+  - maintenance
+# --- multi-property fulltext index on (title, body) ---
+- name: fts-storage-setup-article
+  description: Create an Article for the multi-property fulltext index
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Article {title: 'Aardvark Almanac', body: 'covers nocturnal mammals in detail'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+- name: fts-storage-create-multiprop-index
+  description: Create a multi-property fulltext index on Article(title, body)
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX article_idx FOR (a:Article) ON (a.title, a.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - storage
+  - index
+- name: fts-storage-show-indexes-lists-multiprop
+  description: SHOW INDEXES lists the multi-property fulltext index on Article
+  args:
+  - query
+  - '-'
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - article_idx
+    - '"type":"fulltext"'
+    - Article
+  tags:
+  - fts
+  - storage
+  - catalog
+tags:
+- fulltext
+- search
+- fts-storage
