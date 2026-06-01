@@ -12,6 +12,7 @@ import os
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 
 from .runner_types import DEFAULT_ADMIN_PASSWORD
@@ -144,12 +145,29 @@ def start_server(
         print(f"Starting server: {' '.join(cmd)}")
 
     # Start server process - use start_new_session to create a new process group
-    # This allows us to kill the entire group if needed
+    # This allows us to kill the entire group if needed.
+    #
+    # Capture the server's stdout/stderr to a real temp FILE rather than an
+    # in-memory subprocess.PIPE. Readiness below uses a socket-bind probe, so
+    # the harness never reads these streams during the server's lifetime — and
+    # an undrained PIPE deadlocks the server once it writes past the ~64KB OS
+    # pipe buffer: the server blocks in writev() on stderr while holding the
+    # process-global stderr lock, and any geode thread that logs while holding
+    # a data lock (e.g. graph_storage_adapter.createGraphLocked's per-graph
+    # "created graph" std.log line) then stalls — observed as
+    # gql_catalog_operations_comprehensive.yml hanging 30s per DDL at
+    # --log-level info (verbose runs, which inherit the terminal and have no
+    # pipe, never reproduce it). A regular file never backpressures, so the
+    # server can never block on logging. The file is unlinked immediately
+    # (TemporaryFile) and reaped when the server's fd closes.
+    # Intentionally not a context manager (ruff SIM115): the file must stay
+    # open for the server process's whole lifetime (reaped when its fd closes).
+    server_log = tempfile.TemporaryFile(mode="w+") if not verbose else None  # noqa: SIM115
     process = subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.PIPE if not verbose else None,
-        stderr=subprocess.PIPE if not verbose else None,
+        stdout=server_log if server_log is not None else None,
+        stderr=subprocess.STDOUT if server_log is not None else None,
         text=True,
         start_new_session=True,  # Create new session so we can kill the group
     )
@@ -163,10 +181,17 @@ def start_server(
 
     while time.time() - start < timeout_s:
         if process.poll() is not None:
-            stdout, stderr = process.communicate()
-            raise ServerError(
-                f"Server exited unexpectedly with code {process.returncode}\nstdout: {stdout}\nstderr: {stderr}"
-            )
+            output = ""
+            if server_log is not None:
+                try:
+                    server_log.seek(0)
+                    output = server_log.read()
+                except Exception:
+                    output = "<server log unavailable>"
+            else:
+                # verbose path inherits the terminal; nothing captured here
+                output = "<see terminal output above>"
+            raise ServerError(f"Server exited unexpectedly with code {process.returncode}\n{output}")
 
         # Check if port is bound using zero-cost socket bind probe
         # (replaces subprocess-based ss/netstat polling — PERF-002)
