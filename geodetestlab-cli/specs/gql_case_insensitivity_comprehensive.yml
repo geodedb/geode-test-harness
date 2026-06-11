@@ -1,0 +1,169 @@
+version: '1.0'
+name: GQL Keyword Case-Insensitivity Comprehensive Tests
+description: >
+  GAP-0534: mixed-case GQL keyword coverage. Per ISO/IEC 39075:2024 RQ-0022
+  reserved words and function names are case-insensitive while identifiers,
+  labels, and string literals preserve case. Covers SELECT / MATCH / RETURN /
+  CALL keyword case variants plus CREATE, WHERE, AS, DISTINCT, UNION ALL, and
+  mixed-case builtin function names.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: return-lowercase
+  description: lowercase return/as keywords
+  args:
+  - query
+  - '-'
+  stdin: return 1 as x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - x
+  tags:
+  - case-insensitivity
+  - return
+- name: return-mixed-case
+  description: mixed-case ReTuRn / aS keywords
+  args:
+  - query
+  - '-'
+  stdin: ReTuRn 'ok' aS status
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - status
+    - ok
+  tags:
+  - case-insensitivity
+  - return
+- name: select-mixed-case
+  description: mixed-case SELECT statement form (maps to RETURN semantics)
+  args:
+  - query
+  - '-'
+  stdin: sElEcT 42 As answer
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - answer
+    - '42'
+  tags:
+  - case-insensitivity
+  - select
+- name: create-mixed-case
+  description: mixed-case cReAtE / rEtUrN; label and property case preserved
+  args:
+  - query
+  - '-'
+  stdin: "cReAtE (n:CaseNode {name: 'MixedCase'}) rEtUrN n.name As name"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - name
+    - MixedCase
+  tags:
+  - case-insensitivity
+  - create
+- name: match-where-mixed-case
+  description: mixed-case MaTcH / WhErE / ReTuRn against the created node
+  args:
+  - query
+  - '-'
+  stdin: MaTcH (n:CaseNode) WhErE n.name = 'MixedCase' ReTuRn n.name aS found
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - found
+    - MixedCase
+  tags:
+  - case-insensitivity
+  - match
+  - where
+- name: distinct-mixed-case
+  description: mixed-case DiStInCt modifier
+  args:
+  - query
+  - '-'
+  stdin: ReTuRn DiStInCt 5 aS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - d
+    - '5'
+  tags:
+  - case-insensitivity
+  - distinct
+- name: union-all-mixed-case
+  description: mixed-case UnIoN aLl set operation keywords
+  args:
+  - query
+  - '-'
+  stdin: ReTuRn 2 As v UnIoN aLl rEtUrN 3 As v
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - v
+    - '2'
+    - '3'
+  tags:
+  - case-insensitivity
+  - union
+- name: function-name-mixed-case
+  description: mixed-case builtin function name uPpEr (RQ-0022 function-name case-insensitivity)
+  args:
+  - query
+  - '-'
+  stdin: RETURN uPpEr('case') AS u
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - u
+    - CASE
+  tags:
+  - case-insensitivity
+  - functions
+- name: call-keyword-mixed-case
+  description: mixed-case cAlL keyword with a mixed-case procedure name (procedure dispatch is lowercased, REQ-GQL-CASE-INSENSITIVE-002)
+  args:
+  - query
+  - '-'
+  stdin: cAlL gEoDe.Ts.InSeRt(900, 'case_kw_metric', 1, 1)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - inserted
+  tags:
+  - case-insensitivity
+  - call
+- name: string-literal-case-preserved
+  description: keyword folding must not touch string literal contents
+  args:
+  - query
+  - '-'
+  stdin: rEtUrN 'CaSe PrEsErVeD' aS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CaSe PrEsErVeD
+  tags:
+  - case-insensitivity
+  - literals
+tags:
+- gql
+- case-insensitivity
+- gap-0534

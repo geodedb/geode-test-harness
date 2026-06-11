@@ -1,0 +1,149 @@
+version: '1.0'
+name: Timeseries Mixed-Case Call Tests
+description: >
+  GAP-0536: mixed-case TIMESERIES.* scalar calls and geode.ts.* procedures
+  against a REAL store-bound series. Ingests points via CALL geode.ts.insert
+  (mixed-case procedure names are lowercased by the dispatcher,
+  REQ-GQL-CASE-INSENSITIVE-002), then reads them back through the scalar
+  timeseries.value / timeseries.last_value functions in several case
+  variants (whole-name case-insensitive per ISO/IEC 39075:2024 RQ-0022;
+  suffix matching made case-insensitive by GAP-0537's
+  src/eval/ts_call_handlers.zig extraction).
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: ts-insert-exact-case
+  description: seed the series with an exact-case CALL geode.ts.insert
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.insert(7, 'case_temp', 100, 11)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - inserted
+  tags:
+  - timeseries
+  - insert
+- name: ts-insert-mixed-case-procedure
+  description: mixed-case cAlL keyword + GeOdE.tS.iNsErT procedure name
+  args:
+  - query
+  - '-'
+  stdin: cAlL GeOdE.tS.iNsErT(7, 'case_temp', 200, 22)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - inserted
+  tags:
+  - timeseries
+  - case-insensitivity
+  - insert
+- name: ts-range-mixed-case-procedure
+  description: mixed-case CaLl GEODE.TS.RANGE reads back both store-bound points
+  args:
+  - query
+  - '-'
+  stdin: CaLl GEODE.TS.RANGE(7, 'case_temp', 100, 200)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '11'
+    - '22'
+  tags:
+  - timeseries
+  - case-insensitivity
+  - range
+- name: ts-last-mixed-case-procedure
+  description: mixed-case geode.TS.last returns the newest point
+  args:
+  - query
+  - '-'
+  stdin: call geode.TS.last(7, 'case_temp')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '22'
+  tags:
+  - timeseries
+  - case-insensitivity
+  - last
+- name: ts-scalar-value-uppercase
+  description: scalar TIMESERIES.VALUE in full uppercase against the store-bound series
+  args:
+  - query
+  - '-'
+  stdin: RETURN TIMESERIES.VALUE(7, 'case_temp', 100) AS v
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - v
+    - '11'
+  tags:
+  - timeseries
+  - case-insensitivity
+  - scalar
+- name: ts-scalar-value-mixed-case
+  description: scalar TiMeSeRiEs.VaLuE in mixed case (and mixed-case rEtUrN/aS)
+  args:
+  - query
+  - '-'
+  stdin: rEtUrN TiMeSeRiEs.VaLuE(7, 'case_temp', 200) aS v
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - v
+    - '22'
+  tags:
+  - timeseries
+  - case-insensitivity
+  - scalar
+- name: ts-scalar-last-value-mixed-case-suffix
+  description: scalar tImEsErIeS.LaSt_VaLuE with mixed-case suffix (GAP-0537 made suffix matching case-insensitive)
+  args:
+  - query
+  - '-'
+  stdin: ReTuRn tImEsErIeS.LaSt_VaLuE(7, 'case_temp') As lv
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - lv
+    - '22'
+  tags:
+  - timeseries
+  - case-insensitivity
+  - scalar
+- name: ts-scalar-value-at-mixed-case
+  description: scalar Timeseries.Value_At with mixed-case name resolves the exact point
+  args:
+  - query
+  - '-'
+  stdin: RETURN Timeseries.Value_At(7, 'case_temp', 100) AS va
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - va
+    - '11'
+  tags:
+  - timeseries
+  - case-insensitivity
+  - scalar
+tags:
+- timeseries
+- case-insensitivity
+- gap-0536
