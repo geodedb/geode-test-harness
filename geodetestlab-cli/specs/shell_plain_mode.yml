@@ -1,0 +1,102 @@
+version: '1.0'
+name: Shell plain-mode REPL (geode shell --plain)
+description: |
+  GAP-0514 Phase 6 P2: black-box coverage for the plain-mode REPL lane
+  (src/client/repl/repl_loop.zig runPlainMode, dispatched from
+  src/cli/main.zig `geode shell --plain` — flag added this round; the lane
+  existed but was unreachable from the CLI).
+
+  Covers:
+    1. Plain banner + authenticated HELLO (-U/-P) + query round-trip.
+    2. Empty-enter tolerance: a blank line just re-prompts; the following
+       statement still executes.
+    3. Meta-command dispatch (\help) in plain mode.
+    4. Clean exit via \q (exit code 0).
+
+  Plain mode reads line-based stdin with no terminal control sequences, so
+  piped stdin drives the REAL REPL loop (not `geode query`).
+
+  CANARY: REQ=REQ-SHELL-PLAIN-010; FEATURE="ShellPlainMode"; ASPECT=BlackBox; STATUS=TESTED; TEST=self; OWNER=cli; UPDATED=2026-06-11
+
+single_node_only: true  # REPL/TTY semantics; multi-node promotion is meaningless
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: plain-mode-auth-query-roundtrip
+  description: --plain banner, authenticated hello, query executes, \q exits 0
+  type: bash
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$(printf 'RETURN 42 AS answer;\n\\q\n' | \
+      "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" \
+        --insecure-tls-skip-verify -U geode -P "$PW" 2>&1); RC=$?
+    echo "$OUT" | grep -q "Geode Shell (plain mode)" || { echo "banner=FAIL"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "42" || { echo "result=FAIL"; echo "$OUT"; exit 1; }
+    [ "$RC" -eq 0 ] && echo "roundtrip=ok" || { echo "exit=FAIL rc=$RC"; exit 1; }
+  timeout_ms: 45000
+  expect:
+    exit_code: 0
+    stdout_contains: [roundtrip=ok]
+  tags: [shell, plain-mode, auth, gap-0514]
+
+- name: plain-mode-empty-enter-tolerated
+  description: blank line re-prompts; following statement still executes
+  type: bash
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$(printf '\n\nRETURN 7 AS after_blank;\n\\q\n' | \
+      "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" \
+        --insecure-tls-skip-verify -U geode -P "$PW" 2>&1); RC=$?
+    echo "$OUT" | grep -q "after_blank" || { echo "empty_enter=FAIL"; echo "$OUT"; exit 1; }
+    [ "$RC" -eq 0 ] && echo "empty_enter=ok" || { echo "exit=FAIL rc=$RC"; exit 1; }
+  timeout_ms: 45000
+  expect:
+    exit_code: 0
+    stdout_contains: [empty_enter=ok]
+  tags: [shell, plain-mode, gap-0514]
+
+- name: plain-mode-meta-command-dispatch
+  description: backslash meta-commands dispatch in plain mode (\help)
+  type: bash
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$(printf '\\help\n\\q\n' | \
+      "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" \
+        --insecure-tls-skip-verify -U geode -P "$PW" 2>&1); RC=$?
+    echo "$OUT" | grep -q "Geode Shell Commands" || { echo "meta=FAIL"; echo "$OUT"; exit 1; }
+    [ "$RC" -eq 0 ] && echo "meta=ok" || { echo "exit=FAIL rc=$RC"; exit 1; }
+  timeout_ms: 45000
+  expect:
+    exit_code: 0
+    stdout_contains: [meta=ok]
+  tags: [shell, plain-mode, meta-commands, gap-0514]

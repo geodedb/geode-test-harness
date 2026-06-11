@@ -1,0 +1,113 @@
+version: '1.0'
+name: Offline auth chain CLI (geode auth init / verify / reseal)
+description: |
+  GAP-0514 Phase 6 P2: black-box coverage for the OFFLINE auth chain
+  management CLI surfaces in src/cli/auth_init_cli.zig (dispatched from
+  src/cli/main.zig `geode auth <init|reseal|verify>`):
+
+    1. `geode auth init --data-dir D`   bootstraps the default admin user
+       and HMAC chain root into a fresh data dir (password from
+       GEODE_ADMIN_PASSWORD; never echoed).
+    2. `geode auth init` on a dir that already has records FAILS with a
+       pointer to `geode auth reseal` (no silent re-bootstrap).
+    3. `geode auth verify --data-dir D` reports chain integrity OK.
+    4. `geode auth reseal --data-dir D` recomputes the chain; a following
+       verify still reports integrity OK.
+
+  All four commands run offline against a per-run temp dir under
+  GEODE_STATE_DIR — no server interaction; the spec's server block exists
+  only to satisfy the harness lifecycle.
+
+  CANARY: REQ=REQ-AUTH-INIT-CLI-001; FEATURE="AuthInitCLI"; ASPECT=OfflineRoundTrip; STATUS=TESTED; TEST=self; OWNER=cli; UPDATED=2026-06-11
+
+single_node_only: true  # offline CLI semantics; multi-node promotion is meaningless
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: auth-init-bootstrap-fresh-dir
+  description: geode auth init bootstraps admin + HMAC chain into a fresh dir
+  type: bash
+  command: |
+    D="${GEODE_STATE_DIR:-/tmp}/auth-cli-offline"
+    rm -rf "$D" && mkdir -p "$D"
+    GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}" \
+      "${GEODE_BINARY:-geode}" auth init --data-dir "$D" 2>&1 | grep -q "Admin user created" \
+      && echo "init=ok" || { echo "init=FAIL"; exit 1; }
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains: [init=ok]
+  tags: [auth, cli, offline, gap-0514]
+
+- name: auth-init-refuses-existing-records
+  description: second geode auth init on the same dir must fail with reseal pointer
+  type: bash
+  command: |
+    D="${GEODE_STATE_DIR:-/tmp}/auth-cli-offline"
+    OUT=$(GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}" \
+      "${GEODE_BINARY:-geode}" auth init --data-dir "$D" 2>&1); RC=$?
+    echo "$OUT" | grep -q "already exist" && [ "$RC" -ne 0 ] \
+      && echo "guard=ok" || { echo "guard=FAIL rc=$RC"; echo "$OUT"; exit 1; }
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains: [guard=ok]
+  tags: [auth, cli, offline, gap-0514]
+
+- name: auth-verify-chain-ok
+  description: geode auth verify reports HMAC chain integrity OK after init
+  type: bash
+  command: |
+    D="${GEODE_STATE_DIR:-/tmp}/auth-cli-offline"
+    "${GEODE_BINARY:-geode}" auth verify --data-dir "$D" 2>&1 | grep -q "integrity OK" \
+      && echo "verify=ok" || { echo "verify=FAIL"; exit 1; }
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains: [verify=ok]
+  tags: [auth, cli, offline, gap-0514]
+
+- name: auth-reseal-then-verify
+  description: geode auth reseal recomputes the chain; verify stays green
+  type: bash
+  command: |
+    D="${GEODE_STATE_DIR:-/tmp}/auth-cli-offline"
+    "${GEODE_BINARY:-geode}" auth reseal --data-dir "$D" 2>&1 | grep -q "resealed successfully" \
+      || { echo "reseal=FAIL"; exit 1; }
+    "${GEODE_BINARY:-geode}" auth verify --data-dir "$D" 2>&1 | grep -q "integrity OK" \
+      && echo "reseal_verify=ok" || { echo "reseal_verify=FAIL"; exit 1; }
+  timeout_ms: 30000
+  expect:
+    exit_code: 0
+    stdout_contains: [reseal_verify=ok]
+  tags: [auth, cli, offline, gap-0514]
