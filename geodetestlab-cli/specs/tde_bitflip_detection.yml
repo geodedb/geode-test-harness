@@ -107,67 +107,61 @@ tests:
 
 - name: tde-bitflip-apply-and-restart
   description: |
-    Stop the server (via restart_server), flip one byte in the newest
-    data file, then let the harness bring the server back up.
+    Stop the server (via restart_server), flip one byte in the ciphertext
+    body of every encrypted page-store file, then let the harness bring the
+    server back up.
 
-    The bash step runs in the Geode source directory; it reads
-    GEODE_DATA_DIR from env (injected by harness). If GEODE_DATA_DIR is
-    not set, the test skips the flip and exits 0 (documented gap in env
-    injection for bash steps).
+    The bash step runs in the Geode source directory; it reads GEODE_DATA_DIR
+    from env (injected by the harness for bash steps). If GEODE_DATA_DIR is
+    not set the test fails loudly rather than silently skipping, because a
+    skipped flip would let the downstream "no sentinel after corruption"
+    assertion pass vacuously.
+
+    Geode shards each graph's data across many per-shard page-store files
+    (`<root>/<graph_uuid>/graphs/<shard_uuid>/{nodes,props,var,...}.store`),
+    each AES-GCM encrypted per page. The sentinel node's bytes (and its
+    string value) live in exactly one shard's store files, so we flip every
+    sufficiently-large `.store` file to guarantee the sentinel's encrypted
+    page is corrupted. The page-level auth tag must then reject the tampered
+    page on read.
 
     Byte offset 64 is chosen because:
-    - Offsets 0-7: GEOTDEFL magic header (ASCII, skip to avoid format errors
-      that mask AEAD errors)
-    - Offsets 8-11: version/flags
-    - Offset 64: safely inside the ciphertext body of the first page
+    - Page header (page_id/checksum/write_count) occupies the first bytes;
+    - Offset 64 is safely inside the ciphertext body of the first page,
+      so the flip corrupts authenticated ciphertext rather than the header.
   type: bash
   command: |
     DATA_DIR="${GEODE_DATA_DIR:-}"
     if [ -z "$DATA_DIR" ] || [ ! -d "$DATA_DIR" ]; then
-      echo "SKIP: GEODE_DATA_DIR not available in bash step environment (got: '${DATA_DIR}')"
-      echo "This is a known harness limitation: bash steps run with cwd=geode_source"
-      echo "and do not receive the dynamic data_dir substitution that CLI steps do."
-      echo "bitflip_skip"
-      exit 0
-    fi
-
-    # Find the most recently modified binary data file
-    TARGET=$(find "$DATA_DIR" -type f \( -name "*.dat" -o -name "*.gdb" -o -name "graph_store*" \) \
-      ! -name "*.jsonl" ! -name "*.log" ! -name "*.yml" \
-      -newer "$DATA_DIR" 2>/dev/null | sort -t/ -k1 | tail -1)
-
-    if [ -z "$TARGET" ]; then
-      # Fallback: any file in the data dir, not a log
-      TARGET=$(find "$DATA_DIR" -maxdepth 2 -type f ! -name "*.jsonl" \
-        ! -name "*.log" ! -name "*.yml" ! -name "*.pem" ! -name "*.crt" \
-        2>/dev/null | head -1)
-    fi
-
-    if [ -z "$TARGET" ]; then
-      echo "SKIP: no data files found under $DATA_DIR to flip"
-      echo "bitflip_skip"
-      exit 0
-    fi
-
-    FILE_SIZE=$(stat -c%s "$TARGET" 2>/dev/null || stat -f%z "$TARGET" 2>/dev/null || echo 0)
-    if [ "$FILE_SIZE" -lt 128 ]; then
-      echo "SKIP: target file $TARGET is too small ($FILE_SIZE bytes) for offset-64 flip"
-      echo "bitflip_skip"
-      exit 0
-    fi
-
-    # Flip byte at offset 64 (XOR with 0xFF via urandom, single byte)
-    dd if=/dev/urandom of="$TARGET" bs=1 count=1 seek=64 conv=notrunc 2>/dev/null
-    RC=$?
-    if [ $RC -eq 0 ]; then
-      echo "bitflip_applied to $TARGET at offset 64"
-    else
-      echo "ERROR: dd failed with rc=$RC on $TARGET"
+      echo "FAIL: GEODE_DATA_DIR not available in bash step environment (got: '${DATA_DIR}')"
+      echo "The harness must export the active server data dir to bash steps."
       exit 1
     fi
+
+    # Flip one byte at offset 64 in the ciphertext body of every encrypted
+    # page-store file large enough to have a body past offset 64. Files
+    # smaller than 128 bytes (e.g. empty free.store maps) are skipped.
+    FLIPPED=0
+    while IFS= read -r TARGET; do
+      [ -z "$TARGET" ] && continue
+      FILE_SIZE=$(stat -c%s "$TARGET" 2>/dev/null || stat -f%z "$TARGET" 2>/dev/null || echo 0)
+      if [ "$FILE_SIZE" -lt 128 ]; then
+        continue
+      fi
+      dd if=/dev/urandom of="$TARGET" bs=1 count=1 seek=64 conv=notrunc 2>/dev/null || true
+      FLIPPED=$((FLIPPED + 1))
+    done < <(find "$DATA_DIR" -type f -name "*.store" 2>/dev/null)
+
+    if [ "$FLIPPED" -eq 0 ]; then
+      echo "FAIL: no *.store page files >=128 bytes found under $DATA_DIR to corrupt"
+      exit 1
+    fi
+
+    echo "bitflip_applied to ${FLIPPED} store file(s) at offset 64"
   restart_server: true
   expect:
     exit_code: 0
+    stdout_contains: [bitflip_applied]
   tags: [tde, bitflip, corrupt]
 
 - name: tde-bitflip-read-after-corruption
