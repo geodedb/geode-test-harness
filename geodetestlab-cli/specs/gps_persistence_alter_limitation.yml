@@ -1,15 +1,20 @@
 version: '1.0'
-name: GPS ALTER POLICY known persistence limitation
+name: GPS ALTER POLICY persists across restart (GAP-0858)
 description: |
-  Phase 7 outcome documented (docs/security/gps-phase7-outcome.md):
-  ALTER POLICY persistence is in-memory only — the WriteThroughHooks
-  struct on policy_catalog.zig has only `persist` (CREATE) and `drop`
-  (DROP) function pointers; there is no `alter` hook. This is a
-  documented Phase 8 deferral.
+  GAP-0858 (landed 2026-06-09) made ALTER POLICY durable: the
+  WriteThroughHooks struct on policy_catalog.zig now carries an `alter`
+  hook that write-throughs the altered policy state to __geode_security,
+  and the catalog is hydrated from that store at startup. An ALTER POLICY
+  ... SET ENABLED false now SURVIVES a server restart.
 
-  This spec PINS the limitation so a future fix is forced to flip the
-  assertion (rather than silently changing behaviour). When ALTER
-  persistence lands, this spec will fail and need to be updated.
+  Contract evidence (geode repo): src/execution.zig:2255-2278,
+  src/security/policy_catalog.zig:242-246,
+  tests/test_gap0858_alter_policy_persist.zig, docs/GQL_AUTH_DDL.md.
+
+  This is a SECURITY IMPROVEMENT over the old Phase 7 behaviour, where the
+  ALTER lived only in memory and a write-granting policy silently
+  re-enabled itself on restart (a fail-open footgun). This spec now PINS
+  the durable, fail-closed behaviour.
 
   PHASE 1 (pre-restart):
   - Create alice (readonly)
@@ -18,11 +23,11 @@ description: |
 
   RESTART
 
-  PHASE 2 (post-restart): the policy is hydrated with ENABLED=true
-  (its persisted state). alice can write again because the in-memory
-  ALTER didn't make it to __geode_security.
+  PHASE 2 (post-restart): the policy is hydrated with ENABLED=false (its
+  persisted state from the ALTER's write-through). alice REMAINS denied —
+  the disabled state survived restart.
 
-  CANARY: REQ=REQ-GPS-ALTER-001; FEATURE="GPS ALTER POLICY"; ASPECT=PersistenceLimitation; STATUS=TESTED; OWNER=security; UPDATED=2026-05-21
+  CANARY: REQ=GAP-0858; FEATURE="GPS ALTER POLICY"; ASPECT=PersistenceAcrossRestart; STATUS=TESTED; OWNER=security; UPDATED=2026-06-12
 cli:
   binary: ./zig-out/bin/geode
   working_dir:
@@ -86,7 +91,7 @@ tests:
   tags: [persistence, alter, phase1, positive]
 
 - name: alterlim-disable-policy
-  description: ALTER POLICY SET ENABLED false (in-memory only — does NOT persist).
+  description: ALTER POLICY SET ENABLED false (write-through to __geode_security — persists across restart, GAP-0858).
   args: [query, -U, geode, -P, '${secret:admin_password}', ALTER POLICY alterlim_global SET ENABLED false]
   expect:
     exit_code: 0
@@ -95,8 +100,8 @@ tests:
 
 - name: alterlim-alice-denied-after-alter
   description: |
-    POSITIVE — alice is denied AFTER ALTER (in-memory flag works
-    within the same server lifetime).
+    NEGATIVE — alice is denied AFTER ALTER (the disabled policy now
+    fails closed within the same server lifetime, before restart).
   args: [query, -U, alterlim_alice, -P, alterlim-pass-1234, '-']
   stdin: 'CREATE (n:AlterLimMid {v: 1}) RETURN n'
   expect:
@@ -109,43 +114,46 @@ tests:
   # ============================================================================
 - name: alterlim-restart-checkpoint
   description: |
-    Stop + restart the server. The ALTER's `enabled=false` flip lives
-    only in memory; the persistent layer still has enabled=true.
+    Stop + restart the server. The ALTER's `enabled=false` flip was
+    written through to __geode_security (GAP-0858), so the catalog
+    re-hydrates with enabled=false — the disabled state survives.
   type: bash
-  command: echo 'ALTER POLICY persistence limitation restart checkpoint'
+  command: echo 'ALTER POLICY persistence restart checkpoint'
   restart_server: true
   expect:
     exit_code: 0
   tags: [persistence, alter, restart]
 
   # ============================================================================
-  # PHASE 2: the ALTER did NOT persist, so policy comes back enabled.
-  # When Phase 8 wires the alter write-through, this assertion FLIPS and
-  # the test should be updated to assert alice STAYS denied across restart.
+  # PHASE 2: the ALTER persisted (GAP-0858), so the policy re-hydrates
+  # DISABLED and alice STAYS denied across restart. This is the durable,
+  # fail-closed behaviour — a previously write-granting policy that was
+  # disabled does NOT silently re-enable itself on restart.
   # ============================================================================
-- name: alterlim-alice-allowed-post-restart
+- name: alterlim-alice-denied-post-restart
   description: |
-    KNOWN-LIMITATION — alice can write again post-restart. The ALTER
-    did not propagate to __geode_security; the hydrated policy is
-    ENABLED. This is a Phase 7→Phase 8 transition pin: when ALTER
-    persistence lands, this test will fail and should be updated to
-    assert alice REMAINS denied across restart.
+    NEGATIVE (GAP-0858) — alice REMAINS denied post-restart. The ALTER's
+    `enabled=false` was written through to __geode_security and the
+    hydrated policy is DISABLED, so the write is refused (42501). This
+    asserts ALTER POLICY durability across the restart boundary.
   args: [query, -U, alterlim_alice, -P, alterlim-pass-1234, '-']
   stdin: 'CREATE (n:AlterLimPost {v: 1}) RETURN n'
   expect:
     exit_code: 0
-    stdout_contains: [AlterLimPost]
-    stdout_not_contains: ['42501']
-  tags: [persistence, alter, phase2, known-limitation]
+    stdout_contains: ['42501', Permission denied]
+  tags: [persistence, alter, phase2, negative]
 
   # ============================================================================
-  # POSITIVE follow-up: after restart re-disable, behaviour is identical
-  # (proves the ALTER call itself still works post-restart).
+  # POSITIVE follow-up: re-issuing the ALTER post-restart is an idempotent
+  # no-op flip (the policy is already disabled) and must still succeed,
+  # proving the ALTER procedure path is restored from policy_catalog
+  # hydration and behaves correctly after restart.
   # ============================================================================
 - name: alterlim-disable-again-post-restart
   description: |
-    POSITIVE — ALTER POLICY works after restart (the procedure path
-    is restored from policy_catalog hydration).
+    POSITIVE — ALTER POLICY works after restart (the procedure path is
+    restored from policy_catalog hydration). The policy is already
+    disabled, so this is an idempotent re-disable that must still succeed.
   args: [query, -U, geode, -P, '${secret:admin_password}', ALTER POLICY alterlim_global SET ENABLED false]
   expect:
     exit_code: 0
@@ -154,9 +162,9 @@ tests:
 
 - name: alterlim-alice-denied-again-after-second-alter
   description: |
-    POSITIVE — re-issuing the ALTER post-restart denies alice again,
-    confirming the in-memory flip behaves identically across restart
-    boundaries.
+    NEGATIVE — alice stays denied after the idempotent re-disable,
+    confirming the disabled policy continues to fail closed across the
+    restart boundary and the re-ALTER did not re-open the policy.
   args: [query, -U, alterlim_alice, -P, alterlim-pass-1234, '-']
   stdin: 'CREATE (n:AlterLimPost2 {v: 1}) RETURN n'
   expect:
@@ -180,6 +188,6 @@ tests:
 tags:
 - persistence
 - alter_policy
-- known_limitation
+- gap-0858
 - restart
 - security

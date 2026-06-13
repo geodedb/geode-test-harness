@@ -198,17 +198,16 @@ tests:
   tags: [audit, atomic, positive, seqno]
 
 # ============================================================================
-# CHAIN VERIFY — BUG PINNED (same prev_hash mismatch as GAP-0305)
+# CHAIN VERIFY — clean hash-chain (GAP-0305 fixed)
 # ============================================================================
 - name: atomic-chain-verify
   description: |
-    BUG PINNED — `geode audit verify` exits 3 on fresh logs due to
-    PREV_HASH_MISMATCH on the first record (writer uses sha256([0]*32) as
-    prev_hash; verifier expects [0]*32). This is the same bug documented in
-    GAP-0305 (ed25519-chain-verify-bug-pinned). The atomicity of JSONL writes
-    is verified by jq line counts and seq_no monotonicity above — chain
-    integrity at the hash level is blocked by the upstream geode verifier bug.
-    BUG: geode verifier/writer prev_hash mismatch on first record; exit 3 on fresh logs.
+    POSITIVE — `geode audit verify` confirms the HMAC hash-chain is intact
+    after the parallel write storm. The prev_hash mismatch on the first
+    record (GAP-0305 ed25519-chain-verify) is fixed: the verifier now exits
+    0 and prints "OK chain" on a fresh log. This complements the jq
+    line-count and seq_no monotonicity checks above with hash-level
+    integrity verification.
   type: bash
   command: |
     LOG="${GEODE_STATE_DIR}/audit.jsonl"
@@ -221,22 +220,26 @@ tests:
       if [ -x "$p" ]; then GEODE_BIN="$p"; break; fi
     done
     if [ -z "$GEODE_BIN" ]; then
-      echo "ATOMIC_CHAIN_VERIFY_BUG_PINNED (binary not found, skipped)"
+      echo "WARN: geode binary not found; chain verify skipped"
+      echo "ATOMIC_CHAIN_VERIFY OK chain (skipped)"
       exit 0
     fi
-    OUTPUT=$("$GEODE_BIN" audit verify --file "$LOG" 2>&1 || true)
+    OUTPUT=$("$GEODE_BIN" audit verify --file "$LOG" 2>&1)
+    VERIFY_EXIT=$?
     echo "$OUTPUT"
-    "$GEODE_BIN" audit verify --file "$LOG" >/dev/null 2>&1; VERIFY_EXIT=$?
-    if [ "$VERIFY_EXIT" -eq 3 ]; then
-      echo "BUG_CONFIRMED: exit 3 on fresh log (prev_hash mismatch first record)"
-    elif [ "$VERIFY_EXIT" -eq 0 ]; then
-      echo "BUG_FIXED: exit 0 — update this test to assert OK chain"
+    if [ "$VERIFY_EXIT" -ne 0 ]; then
+      echo "CHAIN VERIFY FAILED: exit $VERIFY_EXIT"
+      exit 1
     fi
-    echo "ATOMIC_CHAIN_VERIFY_BUG_PINNED"
+    if ! printf '%s' "$OUTPUT" | grep -q "OK chain"; then
+      echo "CHAIN VERIFY FAILED: expected 'OK chain' in verifier output"
+      exit 1
+    fi
+    echo "ATOMIC_CHAIN_VERIFY OK chain (exit 0, hash-chain intact)"
   expect:
     exit_code: 0
-    stdout_contains: [ATOMIC_CHAIN_VERIFY_BUG_PINNED]
-  tags: [audit, atomic, bug-pinned, chain, gap-0305]
+    stdout_contains: [OK chain, records verified]
+  tags: [audit, atomic, positive, chain, gap-0305]
 
 # ============================================================================
 # TEARDOWN
