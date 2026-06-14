@@ -46,6 +46,7 @@ from .server import (
     untrack_server,
 )
 from .spec import TestCase, TestSpec
+from .tls_provision import args_contain_flag, provision_tls_certs
 from .utils import find_geode_binary, get_free_port
 
 # Re-export public API so existing ``from .runner import …`` keeps working.
@@ -203,9 +204,13 @@ def _start_initial_server(
     verbose: bool,
     server_port: int | None,
     dry_run: bool,
+    server_args: list[str] | None = None,
 ) -> subprocess.Popen[str] | None:
     if dry_run:
         return None
+    # server_args defaults to the spec's declared args; callers may pass an
+    # augmented list (e.g. with verified-TLS --cert/--key).
+    effective_args = spec.server_args if server_args is None else server_args
     MAX_PORT_RETRIES = 3
     last_error: Exception | None = None
     for attempt in range(MAX_PORT_RETRIES):
@@ -215,7 +220,7 @@ def _start_initial_server(
                 data_dir=data_dir,
                 port=port,
                 env=env,
-                args=spec.server_args,
+                args=effective_args,
                 timeout_ms=server_timeout_ms,
                 verbose=verbose,
                 grpc_port=grpc_port,
@@ -730,6 +735,10 @@ def run_tests(
     server_state = ServerState(process=None, port=0, grpc_port=None)
     cluster_state: ClusterState | None = None
     cluster_ctx: ClusterControlContext | None = None
+    # Temp dir holding the verified-TLS CA+leaf provisioned for a single-server
+    # spec (cluster mode tracks its own on ClusterState.cert_dir). Cleaned up in
+    # the finally block.
+    single_server_cert_dir: str | None = None
 
     if spec.mode == "server":
         data_dir = Path(tempfile.mkdtemp(prefix="geode-test-"))
@@ -746,6 +755,19 @@ def run_tests(
             env["GEODE_ADMIN_PASSWORD"] = DEFAULT_ADMIN_PASSWORD
         env["GEODE_TRANSPORT"] = transport
 
+        # Provision verified TLS so the server presents a CA-signed cert and the
+        # client verifies it with --ca-cert — required on a ReleaseSafe binary,
+        # which refuses --insecure-tls-skip-verify (insecure_tls_gate.zig). Skip
+        # when the spec already supplies its own --cert (respect its intent) or
+        # when openssl is unavailable (fall back to the debug-only insecure path).
+        server_args = list(spec.server_args)
+        if not args_contain_flag(server_args, "--cert"):
+            provisioned = provision_tls_certs()
+            if provisioned is not None:
+                single_server_cert_dir, ca_crt, leaf_crt, leaf_key = provisioned
+                server_args.extend(["--cert", leaf_crt, "--key", leaf_key])
+                env["GEODE_TEST_CA_CERT"] = ca_crt
+
         server_state.process = _start_initial_server(
             spec,
             binary,
@@ -757,6 +779,7 @@ def run_tests(
             verbose,
             server_port,
             dry_run,
+            server_args=server_args,
         )
 
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{server_state.port}"
@@ -786,6 +809,15 @@ def run_tests(
             env["GEODE_TRANSPORT"] = transport
             if target.grpc_port:
                 env["GEODE_GRPC_ADDRESS"] = target.grpc_address or ""
+
+            # Expose the cluster's verified-TLS CA so client queries verify the
+            # node certs with --ca-cert instead of --insecure-tls-skip-verify
+            # (refused on ReleaseSafe binaries). start_cluster provisions the CA
+            # under cert_dir as ca.crt by convention.
+            if cluster_state.cert_dir is not None:
+                ca_crt = str(Path(cluster_state.cert_dir) / "ca.crt")
+                if Path(ca_crt).exists():
+                    env["GEODE_TEST_CA_CERT"] = ca_crt
 
             # Inject cluster metadata
             env["GEODE_CLUSTER_SIZE"] = str(cluster_config.node_count)
@@ -974,6 +1006,11 @@ def run_tests(
                     shutil.rmtree(data_dir, ignore_errors=True)
                 except Exception:
                     pass
+
+        if single_server_cert_dir is not None:
+            import shutil
+
+            shutil.rmtree(single_server_cert_dir, ignore_errors=True)
 
     summary.duration_ms = (time.time() - start_time) * 1000
 

@@ -53,7 +53,7 @@ def test_build_node_env_auto_generates_token() -> None:
     assert len(env["GEODE_CLUSTER_TOKEN"]) == 32
 
 
-def test_build_node_env_loopback_insecure_default() -> None:
+def test_build_node_env_does_not_force_insecure_tls() -> None:
     from geodetestlab.lib.cluster import _build_node_env
     from geodetestlab.lib.cluster_types import ClusterConfig
 
@@ -67,9 +67,12 @@ def test_build_node_env_loopback_insecure_default() -> None:
         data_dir="/tmp/x",
         all_ports=[3141, 3142],
     )
-    # Loopback cluster TLS uses self-signed certs; debug-only insecure
-    # mode is the test default. Specs can override by setting "0".
-    assert env["GEODE_CLUSTER_INSECURE"] == "1"
+    # _build_node_env must NOT force GEODE_CLUSTER_INSECURE=1: geode refuses
+    # that flag in release builds (cluster_auth.zig, GAP-0737), which silently
+    # broke forced clusters on the shipping binary. Verified TLS is configured
+    # by start_cluster() instead (shared CA + leaf). See
+    # test_cluster_tls_provisioning.py.
+    assert "GEODE_CLUSTER_INSECURE" not in env
 
 
 def test_build_node_env_respects_explicit_insecure_override() -> None:

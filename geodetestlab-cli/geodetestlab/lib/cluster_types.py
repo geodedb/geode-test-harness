@@ -39,6 +39,12 @@ class ClusterConfig:
     node_overrides: list[ClusterNodeConfig] = field(default_factory=list)
     startup_timeout_ms: int = 90000
     health_check_interval_ms: int = 5000
+    # When True, start N INDEPENDENT standalone geode servers instead of a Raft
+    # cluster: no GEODE_CLUSTER_TOKEN / GEODE_PEERS, and readiness is per-node
+    # (each client port answers) rather than leader election. Used by specs whose
+    # contract is "independent servers" (e.g. node-signal survivability), which
+    # must not depend on inter-node Raft TLS (the blocked GAP-0838 handshake).
+    independent: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> ClusterConfig:
@@ -55,6 +61,7 @@ class ClusterConfig:
             node_overrides=node_overrides,
             startup_timeout_ms=data.get("startup_timeout_ms", 90000),
             health_check_interval_ms=data.get("health_check_interval_ms", 5000),
+            independent=bool(data.get("independent", False)),
         )
 
     @classmethod
@@ -89,6 +96,10 @@ class ClusterState:
     """Runtime state of a multi-node cluster."""
 
     nodes: list[ClusterNodeState] = field(default_factory=list)
+    # Temp directory holding the shared CA + leaf provisioned by start_cluster()
+    # for verified inter-node TLS. None when a spec supplied its own certs or
+    # opted into the debug-only insecure path. stop_cluster() removes it.
+    cert_dir: str | None = None
     _round_robin_index: int = 0
 
     def node_by_target(self, target: str) -> ClusterNodeState:

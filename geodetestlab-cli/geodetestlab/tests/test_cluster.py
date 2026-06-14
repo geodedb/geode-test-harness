@@ -70,9 +70,14 @@ class TestBuildNodeEnv:
             data_dir="/tmp/n0",
             all_ports=[3141, 3142, 3143],
         )
-        assert "3142" in env.get("GEODE_PEERS", "")
-        assert "3143" in env.get("GEODE_PEERS", "")
-        assert "3141" not in env.get("GEODE_PEERS", "")
+        # GEODE_PEERS uses CLUSTER ports (client_port + 1000) and includes ALL
+        # nodes (self + peers) in a stable order so geode's bootstrap can derive
+        # consistent peer node_ids; the bootstrap skips the self entry by
+        # matching its own cluster_port. See _build_node_env's peer-list comment.
+        peers = env.get("GEODE_PEERS", "")
+        assert peers == "127.0.0.1:4141,127.0.0.1:4142,127.0.0.1:4143"
+        # The raw client ports are NOT what peers dial.
+        assert "3142" not in peers
 
 
 class TestBuildNodeArgs:

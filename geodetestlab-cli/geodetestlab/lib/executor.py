@@ -23,6 +23,7 @@ from .cluster import restart_cluster_node
 from .cluster_types import ClusterControlContext
 from .runner_types import DEFAULT_ADMIN_PASSWORD, DEFAULT_GRPC_PORT, DEFAULT_QUIC_PORT, TestResult
 from .spec import PlaintextCheck, TestCase, TestStep
+from .tls_provision import client_tls_args, reconcile_client_tls
 from .utils import is_valid_gql, sanitize_args
 
 logger = logging.getLogger(__name__)
@@ -424,26 +425,26 @@ def _build_cli_command(
     if test_case.query and resolved_dsn:
         cmd = [binary, "query", test_case.query]
         cmd.extend(["--dsn", resolved_dsn])
-        cmd.extend(["--insecure-tls-skip-verify"])
+        cmd.extend(client_tls_args(env))
     elif test_case.query:
         cmd = [binary, "query", test_case.query]
         cmd.extend(["--server", server_addr])
         if use_grpc:
             cmd.append("--grpc")
         else:
-            cmd.extend(["--insecure-tls-skip-verify"])
+            cmd.extend(client_tls_args(env))
         cmd.extend(["-U", "geode", "-P", admin_password])
     elif test_case.command and is_valid_gql(test_case.command) and resolved_dsn:
         cmd = [binary, "query", test_case.command]
         cmd.extend(["--dsn", resolved_dsn])
-        cmd.extend(["--insecure-tls-skip-verify"])
+        cmd.extend(client_tls_args(env))
     elif test_case.command and is_valid_gql(test_case.command):
         cmd = [binary, "query", test_case.command]
         cmd.extend(["--server", server_addr])
         if use_grpc:
             cmd.append("--grpc")
         else:
-            cmd.extend(["--insecure-tls-skip-verify"])
+            cmd.extend(client_tls_args(env))
         cmd.extend(["-U", "geode", "-P", admin_password])
     elif test_case.command:
         command_str = test_case.command
@@ -500,6 +501,13 @@ def _build_cli_command(
             cmd = shlex.split(command_str)
             args = substitute_variables(test_case.args, env, secrets, data_dir)
             cmd.extend(args)
+
+        # For shlex (non-bash) commands carrying a spec-supplied insecure flag,
+        # reconcile to verified --ca-cert on a release binary (which refuses
+        # --insecure). Bash commands carry the flag inside the -c string and
+        # instead reference $GEODE_CLIENT_TLS, so skip them here.
+        if cmd and cmd[0] != "bash" and not use_grpc and ("--insecure" in cmd or "--insecure-tls-skip-verify" in cmd):
+            cmd = reconcile_client_tls(cmd, [], env)
     else:
         cmd = [binary]
         args = substitute_variables(test_case.args, env, secrets, data_dir)
@@ -523,8 +531,12 @@ def _build_cli_command(
                 cmd.extend(["--server", server_addr])
             if use_grpc and "--grpc" not in args:
                 cmd.append("--grpc")
-            elif not use_grpc and "--insecure-tls-skip-verify" not in args and "--insecure" not in args:
-                cmd.extend(["--insecure-tls-skip-verify"])
+            if not use_grpc:
+                # Reconcile TLS posture for the target binary: on a release
+                # binary a spec-supplied --insecure/--insecure-tls-skip-verify is
+                # REFUSED, so swap it for verified --ca-cert when a CA was
+                # provisioned (else keep the legacy debug-only insecure path).
+                cmd = reconcile_client_tls(cmd, args, env)
             if "-U" not in args and "--no-saved-session" not in args:
                 cmd.extend(["-U", "geode", "-P", admin_password])
             if "--timeout" not in args:
@@ -539,9 +551,23 @@ def _build_cli_command(
                 if use_grpc:
                     cmd.append("--grpc")
                 else:
-                    cmd.extend(["--insecure-tls-skip-verify"])
+                    cmd.extend(client_tls_args(env))
                 cmd.extend(["-U", "geode", "-P", admin_password])
                 cmd.extend(["--timeout", str(max(timeout_ms // 1000, 30))])
+            elif args[0] == "auth" and len(args) > 1 and args[1] == "login" and not use_grpc:
+                # Native QUIC auth-login: point it at the managed test server.
+                # Like backup/restore, its verified-TLS (--ca-cert) handshake
+                # STALLS on a release binary (the tracked geode bug —
+                # docs/bugs/2026-06-13-verified-tls-backup-and-cluster-handshake.md),
+                # so drive it through geode's DOCUMENTED insecure escape hatch
+                # (GEODE_ALLOW_INSECURE_TLS=1 + --insecure-tls-skip-verify). The
+                # auth handshake is still real. geode auth login now also accepts
+                # --ca-cert for when the verified path is fixed.
+                if "--server" not in args:
+                    cmd.extend(["--server", quic_server_addr])
+                if "--insecure-tls-skip-verify" not in cmd and "--insecure" not in cmd and "--ca-cert" not in cmd:
+                    env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+                    cmd.append("--insecure-tls-skip-verify")
             elif "--data-dir" not in args and data_dir:
                 cmd.extend(["--data-dir", data_dir])
         elif args and _is_remote_admin_command(args):
@@ -552,8 +578,23 @@ def _build_cli_command(
                 )
             if "--server" not in args:
                 cmd.extend(["--server", quic_server_addr])
+            # KNOWN GEODE BUG: `backup create` / `restore` stream over QUIC and
+            # their verified-TLS (--ca-cert) handshake STALLS on a release binary
+            # — the handshake's Initial/Handshake packets are processed but the
+            # connection never reaches "active" (a single-shot `query --ca-cert`
+            # works fine; same class as the GAP-0838 client-side TLS-1.3
+            # CertificateVerify path). Until that geode bug is fixed, drive the
+            # streaming backup/restore commands through geode's DOCUMENTED insecure
+            # escape hatch (GEODE_ALLOW_INSECURE_TLS=1 + --insecure-tls-skip-verify)
+            # so the REAL data transfer still happens. `migrate` is not a streaming
+            # command and verifies fine, so it keeps verified TLS via client_tls_args.
+            is_stream_admin = args[0] == "backup" or args[0] == "restore"
             if "--insecure-tls-skip-verify" not in args and "--insecure" not in args:
-                cmd.extend(["--insecure-tls-skip-verify"])
+                if is_stream_admin and not use_grpc:
+                    env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+                    cmd.append("--insecure-tls-skip-verify")
+                else:
+                    cmd.extend(client_tls_args(env))
             if "-U" not in args and "--user" not in args:
                 cmd.extend(["--user", "geode"])
             if "-P" not in args and "--password" not in args:
@@ -594,6 +635,13 @@ def _build_cli_command(
                 error=f"Unsafe argument rejected: {e}",
             )
 
+    # Catch-all: any non-bash geode subcommand (query/shell/migrate/backup/...)
+    # carrying a spec-supplied insecure flag is reconciled to verified --ca-cert
+    # on a release binary, which refuses --insecure. Idempotent if an earlier
+    # branch already reconciled (the insecure token is gone → no-op).
+    if cmd and cmd[0] != "bash" and not use_grpc and ("--insecure" in cmd or "--insecure-tls-skip-verify" in cmd):
+        cmd = reconcile_client_tls(cmd, [], env)
+
     return cmd, None
 
 
@@ -610,6 +658,12 @@ def _execute_and_check(
     """Execute the command and check expectations."""
     test_env = env.copy()
     test_env.update(test_case.env)
+    # Expose the reconciled client-TLS posture to bash/command steps so specs can
+    # connect to the provisioned server without hardcoding --insecure (which a
+    # release binary refuses). Resolves to "--ca-cert <ca>" when a CA was
+    # provisioned, else the legacy "--insecure-tls-skip-verify". A spec's own
+    # test_case.env still wins (setdefault).
+    test_env.setdefault("GEODE_CLIENT_TLS", " ".join(client_tls_args(test_env)))
 
     effective_timeout_ms = max(timeout_ms, test_case.timeout_ms)
 
@@ -911,6 +965,10 @@ def _run_shell_test(
         bin_dir = os.path.dirname(os.path.abspath(str(binary)))
         if bin_dir:
             test_env["PATH"] = bin_dir + os.pathsep + test_env.get("PATH", os.environ.get("PATH", ""))
+    # Reconciled client-TLS posture for shell/bash steps — "--ca-cert <ca>" when
+    # a CA was provisioned (release-safe), else "--insecure-tls-skip-verify".
+    # Specs reference $GEODE_CLIENT_TLS instead of hardcoding the insecure flag.
+    test_env.setdefault("GEODE_CLIENT_TLS", " ".join(client_tls_args(test_env)))
     test_env.update(test_case.env)
 
     # Honor per-test timeout_ms if it exceeds the default shell timeout. Long-
@@ -1175,7 +1233,7 @@ def _run_sequential_test(
                     if use_grpc:
                         cmd.append("--grpc")
                     else:
-                        cmd.extend(["--insecure-tls-skip-verify"])
+                        cmd.extend(client_tls_args(env))
                     cmd.extend(["-U", "geode", "-P", admin_password])
 
                     try:

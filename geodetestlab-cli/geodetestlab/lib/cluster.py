@@ -18,6 +18,7 @@ from pathlib import Path
 from .cluster_types import ClusterConfig, ClusterNodeState, ClusterState
 from .runner_types import DEFAULT_ADMIN_PASSWORD
 from .server import start_server, stop_server
+from .tls_provision import args_contain_flag, provision_tls_certs
 from .utils import get_free_port
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,13 @@ def _wait_for_cluster_port(port: int, deadline_s: float = 15.0) -> bool:
     return False
 
 
+# Cluster + single-server share one TLS-provisioning implementation. These
+# aliases preserve the historical names used by callers and tests in this
+# module.
+_args_contain_flag = args_contain_flag
+_provision_cluster_tls = provision_tls_certs
+
+
 def _build_node_env(
     config: ClusterConfig,
     *,
@@ -87,6 +95,7 @@ def _build_node_env(
     grpc_port: int | None,
     data_dir: str,
     all_ports: list[int] | None = None,
+    cluster_ca_cert: str | None = None,
 ) -> dict[str, str]:
     """Build the environment dict for a single cluster node.
 
@@ -95,6 +104,10 @@ def _build_node_env(
       2. config.shared_env
       3. per-node override env (if present)
       4. injected cluster variables
+
+    ``cluster_ca_cert`` is the verified-TLS CA path provisioned by
+    start_cluster(); it is injected as GEODE_CLUSTER_CA_CERT here (per call,
+    NOT persisted into config) so retries always see a fresh, existing path.
     """
     env: dict[str, str] = {}
     env.update(base_env)
@@ -127,17 +140,37 @@ def _build_node_env(
     cluster_port = _derive_cluster_port(port)
     env["GEODE_CLUSTER_PORT"] = str(cluster_port)
 
+    # Independent-servers mode: do NOT form a Raft cluster. geode's clustering
+    # activates only when GEODE_CLUSTER_TOKEN is set, so omitting it (and the
+    # peer list below) keeps every node a standalone server — exactly the
+    # "independent servers" contract the node-signal specs assert, and it avoids
+    # the blocked GAP-0838 inter-node Raft TLS handshake entirely.
+    if config.independent:
+        env.pop("GEODE_CLUSTER_TOKEN", None)
+        return env
+
     # Auto-generate a per-spec cluster token if the spec did not set one.
     # All nodes in this start_cluster() invocation share the same env source
     # so they get the same token. The token authenticates intra-cluster RPC.
     if "GEODE_CLUSTER_TOKEN" not in env:
         env["GEODE_CLUSTER_TOKEN"] = secrets.token_hex(16)
 
-    # Loopback cluster traffic still goes through QUIC+TLS but with
-    # self-signed certs, so we must opt the test harness into the debug-only
-    # insecure-TLS path. Specs can override by setting the env to "0".
-    if "GEODE_CLUSTER_INSECURE" not in env:
-        env["GEODE_CLUSTER_INSECURE"] = "1"
+    # Cluster TLS: start_cluster() provisions a shared CA + leaf and threads the
+    # CA path in here as GEODE_CLUSTER_CA_CERT (paired with --cert/--key in
+    # _build_node_args) so peers VERIFY each other over QUIC+TLS. We inject it
+    # per call rather than persisting into config.shared_env, so a runner retry
+    # never reuses a cert dir that a prior attempt's rollback already deleted.
+    #
+    # We deliberately do NOT force GEODE_CLUSTER_INSECURE=1: geode's
+    # cluster_auth.zig (GAP-0737 / SEC-INFRA-01) REFUSES that flag in any
+    # non-Debug build, so forcing it silently broke forced clusters on the
+    # shipping ReleaseSafe binary (inter-node Raft TLS handshakes failed with
+    # HandshakeError → no leader → readiness timeout). A spec may still set
+    # GEODE_CLUSTER_INSECURE explicitly (Debug builds only); that value is
+    # honored through the env layering above, and start_cluster() then skips
+    # cert provisioning.
+    if cluster_ca_cert is not None:
+        env["GEODE_CLUSTER_CA_CERT"] = cluster_ca_cert
 
     # Build peer list using CLUSTER ports, not client ports. The intra-cluster
     # listener binds to cluster_port, so peers must dial that port to reach
@@ -163,11 +196,18 @@ def _build_node_args(
     *,
     node_id: int,
     spec_server_args: list[str],
+    cluster_cert: str | None = None,
+    cluster_key: str | None = None,
 ) -> list[str]:
     """Build CLI args for a single cluster node.
 
-    If the node has override args, those replace everything.
-    Otherwise: spec_server_args + shared_args.
+    If the node has override args, those replace everything (an override node
+    is responsible for its own TLS material).
+
+    Otherwise: spec_server_args + shared_args, plus the verified-TLS
+    --cert/--key provisioned by start_cluster() when supplied. The cert pair is
+    threaded in per call (NOT persisted into config.shared_args) so a runner
+    retry never reuses a cert path that a prior attempt's rollback deleted.
     """
     # Check for per-node override args
     if node_id < len(config.node_overrides):
@@ -178,6 +218,8 @@ def _build_node_args(
     # Default: spec args + shared args
     args = list(spec_server_args)
     args.extend(config.shared_args)
+    if cluster_cert is not None and cluster_key is not None:
+        args.extend(["--cert", cluster_cert, "--key", cluster_key])
     return args
 
 
@@ -216,6 +258,53 @@ def start_cluster(
         # accidentally lose it when another shared_env key is set.
         config.shared_env["GEODE_CLUSTER_TOKEN"] = base_env["GEODE_CLUSTER_TOKEN"]
 
+    # Provision verified TLS for the whole cluster (loopback CA + shared leaf).
+    #
+    # The previous default forced GEODE_CLUSTER_INSECURE=1 (skip peer-cert
+    # verification). geode's cluster_auth.zig (GAP-0737 / SEC-INFRA-01) REFUSES
+    # that flag in any non-Debug build, so a forced cluster on the shipping
+    # ReleaseSafe binary could never complete its inter-node Raft TLS handshake:
+    # every peer dial failed with HandshakeError, no leader was elected, and the
+    # readiness gate timed out after ~90s (all promoted specs then failed). We
+    # instead generate a shared CA + leaf and drive geode's verified-TLS path
+    # (GEODE_CLUSTER_CA_CERT + --cert/--key), exactly like geode's own
+    # tests/cluster/netns_cluster_replication_test.sh. This works on Debug AND
+    # release builds and exercises the real production peer-verification path.
+    #
+    # Skipped when a spec explicitly opts into insecure mode (Debug-only) or
+    # already supplies its own cluster certs.
+    #
+    # The provisioned cert paths are threaded into each node via local vars
+    # (passed to _build_node_env / _build_node_args), NOT persisted into
+    # config.shared_env / config.shared_args. The runner reuses the same
+    # spec.cluster_config object across retries, and a prior attempt's rollback
+    # deletes cert_dir — persisting the paths into config would make the retry
+    # reuse a deleted cert and fail with ProvidedCertificateUnreadable.
+    cert_dir: str | None = None
+    cluster_ca_cert: str | None = None
+    cluster_cert: str | None = None
+    cluster_key: str | None = None
+    spec_opts_insecure = "GEODE_CLUSTER_INSECURE" in config.shared_env or "GEODE_CLUSTER_INSECURE" in base_env
+    spec_provides_certs = (
+        "GEODE_CLUSTER_CA_CERT" in config.shared_env
+        or "GEODE_CLUSTER_CA_CERT" in base_env
+        or _args_contain_flag(config.shared_args, "--cert")
+        or _args_contain_flag(spec_server_args, "--cert")
+    )
+    if not spec_opts_insecure and not spec_provides_certs:
+        provisioned = _provision_cluster_tls()
+        if provisioned is not None:
+            cert_dir, cluster_ca_cert, cluster_cert, cluster_key = provisioned
+        else:
+            # openssl unavailable — fall back to the legacy debug-only insecure
+            # path so a Debug-binary loopback cluster still forms. On a release
+            # binary geode will (correctly) refuse it; warn so the cause is clear.
+            logger.warning(
+                "openssl unavailable; falling back to GEODE_CLUSTER_INSECURE=1 "
+                "(Debug-only). A forced cluster will NOT form on a release binary."
+            )
+            config.shared_env["GEODE_CLUSTER_INSECURE"] = "1"
+
     # Pre-allocate ports
     ports: list[int] = []
     grpc_ports: list[int | None] = []
@@ -249,8 +338,15 @@ def start_cluster(
             grpc_port=grpc_ports[i],
             data_dir=data_dir,
             all_ports=ports,
+            cluster_ca_cert=cluster_ca_cert,
         )
-        node_args = _build_node_args(config, node_id=i, spec_server_args=spec_server_args)
+        node_args = _build_node_args(
+            config,
+            node_id=i,
+            spec_server_args=spec_server_args,
+            cluster_cert=cluster_cert,
+            cluster_key=cluster_key,
+        )
 
         try:
             process = start_server(
@@ -265,8 +361,8 @@ def start_cluster(
             )
         except Exception as exc:
             logger.error("Failed to start cluster node %d: %s", i, exc)
-            # Roll back: stop already-started nodes
-            rollback_state = ClusterState(nodes=nodes)
+            # Roll back: stop already-started nodes (and clean provisioned certs)
+            rollback_state = ClusterState(nodes=nodes, cert_dir=cert_dir)
             stop_cluster(rollback_state, verbose=verbose, cleanup_data=True)
             msg = f"Cluster startup failed at node {i}: {exc}"
             raise RuntimeError(msg) from exc
@@ -286,13 +382,23 @@ def start_cluster(
         # try to dial all peers (including this one) while this one's
         # cluster_port is still binding, producing asymmetric handshake
         # failures under simultaneous startup.
-        cluster_port = _derive_cluster_port(ports[i])
-        if not _wait_for_cluster_port(cluster_port, deadline_s=15.0):
-            logger.warning(
-                "Node %d cluster_port %d did not bind within 15s; continuing anyway",
-                i,
-                cluster_port,
-            )
+        # Independent-servers mode has no intra-cluster listener — skip it.
+        if not config.independent:
+            cluster_port = _derive_cluster_port(ports[i])
+            if not _wait_for_cluster_port(cluster_port, deadline_s=15.0):
+                logger.warning(
+                    "Node %d cluster_port %d did not bind within 15s; continuing anyway",
+                    i,
+                    cluster_port,
+                )
+
+    final_state = ClusterState(nodes=nodes, cert_dir=cert_dir)
+
+    # Independent-servers mode: there is no Raft leader to elect. start_server()
+    # already blocked until each node's client port answered, so the nodes are
+    # ready to serve. Skip the cluster-readiness (leader-election) gate.
+    if config.independent:
+        return final_state
 
     # Per-process QUIC listeners are up — now wait for raft to elect a leader
     # and for every node to agree on the membership view. This is the real
@@ -300,13 +406,13 @@ def start_cluster(
     # start_cluster would race the election window.
     from .cluster_readiness import wait_for_cluster_ready
 
-    final_state = ClusterState(nodes=nodes)
     deadline_s = max(60.0, config.startup_timeout_ms / 1000.0)
     if not wait_for_cluster_ready(
         final_state,
         binary=binary,
         admin_password=base_env.get("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
         deadline_s=deadline_s,
+        ca_cert=cluster_ca_cert,
     ):
         stop_cluster(final_state, verbose=verbose, cleanup_data=True)
         msg = f"Cluster of {config.node_count} nodes failed to reach READY within {deadline_s:.0f}s"
@@ -338,6 +444,10 @@ def stop_cluster(
                 shutil.rmtree(node.data_dir, ignore_errors=True)
             except Exception:
                 logger.warning("Error cleaning data dir for node %d: %s", node.node_id, node.data_dir)
+
+    # Remove the shared cluster-TLS material provisioned by start_cluster().
+    if cleanup_data and cluster_state.cert_dir is not None:
+        shutil.rmtree(cluster_state.cert_dir, ignore_errors=True)
 
 
 def check_cluster_health(
@@ -396,6 +506,16 @@ def restart_cluster_node(
             logger.warning("Error stopping node %d before restart", node_id, exc_info=True)
 
     all_ports = [n.port for n in cluster_state.nodes]
+    # Re-derive the verified-TLS material from the cluster's provisioned cert
+    # dir (by convention ca.crt / leaf.crt / leaf.key) so the restarted node
+    # presents and trusts the same certs as its peers.
+    cluster_ca_cert: str | None = None
+    cluster_cert: str | None = None
+    cluster_key: str | None = None
+    if cluster_state.cert_dir is not None:
+        cluster_ca_cert = str(Path(cluster_state.cert_dir) / "ca.crt")
+        cluster_cert = str(Path(cluster_state.cert_dir) / "leaf.crt")
+        cluster_key = str(Path(cluster_state.cert_dir) / "leaf.key")
     node_env = _build_node_env(
         config,
         node_id=node_id,
@@ -404,8 +524,15 @@ def restart_cluster_node(
         grpc_port=node.grpc_port,
         data_dir=node.data_dir,
         all_ports=all_ports,
+        cluster_ca_cert=cluster_ca_cert,
     )
-    node_args = _build_node_args(config, node_id=node_id, spec_server_args=spec_server_args)
+    node_args = _build_node_args(
+        config,
+        node_id=node_id,
+        spec_server_args=spec_server_args,
+        cluster_cert=cluster_cert,
+        cluster_key=cluster_key,
+    )
 
     try:
         process = start_server(

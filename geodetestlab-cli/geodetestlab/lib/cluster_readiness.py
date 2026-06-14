@@ -31,20 +31,29 @@ def _probe_node(
     port: int,
     admin_password: str,
     timeout_s: float = 2.0,
+    ca_cert: str | None = None,
 ) -> dict | None:
     """Issue ``SHOW CLUSTER STATUS`` against the node's client port via geode query.
 
     Returns a dict with keys ``leader_id``, ``member_count``, ``members`` (list
     of node_ids), and ``raw_rows`` if the probe succeeded. Returns ``None``
     on any failure (unreachable, malformed, timeout, not yet ready).
+
+    When ``ca_cert`` is provided the probe VERIFIES the node's TLS cert against
+    that CA (``--server`` + ``--ca-cert``) — required on a ReleaseSafe binary,
+    which refuses the insecure skip. Otherwise it uses the legacy insecure DSN
+    (Debug binaries / no CA provisioned).
     """
+    if ca_cert is not None:
+        tls_args = ["--server", f"127.0.0.1:{port}", "--ca-cert", ca_cert]
+    else:
+        tls_args = ["--dsn", f"127.0.0.1:{port}?insecure=true"]
     try:
         result = subprocess.run(
             [
                 binary,
                 "query",
-                "--dsn",
-                f"127.0.0.1:{port}?insecure=true",
+                *tls_args,
                 "--user",
                 "geode",
                 "--pass",
@@ -100,11 +109,15 @@ def wait_for_cluster_ready(
     admin_password: str = "GeodeTestPassword123!",
     deadline_s: float = 60.0,
     poll_interval_s: float = 1.0,
+    ca_cert: str | None = None,
 ) -> bool:
     """Wait until every node reports a consistent ready cluster state.
 
     Returns ``True`` if ready within ``deadline_s``; ``False`` otherwise.
     Logs progress at INFO so failures are debuggable.
+
+    ``ca_cert`` (the cluster's provisioned CA) makes the probe verify node TLS
+    certs instead of skipping verification — required on ReleaseSafe binaries.
     """
     expected_count = len(cluster_state.nodes)
     start = time.monotonic()
@@ -114,7 +127,7 @@ def wait_for_cluster_ready(
     while time.monotonic() - start < deadline_s:
         observations: list[dict] = []
         for node in cluster_state.nodes:
-            obs = _probe_node(binary, node.port, admin_password)
+            obs = _probe_node(binary, node.port, admin_password, ca_cert=ca_cert)
             if obs is None:
                 break
             observations.append(obs)
@@ -159,7 +172,7 @@ def wait_for_cluster_ready(
     # exactly what disagreed.
     final = []
     for node in cluster_state.nodes:
-        obs = _probe_node(binary, node.port, admin_password)
+        obs = _probe_node(binary, node.port, admin_password, ca_cert=ca_cert)
         final.append((node.port, obs))
     for port, obs in final:
         logger.error(

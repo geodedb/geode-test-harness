@@ -103,7 +103,7 @@ tests:
   type: bash
   command: |
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
-    OUT=$(geode query --server "${GEODE_SERVER_ADDRESS}" --insecure-tls-skip-verify \
+    OUT=$(geode query --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
           -U geode -P "${PW}" --timeout 15 \
           "USE GRAPH gap0326_cancel MATCH (n:RollbackSentinel {id: 'explicit_rb_001'}) RETURN count(n) AS cnt" 2>&1)
     echo "$OUT"
@@ -171,7 +171,7 @@ tests:
   type: bash
   command: |
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
-    OUT=$(geode query --server "${GEODE_SERVER_ADDRESS}" --insecure-tls-skip-verify \
+    OUT=$(geode query --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
           -U geode -P "${PW}" --timeout 15 \
           "USE GRAPH gap0326_cancel MATCH (n:CancelRow {gap: '0326'}) RETURN count(n) AS cnt" 2>&1)
     echo "$OUT"
@@ -181,7 +181,7 @@ tests:
       && echo "rollback_behavior=correct_rolled_back" \
       || echo "rollback_behavior=BUG_writes_not_rolled_back cnt=$CNT"
     # Clean up rows regardless
-    geode query --server "${GEODE_SERVER_ADDRESS}" --insecure-tls-skip-verify \
+    geode query --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
       -U geode -P "${PW}" \
       "USE GRAPH gap0326_cancel MATCH (n:CancelRow {gap: '0326'}) DETACH DELETE n" >/dev/null 2>&1
     exit 0
@@ -214,13 +214,13 @@ tests:
     SENTINEL="KillSentinel_gap0326"
 
     # Ensure clean slate
-    geode query --server "${SERVER}" --insecure-tls-skip-verify \
+    geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
       -U geode -P "${PW}" \
       "USE GRAPH gap0326_cancel MATCH (n:${SENTINEL}) DETACH DELETE n" >/dev/null 2>&1
 
     # Launch a write query in background — a large multi-INSERT that takes
     # enough time for us to kill it mid-flight.
-    geode query --server "${SERVER}" --insecure-tls-skip-verify \
+    geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
       -U geode -P "${PW}" --timeout 60 \
       "USE GRAPH gap0326_cancel
        CREATE (a:${SENTINEL} {id:1}),(b:${SENTINEL} {id:2}),(c:${SENTINEL} {id:3}),
@@ -239,20 +239,20 @@ tests:
     sleep 2
 
     # Verify: how many sentinel rows survived?
-    OUT=$(geode query --server "${SERVER}" --insecure-tls-skip-verify \
+    OUT=$(geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
           -U geode -P "${PW}" --timeout 15 \
           "USE GRAPH gap0326_cancel MATCH (n:${SENTINEL}) RETURN count(n) AS cnt" 2>&1)
     echo "post_cancel_query: $OUT"
 
     # Accept 0 rows (clean rollback) OR the query process completed before kill
     # In either case, server must still be alive
-    HEALTH=$(geode query --server "${SERVER}" --insecure-tls-skip-verify \
+    HEALTH=$(geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
              -U geode -P "${PW}" --timeout 10 \
              "RETURN 'server_alive' AS status" 2>&1)
     echo "$HEALTH" | grep -q "server_alive" && echo "server_health=ok" || echo "server_health=FAIL"
 
     # Clean up any rows that may have been committed before kill
-    geode query --server "${SERVER}" --insecure-tls-skip-verify \
+    geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
       -U geode -P "${PW}" \
       "USE GRAPH gap0326_cancel MATCH (n:${SENTINEL}) DETACH DELETE n" >/dev/null 2>&1
 
@@ -286,7 +286,7 @@ tests:
     # Because --timeout 1 fires before the insert completes (for a large op),
     # the server should roll back.  For lightweight inserts the timeout may
     # or may not fire — we accept either outcome so long as the server is alive.
-    geode query --server "${SERVER}" --insecure-tls-skip-verify \
+    geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
       -U geode -P "${PW}" --timeout 1 \
       "USE GRAPH gap0326_cancel
        CREATE (:TimeoutSentinel {id: 'gap0326_timeout', ts: current_timestamp()})
@@ -296,7 +296,7 @@ tests:
     sleep 2
 
     # Server must still be healthy
-    OUT=$(geode query --server "${SERVER}" --insecure-tls-skip-verify \
+    OUT=$(geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
           -U geode -P "${PW}" --timeout 15 \
           "RETURN 'alive_after_timeout_cancel' AS status" 2>&1)
     echo "$OUT"
