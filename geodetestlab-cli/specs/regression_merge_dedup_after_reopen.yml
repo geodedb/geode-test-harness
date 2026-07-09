@@ -1,0 +1,202 @@
+version: '1.0'
+name: Regression — MERGE dedup after reopen under lazy hydration (geode 35fe3549, GAP-0046)
+description: |
+  Pins a fix (geode commit 35fe3549) for a bug where, after a server
+  restart, the store reopens into deferred (lazy) hydration and a
+  subsequent MERGE over already-persisted nodes missed the dedup lookup —
+  creating duplicate nodes instead of matching the existing one.
+
+  Scenario:
+    1. Seed 6 distinct RG2_Taxon nodes via MERGE (SET n.rank = 'species').
+    2. Verify count(n) == 6 before restart.
+    3. Also seed one RG2_Pair composite-key node before restart.
+    4. Restart the managed server against the SAME data dir
+       (cleanup: false + restart_server: true) — this forces reopen into
+       lazy/deferred hydration.
+    5. KEY: re-run the identical 6 MERGE statements post-reopen (this time
+       SET n.rank = 'genus'). If dedup is broken, this creates 6 NEW nodes
+       and count(n) becomes 12 instead of staying 6. It also proves the
+       MERGE matched (not created) because the SET actually applied to the
+       existing node — rank flips species -> genus in place.
+    6. KEY: re-merge the same RG2_Pair composite key post-reopen — count
+       must stay 1, not become 2.
+    7. Negative control: MERGE a genuinely NEW key (taxon_id: 99) post-
+       reopen — count MUST increment to exactly 7, proving MERGE still
+       creates correctly for keys that were never persisted (i.e. the
+       fix didn't overcorrect into "MERGE never creates").
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4442
+  --data-dir /tmp/probe-r2) before/after a manual SIGTERM + restart on the
+  same data dir: count(n) held at 6 across reopen + re-MERGE, rank flipped
+  species -> genus in place, RG2_Pair count held at 1, and the new-key
+  MERGE brought count to exactly 7 — matching the fixed (post-35fe3549)
+  contract this spec pins.
+
+  CANARY: REQ=REQ-QUERY-MERGE-DEDUP-REOPEN-001; FEATURE="MergeDedup"; ASPECT=ReopenLazyHydration; STATUS=TESTED; TEST=geodetestlab/specs/regression_merge_dedup_after_reopen.yml; OWNER=qa; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed-merge-initial
+  description: |
+    Seed 6 distinct RG2_Taxon nodes via MERGE (create path — none of these
+    keys exist yet), setting rank='species'.
+  query: |
+    MERGE (n:RG2_Taxon {taxon_id: 1, source: 'gbif'}) SET n.rank = 'species';
+    MERGE (n:RG2_Taxon {taxon_id: 2, source: 'gbif'}) SET n.rank = 'species';
+    MERGE (n:RG2_Taxon {taxon_id: 3, source: 'gbif'}) SET n.rank = 'species';
+    MERGE (n:RG2_Taxon {taxon_id: 4, source: 'gbif'}) SET n.rank = 'species';
+    MERGE (n:RG2_Taxon {taxon_id: 5, source: 'gbif'}) SET n.rank = 'species';
+    MERGE (n:RG2_Taxon {taxon_id: 6, source: 'gbif'}) SET n.rank = 'species';
+  expected:
+    exit_code: 0
+  tags: [merge, dedup, reopen, setup]
+
+- name: seed-composite-pair
+  description: Seed the RG2_Pair composite-key node before restart.
+  query: "MERGE (:RG2_Pair {a: 'k1', b: 'k2'})"
+  expected:
+    exit_code: 0
+  tags: [merge, dedup, reopen, setup]
+
+- name: count-before-restart
+  description: Confirm exactly 6 RG2_Taxon nodes exist before the restart.
+  query: MATCH (n:RG2_Taxon) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":6'
+  tags: [merge, dedup, reopen, positive-baseline]
+
+- name: pair-count-before-restart
+  description: Confirm exactly 1 RG2_Pair node exists before the restart.
+  query: MATCH (n:RG2_Pair) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":1'
+  tags: [merge, dedup, reopen, positive-baseline]
+
+- name: restart-server-for-lazy-reopen
+  description: |
+    Restart the managed server against the SAME data dir (cleanup: false
+    above). On reopen, geode hydrates the graph store lazily/deferred —
+    this is the exact condition under which the pre-35fe3549 bug missed
+    the MERGE dedup lookup.
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RESTART
+  tags: [merge, dedup, reopen, restart]
+
+- name: re-merge-after-reopen
+  description: |
+    KEY — identical 6 MERGE statements against the persisted nodes, now
+    setting rank='genus'. Under the pre-fix bug these MERGEs would each
+    miss the dedup lookup against the lazily-hydrated store and CREATE a
+    duplicate node instead of matching the existing one.
+  query: |
+    MERGE (n:RG2_Taxon {taxon_id: 1, source: 'gbif'}) SET n.rank = 'genus';
+    MERGE (n:RG2_Taxon {taxon_id: 2, source: 'gbif'}) SET n.rank = 'genus';
+    MERGE (n:RG2_Taxon {taxon_id: 3, source: 'gbif'}) SET n.rank = 'genus';
+    MERGE (n:RG2_Taxon {taxon_id: 4, source: 'gbif'}) SET n.rank = 'genus';
+    MERGE (n:RG2_Taxon {taxon_id: 5, source: 'gbif'}) SET n.rank = 'genus';
+    MERGE (n:RG2_Taxon {taxon_id: 6, source: 'gbif'}) SET n.rank = 'genus';
+  expected:
+    exit_code: 0
+  tags: [merge, dedup, reopen, key-assertion]
+
+- name: count-after-remerge
+  description: |
+    KEY ASSERTION — count(n) must still be exactly 6 after reopen +
+    re-MERGE. A duplicate-creating regression would flip this to 12
+    (6 pre-restart + 6 spurious duplicates) and FAIL this test.
+  query: MATCH (n:RG2_Taxon) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":6'
+  tags: [merge, dedup, reopen, key-assertion]
+
+- name: rank-readback-after-remerge
+  description: |
+    KEY ASSERTION — the SET on the re-MERGE must have applied to the
+    MATCHED (pre-existing) node, flipping rank from 'species' to 'genus'
+    in place. If the re-MERGE had instead CREATED a duplicate, this
+    original node's rank would remain 'species'.
+  query: "MATCH (n:RG2_Taxon {taxon_id: 1}) RETURN n.rank"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"rank":"genus"'
+    stdout_not_contains:
+    - '"rank":"species"'
+  tags: [merge, dedup, reopen, key-assertion]
+
+- name: composite-key-merge-after-reopen
+  description: |
+    Re-merge the same RG2_Pair composite key post-reopen. count(n) must
+    stay 1, not become 2 — proves dedup also holds for composite
+    (multi-property) merge keys, not just single-property ones.
+  query: "MERGE (:RG2_Pair {a: 'k1', b: 'k2'})"
+  expected:
+    exit_code: 0
+  tags: [merge, dedup, reopen, composite-key, key-assertion]
+
+- name: composite-key-count-after-reopen
+  description: KEY ASSERTION — RG2_Pair count(n) must remain exactly 1.
+  query: MATCH (n:RG2_Pair) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":1'
+  tags: [merge, dedup, reopen, composite-key, key-assertion]
+
+- name: new-key-still-creates
+  description: |
+    Negative control — MERGE a genuinely NEW taxon_id (99) that was never
+    persisted before the restart. This must still CREATE, proving the
+    dedup fix did not overcorrect into "MERGE never creates" after reopen.
+  query: "MERGE (:RG2_Taxon {taxon_id: 99, source: 'gbif'})"
+  expected:
+    exit_code: 0
+  tags: [merge, dedup, reopen, negative-control]
+
+- name: new-key-count-after-create
+  description: |
+    KEY ASSERTION — count(n) must increment to exactly 7 (6 original +
+    1 genuinely new node), confirming create-for-new-keys still works
+    correctly post-reopen.
+  query: MATCH (n:RG2_Taxon) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":7'
+  tags: [merge, dedup, reopen, negative-control]
+
+tags:
+- merge
+- dedup
+- reopen
+- lazy-hydration
+- regression
