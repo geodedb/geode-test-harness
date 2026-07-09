@@ -146,6 +146,42 @@ tests:
   - setup
   - gap-0322
 
+# GRANT explicit per-graph READ access to the readonly principals. A readonly
+# user holds no baseline graph capability, so post-#861 (cross-graph BOLA fix)
+# it must hold an explicit GRANT to bind a graph — the graph-bind gate is the
+# BOLA layer; principal/RLS isolation (below) is the row layer. alice reads
+# BOTH tenant graphs (the tests below assert cnt:2 for each); bob reads tenant_b.
+- name: principal-prop-grant-alice
+  description: Grant alice READ on both tenant graphs so she can bind them.
+  args:
+  - query
+  - '-'
+  stdin: |
+    GRANT READ ON GRAPH principal_tenant_a TO alice_tenant_a_2026;
+    GRANT READ ON GRAPH principal_tenant_b TO alice_tenant_a_2026;
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - setup
+  - gap-0322
+
+- name: principal-prop-grant-bob
+  description: Grant bob READ on tenant_b so he can bind it.
+  args:
+  - query
+  - '-'
+  stdin: |
+    GRANT READ ON GRAPH principal_tenant_b TO bob_tenant_b_2026;
+  expect:
+    exit_code: 0
+  tags:
+  - distributed
+  - principal-propagation
+  - setup
+  - gap-0322
+
 # -----------------------------------------------------------------------
 # Verify tenant_a user reads only tenant_a's data (scope enforcement)
 # -----------------------------------------------------------------------
@@ -374,20 +410,25 @@ tests:
   - cross-shard
   - gap-0322
 
-- name: principal-prop-distributed-envelope-blocked
+- name: principal-prop-distributed-envelope-ignored-on-non-federation
   description: |
-    GAP-0322 acceptance criterion. The connection authenticates as admin
-    `geode`, but --forward-principal attaches a principal_envelope naming
-    alice_envelope_2026 in tenant_a. The server deserialises the envelope
-    (distributed/principal_envelope.zig) and evaluates RLS under alice's
-    identity. The EnvDoc deny policy for alice fires → count MUST be 0.
+    NEW-8 / #860 / #868 security gate. The connection authenticates as admin
+    `geode` (a NON-federation connection) and attaches --forward-principal
+    naming alice_envelope_2026. Because the sender is not the federation
+    principal (`geode-cluster` + GEODE_CLUSTER_TOKEN), the server MUST NOT
+    decode or trust the attacker-controllable principal_envelope_bytes (field
+    4) — see quic_connection_handler.zig `shouldTrustEnvelope`. The envelope is
+    therefore ignored, the connection's admin identity drives RLS, and the
+    EnvDoc deny policy (scoped to alice, not `geode`) does NOT fire → count is 2.
 
-    This is genuine proof: if the envelope were ignored, the connection's
-    admin identity would drive RLS and the count would be 2 (see the
-    admin-baseline test above). A result of 0 can ONLY occur if the
-    forwarded principal — not the connection principal — reached the
-    server's GPS/RLS engine. This exercises the exact deserialize +
-    GPS-evaluate path a distributed shard worker runs.
+    This proves the hardening that closed the envelope-spoofing escalation:
+    a forwarded principal only *refines* an already-authenticated FEDERATION
+    identity; it can never be injected over a normal client connection to
+    assume another user's row scope. End-to-end "envelope applied → deny fires
+    → count 0" coverage lives on the trusted federation/shard-worker path
+    (distributed/principal_envelope.zig + tests/test_new8_envelope_trust.zig),
+    which requires a cluster-token connection and so is out of scope for this
+    standalone spec.
   args:
   - query
   - '-'
@@ -399,12 +440,13 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
-    - '"cnt":0'
+    - '"cnt":2'
   tags:
   - distributed
   - principal-propagation
   - cross-shard
   - gap-0322
+  - new8-envelope-trust-gate
 
 - name: principal-prop-envelope-cleanup
   description: Remove the envelope-test deny policy, user, and graph.

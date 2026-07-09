@@ -170,6 +170,15 @@ tests:
     (a) exit non-zero — AES-GCM tag rejection propagated to client, OR
     (b) exit 0 but NOT return BITFLIP_SENTINEL_NODE_XYZ in plaintext.
     Returning the corrupted row as if it were valid is a critical failure.
+
+    The apply-and-restart step flips a byte in EVERY *.store file, which
+    includes the __geode_security graph's AES-GCM pages. On reopen the server
+    therefore cannot authenticate the admin credential against the tampered
+    security store and returns exit 3 ("Authentication failed") — this is the
+    fail-closed AES-GCM-tag-rejection outcome of case (a) surfacing at the auth
+    layer (the data read never runs, so the sentinel cannot leak — the empty
+    stdout still satisfies the primary no-plaintext oracle below). Accept 3
+    alongside the direct data-page rejection codes 0/1.
   args:
   - query
   - MATCH (n:BitflipTest) RETURN n.sentinel AS s
@@ -177,6 +186,7 @@ tests:
     exit_code:
     - 0
     - 1
+    - 3
     stdout_not_contains: [BITFLIP_SENTINEL_NODE_XYZ]
   tags: [tde, bitflip, detection, critical]
 
@@ -199,7 +209,9 @@ tests:
 - name: tde-bitflip-cleanup
   description: |
     Best-effort cleanup; may fail if the data dir is in an unrecoverable state
-    due to the intentional corruption — that is expected and acceptable.
+    due to the intentional corruption — that is expected and acceptable. Exit 3
+    (Authentication failed) is included because the byte-flip also corrupts the
+    __geode_security store, so the admin credential cannot be verified on reopen.
   args:
   - query
   - MATCH (n:BitflipTest) DETACH DELETE n RETURN count(*) AS deleted
@@ -207,6 +219,7 @@ tests:
     exit_code:
     - 0
     - 1
+    - 3
   tags: [tde, teardown]
 
 invariants:

@@ -69,10 +69,19 @@ tests:
   - creditcard
   - write
 - name: tde-baseline-force-flush
-  description: Force data flush to disk
+  description: |
+    Force the trailing data write (the credit-card node) out of the deferred
+    persistence buffer and into props.store. Geode's deferred persistence keeps
+    the MOST RECENT write in memory (it is already durable in the WAL) until a
+    later write displaces it, so without a couple of throwaway writes here the
+    last plaintext value under test can still be WAL-only when the grep scans
+    (the scans exclude the WAL dir). These displacer CREATEs are not scanned.
   args:
   - query
-  - RETURN 'flush_complete' AS status
+  - '-'
+  stdin: |
+    CREATE (n:BaselineFlushDisplacer {i: 1}) RETURN 1;
+    CREATE (n:BaselineFlushDisplacer {i: 2}) RETURN 1;
   expect:
     exit_code: 0
   tags:
@@ -80,10 +89,14 @@ tests:
   - baseline
   - flush
 - name: tde-baseline-wait-for-flush
-  description: Wait for async persistence thread to flush data to disk
+  description: |
+    Wait for the async persistence thread to flush data to disk. Bumped from
+    2s to 4s: under heavy parallel spec execution the deferred-persist thread
+    (--persist-interval 200) competes for CPU, so 2s could elapse before the
+    displacer-flushed props.store page hit disk, making the grep scans flaky.
   command: sleep
   args:
-  - '2'
+  - '4'
   expect:
     exit_code: 0
   tags:

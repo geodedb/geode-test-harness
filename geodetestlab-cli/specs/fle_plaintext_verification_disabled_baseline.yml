@@ -82,10 +82,18 @@ tests:
   - baseline
   - verify
 - name: fle-baseline-force-checkpoint
-  description: Force checkpoint to ensure all data is written to disk
+  description: |
+    Force the trailing data write (the combined marker) out of the deferred
+    persistence buffer and into props.store. Geode keeps the MOST RECENT write
+    in memory (already durable in the WAL) until a later write displaces it, so
+    without these throwaway CREATEs the last plaintext marker under test can be
+    WAL-only when the grep scans (which exclude the WAL dir). Not scanned.
   args:
   - query
-  - RETURN 'checkpoint_requested' AS status
+  - '-'
+  stdin: |
+    CREATE (n:FLEBaselineFlushDisplacer {i: 1}) RETURN 1;
+    CREATE (n:FLEBaselineFlushDisplacer {i: 2}) RETURN 1;
   expect:
     exit_code: 0
   tags:
@@ -93,10 +101,14 @@ tests:
   - baseline
   - checkpoint
 - name: fle-baseline-wait-for-flush
-  description: Wait for async persistence thread to flush data to disk
+  description: |
+    Wait for the async persistence thread to flush data to disk. Bumped from
+    2s to 4s: under heavy parallel spec execution the deferred-persist thread
+    (--persist-interval 200) competes for CPU, so 2s could elapse before the
+    displacer-flushed props.store page hit disk, making the grep scans flaky.
   command: sleep
   args:
-  - '2'
+  - '4'
   expect:
     exit_code: 0
   tags:
