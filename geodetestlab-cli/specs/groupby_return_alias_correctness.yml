@@ -1,0 +1,178 @@
+version: '1.0'
+name: GROUP BY RETURN-alias correctness (geode ce8bd8f0)
+description: |
+  Pins the fix for a legacy GROUP BY bug: when a GROUP BY clause referenced a
+  bare RETURN alias (e.g. `RETURN n.category AS s, count(*) AS c GROUP BY s`),
+  the legacy grouping path mis-resolved the alias to Null, silently collapsing
+  every row into ONE null group instead of one group per distinct category.
+  The fix routes alias-grouped GROUP BY through the exact index so the alias
+  resolves to the correct per-row grouping key.
+
+  This spec seeds 9 :RG1_Item nodes (4x category='a', 3x category='b',
+  2x category='c'; 5x src='x', 4x src='y') and exercises:
+    1. alias-grouped-count  — GROUP BY s (bare RETURN alias) must produce
+       THREE groups with counts 4/3/2, never a single null-collapsed group.
+    2. alias-grouped-sum    — same alias-grouped path with sum() aggregation.
+    3. property-keyed-differential — GROUP BY n.category (property-keyed,
+       never routed through the buggy alias path) must produce identical
+       groups/counts to the alias form — differential proof the alias path
+       now matches the always-correct property-keyed path.
+    4. groupby-unknown-alias — GROUP BY on an identifier that is neither a
+       RETURN alias nor a property path.
+    5. filtered-count-parity (geode d50d0666) — a plain WHERE-filtered
+       count(n) must match the true filtered cardinality (5 of 9 rows have
+       src='x').
+
+  KNOWN LIMITATION (probed against the current binary, geode ce8bd8f0):
+  GROUP BY on an unresolvable identifier (`GROUP BY nosuch`, case
+  groupby-unknown-alias-limitation-pin below) does NOT raise an error as the
+  ISO/IEC 39075:2024 contract would require. Instead it silently succeeds,
+  collapsing all 9 rows into a single group and reporting the first row's
+  `s` value (non-deterministic w.r.t. row order) alongside a `c` count equal
+  to the FULL unfiltered row count. This is pinned as today's actual
+  behavior per the bug rule — do not weaken this assertion; the correct
+  contract is a query-time error (unknown identifier in GROUP BY).
+
+  CANARY: REQ=REQ-QUERY-GROUPBY-ALIAS-001; FEATURE="GroupByAlias"; ASPECT=AliasResolution; STATUS=TESTED; TEST=geodetestlab/specs/groupby_return_alias_correctness.yml; OWNER=qa; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: groupby-alias-setup-seed
+  description: |
+    Seed 9 :RG1_Item nodes: 4x category='a', 3x category='b', 2x
+    category='c'; 5x src='x' (v=1,2,5,6,8), 4x src='y' (v=3,4,7,9).
+  args:
+  - query
+  - |
+    CREATE
+      (:RG1_Item {category:'a', src:'x', v:1}),
+      (:RG1_Item {category:'a', src:'x', v:2}),
+      (:RG1_Item {category:'a', src:'y', v:3}),
+      (:RG1_Item {category:'a', src:'y', v:4}),
+      (:RG1_Item {category:'b', src:'x', v:5}),
+      (:RG1_Item {category:'b', src:'x', v:6}),
+      (:RG1_Item {category:'b', src:'y', v:7}),
+      (:RG1_Item {category:'c', src:'x', v:8}),
+      (:RG1_Item {category:'c', src:'y', v:9})
+  expected:
+    exit_code: 0
+  tags: [groupby, alias, setup]
+
+- name: alias-grouped-count
+  description: |
+    KEY ASSERTION — GROUP BY on a bare RETURN alias (`s`, aliasing
+    n.category) must produce THREE distinct groups with counts 4/3/2.
+    Pre-fix, the legacy GROUP BY path mis-resolved `s` to Null and
+    collapsed all 9 rows into one null group; this assertion set (each
+    group key bound to ITS count via combined row substrings, plus an
+    explicit stdout_not_contains on "null") fails against that regression
+    AND against any key/count swap. The combined substrings rely on the
+    probed row rendering: fields are adjacent and stably ordered
+    ({"s":"a","c":4}) in the JSON output.
+  args:
+  - query
+  - MATCH (n:RG1_Item) RETURN n.category AS s, count(*) AS c GROUP BY s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"s":"a","c":4'
+    - '"s":"b","c":3'
+    - '"s":"c","c":2'
+    stdout_not_contains:
+    - 'null'
+  tags: [groupby, alias, positive, key-assertion]
+
+- name: alias-grouped-sum
+  description: |
+    Alias-grouped GROUP BY with sum() aggregation — same alias-resolution
+    path as alias-grouped-count, exercised with a different aggregate to
+    rule out a count()-only fix.
+  args:
+  - query
+  - MATCH (n:RG1_Item) RETURN n.category AS s, sum(n.v) AS total GROUP BY s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"s":"a","total":10'
+    - '"s":"b","total":18'
+    - '"s":"c","total":17'
+    stdout_not_contains:
+    - 'null'
+  tags: [groupby, alias, positive]
+
+- name: property-keyed-differential
+  description: |
+    Differential control — GROUP BY n.category (property-keyed, not routed
+    through the RETURN-alias resolution path) must produce identical
+    groups and counts to alias-grouped-count. Confirms parity between the
+    alias path and the always-correct property-keyed path.
+  args:
+  - query
+  - MATCH (n:RG1_Item) RETURN n.category AS s, count(*) AS c GROUP BY n.category
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"s":"a","c":4'
+    - '"s":"b","c":3'
+    - '"s":"c","c":2'
+    stdout_not_contains:
+    - 'null'
+  tags: [groupby, property-keyed, positive, differential]
+
+- name: groupby-unknown-alias-limitation-pin
+  description: |
+    BUG-RULE LIMITATION PIN (geode ce8bd8f0) — GROUP BY on `nosuch`, an
+    identifier that is neither a RETURN alias nor a resolvable property
+    path, SHOULD raise a query-time error per the documented contract
+    ("unknown identifier in GROUP BY"). Probed against the current binary,
+    it instead succeeds (exit 0) and silently collapses all 9 rows into a
+    single group, reporting c=9 (the full unfiltered row count) alongside
+    an arbitrary/non-deterministic value for s. This test pins TODAY'S
+    actual behavior — do not weaken it to assert an error until the
+    underlying resolution bug is fixed; when it is, flip this test to
+    assert a nonzero exit_code / stderr error instead.
+  args:
+  - query
+  - MATCH (n:RG1_Item) RETURN n.category AS s, count(*) AS c GROUP BY nosuch
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":9'
+  tags: [groupby, alias, negative, limitation-pin]
+
+- name: filtered-count-parity
+  description: |
+    geode d50d0666 — a plain WHERE-filtered count(n) must match the true
+    filtered cardinality. 5 of the 9 seeded rows have src='x'
+    (v=1,2,5,6,8).
+  args:
+  - query
+  - MATCH (n:RG1_Item) WHERE n.src='x' RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":5'
+  tags: [groupby, filter, count, positive]
+
+tags:
+- groupby
+- alias
+- regression
+- query
