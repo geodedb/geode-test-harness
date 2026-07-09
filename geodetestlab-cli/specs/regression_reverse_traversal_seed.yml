@@ -1,0 +1,176 @@
+version: '1.0'
+name: Regression — reverse single-hop traversal from bound arrowhead endpoint (geode 2e6283f2, 7ef82b04)
+description: |
+  Pins a fix (geode commits 2e6283f2 / 7ef82b04, "Bug B") for a bug in
+  reverse single-hop pattern matching: `MATCH (b)<-[:R]-(a) WHERE b.id=...`
+  binds the WHERE filter on the arrowhead endpoint `b`, which is the
+  RELATIONSHIP TARGET in a reverse-arrow pattern. Pre-fix, the planner did
+  a wrong-direction label/edge scan from the bound node and returned the
+  neighbors reachable by OUTGOING edges from `b` instead of the neighbors
+  connected by INCOMING edges into `b` — i.e. it silently returned the
+  wrong result set instead of erroring.
+
+  This is pure GQL — no server restart, no persistence-layer interaction.
+
+  Scenario:
+    1. Seed 3 RG4_Src nodes (s1, s2, s3), each with an outgoing
+       `-[:RG4_LINKS]->` edge into a single shared RG4_Dst node (d1).
+       Also seed an isolated RG4_Dst node (d2) with zero in-edges.
+    2. DECOY (the teeth of this spec): add ONE more edge, this time
+       OUTGOING from d1 into a 4th RG4_Src node (s4):
+       `(d1)-[:RG4_LINKS]->(s4)`. This is exactly the edge a
+       wrong-direction scan rooted at d1 would incorrectly walk and
+       return. Its presence means the KEY assertion below is not just
+       checking for "some rows" — it is checking that s4 (reachable only
+       via the wrong direction) is ABSENT and s1/s2/s3 (reachable only via
+       the correct, reverse/incoming direction) are PRESENT.
+    3. KEY — reverse-bound-arrowhead: `MATCH (b:RG4_Dst)<-[:RG4_LINKS]-(a)
+       WHERE b.id = 'd1' RETURN a.id AS src_id`. Must return exactly
+       {s1, s2, s3} and must NOT contain s4 or d1.
+    4. forward-differential: the syntactically-forward equivalent,
+       `MATCH (a)-[:RG4_LINKS]->(b:RG4_Dst) WHERE b.id = 'd1' RETURN
+       a.id AS src_id`, must return the identical 3-id set — proving the
+       two syntactic forms of "who points into d1" agree.
+    5. NEGATIVE CONTROL — reverse-no-inedges: the same reverse pattern
+       bound on d2 (zero in-edges) must return exactly 0 rows with
+       exit_code 0 (not an error) — distinguishing "no matches" from a
+       query failure.
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4444
+  --data-dir /tmp/probe-r4, GEODE_ADMIN_PASSWORD=GeodeTestPassword123!)
+  before writing this spec:
+    - reverse-bound-arrowhead returned exactly src_id in {s1,s2,s3} on the
+      current binary (fix is present; not a live regression).
+    - forward-differential returned the identical {s1,s2,s3} set.
+    - the d2-bound reverse query returned status_class 00000, exit 0,
+      "rows":[] — confirmed as the exact zero-row rendering.
+    - decoy-effectiveness check: the DELIBERATELY wrong-direction query
+      `MATCH (b:RG4_Dst)-[:RG4_LINKS]->(x) WHERE b.id='d1' RETURN x.id AS
+      decoy_id` returned exactly {"decoy_id":"s4"} — proving that had the
+      KEY query above scanned the wrong direction, s4 (not s1/s2/s3) is
+      precisely what would have leaked into the result, and the
+      stdout_not_contains assertion on "s4" would have caught it.
+
+  CANARY: REQ=REQ-QUERY-REVERSE-TRAVERSAL-001; FEATURE="PatternMatch"; ASPECT=ReverseSeedBoundEndpoint; STATUS=TESTED; TEST=geodetestlab/specs/regression_reverse_traversal_seed.yml; OWNER=qa; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed-nodes
+  description: |
+    Seed 3 RG4_Src nodes (s1..s3), a 4th RG4_Src decoy target (s4), and
+    two RG4_Dst nodes: d1 (will get 3 in-edges + 1 out-edge to the decoy)
+    and d2 (stays isolated — zero in-edges, for the negative control).
+  query: |
+    CREATE (:RG4_Src {id: 's1'});
+    CREATE (:RG4_Src {id: 's2'});
+    CREATE (:RG4_Src {id: 's3'});
+    CREATE (:RG4_Src {id: 's4'});
+    CREATE (:RG4_Dst {id: 'd1'});
+    CREATE (:RG4_Dst {id: 'd2'});
+  expected:
+    exit_code: 0
+  tags: [reverse-traversal, seed]
+
+- name: seed-forward-edges-into-d1
+  description: |
+    Create the 3 genuine edges: s1, s2, s3 each point INTO the shared
+    RG4_Dst node d1 via an outgoing RG4_LINKS edge.
+  query: |
+    MATCH (a:RG4_Src {id: 's1'}), (b:RG4_Dst {id: 'd1'}) CREATE (a)-[:RG4_LINKS]->(b);
+    MATCH (a:RG4_Src {id: 's2'}), (b:RG4_Dst {id: 'd1'}) CREATE (a)-[:RG4_LINKS]->(b);
+    MATCH (a:RG4_Src {id: 's3'}), (b:RG4_Dst {id: 'd1'}) CREATE (a)-[:RG4_LINKS]->(b);
+  expected:
+    exit_code: 0
+  tags: [reverse-traversal, seed]
+
+- name: seed-decoy-edge-out-of-d1
+  description: |
+    DECOY — create one edge in the OPPOSITE direction: FROM d1 TO s4
+    (`(d1)-[:RG4_LINKS]->(s4)`). This is exactly the edge a wrong-
+    direction (pre-fix) scan rooted at the bound node d1 would walk and
+    incorrectly return. Its existence is what gives the KEY test below
+    real teeth: a broken reverse-direction implementation would return
+    s4 instead of (or in addition to) s1/s2/s3.
+  query: "MATCH (d:RG4_Dst {id: 'd1'}), (s:RG4_Src {id: 's4'}) CREATE (d)-[:RG4_LINKS]->(s);"
+  expected:
+    exit_code: 0
+  tags: [reverse-traversal, seed, decoy]
+
+- name: reverse-bound-arrowhead
+  description: |
+    KEY ASSERTION — reverse pattern `(b)<-[:R]-(a)` with the WHERE filter
+    bound on b, the arrowhead endpoint (the relationship TARGET). Must
+    return exactly the 3 genuine incoming neighbors {s1, s2, s3} of d1.
+    Must NOT contain s4 (the decoy, reachable only via the wrong/outgoing
+    direction from d1) or d1 itself. A wrong-direction label/edge scan
+    (the pre-2e6283f2/7ef82b04 bug) would leak s4 into this result
+    instead of (or alongside) the correct set.
+  query: "MATCH (b:RG4_Dst)<-[:RG4_LINKS]-(a) WHERE b.id = 'd1' RETURN a.id AS src_id"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"src_id":"s1"'
+    - '"src_id":"s2"'
+    - '"src_id":"s3"'
+    stdout_not_contains:
+    - '"src_id":"s4"'
+    - '"src_id":"d1"'
+  tags: [reverse-traversal, key-assertion]
+
+- name: forward-differential
+  description: |
+    Differential check — the syntactically-forward equivalent pattern,
+    `(a)-[:R]->(b)` with the same WHERE filter on b, must return the
+    identical 3-id set as the reverse form above. This proves both
+    syntactic directions of "who points into d1" agree.
+  query: "MATCH (a)-[:RG4_LINKS]->(b:RG4_Dst) WHERE b.id = 'd1' RETURN a.id AS src_id"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"src_id":"s1"'
+    - '"src_id":"s2"'
+    - '"src_id":"s3"'
+    stdout_not_contains:
+    - '"src_id":"s4"'
+    - '"src_id":"d1"'
+  tags: [reverse-traversal, differential]
+
+- name: reverse-no-inedges
+  description: |
+    NEGATIVE CONTROL — the same reverse pattern bound on d2, which has
+    zero in-edges. Must return exactly 0 rows with exit_code 0 (a clean
+    empty result), NOT an error — distinguishing "no matches" from a
+    query failure. Probed rendering for zero rows is an empty "rows"
+    array with status_class 00000.
+  query: "MATCH (b:RG4_Dst)<-[:RG4_LINKS]-(a) WHERE b.id = 'd2' RETURN a.id AS src_id"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+    stdout_not_contains:
+    - '"src_id":"'
+  tags: [reverse-traversal, negative-control]
+
+tags:
+- reverse-traversal
+- pattern-match
+- regression
