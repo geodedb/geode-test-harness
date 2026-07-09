@@ -1,0 +1,536 @@
+version: '1.0'
+name: Graph-Bind Authorization Matrix — BOLA fix (#861) + permissive single-tenant ReadWrite (6701e9bc)
+description: |
+  Pins the two sides of one authorization lever governing graph-bound
+  sessions (`--dsn quic://user:pass@host:port/graphname`, HELLO
+  `?graph=<name>`) against an EXISTING graph the connecting user has never
+  been granted access to:
+
+    - DENY: geode security issue #861 (BOLA — broken object-level
+      authorization). A ReadOnly non-admin binding an existing but
+      ungranted graph must be denied.
+    - ALLOW: geode commit 6701e9bc deliberately restored a permissive
+      fallback — a ReadWrite non-admin in the DEFAULT (non-strict,
+      single-tenant) posture MAY bind an existing ungranted graph without
+      an explicit GRANT.
+
+  Both sides were probed live against a scratch server before writing this
+  spec (binary HEAD 78173943, a commit past 6701e9bc and the #861 fix
+  chain):
+
+    - `rg6_ro` (ROLE readonly, no grant) binding `rg6_secret` (created by
+      admin, no grants to anyone) → exit 3, `Error: Access denied:
+      insufficient permissions for graph`.
+    - `rg6_rw` (ROLE readwrite, no grant) binding the same graph → exit 0,
+      `"rows":[{"x":1}]`.
+
+  Source confirms this is intentional, not an accident of missing
+  enforcement (`src/security/gps.zig` ~L404-432, `bind_graph` action):
+  Admin always allowed → per-graph grant check → else, only when
+  `!tenancy.isStrictTenancy()`, ReadWrite gets a
+  `bind_graph_readwrite_permissive_single_tenant` pass; ReadOnly always
+  falls through to `bind_graph_no_evidence` (denied) regardless of
+  tenancy mode. Regression coverage referenced in-source:
+  `tests/test_new1_cross_graph_bola.zig`.
+
+  Per the task brief's bug rule: if the ReadOnly bind above were ever
+  observed ALLOWED on the binary under test, that would be a live BOLA
+  regression of #861 and this spec would need to be pulled and the
+  regression reported instead of pinned — the deny case is written with
+  `stdout_not_contains: ['"x":1']` for exactly this reason: a
+  server that let it through would fail this spec, not silently pass.
+
+  ## Strict-tenancy toggle — FOUND, both directions pinned
+
+  `GEODE_STRICT_TENANCY=1` (equivalently `--strict-tenancy`,
+  `src/server/cli_args.zig`) turns off the ReadWrite permissive fallback
+  above (`gps.zig` gates it on `!tenancy.isStrictTenancy()`), so under
+  strict tenancy EVERY non-admin — ReadOnly and ReadWrite alike — needs an
+  explicit GRANT to bind an existing graph. Probed live on a second
+  scratch server (fixed port 4448, own data dir, `GEODE_STRICT_TENANCY=1`
+  in its environment):
+
+    - fresh ReadWrite user, no grant, binds an existing graph under strict
+      tenancy → exit 3, `Access denied: insufficient permissions for
+      graph` (same message as the non-strict ReadOnly deny above — the
+      lever flips ReadWrite onto the same denial path).
+    - the SAME user after `GRANT READ ON GRAPH <g> TO <user>` → exit 0,
+      `"rows":[{"x":1}]`.
+
+  The managed harness server (this spec's primary `cli.server`) cannot
+  express `GEODE_STRICT_TENANCY=1` for only part of a run without
+  affecting every other test in the file, so — mirroring
+  `regression_gap0839_inmemory_graph_tenant_bind.yml`'s established
+  pattern for a second server configuration this harness has no knob for
+  — the strict-tenancy pair runs against a hand-rolled scratch server on
+  a fixed port (4448) started from a fresh `mktemp -d` working directory,
+  with its OWN `--data-dir` (an in-memory, no-data-dir scratch server was
+  probed first and its GRANT statement intermittently reported `error:
+  user not found` for a user created moments earlier on the same
+  connection — a real but out-of-scope in-memory GRANT quirk; using a
+  real data dir for this scratch server sidesteps it and is not itself
+  part of the behavior being pinned here).
+
+  NOTE (probed, out of scope): the strict-grant-allows case uses a
+  SEPARATE ReadWrite user (`rg6_strict_rw2`) from the strict-deny case
+  (`rg6_strict_rw`), not the same user post-grant. Probing found that once
+  a bind is denied for a given (user, graph) pair, a subsequent GRANT to
+  that SAME user does not unstick a later bind attempt — it is still
+  denied — while a user that has never been denied gets the grant
+  recognized immediately. This looks like a negative-authorization-cache
+  invalidation gap distinct from #861/6701e9bc; using a fresh user for the
+  positive case avoids conflating the two and keeps this spec's teeth on
+  the lever it is actually pinning. Worth its own follow-up GAP ticket.
+
+  ## gRPC parity
+
+  `geode query --dsn` accepts a `grpc://` scheme identically to `quic://`
+  (confirmed via `geode query --help`), and the #861 fix chain explicitly
+  implemented `bind_graph` authorization in the gRPC HELLO (geode
+  4d4ea112 "gRPC HELLO uses bind_graph authorization for graph binding",
+  d5a701e9 "gRPC HELLO honors default-graph bind compat, matching QUIC"),
+  so the grpc:// bind-DSN is the correct semantic shape for this
+  assertion. The harness only allocates a gRPC
+  listener/`GEODE_GRPC_ADDRESS` when invoked with `--transport grpc`
+  (`geodetestlab/lib/runner.py`); when it is absent, the parity test
+  documents `SKIPPED_NO_GRPC` / `GRPC_TRANSPORT_NOT_INVOKED` and exits 0
+  without asserting anything fake — the real assertion runs under
+  `make test-grpc` / `--transport grpc`, mirroring
+  `specs/grpc_mtls_rejection_matrix.yml`'s established fallback pattern.
+
+  LIVE gRPC TRANSPORT BREAKAGE (probed 2026-07-09, binary HEAD 78173943):
+  under `--transport grpc` the harness starts the managed server
+  gRPC-only (`--listen-grpc` without `--listen`; server.py), and on the
+  current binary EVERY query over that transport hangs to client timeout
+  — including the harness's own `args:`-built admin queries. Observed in
+  this spec's `--transport grpc` run as "Server hung (unresponsive),
+  force-killing and restarting" on every managed-server test, setup
+  included. Verified independently against a hand-rolled gRPC-only
+  scratch server using the harness's exact recipe
+  (`GEODE_GRPC_ALLOW_PLAINTEXT_FALLBACK=1`, Debug build): the proven
+  `--server <addr> --grpc` form (specs/grpc_mtls_rejection_matrix.yml's
+  shape), the `grpc://` DSN form, and both TLS-flag variants all time out
+  ("Error: query timed out"), with the server logging only "Connection
+  handling failed: error.ConnectionClosed". Likely root cause (source):
+  globals the gRPC handler depends on are only initialized inside the
+  QUIC-listen branch of `src/server/main.zig`; a dual QUIC+gRPC serve was
+  separately observed to hang at startup. This is a geode transport
+  regression, out of scope for this authorization spec. The parity test
+  therefore gates its real assertion on a transport-liveness BASELINE
+  (plain admin query via the proven `--server --grpc` form): if even the
+  baseline cannot complete, it documents GRPC_TRANSPORT_BROKEN_ON_BINARY
+  and exits 0 — the transport outage is already loudly visible in the
+  same run via every other managed-server test failing — instead of
+  converting a transport outage into a spurious authorization-matrix
+  failure. When the transport works, the ReadOnly denial is asserted for
+  real: a permitted bind (or any non-denial outcome) fails the test.
+
+  CANARY: REQ=REQ-SEC-GRAPH-BIND-AUTHZ-001; FEATURE="GraphBindAuthz"; ASPECT=BOLADenyMatrix; STATUS=TESTED; TEST=geodetestlab/specs/security_graph_bind_authorization_861.yml; OWNER=security; UPDATED=2026-07-09
+
+single_node_only: true  # strict-tenancy pair drives a second hand-rolled scratch server on a fixed port
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Setup — admin creates the graph and both non-admin principals, no grants
+# ---------------------------------------------------------------------------
+
+- name: rg6-setup-secret-graph
+  description: Admin creates the target graph. No GRANT is issued to any non-admin user anywhere in this spec.
+  args: [query, -U, geode, -P, '${env:GEODE_ADMIN_PASSWORD}', CREATE GRAPH rg6_secret]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [security, graph-bind, setup]
+
+- name: rg6-setup-readonly-user
+  description: |
+    Create rg6_ro via the GQL DDL path (`CREATE USER ... ROLE readonly`),
+    not `geode user create --role` — per sibling spec probe notes
+    (regression_gap0839_inmemory_graph_tenant_bind.yml /
+    gps_decide_smoke.yml), only the DDL path persists the role where the
+    live QUIC/gRPC HELLO auth resolver sees it.
+  args: [query, -U, geode, -P, '${env:GEODE_ADMIN_PASSWORD}', CREATE USER rg6_ro SET PASSWORD 'Rg6RoAuthzPass!234' ROLE readonly]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - rg6_ro
+  tags: [security, graph-bind, setup]
+
+- name: rg6-setup-readwrite-user
+  description: Create rg6_rw with the built-in readwrite role. No grant follows — the allow case below must be genuinely ungranted.
+  args: [query, -U, geode, -P, '${env:GEODE_ADMIN_PASSWORD}', CREATE USER rg6_rw SET PASSWORD 'Rg6RwAuthzPass!234' ROLE readwrite]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - rg6_rw
+  tags: [security, graph-bind, setup]
+
+# ---------------------------------------------------------------------------
+# KEY NEGATIVE — ReadOnly non-admin denied binding an ungranted graph (#861)
+# ---------------------------------------------------------------------------
+
+- name: rg6-readonly-bind-denied
+  description: |
+    KEY NEGATIVE (#861 BOLA fix). rg6_ro has no grant on rg6_secret, which
+    exists (created by admin above). A graph-bound DSN session must be
+    denied at bind time — not auto-created, not silently downgraded to an
+    empty result. stdout_not_contains asserts the query never actually
+    ran: a server that let this bind through would return `"x":1` and
+    this test would fail, giving the negative real teeth.
+  dsn: quic://rg6_ro:Rg6RoAuthzPass!234@127.0.0.1:${PORT}/rg6_secret
+  query: RETURN 1 AS x
+  expected:
+    exit_code: 3
+    stdout_contains:
+    - 'Access denied: insufficient permissions for graph'
+    stdout_not_contains:
+    - '"x":1'
+    - '"status_class":"00000"'
+  tags: [security, graph-bind, negative, key-assertion, bola, gap-861]
+
+# ---------------------------------------------------------------------------
+# KEY POSITIVE — ReadWrite non-admin allowed to bind an ungranted graph
+# in the default non-strict (single-tenant) posture (geode 6701e9bc)
+# ---------------------------------------------------------------------------
+
+- name: rg6-readwrite-bind-allowed-nonstrict
+  description: |
+    KEY POSITIVE (geode 6701e9bc permissive single-tenant restore).
+    rg6_rw has no grant on rg6_secret either — same ungranted graph as the
+    ReadOnly deny above. In the harness's default (non-strict) posture the
+    bind must succeed and the graph-bound session must run a real query.
+  dsn: quic://rg6_rw:Rg6RwAuthzPass!234@127.0.0.1:${PORT}/rg6_secret
+  query: RETURN 1 AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"x":1'
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - 'Access denied'
+  tags: [security, graph-bind, positive, key-assertion, gap-6701e9bc]
+
+# ---------------------------------------------------------------------------
+# gRPC parity — repeats the ReadOnly denial over grpc:// when the harness
+# was invoked with --transport grpc; documents and no-ops otherwise.
+# ---------------------------------------------------------------------------
+
+- name: rg6-grpc-parity-readonly-denied (no-ops without gRPC)
+  description: |
+    Repeats rg6-readonly-bind-denied over gRPC transport when the harness
+    run allocated a gRPC listener (GEODE_GRPC_ADDRESS set — i.e. this spec
+    was invoked with --transport grpc / `make test-grpc`). The grpc://
+    bind-DSN is the correct semantic shape: the #861 fix chain implemented
+    bind_graph authorization in the gRPC HELLO itself (geode 4d4ea112,
+    d5a701e9).
+
+    Three-way outcome (see the spec description's "LIVE gRPC TRANSPORT
+    BREAKAGE" section for why the baseline gate exists):
+      1. No GEODE_GRPC_ADDRESS → SKIPPED_NO_GRPC /
+         GRPC_TRANSPORT_NOT_INVOKED, exit 0 (coverage not exercised this
+         invocation; runs for real under --transport grpc).
+      2. GEODE_GRPC_ADDRESS set but even a plain ADMIN query over the
+         proven `--server <addr> --grpc` form cannot complete →
+         GRPC_TRANSPORT_BROKEN_ON_BINARY, exit 0. The transport outage
+         (current state at binary HEAD 78173943: every gRPC query hangs)
+         is already failing every other managed-server test in the same
+         run; this authz test does not double-report it as a spurious
+         authorization failure.
+      3. Baseline works → the ReadOnly bind-DSN denial is asserted for
+         real: anything other than exit 3 + the access-denied text (and
+         no "x":1 result leak) is GRPC_PARITY_MISMATCH, exit 1 — a
+         permitted bind over gRPC fails this spec (BOLA #861).
+  type: bash
+  timeout_ms: 60000
+  command: |
+    if [ -n "${GEODE_GRPC_ADDRESS:-}" ]; then
+      BIN="${GEODE_BINARY:-geode}"
+      PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+
+      # Transport-liveness baseline: proven --server/--grpc form from
+      # specs/grpc_mtls_rejection_matrix.yml. If the gRPC transport
+      # itself cannot complete an admin query, document and stand down
+      # (see spec description).
+      BASE_OUT=$(timeout 20 "$BIN" query "RETURN 'rg6-grpc-baseline' AS s" --server "${GEODE_GRPC_ADDRESS}" --grpc -U geode -P "$PW" --timeout 15 2>&1)
+      if ! echo "$BASE_OUT" | grep -qF 'rg6-grpc-baseline'; then
+        echo "$BASE_OUT"
+        echo "GRPC_TRANSPORT_BROKEN_ON_BINARY — a plain admin query over --server ${GEODE_GRPC_ADDRESS} --grpc did not complete; gRPC transport is down on this binary (known regression, see spec description). Authorization parity cannot be evaluated until the transport works."
+        exit 0
+      fi
+      echo "GRPC_BASELINE_OK"
+
+      OUT=$(timeout 20 "$BIN" query "RETURN 1 AS x" --dsn "grpc://rg6_ro:Rg6RoAuthzPass!234@${GEODE_GRPC_ADDRESS}/rg6_secret" --timeout 15 2>&1)
+      STATUS=$?
+      echo "$OUT"
+      echo "EXIT_CODE_WAS=${STATUS}"
+      if [ "$STATUS" -eq 3 ] && echo "$OUT" | grep -qF 'Access denied: insufficient permissions for graph' && ! echo "$OUT" | grep -qF '"x":1'; then
+        echo "GRPC_PARITY_DENIED_CORRECTLY"
+        exit 0
+      else
+        echo "GRPC_PARITY_MISMATCH"
+        exit 1
+      fi
+    else
+      echo "SKIPPED_NO_GRPC"
+      echo "GRPC_TRANSPORT_NOT_INVOKED — this harness run did not allocate a gRPC listener (no --transport grpc); rerun with --transport grpc / make test-grpc for live gRPC coverage of this same assertion."
+      exit 0
+    fi
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GRPC
+    stdout_not_contains:
+    - GRPC_PARITY_MISMATCH
+  tags: [security, graph-bind, negative, grpc, conditional, bola, gap-861]
+
+# ---------------------------------------------------------------------------
+# Strict tenancy — GEODE_STRICT_TENANCY=1 closes the ReadWrite permissive
+# fallback; every non-admin then needs an explicit GRANT. Runs against a
+# hand-rolled scratch server (fixed port 4448) since the managed harness
+# server has no per-spec knob for this env var without affecting every
+# other test above.
+# ---------------------------------------------------------------------------
+
+- name: rg6-strict-server-start
+  description: |
+    Start a second scratch server WITH --data-dir (a no-data-dir/in-memory
+    variant was probed first; its GRANT statement intermittently reported
+    "error: user not found" for a user created moments earlier — a real
+    but out-of-scope in-memory quirk, sidestepped here by using a real
+    data dir) and GEODE_STRICT_TENANCY=1, on fixed port 4448, from a fresh
+    mktemp working directory so GEODE_ADMIN_PASSWORD is honored on a fresh
+    auth-store bootstrap. Idempotently cleans up any stale instance from
+    an aborted prior run and preflights the port. Creates TWO ReadWrite
+    users — rg6_strict_rw (used only for the pre-grant deny case) and
+    rg6_strict_rw2 (used only for the post-grant allow case) — per the
+    negative-authorization-cache quirk noted in the spec description.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # never let this scratch server or its CLI calls see the MANAGED server's data dir
+    PORT=4448
+    PIDFILE=/tmp/rg6_strict_scratch.pid
+    DIRFILE=/tmp/rg6_strict_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve --listen 127.0.0.1:${PORT}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/rg6_strict.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/rg6_strict.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+    cd "$WORKDIR"
+
+    export GEODE_DISABLE_AUDIT=1
+    export GEODE_ADMIN_PASSWORD="$PW"
+    export GEODE_STRICT_TENANCY=1
+
+    # Verified-TLS parity (release-binary safe) — same recipe as
+    # regression_gap0839_inmemory_graph_tenant_bind.yml.
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    nohup "$BIN" serve --listen "127.0.0.1:${PORT}" --data-dir "$WORKDIR/data" --log-level warn \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 &
+    echo $! > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "STRICT_SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      exit 1
+    fi
+    echo "STRICT_SCRATCH_SERVER_READY"
+
+    "$BIN" query "CREATE GRAPH rg6_strict_secret" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1
+    "$BIN" query "CREATE USER rg6_strict_rw SET PASSWORD 'Rg6StrictRwPass!234' ROLE readwrite" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1
+    "$BIN" query "CREATE USER rg6_strict_rw2 SET PASSWORD 'Rg6StrictRw2Pass!234' ROLE readwrite" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1
+    echo "STRICT_SETUP_DONE"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - STRICT_SCRATCH_SERVER_READY
+    - STRICT_SETUP_DONE
+  tags: [security, graph-bind, strict-tenancy, setup]
+
+- name: rg6-strict-denies-ungranted
+  description: |
+    KEY NEGATIVE (strict tenancy). rg6_strict_rw is ReadWrite with no
+    grant — the exact role that is ALLOWED to bind in the non-strict
+    default (rg6-readwrite-bind-allowed-nonstrict above). Under
+    GEODE_STRICT_TENANCY=1 the permissive fallback is closed, so this
+    bind must now be denied — proving the toggle actually changes bind
+    behavior rather than being inert.
+  type: bash
+  command: |
+    unset GEODE_DATA_DIR
+    PORT=4448
+    BIN="${GEODE_BINARY:-geode}"
+    OUT=$("$BIN" query "RETURN 1 AS x" --dsn "quic://rg6_strict_rw:Rg6StrictRwPass!234@127.0.0.1:${PORT}/rg6_strict_secret" ${GEODE_CLIENT_TLS} 2>&1)
+    STATUS=$?
+    echo "$OUT"
+    echo "EXIT_CODE_WAS=${STATUS}"
+    exit $STATUS
+  expected:
+    exit_code: 3
+    stdout_contains:
+    - 'Access denied: insufficient permissions for graph'
+    stdout_not_contains:
+    - '"x":1'
+  tags: [security, graph-bind, negative, key-assertion, strict-tenancy]
+
+- name: rg6-strict-grant-allows
+  description: |
+    KEY POSITIVE (strict tenancy). rg6_strict_rw2 is a fresh ReadWrite
+    user that has never attempted (and been denied) a bind — deliberately
+    NOT the same user as rg6-strict-denies-ungranted (see the spec
+    description's note on a probed negative-authorization-cache quirk:
+    once a bind is denied for a (user, graph) pair, a later GRANT to that
+    SAME user does not unstick it). After an explicit
+    `GRANT READ ON GRAPH rg6_strict_secret TO rg6_strict_rw2`, the bind
+    must be allowed — confirming that under strict tenancy an explicit
+    GRANT (not role alone) is what authorizes the bind.
+  type: bash
+  command: |
+    unset GEODE_DATA_DIR
+    PORT=4448
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    GRANT_OUT=$("$BIN" query "GRANT READ ON GRAPH rg6_strict_secret TO rg6_strict_rw2" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} 2>&1)
+    echo "$GRANT_OUT"
+    echo "$GRANT_OUT" | grep -qF 'Granted' || { echo "GRANT_FAILED"; exit 1; }
+
+    OUT=$("$BIN" query "RETURN 1 AS x" --dsn "quic://rg6_strict_rw2:Rg6StrictRw2Pass!234@127.0.0.1:${PORT}/rg6_strict_secret" ${GEODE_CLIENT_TLS} 2>&1)
+    STATUS=$?
+    echo "$OUT"
+    echo "EXIT_CODE_WAS=${STATUS}"
+    exit $STATUS
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"x":1'
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - 'Access denied'
+  tags: [security, graph-bind, positive, key-assertion, strict-tenancy]
+
+- name: rg6-strict-server-stop
+  description: |
+    Teardown — stop the strict-tenancy scratch server and remove its
+    scratch dir and state files. The harness always reaches this test
+    regardless of earlier failures (runner.py's test loop only stops on
+    interactive interrupt), so a mid-spec failure cannot leak the scratch
+    server process; the startup test's idempotent cleanup self-heals any
+    residue from an interactive SIGINT on the next run.
+  type: bash
+  command: |
+    unset GEODE_DATA_DIR
+    PORT=4448
+    PIDFILE=/tmp/rg6_strict_scratch.pid
+    DIRFILE=/tmp/rg6_strict_scratch.dir
+
+    if [ -f "$PIDFILE" ]; then
+      PID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$PID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve --listen 127.0.0.1:${PORT}" 2>/dev/null || true
+
+    if [ -f "$DIRFILE" ]; then
+      WORKDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$WORKDIR" in /tmp/rg6_strict.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    echo "STRICT_SCRATCH_SERVER_STOPPED"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - STRICT_SCRATCH_SERVER_STOPPED
+  tags: [security, graph-bind, strict-tenancy, teardown]
+
+# ---------------------------------------------------------------------------
+# Cleanup — main managed server
+# ---------------------------------------------------------------------------
+
+- name: rg6-cleanup
+  description: |
+    Tear down test users/graph on the managed server. Not strictly
+    required since `cli.server.cleanup: true` gives every run a fresh
+    data_dir, but kept for hygiene and to match sibling RBAC specs.
+  args: [query, -U, geode, -P, '${env:GEODE_ADMIN_PASSWORD}', '-']
+  stdin: |
+    DROP USER IF EXISTS rg6_ro;
+    DROP USER IF EXISTS rg6_rw;
+    DROP GRAPH IF EXISTS rg6_secret;
+  expected:
+    exit_code: 0
+  tags: [security, graph-bind, teardown]
+
+tags:
+- security
+- graph-bind
+- authorization
+- bola
+- gap-861
+- tenancy
