@@ -1,0 +1,426 @@
+version: '1.0'
+name: Regression — in-memory graph tenant bind (geode b350484d, 09f18baa, GAP-0839)
+description: |
+  Pins a fix (geode commits b350484d / 09f18baa, "assign persistent UUID on
+  graph create so tenant-bound sessions work", GAP-0839) for a bug that only
+  reproduces when the server runs WITHOUT `--data-dir` ("in-memory mode").
+
+  Pre-fix: `createGraph` in in-memory mode did a pure in-memory registry put
+  with no UUID assigned (`getGraphUuid` only read from the on-disk adapter,
+  which does not exist without `--data-dir`). Every graph-bound HELLO
+  session (`?graph=<name>` in the DSN / QUIC HELLO) was then rejected with
+  "Graph created without persistent UUID" — even for a graph that was just
+  successfully created moments earlier on the SAME server. The fix adds an
+  in-memory `graph_uuids` fallback map so every created graph carries a
+  stable non-zero UUIDv7 even with no disk adapter present; the disk
+  adapter remains the source of truth when one exists.
+
+  ## Why this spec drives its own scratch server
+
+  The geodetestlab-cli managed server (`geodetestlab/lib/server.py
+  start_server()`) unconditionally appends `--data-dir <path>` to every
+  server it launches — there is no `cli.server` knob to omit it. That makes
+  the managed server structurally unable to reproduce in-memory mode, which
+  is the entire premise of GAP-0839. This spec therefore:
+    - keeps a normal managed server (`cli.server.enabled: true`) solely to
+      satisfy the harness's `server_running` invariant — no test below
+      queries it;
+    - drives every actual assertion via `type: bash` tests against a
+      second, hand-rolled scratch server on a fixed port (4445), started
+      with `geode serve --listen 127.0.0.1:4445` and deliberately NO
+      `--data-dir` flag. The server is launched from a FRESH mktemp
+      working directory (recorded in /tmp/rg5_gap0839_scratch.dir) —
+      critical because a no-data-dir server bootstraps its admin user
+      store in its cwd, honoring $GEODE_ADMIN_PASSWORD only on a fresh
+      bootstrap; starting it from the geode source tree (the executor's
+      bash cwd) would pick up a stale auth store with an unknown password
+      and every login would fail into the auth rate limiter. It is
+      backgrounded with `nohup` and tracked by a PID file so later steps —
+      including the final teardown test, which the harness always reaches
+      because the runner's test loop never aborts a spec early on a test
+      failure (only on interactive interrupt; see runner.py) — can stop it
+      cleanly. The startup test also idempotently kills any stale scratch
+      server left by a prior aborted run before claiming the port.
+
+  ## Global catalog hygiene (probed pitfall)
+
+  With no data_dir, the graph CATALOG persists to the machine-global file
+  /tmp/geode_catalog.dat (execution.zig ensureCatalogInstance →
+  Catalog.init(alloc, null)). Graph NAMES therefore leak across scratch
+  in-memory server runs even though graph DATA does not: a rerun's
+  `CREATE GRAPH rg5_g1` reports 42P07 "Duplicate graph name" (still exit 0
+  — the CLI exits 0 on SQLSTATE errors, so stdout status_class assertions
+  below are the real teeth, not exit codes), and a stale `rg5_missing`
+  catalog entry flips the negative case's error from "Graph does not
+  exist and user lacks permission to create it" to "Access denied:
+  insufficient permissions for graph". The startup test therefore DROPs
+  both rg5_ graphs (idempotent — dropping a nonexistent graph is exit 0 /
+  3F000) to reset catalog state, and the teardown DROPs rg5_g1 again so
+  this spec leaves no rg5_ residue in the global catalog.
+
+  ## Probed against a scratch server (this exact recipe) before writing
+
+    - `geode serve --listen 127.0.0.1:4445` (no --data-dir) from a fresh
+      cwd starts cleanly; the ONLY file it creates in its cwd is
+      `.geode_admin_password` (auth bootstrap) — no data/ directory, no
+      graph store dirs, confirming genuinely in-memory graph storage.
+    - `CREATE GRAPH rg5_g1` (admin) → exit 0, status_class 00000.
+    - KEY POSITIVE — graph-bound DSN
+      `quic://geode:<pw>@127.0.0.1:4445/rg5_g1` running `RETURN 1 AS x` →
+      exit 0, `"rows":[{"x":1}]`. Pre-fix this HELLO was rejected with
+      "Graph created without persistent UUID" for every in-memory graph —
+      this is the regression tooth GAP-0839 closes.
+    - Admin auto-create-on-bind (same as specs/dsn_graph_binding.yml)
+      means the admin binding to a missing graph silently creates it — so
+      the negative case must NOT use the admin. Per the QUIC HELLO handler
+      (src/server/quic_connection_handler.zig), a missing graph is only
+      auto-created for Admin/ReadWrite roles; other roles get "Graph does
+      not exist and user lacks permission to create it". Per
+      specs/gps_decide_smoke.yml, the role must be set via GQL DDL
+      (`CREATE USER ... ROLE readonly`), not `geode user create --role`,
+      for the live auth resolver to see it.
+    - KEY NEGATIVE — `quic://rg5_ro:<pw>@127.0.0.1:4445/rg5_missing` as
+      the readonly user → exit 3, stderr "Error: Graph does not exist and
+      user lacks permission to create it".
+    - After ALL graph operations, the scratch cwd listing is unchanged
+      from its post-startup baseline — no on-disk graph data ever
+      appeared (in-memory evidence assertion, its own test below).
+
+  CANARY: REQ=REQ-GRAPH-INMEMORY-BIND-001; FEATURE="GraphBinding"; ASPECT=InMemoryUUID; STATUS=TESTED; TEST=geodetestlab/specs/regression_gap0839_inmemory_graph_tenant_bind.yml; OWNER=qa; UPDATED=2026-07-09
+
+single_node_only: true  # entire spec is bash-driven against a single hand-rolled scratch server on a fixed port
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: rg5-inmemory-server-start
+  description: |
+    Start the GAP-0839 scratch server on fixed port 4445 WITHOUT
+    --data-dir (in-memory mode), from a fresh mktemp working directory so
+    the admin user store bootstraps fresh and honors GEODE_ADMIN_PASSWORD.
+    Idempotently kills any stale scratch server from a prior aborted run,
+    resets the /tmp/geode_catalog.dat entries for rg5_g1 / rg5_missing,
+    and snapshots the scratch cwd listing as the in-memory baseline.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    # CRITICAL — the harness executor exports GEODE_DATA_DIR (the MANAGED
+    # server's data dir) into every bash test, and a geode server started
+    # without --data-dir falls back to that env var
+    # (src/graph_store.zig getDataDir → GEODE_DATA_DIR). Left set, the
+    # scratch server would silently disk-adapt onto the managed server's
+    # data dir — not in-memory at all, and its auth store would collide
+    # with the running managed server (observed as every login failing
+    # into the auth rate limiter). Unset it so "no --data-dir" truly
+    # means in-memory.
+    unset GEODE_DATA_DIR
+    PORT=4445
+    PIDFILE=/tmp/rg5_gap0839_scratch.pid
+    DIRFILE=/tmp/rg5_gap0839_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    # Idempotent cleanup: kill any stale scratch server and remove its
+    # scratch dir before claiming the port.
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve --listen 127.0.0.1:${PORT}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/rg5_gap0839.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    # Preflight: the cleanup above only removes THIS spec's prior leaked
+    # instance (PID file + scoped pkill). If an UNRELATED process is
+    # squatting on the fixed port, fail fast with a clear message
+    # instead of cryptic bind/connect errors downstream. QUIC is UDP;
+    # check TCP too for completeness.
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"$"' || true
+      exit 1
+    fi
+
+    # Fresh working directory — a no-data-dir server bootstraps its admin
+    # user store in cwd and only honors GEODE_ADMIN_PASSWORD on a FRESH
+    # bootstrap. Starting from a reused cwd (e.g. the geode source tree)
+    # picks up a stale store with an unknown password and rate-limits out.
+    WORKDIR=$(mktemp -d /tmp/rg5_gap0839.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+    cd "$WORKDIR"
+
+    export GEODE_DISABLE_AUDIT=1
+    export GEODE_ADMIN_PASSWORD="$PW"
+
+    # Verified-TLS parity (release-binary safe): when the harness
+    # provisioned a CA (GEODE_TEST_CA_CERT), ${GEODE_CLIENT_TLS} is
+    # "--ca-cert <ca>", so the scratch server must present the CA-signed
+    # leaf certificate that lives next to ca.crt (tls_provision.py puts
+    # ca.crt, leaf.crt, leaf.key in one cert dir). Without a CA the
+    # client falls back to --insecure-tls-skip-verify and the server
+    # auto-generates a self-signed cert.
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    # NOTE: deliberately NO --data-dir — in-memory mode is the entire
+    # point of this spec (GAP-0839).
+    nohup "$BIN" serve --listen "127.0.0.1:${PORT}" --log-level warn \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 &
+    echo $! > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      exit 1
+    fi
+    echo "SCRATCH_SERVER_READY"
+
+    # Catalog hygiene: with no data_dir the graph catalog persists to the
+    # machine-global /tmp/geode_catalog.dat, so rg5_ graph NAMES leak
+    # across runs. Drop both (idempotent: nonexistent → 3F000, exit 0) so
+    # create-graph below is a true fresh create and rg5_missing is truly
+    # missing for the negative case.
+    "$BIN" query "DROP GRAPH rg5_g1" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1 || true
+    "$BIN" query "DROP GRAPH rg5_missing" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1 || true
+    echo "CATALOG_RESET"
+
+    # In-memory baseline: snapshot the scratch cwd listing. The graph ops
+    # in later tests must not add ANY file here (no data/ dir, no graph
+    # store dirs) — asserted by rg5-inmemory-evidence.
+    ls -A "$WORKDIR" | sort > /tmp/rg5_gap0839_baseline.txt
+    echo "BASELINE_CAPTURED"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+    - CATALOG_RESET
+    - BASELINE_CAPTURED
+  tags: [gap-0839, in-memory, setup]
+
+- name: rg5-create-graph
+  description: |
+    POSITIVE — `CREATE GRAPH rg5_g1` as the admin user against the
+    in-memory scratch server must succeed with status_class 00000. The
+    stdout assertion (not the exit code) is the real check: the geode CLI
+    exits 0 even for SQLSTATE errors such as 42P07 "Duplicate graph name"
+    (probed), which the startup test's catalog reset rules out.
+  type: bash
+  command: |
+    unset GEODE_DATA_DIR  # see rg5-inmemory-server-start — never let the CLI/server see the managed data dir
+    PORT=4445
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    OUT=$("$BIN" query "CREATE GRAPH rg5_g1" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} 2>&1)
+    STATUS=$?
+    echo "$OUT"
+    exit $STATUS
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - Duplicate graph name
+  tags: [gap-0839, in-memory, positive, create-graph]
+
+- name: rg5-graph-bound-session
+  description: |
+    KEY POSITIVE — a graph-bound DSN connection
+    (`quic://geode:<pw>@127.0.0.1:4445/rg5_g1`) to the in-memory graph
+    created above must run `RETURN 1 AS x` successfully. Pre-GAP-0839 this
+    HELLO was rejected with "Graph created without persistent UUID"
+    because in-memory createGraph never assigned a UUID; this is the
+    regression tooth.
+  type: bash
+  command: |
+    unset GEODE_DATA_DIR  # see rg5-inmemory-server-start — never let the CLI/server see the managed data dir
+    PORT=4445
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    OUT=$("$BIN" query "RETURN 1 AS x" --dsn "quic://geode:${PW}@127.0.0.1:${PORT}/rg5_g1" ${GEODE_CLIENT_TLS} 2>&1)
+    STATUS=$?
+    echo "$OUT"
+    exit $STATUS
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"x":1'
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - persistent UUID
+  tags: [gap-0839, in-memory, positive, key-assertion, graph-bind]
+
+- name: rg5-create-readonly-user
+  description: |
+    Setup for the negative control below. Creates a ROLE readonly user
+    via the GQL DDL path (`CREATE USER ... ROLE readonly`), NOT
+    `geode user create --role` — per specs/gps_decide_smoke.yml, only the
+    DDL path persists the role where the live QUIC HELLO auth resolver
+    sees it. The user store is per-run (fresh scratch cwd), so this never
+    collides with a prior run's rg5_ro.
+  type: bash
+  command: |
+    unset GEODE_DATA_DIR  # see rg5-inmemory-server-start — never let the CLI/server see the managed data dir
+    PORT=4445
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    OUT=$("$BIN" query "CREATE USER rg5_ro SET PASSWORD 'Rg5RoPass1234!' ROLE readonly" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} 2>&1)
+    STATUS=$?
+    echo "$OUT"
+    exit $STATUS
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - rg5_ro
+  tags: [gap-0839, in-memory, setup]
+
+- name: rg5-bind-nonexistent-graph
+  description: |
+    KEY NEGATIVE — the readonly user (no create-graph permission) binds
+    via DSN to `rg5_missing`, a graph the startup test guaranteed absent.
+    The admin user would silently auto-create it and succeed (same
+    behavior as specs/dsn_graph_binding.yml), giving this control no
+    teeth — the readonly principal instead exercises the real bind-time
+    "graph does not exist" failure path in the QUIC HELLO handler,
+    distinct from the (now-fixed) GAP-0839 missing-UUID rejection.
+    Probed: the CLI's error output does NOT echo the graph name anywhere
+    (combined stdout+stderr is exactly "Error: Graph does not exist and
+    user lacks permission to create it", plus the TLS warning line on
+    insecure runs), so the generic rejection text plus the nonzero exit
+    code is the strongest assertable signal.
+  type: bash
+  command: |
+    unset GEODE_DATA_DIR  # see rg5-inmemory-server-start — never let the CLI/server see the managed data dir
+    PORT=4445
+    BIN="${GEODE_BINARY:-geode}"
+    OUT=$("$BIN" query "RETURN 1 AS x" --dsn "quic://rg5_ro:Rg5RoPass1234!@127.0.0.1:${PORT}/rg5_missing" ${GEODE_CLIENT_TLS} 2>&1)
+    STATUS=$?
+    echo "$OUT"
+    echo "EXIT_CODE_WAS=${STATUS}"
+    exit $STATUS
+  expected:
+    exit_code: 3
+    stdout_contains:
+    - Graph does not exist and user lacks permission to create it
+  tags: [gap-0839, in-memory, negative, key-assertion, graph-bind]
+
+- name: rg5-inmemory-evidence
+  description: |
+    IN-MEMORY EVIDENCE — after CREATE GRAPH, a graph-bound session, and
+    CREATE USER, the scratch server's working directory listing must be
+    byte-identical to the post-startup baseline: no data/ directory and
+    no graph-store files ever appeared. This proves the KEY positive
+    above genuinely exercised in-memory graph storage (a disk-backed
+    graph would have created store files under a data dir).
+  type: bash
+  command: |
+    DIRFILE=/tmp/rg5_gap0839_scratch.dir
+    WORKDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+    if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
+      echo "SCRATCH_DIR_MISSING"
+      exit 1
+    fi
+    ls -A "$WORKDIR" | sort > /tmp/rg5_gap0839_after.txt
+    if diff /tmp/rg5_gap0839_baseline.txt /tmp/rg5_gap0839_after.txt; then
+      echo "NO_ON_DISK_GRAPH_DATA"
+    else
+      echo "ON_DISK_STATE_APPEARED"
+      exit 1
+    fi
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - NO_ON_DISK_GRAPH_DATA
+  tags: [gap-0839, in-memory, evidence]
+
+- name: rg5-inmemory-server-stop
+  description: |
+    Teardown — drop rg5_g1 from the global /tmp catalog (leave no rg5_
+    residue for other runs), stop the scratch server, and remove the
+    scratch dir and state files. The harness always reaches this test
+    regardless of earlier failures (runner.py's test loop only stops on
+    interactive interrupt), so a mid-spec failure cannot leak the scratch
+    server process. Known limitation: an interactive SIGINT mid-spec CAN
+    still leak the server — accepted, since the startup test's idempotent
+    cleanup self-heals it on the next run.
+  type: bash
+  command: |
+    unset GEODE_DATA_DIR  # see rg5-inmemory-server-start — never let the CLI/server see the managed data dir
+    PORT=4445
+    PIDFILE=/tmp/rg5_gap0839_scratch.pid
+    DIRFILE=/tmp/rg5_gap0839_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    # Catalog hygiene (best-effort; server may already be dead).
+    "$BIN" query "DROP GRAPH rg5_g1" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1 || true
+
+    if [ -f "$PIDFILE" ]; then
+      PID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$PID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve --listen 127.0.0.1:${PORT}" 2>/dev/null || true
+
+    if [ -f "$DIRFILE" ]; then
+      WORKDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$WORKDIR" in /tmp/rg5_gap0839.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    rm -f /tmp/rg5_gap0839_baseline.txt /tmp/rg5_gap0839_after.txt
+    echo "SCRATCH_SERVER_STOPPED"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags: [gap-0839, in-memory, teardown]
+
+tags:
+- gap-0839
+- in-memory
+- graph-bind
+- regression
