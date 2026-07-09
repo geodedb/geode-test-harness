@@ -1,0 +1,449 @@
+version: '1.0'
+name: Regression — single-label count(n) full total on FIRST post-reopen read (geode 9a255a83)
+description: |
+  Pins a fix (geode commit 9a255a83) for a bug where, immediately after a
+  server restart, the graph store reopens into deferred (lazy) hydration
+  and the VERY FIRST count(n) query against a single label was served by
+  the not-yet-hydrated engine label index instead of the authoritative
+  in-memory refcount — returning 0 or a partial "still climbing" count
+  instead of the true persisted total. The fix routes user-facing counts
+  through the in-memory refcount so the first read after reopen is
+  already correct, without needing a warm-up query to hydrate the index
+  first.
+
+  The defining property of this bug is timing: a warm-up query issued
+  before the count query would fully hydrate the label index and mask
+  the regression. This spec is deliberately built so the count query is
+  the IMMEDIATE next test after each restart marker — no other query
+  test runs in between — so a regression cannot hide behind incidental
+  hydration from an earlier read.
+
+  Scenario:
+    1. Seed exactly 250 RG3_A nodes via 250 individual CREATE statements
+       (UNWIND/FOREACH range-seeding was probed against a scratch server
+       and both return a GQL parse error on this build — UNWIND is not
+       yet a supported clause — so a script-generated CREATE batch is
+       used instead).
+    2. Verify count(n) == 250 before restart.
+    3. Restart the managed server against the SAME data dir (cleanup:
+       false + restart_server: true) — this forces reopen into
+       lazy/deferred hydration.
+    4. KEY: the count(n:RG3_A) query is the FIRST query test that runs
+       after the restart marker — no warm-up query precedes it. Under
+       the pre-9a255a83 bug this would return 0 or a partial count
+       because the deferred-EMPTY engine label index — not yet
+       hydrated — served the read instead of the in-memory refcount.
+       Must return exactly 250.
+    5. Restart again (second reopen).
+    6. KEY: this time a LIMIT-5 walk (MATCH (n:RG3_A) RETURN n.id LIMIT 5)
+       runs FIRST, then the count. The count must still be exactly 250
+       after a partial walk has touched only 5 of the 250 nodes — proving
+       the fix is not merely "count happens to be first" but that counts
+       stay correct regardless of what partial reads preceded them.
+    7. Negative/empty-label control: MATCH (n:RG3_Empty) RETURN count(n)
+       — a label with zero persisted nodes — must return exactly 0,
+       both before and after reopen, proving the fix didn't overcorrect
+       into always returning a nonzero/stale count.
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4443
+  --data-dir /tmp/probe-r3) before/after two manual SIGTERM + restart
+  cycles on the same data dir: UNWIND range(1,250) and FOREACH both
+  produced a GQL parse error (confirming neither is supported on this
+  build, hence the 250-line CREATE batch below); count(n) held at
+  exactly 250 as the literal first post-restart query on both restarts,
+  including after an intervening LIMIT 5 walk; RG3_Empty held at 0
+  throughout — matching the fixed (post-9a255a83) contract this spec
+  pins. No live regression was observed on this build.
+
+  CANARY: REQ=REQ-QUERY-LABEL-COUNT-REOPEN-001; FEATURE="LabelCount"; ASPECT=DeferredHydrationFirstRead; STATUS=TESTED; TEST=geodetestlab/specs/regression_label_count_after_reopen.yml; OWNER=qa; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed-rg3-a-250
+  description: |
+    Seed exactly 250 RG3_A nodes via 250 individual CREATE statements.
+    UNWIND range(1,250) and FOREACH were both probed against a scratch
+    server and returned a GQL parse error (UNWIND is not a supported
+    clause on this build), so this script-generated CREATE batch is
+    used instead.
+  query: |
+    CREATE (:RG3_A {id: 1});
+    CREATE (:RG3_A {id: 2});
+    CREATE (:RG3_A {id: 3});
+    CREATE (:RG3_A {id: 4});
+    CREATE (:RG3_A {id: 5});
+    CREATE (:RG3_A {id: 6});
+    CREATE (:RG3_A {id: 7});
+    CREATE (:RG3_A {id: 8});
+    CREATE (:RG3_A {id: 9});
+    CREATE (:RG3_A {id: 10});
+    CREATE (:RG3_A {id: 11});
+    CREATE (:RG3_A {id: 12});
+    CREATE (:RG3_A {id: 13});
+    CREATE (:RG3_A {id: 14});
+    CREATE (:RG3_A {id: 15});
+    CREATE (:RG3_A {id: 16});
+    CREATE (:RG3_A {id: 17});
+    CREATE (:RG3_A {id: 18});
+    CREATE (:RG3_A {id: 19});
+    CREATE (:RG3_A {id: 20});
+    CREATE (:RG3_A {id: 21});
+    CREATE (:RG3_A {id: 22});
+    CREATE (:RG3_A {id: 23});
+    CREATE (:RG3_A {id: 24});
+    CREATE (:RG3_A {id: 25});
+    CREATE (:RG3_A {id: 26});
+    CREATE (:RG3_A {id: 27});
+    CREATE (:RG3_A {id: 28});
+    CREATE (:RG3_A {id: 29});
+    CREATE (:RG3_A {id: 30});
+    CREATE (:RG3_A {id: 31});
+    CREATE (:RG3_A {id: 32});
+    CREATE (:RG3_A {id: 33});
+    CREATE (:RG3_A {id: 34});
+    CREATE (:RG3_A {id: 35});
+    CREATE (:RG3_A {id: 36});
+    CREATE (:RG3_A {id: 37});
+    CREATE (:RG3_A {id: 38});
+    CREATE (:RG3_A {id: 39});
+    CREATE (:RG3_A {id: 40});
+    CREATE (:RG3_A {id: 41});
+    CREATE (:RG3_A {id: 42});
+    CREATE (:RG3_A {id: 43});
+    CREATE (:RG3_A {id: 44});
+    CREATE (:RG3_A {id: 45});
+    CREATE (:RG3_A {id: 46});
+    CREATE (:RG3_A {id: 47});
+    CREATE (:RG3_A {id: 48});
+    CREATE (:RG3_A {id: 49});
+    CREATE (:RG3_A {id: 50});
+    CREATE (:RG3_A {id: 51});
+    CREATE (:RG3_A {id: 52});
+    CREATE (:RG3_A {id: 53});
+    CREATE (:RG3_A {id: 54});
+    CREATE (:RG3_A {id: 55});
+    CREATE (:RG3_A {id: 56});
+    CREATE (:RG3_A {id: 57});
+    CREATE (:RG3_A {id: 58});
+    CREATE (:RG3_A {id: 59});
+    CREATE (:RG3_A {id: 60});
+    CREATE (:RG3_A {id: 61});
+    CREATE (:RG3_A {id: 62});
+    CREATE (:RG3_A {id: 63});
+    CREATE (:RG3_A {id: 64});
+    CREATE (:RG3_A {id: 65});
+    CREATE (:RG3_A {id: 66});
+    CREATE (:RG3_A {id: 67});
+    CREATE (:RG3_A {id: 68});
+    CREATE (:RG3_A {id: 69});
+    CREATE (:RG3_A {id: 70});
+    CREATE (:RG3_A {id: 71});
+    CREATE (:RG3_A {id: 72});
+    CREATE (:RG3_A {id: 73});
+    CREATE (:RG3_A {id: 74});
+    CREATE (:RG3_A {id: 75});
+    CREATE (:RG3_A {id: 76});
+    CREATE (:RG3_A {id: 77});
+    CREATE (:RG3_A {id: 78});
+    CREATE (:RG3_A {id: 79});
+    CREATE (:RG3_A {id: 80});
+    CREATE (:RG3_A {id: 81});
+    CREATE (:RG3_A {id: 82});
+    CREATE (:RG3_A {id: 83});
+    CREATE (:RG3_A {id: 84});
+    CREATE (:RG3_A {id: 85});
+    CREATE (:RG3_A {id: 86});
+    CREATE (:RG3_A {id: 87});
+    CREATE (:RG3_A {id: 88});
+    CREATE (:RG3_A {id: 89});
+    CREATE (:RG3_A {id: 90});
+    CREATE (:RG3_A {id: 91});
+    CREATE (:RG3_A {id: 92});
+    CREATE (:RG3_A {id: 93});
+    CREATE (:RG3_A {id: 94});
+    CREATE (:RG3_A {id: 95});
+    CREATE (:RG3_A {id: 96});
+    CREATE (:RG3_A {id: 97});
+    CREATE (:RG3_A {id: 98});
+    CREATE (:RG3_A {id: 99});
+    CREATE (:RG3_A {id: 100});
+    CREATE (:RG3_A {id: 101});
+    CREATE (:RG3_A {id: 102});
+    CREATE (:RG3_A {id: 103});
+    CREATE (:RG3_A {id: 104});
+    CREATE (:RG3_A {id: 105});
+    CREATE (:RG3_A {id: 106});
+    CREATE (:RG3_A {id: 107});
+    CREATE (:RG3_A {id: 108});
+    CREATE (:RG3_A {id: 109});
+    CREATE (:RG3_A {id: 110});
+    CREATE (:RG3_A {id: 111});
+    CREATE (:RG3_A {id: 112});
+    CREATE (:RG3_A {id: 113});
+    CREATE (:RG3_A {id: 114});
+    CREATE (:RG3_A {id: 115});
+    CREATE (:RG3_A {id: 116});
+    CREATE (:RG3_A {id: 117});
+    CREATE (:RG3_A {id: 118});
+    CREATE (:RG3_A {id: 119});
+    CREATE (:RG3_A {id: 120});
+    CREATE (:RG3_A {id: 121});
+    CREATE (:RG3_A {id: 122});
+    CREATE (:RG3_A {id: 123});
+    CREATE (:RG3_A {id: 124});
+    CREATE (:RG3_A {id: 125});
+    CREATE (:RG3_A {id: 126});
+    CREATE (:RG3_A {id: 127});
+    CREATE (:RG3_A {id: 128});
+    CREATE (:RG3_A {id: 129});
+    CREATE (:RG3_A {id: 130});
+    CREATE (:RG3_A {id: 131});
+    CREATE (:RG3_A {id: 132});
+    CREATE (:RG3_A {id: 133});
+    CREATE (:RG3_A {id: 134});
+    CREATE (:RG3_A {id: 135});
+    CREATE (:RG3_A {id: 136});
+    CREATE (:RG3_A {id: 137});
+    CREATE (:RG3_A {id: 138});
+    CREATE (:RG3_A {id: 139});
+    CREATE (:RG3_A {id: 140});
+    CREATE (:RG3_A {id: 141});
+    CREATE (:RG3_A {id: 142});
+    CREATE (:RG3_A {id: 143});
+    CREATE (:RG3_A {id: 144});
+    CREATE (:RG3_A {id: 145});
+    CREATE (:RG3_A {id: 146});
+    CREATE (:RG3_A {id: 147});
+    CREATE (:RG3_A {id: 148});
+    CREATE (:RG3_A {id: 149});
+    CREATE (:RG3_A {id: 150});
+    CREATE (:RG3_A {id: 151});
+    CREATE (:RG3_A {id: 152});
+    CREATE (:RG3_A {id: 153});
+    CREATE (:RG3_A {id: 154});
+    CREATE (:RG3_A {id: 155});
+    CREATE (:RG3_A {id: 156});
+    CREATE (:RG3_A {id: 157});
+    CREATE (:RG3_A {id: 158});
+    CREATE (:RG3_A {id: 159});
+    CREATE (:RG3_A {id: 160});
+    CREATE (:RG3_A {id: 161});
+    CREATE (:RG3_A {id: 162});
+    CREATE (:RG3_A {id: 163});
+    CREATE (:RG3_A {id: 164});
+    CREATE (:RG3_A {id: 165});
+    CREATE (:RG3_A {id: 166});
+    CREATE (:RG3_A {id: 167});
+    CREATE (:RG3_A {id: 168});
+    CREATE (:RG3_A {id: 169});
+    CREATE (:RG3_A {id: 170});
+    CREATE (:RG3_A {id: 171});
+    CREATE (:RG3_A {id: 172});
+    CREATE (:RG3_A {id: 173});
+    CREATE (:RG3_A {id: 174});
+    CREATE (:RG3_A {id: 175});
+    CREATE (:RG3_A {id: 176});
+    CREATE (:RG3_A {id: 177});
+    CREATE (:RG3_A {id: 178});
+    CREATE (:RG3_A {id: 179});
+    CREATE (:RG3_A {id: 180});
+    CREATE (:RG3_A {id: 181});
+    CREATE (:RG3_A {id: 182});
+    CREATE (:RG3_A {id: 183});
+    CREATE (:RG3_A {id: 184});
+    CREATE (:RG3_A {id: 185});
+    CREATE (:RG3_A {id: 186});
+    CREATE (:RG3_A {id: 187});
+    CREATE (:RG3_A {id: 188});
+    CREATE (:RG3_A {id: 189});
+    CREATE (:RG3_A {id: 190});
+    CREATE (:RG3_A {id: 191});
+    CREATE (:RG3_A {id: 192});
+    CREATE (:RG3_A {id: 193});
+    CREATE (:RG3_A {id: 194});
+    CREATE (:RG3_A {id: 195});
+    CREATE (:RG3_A {id: 196});
+    CREATE (:RG3_A {id: 197});
+    CREATE (:RG3_A {id: 198});
+    CREATE (:RG3_A {id: 199});
+    CREATE (:RG3_A {id: 200});
+    CREATE (:RG3_A {id: 201});
+    CREATE (:RG3_A {id: 202});
+    CREATE (:RG3_A {id: 203});
+    CREATE (:RG3_A {id: 204});
+    CREATE (:RG3_A {id: 205});
+    CREATE (:RG3_A {id: 206});
+    CREATE (:RG3_A {id: 207});
+    CREATE (:RG3_A {id: 208});
+    CREATE (:RG3_A {id: 209});
+    CREATE (:RG3_A {id: 210});
+    CREATE (:RG3_A {id: 211});
+    CREATE (:RG3_A {id: 212});
+    CREATE (:RG3_A {id: 213});
+    CREATE (:RG3_A {id: 214});
+    CREATE (:RG3_A {id: 215});
+    CREATE (:RG3_A {id: 216});
+    CREATE (:RG3_A {id: 217});
+    CREATE (:RG3_A {id: 218});
+    CREATE (:RG3_A {id: 219});
+    CREATE (:RG3_A {id: 220});
+    CREATE (:RG3_A {id: 221});
+    CREATE (:RG3_A {id: 222});
+    CREATE (:RG3_A {id: 223});
+    CREATE (:RG3_A {id: 224});
+    CREATE (:RG3_A {id: 225});
+    CREATE (:RG3_A {id: 226});
+    CREATE (:RG3_A {id: 227});
+    CREATE (:RG3_A {id: 228});
+    CREATE (:RG3_A {id: 229});
+    CREATE (:RG3_A {id: 230});
+    CREATE (:RG3_A {id: 231});
+    CREATE (:RG3_A {id: 232});
+    CREATE (:RG3_A {id: 233});
+    CREATE (:RG3_A {id: 234});
+    CREATE (:RG3_A {id: 235});
+    CREATE (:RG3_A {id: 236});
+    CREATE (:RG3_A {id: 237});
+    CREATE (:RG3_A {id: 238});
+    CREATE (:RG3_A {id: 239});
+    CREATE (:RG3_A {id: 240});
+    CREATE (:RG3_A {id: 241});
+    CREATE (:RG3_A {id: 242});
+    CREATE (:RG3_A {id: 243});
+    CREATE (:RG3_A {id: 244});
+    CREATE (:RG3_A {id: 245});
+    CREATE (:RG3_A {id: 246});
+    CREATE (:RG3_A {id: 247});
+    CREATE (:RG3_A {id: 248});
+    CREATE (:RG3_A {id: 249});
+    CREATE (:RG3_A {id: 250});
+  expected:
+    exit_code: 0
+  tags: [label-count, reopen, setup]
+
+- name: count-before-restart
+  description: Confirm exactly 250 RG3_A nodes exist before the restart.
+  query: MATCH (n:RG3_A) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":250'
+  tags: [label-count, reopen, positive-baseline]
+
+- name: empty-label-count-before-restart
+  description: |
+    Negative control — RG3_Empty has zero persisted nodes; count(n)
+    must be exactly 0 before the restart.
+  query: MATCH (n:RG3_Empty) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":0'
+  tags: [label-count, reopen, negative-control]
+
+- name: restart-server-for-lazy-reopen
+  description: |
+    Restart the managed server against the SAME data dir (cleanup:
+    false above). On reopen, geode hydrates the graph store
+    lazily/deferred — this is the exact condition under which the
+    pre-9a255a83 bug served count(n) from the not-yet-hydrated engine
+    label index instead of the in-memory refcount.
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RESTART
+  tags: [label-count, reopen, restart]
+
+- name: first-query-count-after-reopen
+  description: |
+    KEY ASSERTION — this is the FIRST query test after the restart
+    marker above; no warm-up query precedes it. Under the pre-9a255a83
+    bug, the deferred-EMPTY engine label index would serve this read
+    and return 0 or a partial "still climbing" count instead of the
+    true persisted total. Must return exactly 250.
+  query: MATCH (n:RG3_A) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":250'
+  tags: [label-count, reopen, key-assertion]
+
+- name: restart-server-second-reopen
+  description: |
+    Second restart against the same data dir, to test the count under a
+    different first-query shape (a partial LIMIT walk instead of an
+    immediate count).
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RESTART
+  tags: [label-count, reopen, restart]
+
+- name: walk-limit-5-after-second-reopen
+  description: |
+    First query after the second restart — a partial LIMIT-5 walk that
+    touches only 5 of the 250 persisted RG3_A nodes. This runs BEFORE
+    the count on purpose: it proves the subsequent count is not merely
+    correct because it happened to run first, but stays correct even
+    after a partial read has already touched the (still lazily
+    hydrating) label index.
+  query: MATCH (n:RG3_A) RETURN n.id LIMIT 5
+  expected:
+    exit_code: 0
+  tags: [label-count, reopen, walk]
+
+- name: count-after-walk-second-reopen
+  description: |
+    KEY ASSERTION — count(n) must still be exactly 250 after the
+    second reopen, even though a partial LIMIT-5 walk ran immediately
+    before it. A regression of geode 9a255a83 would show up here as a
+    partial/climbing count reflecting only the nodes the walk (or the
+    still-hydrating index) had touched, instead of the true total.
+  query: MATCH (n:RG3_A) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":250'
+  tags: [label-count, reopen, key-assertion]
+
+- name: empty-label-count-after-reopen
+  description: |
+    Negative control, repeated post-reopen — RG3_Empty must still be
+    exactly 0, proving the fix didn't overcorrect into always returning
+    a nonzero/stale count regardless of label.
+  query: MATCH (n:RG3_Empty) RETURN count(n)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":0'
+  tags: [label-count, reopen, negative-control]
+
+tags:
+- label-count
+- reopen
+- lazy-hydration
+- regression
