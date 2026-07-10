@@ -1,0 +1,271 @@
+version: '1.0'
+name: TDE — hydration snapshots (hydration_merge/labels/counters.snap) hold no plaintext property values
+description: |
+  Pins a fix (geode commit 7cc6858e) for the GAP-ENT-0023 P3 loop2-product
+  hydration snapshots: `hydration_merge.snap` (the {graph,label,key,VALUE}
+  -> node_id merge property index), `hydration_labels.snap` (per-label
+  node-id postings) and `hydration_counters.snap` (label/edge-type counts).
+  These side-car files are written by the hydration_snapshot writer with
+  magic+CRC framing but are NOT independently encrypted, so if written while
+  TDE is enabled they would leak raw property values to disk in plaintext —
+  defeating TDE's at-rest guarantee even though the main engine page store
+  is correctly AES-GCM encrypted.
+
+  The fix (`hydrationSnapshotsDisabled()` in graph_store.zig) suppresses
+  BOTH writing and loading of all three snapshot files whenever
+  GEODE_TDE_KEY is set: hydration falls back to the (encrypted-page) engine
+  scan instead, at the cost of one scan-rebuild per graph per process
+  lifetime — a pure optimization, never a correctness dependency.
+
+  Scenario:
+    1. Seed 50 sentinel nodes (:RG11_Doc {secret:'TDE_SENTINEL_RG11_XYZZY<i>'})
+       under a TDE-enabled server (individual CREATE statements — UNWIND is
+       not a supported clause on this build; confirmed via scratch-server
+       probe, see regression_label_count_after_reopen.yml for the same
+       finding).
+    2. Force a FULL checkpoint via `restart_server: true` (only the FULL
+       checkpoint — clean shutdown / explicit save — calls
+       `saveHydrationSnapshots`; the periodic LIGHT runtime checkpoint
+       skips it).
+    3. KEY negative: scope a grep to every `hydration_*.snap` file under
+       GEODE_DATA_DIR and assert the sentinel string appears in NONE of
+       them. Because the TDE guard suppresses the writer entirely, the
+       expected (and observed) outcome is that no hydration_*.snap files
+       exist at all post-checkpoint — a vacuous but correct pass. The
+       assertion is written so it would also fail loudly if some future
+       change reintroduced a partial/conditional writer that still leaked
+       the merge index while TDE is on.
+    4. Positive control: the data is still fully readable through the
+       normal query API, proving TDE round-trips the data rather than
+       merely making the snapshot mechanism inert by destroying it.
+
+  TEETH (scratch-server probe at /tmp/probe-r11, port auto, before writing
+  this spec): the SAME 50-node seed + restart_server cycle was run WITHOUT
+  any TDE flags/env. Result: `hydration_merge.snap` and `hydration_labels.snap`
+  and `hydration_counters.snap` all exist post-restart, and `grep -c` against
+  `hydration_merge.snap` found the sentinel pattern (2 raw-byte matches per
+  50-node graph engine root; `hydration_labels.snap` and
+  `hydration_counters.snap` showed 0 matches each — those two files hold
+  structural data (node-id postings / counts) and never carry property
+  VALUES, so `hydration_merge.snap` is the only one of the three that can
+  leak plaintext property values; the other two are included in the scan
+  purely for completeness/future-proofing). Extracting the matched strings
+  confirmed literal plaintext values (`TDE_SENTINEL_RG11_XYZZY1`,
+  `..._10`, `..._11`, `..._12`, `..._13`, ...) sitting in the unencrypted
+  merge-index file when TDE is off — i.e. absent the 7cc6858e guard, this
+  spec's KEY assertion would fail exactly as designed. With TDE on, the
+  identical scenario produced zero hydration_*.snap files anywhere under
+  the data dir.
+
+  CANARY: REQ=REQ-SEC-TDE-SNAPSHOT-NO-PLAINTEXT-001; FEATURE="TDE"; ASPECT=HydrationSnapshotEncryption; STATUS=TESTED; TEST=geodetestlab/specs/tde_hydration_snapshot_no_plaintext.yml; OWNER=security; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --enable-tde
+    - --enable-wal-encryption
+    - --tde-provider
+    - MockKms
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+env:
+  GEODE_TDE_KEY: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  GEODE_WAL_KEY: cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe
+  GEODE_TDE_ENABLED: 'true'
+  GEODE_WAL_ENCRYPTION_ENABLED: 'true'
+
+tests:
+- name: rg11-seed-sentinel
+  description: |
+    Seed 50 sentinel nodes via 50 individual CREATE statements. UNWIND
+    range-seeding was probed against a scratch server and returns a GQL
+    parse error on this build (same finding as
+    regression_label_count_after_reopen.yml), so a script-generated CREATE
+    batch is used instead.
+  query: |
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY1'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY2'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY3'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY4'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY5'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY6'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY7'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY8'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY9'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY10'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY11'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY12'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY13'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY14'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY15'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY16'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY17'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY18'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY19'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY20'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY21'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY22'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY23'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY24'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY25'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY26'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY27'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY28'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY29'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY30'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY31'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY32'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY33'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY34'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY35'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY36'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY37'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY38'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY39'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY40'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY41'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY42'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY43'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY44'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY45'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY46'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY47'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY48'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY49'});
+    CREATE (:RG11_Doc {secret: 'TDE_SENTINEL_RG11_XYZZY50'});
+  expect:
+    exit_code: 0
+  tags: [tde, hydration, setup]
+
+- name: rg11-count-before-checkpoint
+  description: Sanity check all 50 sentinel nodes are visible before forcing the checkpoint.
+  query: MATCH (n:RG11_Doc) RETURN count(n) AS total
+  expect:
+    exit_code: 0
+    stdout_contains: ['50']
+  tags: [tde, hydration, setup]
+
+- name: rg11-force-snapshot
+  description: |
+    Force a FULL checkpoint (clean shutdown + reopen). Only the full
+    checkpoint path (`saveToFileEx(light=false)`) calls
+    `saveHydrationSnapshots`, which is where `hydration_merge.snap` /
+    `hydration_labels.snap` / `hydration_counters.snap` would be written
+    for every hydrated, non-deferred graph — exactly the point at which a
+    plaintext leak would land on disk if the TDE guard were missing or
+    broken.
+  type: bash
+  command: echo 'rg11-checkpoint-triggered'
+  restart_server: true
+  expect:
+    exit_code: 0
+    stdout_contains: [rg11-checkpoint-triggered]
+  tags: [tde, hydration, checkpoint]
+
+- name: rg11-scan-no-plaintext-in-hydration-snaps
+  description: |
+    KEY negative: the sentinel must not appear in ANY hydration_*.snap
+    file anywhere under the data dir. GEODE_DATA_DIR is exported by the
+    harness into bash-step environments; the step fails loudly (exit 2)
+    rather than silently passing if that variable is missing, so an
+    unwired env can never masquerade as "no leak found".
+
+    With the 7cc6858e TDE guard in place, no hydration_*.snap files are
+    written at all while GEODE_TDE_KEY is set (confirmed by a scratch-
+    server probe run alongside this spec's development), so the search
+    below is expected to find zero snapshot files and therefore trivially
+    zero matches. The assertion is written to actively fail (exit 1) if a
+    match IS found, so a regression that reintroduces plaintext writes
+    under TDE is still caught.
+  type: bash
+  command: |
+    DATA_DIR="${GEODE_DATA_DIR:-}"
+    if [ -z "$DATA_DIR" ] || [ ! -d "$DATA_DIR" ]; then
+      echo "FAIL: GEODE_DATA_DIR not available in bash step environment (got: '${DATA_DIR}')"
+      exit 2
+    fi
+
+    SNAP_FILES=$(find "$DATA_DIR" -name "hydration_*.snap" 2>/dev/null)
+    SNAP_COUNT=0
+    if [ -n "$SNAP_FILES" ]; then
+      SNAP_COUNT=$(printf '%s\n' "$SNAP_FILES" | wc -l)
+    fi
+    echo "hydration_*.snap files found under TDE: ${SNAP_COUNT}"
+
+    MATCHES=""
+    if [ -n "$SNAP_FILES" ]; then
+      MATCHES=$(printf '%s\n' "$SNAP_FILES" | xargs -r grep -a -l "TDE_SENTINEL_RG11_XYZZY" 2>/dev/null || true)
+    fi
+
+    if [ -n "$MATCHES" ]; then
+      echo "PLAINTEXT LEAK: sentinel found in: $MATCHES"
+      exit 1
+    fi
+
+    echo "no plaintext sentinel found in any hydration_*.snap file"
+    exit 0
+  expect:
+    exit_code: 0
+    stdout_contains: [no plaintext sentinel found]
+  tags: [tde, hydration, scan, critical]
+
+- name: rg11-scan-no-plaintext-in-datadir
+  description: |
+    Defense-in-depth: the sentinel must not appear anywhere else in the
+    data dir either (jsonl/timeseries/fts/wal side-cars excluded, matching
+    the existing tde_bitflip_detection.yml / fle_plaintext_verification_basic.yml
+    convention) — confirms TDE's page encryption also covers the primary
+    engine store, not just the hydration side-car files this spec targets.
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - TDE_SENTINEL_RG11_XYZZY
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [tde, hydration, scan, critical]
+
+- name: rg11-data-readable
+  description: 'Positive control: sentinel data round-trips correctly through the query API under TDE.'
+  query: MATCH (n:RG11_Doc) RETURN n.secret AS secret ORDER BY secret
+  expect:
+    exit_code: 0
+    stdout_contains: ['TDE_SENTINEL_RG11_XYZZY1', 'TDE_SENTINEL_RG11_XYZZY50']
+    geode_query:
+      row_count: 50
+  tags: [tde, hydration, readable]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  search_patterns:
+  - TDE_SENTINEL_RG11_XYZZY
+  fail_on_violation: true
+
+tags:
+- tde
+- hydration
+- snapshot
+- plaintext-verification
+- security
+- critical
+- gap-ent-0023
