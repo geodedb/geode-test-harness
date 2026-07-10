@@ -1,0 +1,512 @@
+version: '1.0'
+name: Spatial Geometry Negative Paths (malformed WKT/arity/polygon/bbox)
+description: >
+  Plan 2, Task 10 — negative-path coverage for spatial geometry functions.
+  `spatial_wkb_functions.yml` / `spatial_rtree_comprehensive.yml` are
+  happy-path only and never feed bad geometry in. This spec adds malformed
+  WKT, wrong function arity, invalid (unclosed/self-intersecting/
+  degenerate) polygons, and an inverted (min>max) bbox query.
+
+
+  ## PROBE FINDINGS (2026-07-10, scratch server, ../geode/zig-out/bin/geode, port 4477)
+
+
+  1. FUNCTION NAME + THE CORE PATTERN: the task brief's `ST_GeomFromText`
+     does NOT exist on this binary. Neither `ST_GeomFromText(...)` nor
+     `GeometryFromText(...)` ever raises a parse/type error directly, no
+     matter how malformed the input — both silently resolve to `NULL`
+     (`status_class":"00000"`, exit 0) for well-formed WKT passed to the
+     nonexistent `ST_GeomFromText`, for malformed WKT text passed to the
+     real `GeometryFromText`, and for a genuinely nonexistent function
+     name (`ThisFunctionDoesNotExist(...)`) — the expression evaluator
+     collapses any unrecognized/unparseable expression to NULL rather
+     than raising an error at that point. The error only surfaces one
+     level up: composing the NULL-producing call with a second function
+     that requires a real (non-NULL) geometry argument — `ST_AsText`,
+     `ST_Contains`, `ST_Within`, etc. — DOES raise a genuine
+     `status_class":"58000"`/`TypeMismatch`, because *that* function
+     rejects a NULL/wrong-type argument, not because the WKT/function-name
+     problem was caught at its own parse time. This is the single
+     mechanism behind findings 2 and 4c below, and is why
+     `spatial_wkb_functions.yml`/`spatial_rtree_comprehensive.yml` (both
+     `GeometryFromText`) never noticed it — they only ever pass
+     well-formed WKT.
+
+  2. MALFORMED WKT IS SILENTLY ACCEPTED AS NULL — BUG (KEY negative, per
+     task brief). `GeometryFromText('POINT(banana)')` returns
+     `status_class":"00000"` (success), exit 0, with the result value
+     silently set to `NULL`. No parse error, no warning. This holds for
+     any malformed WKT text (`'this is not wkt at all'`, `''`, and
+     unbalanced-paren WKT). The NULL is not a transient artifact: storing
+     it (`CREATE (n {g: GeometryFromText('POINT(banana)')})`) and reading
+     it back confirms a genuine stored NULL. Pinned honestly below
+     (`p10_malformed_wkt_limitation_pin` + evidence tests), consistent
+     with the same silent-NULL-swallow pattern found for vector literals
+     in Task 7 (`vector_index_errors.yml`).
+
+  3. WRONG ARITY IS A GENUINE, CORRECTLY-REJECTED ERROR — NOT a silent
+     accept, and NOT NULL-swallowed. `ST_Point(1)` (missing arg),
+     `ST_Point()` (no args), and `ST_Point(1,2,3)` (extra args) all
+     return a real `status_class":"58000"`/`error":"InvalidArgs"` bare,
+     with no wrapping function needed — asserted as the expected
+     rejection (not a limitation pin). `ST_Point('abc', 2)` (non-numeric
+     arg) is a separate, also-genuine
+     `status_class":"58000"`/`error":"TypeMismatch"` rejection. Unlike
+     `GeometryFromText`, `ST_Point` validates its own argument count/types
+     immediately rather than deferring to NULL.
+
+  4. INVALID POLYGON — mixed result, probed three shapes:
+     a. UNCLOSED ring (first point != last point,
+        `POLYGON((0 0, 10 0, 10 10, 0 10))`): genuinely, correctly
+        handled — the ring is implicitly closed for area/containment
+        purposes. `ST_Area` returns the correct value (100 for a 10x10
+        square) and `ST_Contains` gives correct true/false for
+        inside/outside points. This is real, working, documented
+        behavior (implicit ring closure), NOT a bug — asserted as
+        positive/documented.
+     b. SELF-INTERSECTING ("bowtie") ring
+        (`POLYGON((0 0, 10 10, 10 0, 0 10, 0 0))`, a non-simple polygon
+        per OGC Simple Features): structurally parses fine (NOT NULL —
+        distinct from finding 1/2 above, since it has enough well-formed
+        points) and is SILENTLY ACCEPTED with no self-intersection
+        validation — `GeometryFromText` succeeds (`00000`) with a real
+        geometry value, and predicates against it (`ST_Contains`) return
+        deterministic (not random, not a crash) but geometrically
+        ambiguous results driven by whatever point-in-polygon algorithm
+        is used internally (verified: point (9,9) → true, point (1,1) →
+        false, despite both being symmetric corners of the bowtie's two
+        triangular lobes). No crash, no hang, no wrong-typed result —
+        pinned as an honest silent-accept limitation (missing
+        simple-polygon validation), not a hard bug per the bug rule.
+     c. DEGENERATE ring (only 2 distinct points,
+        `POLYGON((0 0, 10 10))`): follows the SAME NULL-swallow pattern
+        as finding 1/2, not a distinct structural check — the bare call
+        silently resolves to `NULL`/`00000` (verified directly; an
+        earlier draft of this probe mistakenly attributed the error seen
+        with an `ST_AsText`/`ST_Contains` wrapper to the bare call
+        itself). When the resulting NULL is fed into `ST_Contains` as a
+        predicate argument, THAT function correctly raises
+        `status_class":"58000"`/`TypeMismatch` rather than returning a
+        wrong true/false — real, correct rejection, but only at the
+        consuming-function boundary, not at WKT-construction time.
+
+  5. INVERTED BBOX (min>max) IS GENUINE, CORRECT BOUNDARY BEHAVIOR — not
+     a bug, not an error. A bbox predicate with inverted bounds
+     (`ST_X(p.geo) >= 10.0 AND ST_X(p.geo) <= 0.0`) against a graph
+     containing a known in-range point (5,5) returns a correct empty
+     result (`count = 0`, zero rows), never the wrong/in-range row. This
+     is expected AND-predicate semantics (no value satisfies both
+     `>= 10` and `<= 0` simultaneously) — asserted as real, correct
+     behavior.
+
+  Mechanism note (same as Task 7/8): the `geode query` CLI subcommand
+  always exits 0 regardless of GQL-level success or failure; every
+  negative/positive assertion below checks the JSON body's
+  `status_class`/`error` fields via `stdout_contains`/
+  `stdout_not_contains`, never `exit_code` alone for pass/fail semantics
+  (though `exit_code: 0` is still asserted since the CLI itself never
+  crashes for any case here).
+
+  CANARY: REQ=REQ-SPATIAL-GEOMETRY-ERRORS-001; FEATURE="Spatial"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/spatial_geometry_errors.yml; OWNER=qa; UPDATED=2026-07-10
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- spatial
+- geometry
+- negative-paths
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: p10_teardown_canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:P10Geo) DETACH DELETE n
+    MATCH (n:P10Bbox) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [spatial, setup, canary]
+
+  # --------------------------------------------------------------- setup --
+- name: p10_setup_st_point_roundtrip
+  description: "Positive setup: ST_Point -> ST_AsText WKT round trip"
+  args: [query, '-']
+  stdin: RETURN ST_AsText(ST_Point(1.5, 2.5)) AS wkt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - 'POINT(1.5 2.5)'
+  tags: [spatial, setup, positive, point]
+
+- name: p10_setup_geometryfromtext_roundtrip
+  description: >
+    Positive setup: GeometryFromText -> ST_AsText WKT round trip (the real
+    WKT constructor on this binary; see PROBE FINDING 1 re: ST_GeomFromText).
+  args: [query, '-']
+  stdin: RETURN ST_AsText(GeometryFromText('POINT(3 4)')) AS wkt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - 'POINT(3 4)'
+  tags: [spatial, setup, positive, wkt]
+
+- name: p10_setup_st_geomfromtext_absent_bare_evidence
+  description: >
+    Evidence for PROBE FINDING 1 -- ST_GeomFromText does not exist on this
+    binary. Bare, it silently resolves to NULL (status_class 00000) just
+    like malformed WKT does -- the nonexistent-function problem is not
+    caught at call time.
+  args: [query, '-']
+  stdin: RETURN ST_GeomFromText('POINT(1 2)') AS g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"g":null'
+  tags: [spatial, setup, evidence, function-name]
+
+- name: p10_setup_st_geomfromtext_absent_composed_evidence
+  description: >
+    Further evidence for PROBE FINDING 1 -- composing the same
+    ST_GeomFromText call (well-formed WKT) with ST_AsText DOES raise a
+    genuine TypeMismatch, confirming ST_GeomFromText's NULL is rejected by
+    a real geometry-consuming function -- i.e. ST_GeomFromText genuinely
+    does not exist / never produces a real geometry value, and
+    GeometryFromText (not ST_GeomFromText) is the real constructor name.
+  args: [query, '-']
+  stdin: RETURN ST_AsText(ST_GeomFromText('POINT(1 2)')) AS g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, setup, evidence, function-name]
+
+  # ------------------------------------------------------------- malformed WKT --
+- name: p10_malformed_wkt_limitation_pin
+  description: >
+    KEY negative (per task brief) -- GeometryFromText('POINT(banana)').
+    EXPECTED: parse/data-exception error. ACTUAL (verified): silently
+    ACCEPTED -- status_class 00000, exit 0, result is NULL, no parse
+    error, no warning. Pinned honestly, not hidden. If this changes to a
+    genuine rejection, update this test and its known_limitation/bug tags.
+  args: [query, '-']
+  stdin: RETURN GeometryFromText('POINT(banana)') AS g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"g":null'
+  tags: [spatial, wkt, known_limitation, bug]
+
+- name: p10_malformed_wkt_stored_value_evidence
+  description: >
+    Evidence for the pin above in a storage context: CREATE-ing a node
+    with the same malformed WKT as a property value silently stores NULL
+    rather than failing the write, and the stored NULL persists on
+    read-back.
+  args: [query, '-']
+  stdin: |
+    CREATE (n1:P10Geo {id: 1, g: GeometryFromText('POINT(banana)')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, wkt, known_limitation, bug, evidence]
+
+- name: p10_malformed_wkt_readback_evidence
+  description: Confirms the property stored for n1 is genuinely NULL on read-back.
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:P10Geo {id: 1}) RETURN n.g AS g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"g":null'
+  tags: [spatial, wkt, known_limitation, bug, evidence]
+
+- name: p10_malformed_wkt_composed_function_evidence
+  description: >
+    Evidence that the silent-NULL swallow (not a parse-time catch) is
+    what's happening: composing the malformed-WKT call with ST_AsText
+    DOES raise a real error, but only because ST_AsText rejects a
+    NULL/non-geometry argument -- not because GeometryFromText caught the
+    malformed WKT at parse time.
+  args: [query, '-']
+  stdin: RETURN ST_AsText(GeometryFromText('POINT(banana)')) AS wkt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, wkt, known_limitation, bug, evidence]
+
+  # ------------------------------------------------------------- wrong arity --
+- name: p10_wrong_arity_missing_arg
+  description: >
+    Negative -- ST_Point(1), missing the y argument. Verified real
+    outcome: genuine rejection, status_class 58000, error InvalidArgs.
+    This IS the expected rejection (not a limitation pin).
+  args: [query, '-']
+  stdin: RETURN ST_Point(1) AS p
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - InvalidArgs
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, point, arity, negative]
+
+- name: p10_wrong_arity_no_args
+  description: Negative -- ST_Point() with zero args. Genuine rejection, InvalidArgs.
+  args: [query, '-']
+  stdin: RETURN ST_Point() AS p
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - InvalidArgs
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, point, arity, negative]
+
+- name: p10_wrong_arity_extra_args
+  description: Negative -- ST_Point(1,2,3), one extra arg. Genuine rejection, InvalidArgs.
+  args: [query, '-']
+  stdin: RETURN ST_Point(1,2,3) AS p
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - InvalidArgs
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, point, arity, negative]
+
+- name: p10_wrong_arity_non_numeric_arg
+  description: >
+    Negative -- ST_Point('abc', 2), non-numeric x argument. Genuine
+    rejection, status_class 58000, error TypeMismatch (distinct from the
+    arity errors above but equally a real, correct rejection).
+  args: [query, '-']
+  stdin: RETURN ST_Point('abc', 2) AS p
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, point, arity, negative, type]
+
+  # ---------------------------------------------------------- invalid polygon --
+- name: p10_unclosed_polygon_area_documented
+  description: >
+    Documented positive, not a bug -- an unclosed ring (first point !=
+    last point) is implicitly closed for area computation. ST_Area of a
+    10x10 unclosed square correctly returns 100.
+  args: [query, '-']
+  stdin: RETURN ST_Area(GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10))')) AS a
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"a":"100'
+  tags: [spatial, polygon, unclosed, documented]
+
+- name: p10_unclosed_polygon_contains_documented
+  description: >
+    Documented positive -- the same unclosed ring correctly reports
+    containment: true for a center point, false for a far-outside point.
+  args: [query, '-']
+  stdin: >-
+    RETURN
+      ST_Contains(GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10))'), ST_Point(5,5)) AS inside,
+      ST_Contains(GeometryFromText('POLYGON((0 0, 10 0, 10 10, 0 10))'), ST_Point(50,50)) AS outside
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"inside":true'
+    - '"outside":false'
+  tags: [spatial, polygon, unclosed, documented]
+
+- name: p10_self_intersecting_polygon_limitation_pin
+  description: >
+    Negative-shaped case -- a self-intersecting ("bowtie") ring
+    (POLYGON((0 0, 10 10, 10 0, 0 10, 0 0))) is not a valid OGC Simple
+    Feature polygon. EXPECTED: rejected (invalid/non-simple geometry
+    error). ACTUAL (verified): silently ACCEPTED -- status_class 00000,
+    no self-intersection validation performed at parse time. Pinned
+    honestly, not a crash/hang (bug rule not triggered as a hard bug, but
+    documented as a missing-validation limitation).
+  args: [query, '-']
+  stdin: RETURN ST_AsText(GeometryFromText('POLYGON((0 0, 10 10, 10 0, 0 10, 0 0))')) AS g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - POLYGON
+  tags: [spatial, polygon, self-intersecting, known_limitation, bug]
+
+- name: p10_self_intersecting_polygon_predicate_evidence
+  description: >
+    Evidence for the pin above -- the accepted bowtie ring is usable in
+    ST_Contains without crashing, but produces geometrically ambiguous
+    (fill-rule-dependent) results for its two triangular lobes: point
+    (9,9) reports true, symmetric point (1,1) reports false. No crash, no
+    hang -- deterministic but ungoverned by any simple-polygon check.
+  args: [query, '-']
+  stdin: >-
+    RETURN
+      ST_Contains(GeometryFromText('POLYGON((0 0, 10 10, 10 0, 0 10, 0 0))'), ST_Point(9,9)) AS lobe_a,
+      ST_Contains(GeometryFromText('POLYGON((0 0, 10 10, 10 0, 0 10, 0 0))'), ST_Point(1,1)) AS lobe_b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"lobe_a":true'
+    - '"lobe_b":false'
+  tags: [spatial, polygon, self-intersecting, known_limitation, bug, evidence]
+
+- name: p10_degenerate_polygon_null_at_construction_limitation_pin
+  description: >
+    Negative-shaped case -- a degenerate ring with only 2 distinct points
+    (POLYGON((0 0, 10 10))), not enough points to form a ring. EXPECTED:
+    rejected at construction. ACTUAL (verified): follows the SAME
+    NULL-swallow pattern as the malformed-WKT case above (finding 1/2) --
+    the bare call silently resolves to NULL, status_class 00000, no
+    parse error. Pinned honestly as the same known limitation, not a
+    separate structural check.
+  args: [query, '-']
+  stdin: RETURN GeometryFromText('POLYGON((0 0, 10 10))') AS g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"g":null'
+  tags: [spatial, polygon, degenerate, known_limitation, bug]
+
+- name: p10_degenerate_polygon_predicate_rejected
+  description: >
+    Negative -- feeding the same degenerate ring's NULL result into
+    ST_Contains as a predicate argument DOES raise a genuine,
+    correctly-rejected error (status_class 58000, error TypeMismatch),
+    rather than silently returning a wrong true/false. The rejection
+    happens at the consuming-function boundary (ST_Contains requires a
+    real geometry argument), not at GeometryFromText/WKT-construction
+    time -- consistent with finding 1's composed-function evidence.
+  args: [query, '-']
+  stdin: >-
+    RETURN ST_Contains(GeometryFromText('POLYGON((0 0, 10 10))'), ST_Point(5,5)) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, polygon, degenerate, negative]
+
+  # -------------------------------------------------------------- inverted bbox --
+- name: p10_bbox_setup_known_point
+  description: "Positive setup: insert one known in-range point (5,5) for the bbox boundary check."
+  args: [query, '-']
+  stdin: |
+    CREATE (n1:P10Bbox {id: 1, geo: ST_Point(5.0, 5.0)})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [spatial, bbox, setup]
+
+- name: p10_bbox_normal_finds_point
+  description: "Sanity check: a normal (min<=max) bbox containing (5,5) finds it."
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:P10Bbox)
+    WHERE ST_X(p.geo) >= 0.0 AND ST_X(p.geo) <= 10.0
+      AND ST_Y(p.geo) >= 0.0 AND ST_Y(p.geo) <= 10.0
+    RETURN count(p) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"cnt":1'
+  tags: [spatial, bbox, setup]
+
+- name: p10_inverted_bbox_empty_not_error
+  description: >
+    Boundary case -- an inverted bbox (min>max: ST_X >= 10.0 AND
+    ST_X <= 0.0) against a graph containing the known in-range point
+    (5,5). Verified real outcome: genuine, correct empty result (count 0)
+    -- not an error, not a crash, and critically never the wrong
+    (in-range) row. This is expected AND-predicate semantics, asserted as
+    real documented behavior.
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:P10Bbox)
+    WHERE ST_X(p.geo) >= 10.0 AND ST_X(p.geo) <= 0.0
+      AND ST_Y(p.geo) >= 0.0 AND ST_Y(p.geo) <= 10.0
+    RETURN count(p) AS cnt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"cnt":0'
+  tags: [spatial, bbox, boundary]
+
+- name: p10_inverted_bbox_never_wrong_row
+  description: >
+    Evidence for the case above -- the inverted-bbox query's row set is
+    genuinely empty, not merely miscounted; the known in-range point's id
+    (1) never appears.
+  args: [query, '-']
+  stdin: >-
+    MATCH (p:P10Bbox)
+    WHERE ST_X(p.geo) >= 10.0 AND ST_X(p.geo) <= 0.0
+      AND ST_Y(p.geo) >= 0.0 AND ST_Y(p.geo) <= 10.0
+    RETURN p.id AS id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+    stdout_not_contains:
+    - '"id":1'
+  tags: [spatial, bbox, boundary, evidence]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: p10_teardown
+  description: Remove all P10 test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:P10Geo) DETACH DELETE n
+    MATCH (n:P10Bbox) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [spatial, cleanup, canary]
