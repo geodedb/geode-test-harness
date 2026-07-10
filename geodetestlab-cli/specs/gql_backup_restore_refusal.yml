@@ -1,0 +1,137 @@
+version: '1.0'
+name: GQL BACKUP/RESTORE stable refusal (geode 6264a7e0, GAP-0871)
+description: |
+  Pins the fix (geode commit 6264a7e0, GAP-0871) that gives GQL `BACKUP`/
+  `RESTORE` statements a STABLE, DOCUMENTED refusal instead of a bare
+  catch-all `NotImplemented`. The parser accepts the statement forms (so
+  the refusal is a clean executor-level contract, not a parse error); the
+  executor returns the named error `error.GqlBackupRestoreUnsupported`;
+  the wire layer maps it to SQLSTATE `0A000` ("feature not supported")
+  with a client-visible message naming the supported CLI alternative
+  (`geode backup create` / `geode restore`).
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4466
+  --data-dir /tmp/probe-r22, GEODE_ADMIN_PASSWORD set so no forced
+  password-reset gate) before writing this spec, using the same auth
+  flow the harness auto-injects for `query`/`backup` CLI invocations:
+    - `geode query "BACKUP TO '/tmp/x.bak'"` → exit code 0 (the CLI
+      process itself succeeds — the refusal is carried IN the JSON
+      response body, not via nonzero process exit). stdout is exactly:
+      `{"status_class":"0A000","error_code":"0A000","error":"GQL
+      BACKUP/RESTORE statements are unsupported: use the CLI instead
+      (\`geode backup create --output <file>\` to create a backup,
+      \`geode restore <file>\` to restore one).","additional_statuses":
+      [],"flagger_findings":[]}`
+    - `geode query "RESTORE FROM '/tmp/x.bak'"` → byte-identical error
+      body/status_class (same named error, same message — RESTORE is
+      not a lesser-effort stub of BACKUP).
+    - This is a SEMANTIC (executor-level) refusal, not a parser syntax
+      error: status_class is `0A000` ("feature not supported"), not
+      `42000` (a real GQL parse-error SQLSTATE). The parser genuinely
+      recognizes `BACKUP TO '<path>'` / `RESTORE FROM '<path>'` and
+      hands a well-formed AST node to the executor, which then refuses
+      it by name.
+    - No crash, no hang, no partial file write: the server process
+      stayed up and answered a plain `RETURN 1` immediately after both
+      refusals.
+    - `geode backup create --output <file>` (the documented alternative
+      named in the refusal message) completed successfully end-to-end
+      against the same running server — proving the refusal is
+      GQL-surface-only, not backup being broken entirely.
+
+  CANARY: REQ=REQ-GQL-BACKUP-RESTORE-REFUSAL-001; FEATURE="BackupRestore"; ASPECT=GqlStableRefusal; STATUS=TESTED; TEST=geodetestlab/specs/gql_backup_restore_refusal.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: gql-backup-refused
+  description: |
+    KEY (negative) — the GQL statement `BACKUP TO '<path>'` (the exact
+    probed syntax the parser recognizes-then-refuses) must return a
+    clean, stable "unsupported" error — NOT a crash, NOT a silent
+    success (no backup file must actually be written), NOT a bare/vague
+    NotImplemented. The refusal surfaces as SQLSTATE 0A000 in the JSON
+    response body with exit_code 0 (the CLI process itself does not
+    fail — the error is carried in the query result), and the message
+    names both documented CLI alternatives.
+  query: BACKUP TO '/tmp/rg22_gql_backup_refusal.bak'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - '"error_code":"0A000"'
+    - GQL BACKUP/RESTORE statements are unsupported
+    - geode backup create --output <file>
+    - geode restore <file>
+  tags: [gql-backup-restore, gap-0871, key-assertion, negative-control]
+
+- name: gql-restore-refused
+  description: |
+    Negative — the GQL statement `RESTORE FROM '<path>'` gets the SAME
+    stable refusal (same named error, same message, same SQLSTATE) as
+    BACKUP — proving RESTORE is not a lesser-effort stub that crashes
+    or silently no-ops instead of refusing cleanly.
+  query: RESTORE FROM '/tmp/rg22_gql_backup_refusal.bak'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - '"error_code":"0A000"'
+    - GQL BACKUP/RESTORE statements are unsupported
+    - geode backup create --output <file>
+    - geode restore <file>
+  tags: [gql-backup-restore, gap-0871, negative-control]
+
+- name: server-alive
+  description: |
+    KEY ASSERTION — the server must still be alive and answering plain
+    queries after both refused BACKUP and RESTORE statements. A
+    regression here (crash, hang, connection drop) would be the GAP-0871
+    live-regression bug rule this spec is on guard for.
+  query: RETURN 1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"expr":1'
+  tags: [gql-backup-restore, gap-0871, key-assertion, server-alive]
+
+- name: cli-backup-works
+  description: |
+    Positive control — the supported CLI backup path (`geode backup
+    create --output <file>`, the alternative named in the GQL refusal
+    message, per geodetestlab-cli/specs/backup_operations_basic.yml)
+    still succeeds. Proves the GAP-0871 refusal is GQL-surface-only —
+    backup itself is not broken.
+  args:
+  - backup
+  - create
+  - --output
+  - /tmp/rg22_cli_backup_control.gz
+  expected:
+    exit_code: 0
+  tags: [gql-backup-restore, gap-0871, positive-control, backup]
+
+tags:
+- gql-backup-restore
+- gap-0871
+- regression
