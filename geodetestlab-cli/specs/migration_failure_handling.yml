@@ -1,0 +1,183 @@
+version: '1.0'
+name: migration-failure-handling
+description: |
+  CANARY: REQ=REQ-MIGRATION-FAILURE-001; FEATURE="Migrations"; ASPECT=RunPathBroken; STATUS=TESTED; TEST=geodetestlab/specs/migration_failure_handling.yml; OWNER=qa; UPDATED=2026-07-10
+
+  Migration failure-handling coverage for the `geode migrate` CLI surface.
+
+  WHAT IS TESTED (safe, black-box, deterministic):
+    - LOCAL positive surface (no server): `migrate create` produces a
+      versioned migration file; `migrate status` reads the directory + ledger
+      and reports Applied/Pending/Total with per-file [pending]/[applied].
+    - `migrate status` on an empty dir => 0/0/0 (no false pending).
+    - `migrate status` against a seeded ledger marking version 1 applied =>
+      Applied: 1 / Pending: 0 (proves status distinguishes applied vs pending,
+      i.e. version tracking works locally without a live server).
+    - unreachable-server LIMITATION PIN (dead port, never the managed server):
+      `migrate run --server 127.0.0.1:65000` hangs on the QUIC handshake and is
+      killed by an outer `timeout 15` => exit 124. Port 65000 is ABOVE the Linux
+      ephemeral range (32768-60999) that the harness's get_free_port() draws
+      from, so it can never collide with an OS-assigned managed-server port under
+      --parallel. Expected behaviour would be a
+      clean, bounded "connection refused / unreachable" error with a nonzero
+      exit; actual behaviour is an indefinite hang. This test PINS that bug:
+      when the connect path is fixed to fail fast, exit code 124 will change and
+      this test will flip, prompting an update.
+
+  KNOWN BUG — DOCUMENTED, NOT EXERCISED (do NOT add a live-server migrate-run
+  test here; it destabilises the managed server for the whole suite):
+    `geode migrate run --server <LIVE server>` is broken in this build. For BOTH
+    valid AND invalid migrations it hangs indefinitely (client never returns;
+    killed by timeout) and CRASHES the managed server ("Server died during
+    test"); when it does return it exits without applying (ledger Applied stays
+    0, version never advances). The defect is migrate-path specific: the SAME
+    malformed GQL sent via `geode query` exits 0 and the server survives, and
+    thousands of `geode query` tests pass over the identical TLS/auth setup. Root
+    area (code read, not fixed): src/cli/backup_cli.zig::execMigrationScript /
+    connectMigrationClient (per-script QUIC reconnect + hello + consumeQuery),
+    invoked by src/migration/apply.zig::applyUpMigrations. Signing is not the
+    cause: verifyMigrationSignature runs before execMigrationScript and is
+    bypassed by --allow-unsigned. Consequently the required syntax-error,
+    duplicate-version, and valid-apply "version advances/does-not-advance"
+    negatives are NOT black-box testable without crashing the server, so they
+    are documented here rather than asserted.
+
+  Migration surface reference:
+    geode migrate status  --dir <d>              (LOCAL; reads ledger, no server)
+    geode migrate create  <name> --dir <d>       (LOCAL; NNN_<name>.gql, auto-version)
+    geode migrate sign    [--all] --dir <d>      (LOCAL; writes <name>.sig)
+    geode migrate run     --dir <d> --server ... (LIVE server over QUIC; BROKEN)
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# LOCAL positive surface (no server): create advances the pending set, and
+# status reports it correctly. Proves the migration surface works locally.
+# ---------------------------------------------------------------------------
+- name: p24_create_and_status_pending
+  description: |
+    `migrate create` writes a versioned migration file; `migrate status` then
+    reports it as pending (Applied: 0 / Pending: 1 / Total: 1). Self-contained
+    in a fresh mktemp dir for determinism.
+  type: bash
+  command: |
+    set -e
+    DIR=$(mktemp -d /tmp/p24_create.XXXXXX)
+    "${GEODE_BINARY}" migrate create p24_sample --dir "$DIR" --no-sign
+    "${GEODE_BINARY}" migrate status --dir "$DIR"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'Created migration file'
+    - 'Applied: 0'
+    - 'Pending: 1'
+    - 'Total: 1'
+    - '[pending]'
+  tags:
+  - migration
+  - failure-handling
+  - local-surface
+  - positive
+
+# ---------------------------------------------------------------------------
+# LOCAL: empty migrations dir => nothing pending, nothing applied.
+# ---------------------------------------------------------------------------
+- name: p24_status_empty_dir
+  description: |
+    `migrate status` on an empty directory reports 0 applied / 0 pending /
+    0 total (no phantom migrations).
+  type: bash
+  command: |
+    DIR=$(mktemp -d /tmp/p24_empty.XXXXXX)
+    "${GEODE_BINARY}" migrate status --dir "$DIR"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'Applied: 0'
+    - 'Pending: 0'
+    - 'Total: 0'
+  tags:
+  - migration
+  - failure-handling
+  - local-surface
+
+# ---------------------------------------------------------------------------
+# LOCAL (teeth): a ledger marking version 1 applied makes status report it as
+# applied, not pending. Proves status reflects real version-tracking state
+# without needing the (broken) live run path.
+# ---------------------------------------------------------------------------
+- name: p24_status_reads_applied_ledger
+  description: |
+    Seed a migrations dir with 001_seed.gql plus a migration_ledger.json that
+    records version 1 as applied. `migrate status` must report Applied: 1 /
+    Pending: 0 and mark the file [applied] — distinguishing applied from pending.
+  type: bash
+  command: |
+    set -e
+    DIR=$(mktemp -d /tmp/p24_applied.XXXXXX)
+    printf 'CREATE (:P24Seed {name: "seed"});\n' > "$DIR/001_seed.gql"
+    printf '%s\n' '{"baseline_fingerprint":14037138416687337835,"rows":[{"version":1,"name":"001_seed.gql","applied":true,"checksum_prefix":"5ae0a4c"}],"metrics":{"applied_total":1,"failed_total":0,"drift_detected_total":0}}' > "$DIR/migration_ledger.json"
+    "${GEODE_BINARY}" migrate status --dir "$DIR"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'Applied: 1'
+    - 'Pending: 0'
+    - 'Total: 1'
+    - '[applied]'
+  tags:
+  - migration
+  - failure-handling
+  - local-surface
+  - ledger
+
+# ---------------------------------------------------------------------------
+# NEGATIVE (LIMITATION PIN): migrate run against a DEAD port (65000 — above the
+# Linux ephemeral range 32768-60999, so never an OS-assigned managed-server port
+# even under --parallel) hangs on the QUIC handshake instead of returning a clean
+# connection error, so an outer `timeout 15` kills it => exit 124. This documents
+# the hang-instead-of-clean-error bug with a bounded assertion.
+# ---------------------------------------------------------------------------
+- name: p24_unreachable_dead_port_hangs
+  description: |
+    LIMITATION PIN. `migrate run --server 127.0.0.1:65000` (a dead port ABOVE the
+    Linux ephemeral range 32768-60999, so it can never be an OS-assigned managed
+    server port under --parallel) never returns a bounded connection error — it blocks on the
+    QUIC handshake until the outer `timeout 15` kills it (exit 124). Expected: a
+    clean "connection refused / unreachable" error with a fast nonzero exit.
+    Actual: indefinite hang. When the connect path is fixed to fail fast, the
+    exit code will no longer be 124 and this pin will flip.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    DIR=$(mktemp -d /tmp/p24_dead.XXXXXX)
+    printf 'CREATE (:P24Dead {tag: "p24"});\n' > "$DIR/001_x.gql"
+    timeout 15 "${GEODE_BINARY}" migrate run --dir "$DIR" --server 127.0.0.1:65000 \
+      --user geode --password "${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}" \
+      --allow-unsigned ${GEODE_CLIENT_TLS}
+  expect:
+    exit_code: 124
+  tags:
+  - migration
+  - failure-handling
+  - unreachable
+  - limitation-pin
