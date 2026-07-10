@@ -1,0 +1,283 @@
+version: '1.0'
+name: Security-graph crash-durability under GEODE_WAL_SYNC=deferred (geode be11253c, GAP-0026)
+description: |
+  Pins a fix (geode commit be11253c) for gap 0026: with
+  GEODE_WAL_SYNC=deferred set on the server, bulk graph writes may defer
+  their fsync for throughput, but security-graph mutations (user
+  create/password rotation) MUST still fsync synchronously so an ACKED
+  credential change survives an UNCLEAN crash. This spec proves an
+  admin-driven password rotation on a security-graph user is durable
+  across a HARD-KILL (SIGKILL) crash — no graceful shutdown, no
+  checkpoint — even with deferred sync enabled for the rest of the store.
+
+  WHY A HARD KILL (the teeth): a graceful shutdown always runs geode's
+  checkpointAll(), which durably flushes EVERY pending mutation to disk
+  regardless of GEODE_WAL_SYNC. So a graceful restart would pass
+  identically on a pre-fix (broken) and post-fix binary — it cannot
+  detect the be11253c carve-out at all. The loss window that be11253c
+  closes only exists when the process dies WITHOUT checkpointing. This
+  spec therefore SIGKILLs the managed server (uncatchable, no flush,
+  no checkpoint) via a `type: bash` step, then relies on the harness's
+  `restart_server: true` to reopen the SAME data dir under the SAME
+  GEODE_WAL_SYNC=deferred env. On reopen the security graph must recover
+  the rotated credential purely from the synchronously-fsync'd security
+  WAL — which is exactly the property be11253c guarantees and a pre-fix
+  binary would not.
+
+  Scenario:
+    1. Create rg9_user with an initial password (security-graph mutation).
+    2. Baseline: the initial password authenticates.
+    3. Rotate rg9_user's password via
+       `user reset-password <username> --new-password <new>` (an ACKED
+       admin-driven security mutation). Converts to
+       CALL geode.auth.user_reset_password under the harness's
+       CLI-to-query translation.
+    4. Pre-crash baseline: new password authenticates, old is rejected.
+    5. Hard-crash: SIGKILL the managed server (NO checkpoint) via a
+       `type: bash` step that pkills the process by its unique data dir,
+       carrying restart_server: true so the harness brings it back up on
+       the same data dir + same GEODE_WAL_SYNC=deferred env. Because the
+       process is already dead when the harness's graceful stop runs,
+       that stop reaps an already-dead process and never checkpoints —
+       preserving the deferred-sync loss window.
+    6. KEY (positive): after the crash+restart, login with the NEW
+       password succeeds — the acked rotation was fsync'd and recovered.
+    7. KEY (negative): after the crash+restart, login with the OLD
+       password is rejected (exit 3, "Invalid username or password", and
+       must NOT show "Successfully authenticated") — the old credential
+       did not resurrect from a stale/un-synced security-graph snapshot.
+    8. Positive: rg9_user is still listed (active) after restart.
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4451
+  --data-dir /tmp/probe-r9, GEODE_WAL_SYNC=deferred,
+  GEODE_ADMIN_PASSWORD=GeodeTestPassword123! set at boot so the admin
+  account isn't stuck in the generated-password force-reset state) with a
+  MANUAL kill -9 (no graceful stop) between rotation and restart:
+    - After SIGKILL the server log showed NO "[shutdown] data flush
+      complete" (no checkpoint ran), and the reopen logged
+      "opened existing graph '__geode_security' (property index rebuilt
+      from scan)" — the crash-recovery path, distinct from the graceful
+      reopen's "property index loaded from disk".
+    - After the crash+restart on the same data dir with
+      GEODE_WAL_SYNC=deferred still set: the NEW password authenticated
+      (exit 0, "Successfully authenticated"), the OLD password was
+      rejected (exit 3, "Invalid username or password"), and
+      CALL geode.auth.user_list() showed rg9_user active. This proves
+      be11253c is live: the security mutation was synchronously fsync'd
+      despite deferred sync and survived the unclean crash. A pre-fix
+      binary would have lost the deferred, un-synced rotation (old
+      credential resurrecting or new one lost) and FAILED these
+      assertions. No regression observed.
+    - GEODE_ALLOW_TEST_AUDIT_KEYS was NOT needed: user create, password
+      rotation, and the security graph all persisted correctly without
+      it (geode falls back to file-based audit signing keys with a
+      startup warning, which is harmless here).
+
+  CANARY: REQ=REQ-SEC-WAL-DURABILITY-DEFERRED-001; FEATURE="SecurityGraphDurability"; ASPECT=DeferredWalFsync; STATUS=TESTED; TEST=geodetestlab/specs/security_graph_wal_durability_deferred_0026.yml; OWNER=security; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_WAL_SYNC: deferred
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: create-user-deferred
+  description: |
+    Setup — create rg9_user under GEODE_WAL_SYNC=deferred. This is the
+    security-graph mutation whose crash-durability this spec pins.
+  args:
+  - user
+  - create
+  - rg9_user
+  - rg9@test.example.com
+  - --password
+  - Rg9_Pass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - rg9_user
+    - created
+  tags: [security, wal-durability, deferred-sync, setup]
+
+- name: initial-password-works
+  description: Baseline — the initial password authenticates before rotation.
+  args:
+  - auth
+  - login
+  - --user
+  - rg9_user
+  - --password
+  - Rg9_Pass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [security, wal-durability, deferred-sync, positive-baseline]
+
+- name: rotate-password
+  description: |
+    Admin-driven password rotation (ACKED security-graph mutation) —
+    `user reset-password <username> --new-password <new>` converts to
+    CALL geode.auth.user_reset_password via the harness's CLI-to-query
+    translation and succeeds as the admin, no old password required.
+  args:
+  - user
+  - reset-password
+  - rg9_user
+  - --new-password
+  - Rg9_New_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - 'Password reset for rg9_user'
+  tags: [security, wal-durability, deferred-sync, key-assertion]
+
+- name: new-password-works-before-crash
+  description: |
+    Confirm the rotation took effect immediately (before the crash) —
+    the new password authenticates.
+  args:
+  - auth
+  - login
+  - --user
+  - rg9_user
+  - --password
+  - Rg9_New_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [security, wal-durability, deferred-sync, positive-baseline]
+
+- name: old-password-rejected-before-crash
+  description: |
+    Confirm the OLD password is already invalid immediately after
+    rotation (before the crash) — establishes the pre-crash baseline
+    that the post-crash negative assertion must still hold.
+  args:
+  - auth
+  - login
+  - --user
+  - rg9_user
+  - --password
+  - Rg9_Pass_2026!
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Invalid username or password
+    stdout_not_contains:
+    - Successfully authenticated
+  tags: [security, wal-durability, deferred-sync, negative-baseline]
+
+- name: crash-kill-and-restart-under-deferred-sync
+  description: |
+    HARD CRASH — SIGKILL the managed server (uncatchable; no graceful
+    shutdown, no checkpointAll()) so the deferred-sync loss window is
+    preserved, then let the harness restart it on the SAME data dir with
+    GEODE_WAL_SYNC=deferred still in effect. The server is targeted by
+    its unique per-run data dir (GEODE_DATA_DIR, exported into bash
+    steps); the kill pattern is expanded at runtime so it matches only
+    the live geode process, never this bash step's own (unexpanded)
+    command line. `set -e` fails the step loudly if no server matched —
+    guaranteeing we never silently fall back to a graceful (checkpointed)
+    restart. After this kill, the harness's graceful stop reaps an
+    already-dead process and cannot checkpoint; `restart_server: true`
+    then reopens the un-checkpointed data dir. Only a synchronously
+    fsync'd security mutation (the be11253c guarantee) survives this.
+  type: bash
+  command: |
+    set -e
+    pkill -9 -f "geode serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags: [security, wal-durability, deferred-sync, crash, restart]
+
+- name: new-password-works
+  description: |
+    KEY ASSERTION (positive) — after the UNCLEAN crash + restart, the NEW
+    (rotated) password still authenticates. This only holds if the acked
+    rotation was synchronously fsync'd to the security WAL despite
+    GEODE_WAL_SYNC=deferred (the be11253c fix) and recovered on reopen. A
+    pre-fix binary that deferred the security mutation's sync would have
+    lost it in the crash and this login would fail — giving the test real
+    regression-detection power.
+  args:
+  - auth
+  - login
+  - --user
+  - rg9_user
+  - --password
+  - Rg9_New_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [security, wal-durability, deferred-sync, key-assertion]
+
+- name: old-password-rejected
+  description: |
+    KEY ASSERTION (negative) — after the UNCLEAN crash + restart, the OLD
+    (pre-rotation) password must NOT authenticate. If deferred sync had
+    dropped the acked rotation and the crash-reopen recovered a stale
+    pre-rotation security-graph snapshot, this old credential would
+    incorrectly succeed — a live regression of be11253c. This test must
+    catch that: exit 3, "Invalid username or password", and never
+    "Successfully authenticated".
+  args:
+  - auth
+  - login
+  - --user
+  - rg9_user
+  - --password
+  - Rg9_Pass_2026!
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Invalid username or password
+    stdout_not_contains:
+    - Successfully authenticated
+  tags: [security, wal-durability, deferred-sync, key-assertion, negative-control]
+
+- name: user-survives
+  description: |
+    Positive — rg9_user is still listed and active after the crash+restart,
+    confirming the user record itself (not just the password hash)
+    survived the unclean reopen under deferred sync.
+  args:
+  - user
+  - list
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - rg9_user
+    - '"active":true'
+  tags: [security, wal-durability, deferred-sync, positive-baseline]
+
+tags:
+- security
+- wal-durability
+- deferred-sync
+- crash-recovery
+- auth
+- regression
