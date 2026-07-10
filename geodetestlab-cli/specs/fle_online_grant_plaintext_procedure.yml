@@ -1,0 +1,305 @@
+version: '1.0'
+name: FLE Online grantPlaintext — grants role plaintext read without restart, restart-safe
+description: |
+  CANARY: REQ=REQ-FLE-ONLINE-GRANT-PLAINTEXT-001; FEATURE="FLE"; ASPECT=OnlineGrantNoRestart; STATUS=TESTED; TEST=geodetestlab/specs/fle_online_grant_plaintext_procedure.yml; OWNER=security; UPDATED=2026-07-10
+
+  Pins geode commits ad6982d4 / b0b4b3bd ("feat(fle): online
+  geode.fle.grantPlaintext procedure (no server restart)"):
+  `CALL geode.fle.grantPlaintext('<Label>','<field>','<role>')` grants a role
+  plaintext read of an FLE-encrypted field ONLINE — while the server keeps
+  running — and the grant is restart-safe (persisted to
+  geode_fle_catalog.dat via the same code path the offline
+  `geode fle grant-plaintext` CLI uses).
+
+  ## Probe findings (source read + live scratch-server probe, port 4464)
+
+  - Procedure signature confirmed via commit b0b4b3bd
+    (`src/execution/storage_dispatch.zig` `handleGeodeFleGrantplaintext`,
+    dispatch-table key `geode.fle.grantplaintext`) and its regression test
+    (`tests/test_fle_online_grant.zig`):
+      `CALL geode.fle.grantPlaintext(type_name, field_name, role)`
+    Argument order is (Label/type name, field name, role name) — the SAME
+    positional order as `geode.fle.configureField`'s first two args. The
+    handler resolves the process-wide `fle_catalog.globalCatalog` (the same
+    catalog `configureField` writes and the decrypt read path
+    `fle_integration.canReadPlaintext` consults) and calls
+    `catalog.grantPlaintextAccess(type_name, field_name, role)` — byte-for-
+    byte the same call the offline CLI's `grantPlaintext` makes
+    (`src/admin/fle_commands.zig:410`). It is gated as an unreplicated
+    catalog write (`cluster_mod.gateUnreplicatedWrite()`).
+  - Per-role enforcement: `fle_integration.canReadPlaintext()` checks
+    `ctx.fle_role` (the GAP-0271 per-request role, set via the CLI's
+    `--role <name>` flag / `HelloRequest.role`, independent of `-U`/`-P`)
+    against `field_meta.visibility.to_roles` — the exact list
+    `grantPlaintextAccess` appends to. This is the SAME mechanism
+    `fle_plaintext_verification_access_control.yml` already uses to test
+    per-role FLE reads (`args: [query, --role, <role>, ...]`), and
+    `-U`/`-P` + `--role` combine freely in one HELLO
+    (`src/cli/main.zig:2610-2616` sets `.username`, `.password`, and
+    `.role` unconditionally from independent flags).
+  - Live-probed on a scratch server (FLE enabled, `RG20_Rec.ssn` configured
+    with `visibility: []` i.e. locked-to-nobody): a read with
+    `--role rg20_analyst` BEFORE any grant returned the placeholder
+    `"ssn":"[REDACTED]"` — never the plaintext. `CALL
+    geode.fle.grantPlaintext('RG20_Rec','ssn','rg20_analyst')` then
+    returned `{"status":"granted"}` with exit 0, and — WITHOUT touching or
+    restarting the server — the immediately-following `--role
+    rg20_analyst` read returned `"ssn":"123-45-6789"` (plaintext). A
+    read with a DIFFERENT, non-granted role (`--role rg20_other`)
+    immediately after the grant still returned `[REDACTED]`, proving the
+    grant is role-scoped, not a global unlock. Killing (SIGTERM, graceful
+    drain logged) and restarting the server against the SAME data dir
+    (`cleanup: false`) reproduced the plaintext read for `rg20_analyst`
+    with no re-grant — the grant is restart-safe.
+
+  ## Known-limitation note (does NOT affect this spec's teeth)
+
+  geode has a documented limitation (GAP-0288, see
+  `rbac_custom_role_binding_pin.yml`): `CREATE USER ... ROLE <custom_role>`
+  does NOT bind the custom role's RBAC privileges — the user silently
+  falls back to the `.User` built-in. That limitation is about the
+  RBAC/GPS privilege system and is ORTHOGONAL to FLE's per-request
+  `--role` mechanism (GAP-0271), which is a separate code path
+  (`ctx.fle_role`, set directly via HELLO) that does NOT depend on the
+  broken custom-role RBAC binding. This spec creates a real
+  `rg20_analyst` role and a real `rg20_user` bound to it (for realism/
+  documentation, matching the task's requested setup), but the KEY read
+  assertions use `--role rg20_analyst` on the query — the same working,
+  production mechanism `fle_plaintext_verification_access_control.yml`
+  already relies on — to reliably exercise the exact
+  `canReadPlaintext()` / `to_roles` check that `grantPlaintext` mutates.
+  This is not a workaround for a gap in the FEATURE UNDER TEST; GAP-0288
+  is unrelated to online-grant correctness.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --enable-fle
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+env:
+  GEODE_FLE_ENABLED: 'true'
+  GEODE_MASTER_KEY: rg20-online-grant-master-key-32bytes!!
+skip_isolation: true
+
+tests:
+  # ============================================================
+  # SETUP
+  # ============================================================
+- name: rg20-preflight-cleanup
+  description: Idempotent pre-flight cleanup of any leftovers from a prior run.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rg20_user;
+    DROP ROLE IF EXISTS rg20_analyst;
+    MATCH (n:RG20_Rec) DETACH DELETE n;
+  expect:
+    exit_code: 0
+  tags: [fle, online-grant, setup]
+
+- name: rg20-create-role
+  description: Create the rg20_analyst role that will be granted FLE plaintext access online.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE ROLE rg20_analyst]
+  expect:
+    exit_code: 0
+  tags: [fle, online-grant, setup]
+
+- name: rg20-create-user
+  description: Create rg20_user bound to rg20_analyst (documentation/realism; FLE role checks below use --role, see GAP-0288 note in description).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rg20_user SET PASSWORD 'Rg20UserPass123!' ROLE rg20_analyst]
+  expect:
+    exit_code: 0
+  tags: [fle, online-grant, setup]
+
+- name: rg20-configure-field-locked
+  description: |
+    Configure RG20_Rec.ssn as FLE-encrypted with EMPTY visibility (locked to
+    nobody). This is the pre-grant state: no role, including rg20_analyst,
+    has plaintext access yet.
+  args:
+  - query
+  - "CALL geode.fle.configureField('RG20_Rec', 'ssn', { algorithm: 'AES-256-GCM', keyVersion: 1, visibility: [] }) RETURN 'configured' AS status"
+  expect:
+    exit_code: 0
+    stdout_contains: [configured]
+  tags: [fle, online-grant, configure]
+
+- name: rg20-seed-record
+  description: Seed the RG20_Rec node with a plaintext SSN value (admin write; FLE encrypts it at rest).
+  args:
+  - query
+  - "CREATE (n:RG20_Rec {rec_id: 'RG20_001', ssn: '123-45-6789'}) RETURN n.rec_id AS rec_id"
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+  tags: [fle, online-grant, seed]
+
+- name: rg20-scan-no-plaintext-on-disk
+  description: 'CRITICAL: the seeded SSN plaintext must NOT appear on disk (FLE encrypts at rest).'
+  command: grep
+  args:
+  - -r
+  - -a
+  - -l
+  - --exclude=*.jsonl
+  - --exclude-dir=timeseries
+  - --exclude-dir=fts
+  - --exclude-dir=wal
+  - 123-45-6789
+  - ${data_dir}
+  expect:
+    exit_code: 1
+  tags: [fle, online-grant, scan, critical]
+
+  # ============================================================
+  # KEY NEGATIVE: before the grant, rg20_analyst gets a placeholder,
+  # NOT the plaintext SSN.
+  # ============================================================
+- name: read-before-grant
+  description: |
+    KEY NEGATIVE — querying as rg20_analyst (via --role, GAP-0271 FLE
+    per-request role scoping) BEFORE any grant must NOT return the
+    plaintext SSN. The field is locked (empty visibility): the response
+    must contain a redaction placeholder (e.g. [REDACTED], null, "").
+  args: [query, -U, geode, -P, '${secret:admin_password}', --role, rg20_analyst, "MATCH (n:RG20_Rec {rec_id: 'RG20_001'}) RETURN n.ssn AS ssn"]
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - 123-45-6789
+    stdout_contains:
+    - '[REDACTED]'
+  tags: [fle, online-grant, negative, critical, key-assertion]
+
+  # ============================================================
+  # KEY: online grant — no server restart before or after this step.
+  # ============================================================
+- name: grant-online
+  description: |
+    KEY — admin issues CALL geode.fle.grantPlaintext('RG20_Rec','ssn','rg20_analyst')
+    while the server is running (no restart). Must succeed (exit 0,
+    status 'granted').
+  args:
+  - query
+  - -U
+  - geode
+  - -P
+  - '${secret:admin_password}'
+  - "CALL geode.fle.grantPlaintext('RG20_Rec','ssn','rg20_analyst') RETURN 'granted' AS status"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - granted
+  tags: [fle, online-grant, key-assertion]
+
+  # ============================================================
+  # KEY POSITIVE: immediately after the grant (NO restart in between),
+  # rg20_analyst now sees the plaintext SSN.
+  # ============================================================
+- name: read-after-grant
+  description: |
+    KEY POSITIVE — the SAME query, as rg20_analyst, immediately after
+    grant-online with NO server restart in between, now returns the
+    plaintext SSN. This is the online-grant teeth: the transition from
+    denied to granted happened without stopping the server.
+  args: [query, -U, geode, -P, '${secret:admin_password}', --role, rg20_analyst, "MATCH (n:RG20_Rec {rec_id: 'RG20_001'}) RETURN n.ssn AS ssn"]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 123-45-6789
+  tags: [fle, online-grant, positive, critical, key-assertion]
+
+- name: read-after-grant-other-role-still-denied
+  description: |
+    POSITIVE (role-scoping proof) — a DIFFERENT, non-granted role
+    (rg20_other) queried immediately after the grant STILL gets the
+    placeholder, not the plaintext. Proves grantPlaintext is scoped to the
+    named role, not a global unlock of the field.
+  args: [query, -U, geode, -P, '${secret:admin_password}', --role, rg20_other, "MATCH (n:RG20_Rec {rec_id: 'RG20_001'}) RETURN n.ssn AS ssn"]
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - 123-45-6789
+  tags: [fle, online-grant, negative, role-scoping]
+
+  # ============================================================
+  # Restart the managed server (same data_dir, cleanup: false) and confirm
+  # the grant survives — restart-safety half of the pin.
+  # ============================================================
+- name: restart-server-after-grant
+  description: |
+    Graceful restart of the managed server against the same data dir
+    (cleanup: false). Proves the grant made via the ONLINE procedure was
+    persisted (geode_fle_catalog.dat), not just an in-memory mutation.
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - RESTART
+  tags: [fle, online-grant, restart]
+
+- name: grant-survives-restart
+  description: |
+    KEY — after the restart, rg20_analyst STILL reads the plaintext SSN
+    with no re-grant. Confirms grantPlaintextAccess's persistence
+    (geode_fle_catalog.dat) makes the online grant restart-safe, byte-
+    for-byte equivalent to the offline `geode fle grant-plaintext` CLI.
+  args: [query, -U, geode, -P, '${secret:admin_password}', --role, rg20_analyst, "MATCH (n:RG20_Rec {rec_id: 'RG20_001'}) RETURN n.ssn AS ssn"]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 123-45-6789
+  tags: [fle, online-grant, restart, positive, critical, key-assertion]
+
+  # ============================================================
+  # TEARDOWN
+  # ============================================================
+- name: rg20-cleanup
+  description: Drop test user, role, and seeded data.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS rg20_user;
+    DROP ROLE IF EXISTS rg20_analyst;
+    MATCH (n:RG20_Rec) DETACH DELETE n;
+  expect:
+    exit_code: 0
+  tags: [fle, online-grant, teardown]
+
+invariants:
+- type: server_running
+
+plaintext_verification:
+  enabled: true
+  patterns:
+  - 123-45-6789
+  fail_on_violation: true
+  scan_binary_files: true
+
+tags:
+- fle
+- field-level-encryption
+- security
+- online-grant
+- restart-safe
+- access-control
+- critical
