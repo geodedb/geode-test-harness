@@ -1,0 +1,298 @@
+version: '1.0'
+name: Multi-Graph Isolation Negatives
+description: |
+  Task 29 (Plan 2, FINAL) — multi-graph isolation negatives. `multi_graph.yml`
+  covers CREATE/USE/DROP GRAPH happy paths plus a single "use nonexistent
+  graph" error case; `per_graph_storage.yml` / `per_graph_storage_resilience.yml`
+  are positive-only isolation coverage (and use the dead top-level
+  `expect: {row_count: N}` shape, which `ExpectedResult` does not parse — see
+  KEY LORE below). This spec adds the missing NEGATIVE coverage: duplicate
+  graph names, querying a dropped graph, and cross-graph references without
+  USE GRAPH — plus one KEY POSITIVE isolation check with real teeth (exact
+  0-row assertion in the sibling graph).
+
+  ## KEY LORE — dead assertion shapes avoided here
+
+  `geode query` always exits 0 for SQLSTATE-level errors (parse errors,
+  duplicate-name conflicts, etc.) — only auth/bind-time errors (wrong
+  credentials, denied graph bind) exit 3. Every assertion below therefore
+  checks `stdout_contains` for the real `status_class` / error text, with
+  `stdout_not_contains: ['"status_class":"00000"']` to prove the query did
+  NOT silently succeed. The bare `expect: {row_count: N}` shape used by
+  `per_graph_storage.yml` is not read by `ExpectedResult.from_dict` (only
+  the nested `geode_query: {row_count: N}` form is) — this spec asserts row
+  counts via `stdout_contains: ['"cnt":N']` on an explicit
+  `RETURN count(n) AS cnt` instead.
+
+  ## Probed live (scratch server, port 65003, `/tmp/probe-p29-work`,
+  binary `../geode/zig-out/bin/geode`) before writing this spec
+
+    - `CREATE GRAPH p29_a` / `CREATE GRAPH p29_b` (admin) → both
+      `"status_class":"00000"`.
+    - `CREATE (:P29Node {marker:'p29_isolation_marker'})` written into
+      `p29_a` (via `USE GRAPH p29_a; CREATE (...); MATCH (...) RETURN
+      count(n) AS cnt` in one invocation — multi-statement semicolon
+      queries share session context within a single CLI call, confirmed
+      live) → `"cnt":1`.
+    - KEY POSITIVE — isolation holds: the SAME marker queried from
+      `p29_b` (`USE GRAPH p29_b; MATCH (n:P29Node {marker:
+      'p29_isolation_marker'}) RETURN count(n) AS cnt`) → `"cnt":0`. No
+      leak observed; re-querying from `p29_a` still returns `"cnt":1`,
+      so this is real isolation, not data loss.
+    - `duplicate-graph-name` — `CREATE GRAPH p29_a` a second time (admin,
+      graph never dropped) → exit 0, `"status_class":"42P07"`,
+      `"error":"Duplicate graph name"`. A REAL negative, not a
+      silent-accept — no limitation-pin needed.
+    - `query-dropped-graph` — probed the admin auto-create caveat directly:
+      after `DROP GRAPH p29_b`, BOTH a plain admin `USE GRAPH p29_b` query
+      AND an admin DSN bind (`quic://geode:<pw>@host/p29_b`) silently
+      **auto-create** the graph and return `"status_class":"00000"` —
+      there is no behavioral difference between the two admin paths here,
+      contrary to the brief's speculation that they might differ. This
+      matches the documented admin auto-create-on-bind behavior from
+      `regression_gap0839_inmemory_graph_tenant_bind.yml` /
+      `security_graph_bind_authorization_861.yml` (Admin role is always
+      allowed to create-on-bind). The admin path therefore has NO negative
+      teeth for this case and is not used for the assertion (documented
+      here, not pinned as its own test, to avoid a redundant no-op case).
+      A genuinely non-privileged principal (`p29_ro`, `ROLE readonly`, no
+      grant, created via the `CREATE USER ... ROLE readonly` GQL DDL path
+      per `gps_decide_smoke.yml` / `regression_gap0839...` — NOT `geode
+      user create --role`, which the live auth resolver does not see)
+      binding the same dropped graph via `--dsn` → exit 3, "Error: Graph
+      does not exist and user lacks permission to create it". Real
+      negative teeth via a non-admin principal.
+    - `cross-graph-without-use` — GQL has no dot-qualified or inline
+      graph-scoping syntax at all. Probed three shapes against the running
+      server: `MATCH (n:p29_a.P29Node) RETURN ...` →
+      `"status_class":"42000"`, `"expected token 'r_paren', got 'dot' at
+      line 1 col 15"`; `GRAPH p29_a MATCH (n:P29Node) RETURN ...` →
+      `"status_class":"42000"`, `"parse error"`; `FROM GRAPH p29_a MATCH
+      (n:P29Node) RETURN ...` → same. All three are parser-level
+      rejections (exit 0, per the KEY LORE above) — cross-graph reference
+      without `USE GRAPH` (or a graph-bound DSN) is not merely
+      unsupported at the semantic level, it does not parse at all. This
+      spec pins the dot-qualified form as the canonical negative.
+
+  CANARY: REQ=REQ-MULTI-GRAPH-ISOLATION-001; FEATURE="MultiGraph"; ASPECT=IsolationNegatives; STATUS=TESTED; TEST=geodetestlab/specs/multi_graph_isolation_negative.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: info
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    server_address: 127.0.0.1:3141
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Setup — create the two graphs used for isolation
+# ---------------------------------------------------------------------------
+
+- name: p29-setup-create-graph-a
+  description: Admin creates the first graph.
+  query: CREATE GRAPH p29_a
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [multi-graph, isolation, setup]
+
+- name: p29-setup-create-graph-b
+  description: Admin creates the second graph.
+  query: CREATE GRAPH p29_b
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [multi-graph, isolation, setup]
+
+- name: p29-setup-write-node-graph-a
+  description: |
+    Write a uniquely-marked node into p29_a only. USE GRAPH plus the
+    CREATE and a verifying MATCH run as one multi-statement query in a
+    single CLI invocation (probed live to share session/graph context
+    within one call) so the write is confirmed before the isolation
+    check below relies on it.
+  query: |
+    USE GRAPH p29_a; CREATE (:P29Node {marker: 'p29_isolation_marker'}); MATCH (n:P29Node {marker: 'p29_isolation_marker'}) RETURN count(n) AS cnt
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"cnt":1'
+  tags: [multi-graph, isolation, setup]
+
+# ---------------------------------------------------------------------------
+# KEY POSITIVE — isolation holds: p29_b sees zero rows for p29_a's node
+# ---------------------------------------------------------------------------
+
+- name: p29-isolation-graph-b-sees-nothing
+  description: |
+    KEY POSITIVE — the data-integrity teeth of this spec. Querying p29_b
+    for the exact marker written into p29_a above must return an EXACT
+    zero-row count, not merely "no error". stdout_not_contains rules out
+    both a leaked "cnt":1 and any generic success text that could mask a
+    parse/bind failure silently returning an empty-looking result for the
+    wrong reason.
+  query: |
+    USE GRAPH p29_b; MATCH (n:P29Node {marker: 'p29_isolation_marker'}) RETURN count(n) AS cnt
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"cnt":0'
+    stdout_not_contains:
+    - '"cnt":1'
+  tags: [multi-graph, isolation, positive, key-assertion]
+
+- name: p29-isolation-graph-a-retains-node
+  description: |
+    Symmetric check — p29_a must still see its own node after the p29_b
+    query above, proving the isolation check queried an actually-isolated
+    sibling graph rather than accidentally deleting/moving the node.
+  query: |
+    USE GRAPH p29_a; MATCH (n:P29Node {marker: 'p29_isolation_marker'}) RETURN count(n) AS cnt
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"cnt":1'
+  tags: [multi-graph, isolation, positive]
+
+# ---------------------------------------------------------------------------
+# Negative — duplicate graph name
+# ---------------------------------------------------------------------------
+
+- name: p29-negative-duplicate-graph-name
+  description: |
+    NEGATIVE. p29_a already exists (created above, never dropped).
+    CREATE GRAPH p29_a again must report a real conflict error, not a
+    silent-accept. Probed: real error, no limitation-pin needed —
+    exit 0 (SQLSTATE-level error per KEY LORE) with status_class 42P07.
+  query: CREATE GRAPH p29_a
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42P07"'
+    - Duplicate graph name
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [multi-graph, isolation, negative, key-assertion]
+
+# ---------------------------------------------------------------------------
+# Negative — query against a dropped graph (non-admin principal)
+# ---------------------------------------------------------------------------
+
+- name: p29-setup-readonly-user
+  description: |
+    Setup for the dropped-graph negative below. Created via the GQL DDL
+    path (CREATE USER ... ROLE readonly), not `geode user create --role`
+    — per regression_gap0839_inmemory_graph_tenant_bind.yml /
+    gps_decide_smoke.yml, only the DDL path persists the role where the
+    live QUIC HELLO auth resolver sees it. No grant is issued to this
+    user on any graph.
+  query: CREATE USER p29_ro SET PASSWORD 'P29RoPass1234!' ROLE readonly
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - p29_ro
+  tags: [multi-graph, isolation, setup]
+
+- name: p29-drop-graph-b
+  description: Admin drops p29_b so the dropped-graph negative below has a genuinely absent graph to target.
+  query: DROP GRAPH p29_b
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [multi-graph, isolation, setup]
+
+- name: p29-negative-query-dropped-graph
+  description: |
+    KEY NEGATIVE. p29_b was just dropped. p29_ro (ROLE readonly, no
+    grant, no create-graph permission) binds it via --dsn. Probed: the
+    ADMIN path (plain USE GRAPH, or an admin DSN bind) silently
+    auto-creates a missing/dropped graph and returns status_class 00000
+    — documented in this spec's description as a real caveat, not
+    asserted here because it has no negative teeth (matches
+    regression_gap0839_inmemory_graph_tenant_bind.yml's established
+    admin-auto-create behavior). The readonly, ungranted principal used
+    here instead exercises the real bind-time "graph does not exist and
+    caller cannot create it" rejection: exit 3, and the query result
+    ("x":1) must never appear.
+  query: RETURN 1 AS x
+  dsn: quic://p29_ro:P29RoPass1234!@127.0.0.1:${PORT}/p29_b
+  expected:
+    exit_code: 3
+    stdout_contains:
+    - Graph does not exist and user lacks permission to create it
+    stdout_not_contains:
+    - '"x":1'
+    - '"status_class":"00000"'
+  tags: [multi-graph, isolation, negative, key-assertion]
+
+# ---------------------------------------------------------------------------
+# Negative — cross-graph reference without USE GRAPH
+# ---------------------------------------------------------------------------
+
+- name: p29-negative-cross-graph-without-use
+  description: |
+    NEGATIVE. GQL has no dot-qualified (or any inline) graph-scoping
+    syntax — probed three shapes live (`n:p29_a.P29Node`,
+    `GRAPH p29_a MATCH ...`, `FROM GRAPH p29_a MATCH ...`); all three are
+    parser-level rejections (status_class 42000, exit 0 per the KEY LORE
+    dead-geode_query-block note above — SQLSTATE errors do not raise the
+    CLI's exit code). This pins the dot-qualified form: referencing
+    another graph's label without first switching context via
+    USE GRAPH (or a graph-bound --dsn) does not parse, it is not merely
+    denied at the semantic/authorization layer.
+  query: MATCH (n:p29_a.P29Node) RETURN count(n) AS cnt
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [multi-graph, isolation, negative]
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+- name: p29-cleanup
+  description: |
+    Tear down test graphs and the readonly user. Not strictly required
+    since cli.server.cleanup gives every run a fresh data_dir, but kept
+    for hygiene to match sibling specs.
+  query: |
+    DROP USER IF EXISTS p29_ro; DROP GRAPH IF EXISTS p29_a; DROP GRAPH IF EXISTS p29_b
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [multi-graph, isolation, cleanup]
+
+tags:
+- multi-graph
+- isolation
+- negative
+- security
