@@ -1,0 +1,365 @@
+version: '1.0'
+name: GPS DECIDE / USE GRAPH negative paths — malformed, unknown-verb, unauthorized
+description: |
+  Negative-path coverage for the GPS decision engine (gps.decide()) and the
+  USE GRAPH bind path, complementing gps_phase2_decide_comprehensive.yml
+  (role/permission matrix, no malformed-input case) and
+  gps_phase3_use_graph_authorization.yml (isolation, all positive). This
+  spec probes what ACTUALLY happens (not assumed behavior) for:
+
+    1. setup (POSITIVE): a valid write routes through gps.decide() and
+       succeeds for admin; a valid USE GRAPH works. Proves the surface is
+       reachable before testing its negative edges.
+    2. malformed-decide (KEY NEGATIVE): a CREATE POLICY statement with a
+       malformed policy reference (missing the required name/identifier)
+       — the parser rejects it with SQLSTATE 42000 before it ever reaches
+       gps.decide()/the policy catalog.
+    3. unknown-action-verb (NEGATIVE): CREATE POLICY ... FOR <verb> with an
+       action verb the grammar does not recognize — SQLSTATE 42000,
+       "expected one of READ, WRITE, MATCH, CREATE, UPDATE, DELETE,
+       SCHEMA" (the exact GPS Action enum).
+    4. use-graph-nonexistent (NEGATIVE): a non-admin user issuing
+       USE GRAPH on a graph that does not exist anywhere gets a genuine
+       denial: "Graph does not exist and user lacks permission to create
+       it" (exit 3). Probed and confirmed DIFFERENT from admin behavior:
+       an ADMIN issuing USE GRAPH on a nonexistent name silently
+       AUTO-CREATES it (status_class 00000, per Plan1 Task5's finding on
+       bind-time graph auto-creation) — so this negative is only real for
+       a non-admin principal, which is what this test exercises.
+    5. use-graph-unauthorized (NEGATIVE): a non-admin readonly user with
+       NO grant on an EXISTING admin-only graph is denied at bind time:
+       "Access denied: insufficient permissions for graph" (exit 3) — the
+       same #861 BOLA-fix lever pinned in
+       security_graph_bind_authorization_861.yml, exercised here via the
+       `USE GRAPH` statement form (that spec used `--dsn .../graphname`
+       bind; this one uses the mid-session `USE GRAPH` statement — same
+       gps.decide(.bind_graph) gate, different call site).
+    6. policy-ddl-unauthorized (NEGATIVE — PROBED, DOCUMENTED SECURITY
+       GAP, NOT a fresh regression): a non-admin readonly user with no
+       schema grant CAN create a GPS policy. Probed live against binary
+       v0.8.0-19-gddc852c2 (scratch server, port 4493): `p26_ro` (ROLE
+       readonly) executes `CREATE POLICY p26_probe_unauthorized_policy ON
+       GRAPH * FOR WRITE USING true` and receives status_class 00000,
+       "Policy created" — and the policy PERSISTS (confirmed via a
+       follow-up admin `SHOW POLICIES`). Source inspection
+       (src/execution.zig ~L2153, the `.CreatePolicy` dispatch arm) shows
+       NO checkPermission()/gps.decide() call precedes
+       `pol_cat.addPolicy(...)` — the handler goes straight from parse to
+       catalog write. This is the SAME pre-existing dispatch-layer gap
+       gps_phase2_decide_comprehensive.yml already documents for CREATE
+       GRAPH / CREATE INDEX (that spec's "NOTE on schema-permission
+       gating", ~L184-190: "CREATE GRAPH / CREATE INDEX are NOT currently
+       gated through checkPermission(.Schema) — the dispatch paths ...
+       bypass the check"); CreatePolicy is classified as the same
+       `.schema` GPS action
+       (src/execution/statement_handlers.zig:1268,
+       `classifyAction`) but that classification is ONLY consumed by the
+       `EXPLAIN POLICY` introspection path, never by an enforcement gate
+       on the real CREATE POLICY execution arm. `admin_ddl.zig`'s feature
+       table independently corroborates this: `.{ .name = "policy_ddl",
+       .supported = false }`. Per the task's bug rule ("an unauthorized
+       DECIDE/USE-GRAPH/policy-DDL that SUCCEEDS = security bug with
+       evidence"), this is flagged as a security-relevant finding in the
+       task report — but it is NOT a new regression introduced by this
+       spec's work and is limitation-pinned honestly below rather than
+       asserted as a false negative (asserting a denial here would make
+       this spec permanently fail against the current binary for a
+       reason unrelated to what it is meant to pin).
+
+  CANARY: REQ=REQ-GPS-DECIDE-NEGATIVE-001; FEATURE="GPS"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/gps_decide_negative.yml; OWNER=security; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+  # ============================================================================
+  # SETUP — idempotent preflight cleanup
+  # ============================================================================
+- name: p26-preflight-cleanup
+  description: Idempotent pre-flight drop of any leftover test users/graphs/policies.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS p26_ro;
+    DROP GRAPH IF EXISTS p26_setup_graph;
+    DROP GRAPH IF EXISTS p26_admin_only;
+    DROP GRAPH IF EXISTS p26_nosuch_admin;
+    DROP POLICY IF EXISTS p26_unknown_verb_policy;
+    DROP POLICY IF EXISTS p26_probe_unauthorized_policy;
+  expect:
+    exit_code: 0
+  tags: [p26, setup]
+
+  # ============================================================================
+  # CASE 1 — SETUP (POSITIVE): a valid write routes through gps.decide()
+  # and succeeds; a valid USE GRAPH works. Proves the surface before
+  # testing its negative edges.
+  # ============================================================================
+- name: p26-setup-valid-decide-write-succeeds
+  description: |
+    POSITIVE — admin CREATE routes through gps.decide() (Admin role is
+    always allowed) and succeeds. If this fails, the enforcement surface
+    itself is broken and the negatives below are moot.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: "CREATE (n:P26SetupNode {v: 1}) RETURN n"
+  expect:
+    exit_code: 0
+    stdout_contains: [P26SetupNode]
+    stdout_not_contains: ['42501', 'Permission denied']
+  tags: [p26, setup, positive]
+
+- name: p26-setup-create-graph
+  description: Admin creates a graph to prove the USE GRAPH surface.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH p26_setup_graph]
+  expect:
+    exit_code: 0
+  tags: [p26, setup, positive]
+
+- name: p26-setup-valid-use-graph-succeeds
+  description: |
+    POSITIVE — admin USE GRAPH on an existing graph, then a Read,
+    succeeds cleanly. Baseline for the negatives below.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH p26_setup_graph;
+    RETURN 1 AS probe
+  expect:
+    exit_code: 0
+    stdout_contains: [probe]
+    stdout_not_contains: ['Access denied', 'Error:']
+  tags: [p26, setup, positive]
+
+  # ============================================================================
+  # CASE 2 — KEY NEGATIVE: malformed-decide. CREATE POLICY with a garbage/
+  # malformed policy reference (missing the required name) must be
+  # rejected by the parser before it ever reaches the policy catalog.
+  # Probed live: SQLSTATE 42000, "expected a name (identifier)", exit 0
+  # (geode query always exits 0 on a completed transport round-trip; the
+  # error lives in the JSON status, per KEY LORE).
+  # ============================================================================
+- name: p26-malformed-decide-missing-policy-name
+  description: |
+    KEY NEGATIVE — CREATE POLICY with a malformed/missing policy
+    reference (no name between CREATE POLICY and ON GRAPH). Probed
+    live: rejected at parse time with SQLSTATE 42000 ("expected a name
+    (identifier)") — the malformed statement never reaches
+    gps.decide() or the PolicyCatalog. exit_code stays 0 (transport
+    succeeded); the negative signal is the 42000 status class, NOT a
+    non-zero exit.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: 'CREATE POLICY ON GRAPH * FOR WRITE USING true'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42000']
+    stdout_not_contains: ['"status_class":"00000"', 'Policy created']
+  tags: [p26, negative, malformed]
+
+- name: p26-malformed-decide-garbage-statement
+  description: |
+    NEGATIVE (supporting) — a fully garbled statement that isn't valid
+    GQL at all must also be rejected with a parse error, confirming the
+    malformed-input path is generally fail-closed at the parser, not
+    just for the missing-name case above.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: '###totally-garbage-not-gql###'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42000', 'parse error']
+    stdout_not_contains: ['"status_class":"00000"']
+  tags: [p26, negative, malformed]
+
+  # ============================================================================
+  # CASE 3 — NEGATIVE: unknown-action-verb. CREATE POLICY ... FOR
+  # <unsupported verb> is rejected by the parser with the exact list of
+  # valid GPS Action verbs.
+  # ============================================================================
+- name: p26-unknown-action-verb
+  description: |
+    NEGATIVE — CREATE POLICY with an unsupported action verb
+    (BOGUSACTION is not READ/WRITE/MATCH/CREATE/UPDATE/DELETE/SCHEMA).
+    Probed live: SQLSTATE 42000, "expected one of READ, WRITE, MATCH,
+    CREATE, UPDATE, DELETE, SCHEMA" — the parser enumerates the exact
+    GPS Action set and rejects anything outside it before the statement
+    reaches the policy catalog.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: "CREATE POLICY p26_unknown_verb_policy ON GRAPH * FOR BOGUSACTION USING true"
+  expect:
+    exit_code: 0
+    stdout_contains: ['42000', 'expected one of']
+    stdout_not_contains: ['"status_class":"00000"', 'Policy created']
+  tags: [p26, negative, unknown-verb]
+
+  # ============================================================================
+  # Non-admin setup: readonly user with NO grants anywhere.
+  # ============================================================================
+- name: p26-create-readonly-user
+  description: |
+    Create the non-admin readonly test user via the GQL DDL path
+    (CREATE USER ... ROLE readonly) so the role is persisted to
+    __geode_security and visible to the live auth resolver — per the
+    established pattern in gps_decide_smoke.yml /
+    security_graph_bind_authorization_861.yml. No grants are issued to
+    this user anywhere in this spec.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p26_ro SET PASSWORD 'P26RoAuthzPass!234' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [p26_ro]
+  tags: [p26, setup]
+
+- name: p26-admin-create-admin-only-graph
+  description: |
+    Admin creates a graph that no grant is ever issued on. Used as the
+    target for the use-graph-unauthorized case below.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH p26_admin_only]
+  expect:
+    exit_code: 0
+  tags: [p26, setup]
+
+  # ============================================================================
+  # CASE 4 — NEGATIVE: use-graph-nonexistent (as non-admin). Probed live
+  # and confirmed materially different from the admin case: an ADMIN
+  # issuing USE GRAPH on a name that doesn't exist anywhere silently
+  # auto-creates it (status_class 00000) per Plan1 Task5's finding on
+  # bind-time auto-creation — so this negative is only real for a
+  # non-admin principal, who lacks CREATE permission and is denied
+  # instead of auto-creating.
+  # ============================================================================
+- name: p26-use-graph-nonexistent-as-nonadmin-denied
+  description: |
+    NEGATIVE — p26_ro (readonly, no grants) issues USE GRAPH against a
+    graph name that does not exist ANYWHERE (not created by anyone in
+    this spec). Probed live: exit 3, "Error: Graph does not exist and
+    user lacks permission to create it" on stderr/stdout. This is
+    genuinely different wording from the use-graph-unauthorized case
+    below (existing-but-ungranted graph) — proving the server
+    distinguishes "doesn't exist + can't auto-create" from "exists but
+    access denied".
+  args: [query, -U, p26_ro, -P, 'P26RoAuthzPass!234', '-']
+  stdin: |
+    USE GRAPH p26_nosuch_nonexistent;
+    RETURN 1 AS x
+  expect:
+    exit_code: 3
+    stdout_contains: ['Graph does not exist']
+    stdout_not_contains: ['"x":1', '"status_class":"00000"']
+  tags: [p26, negative, use-graph, nonexistent]
+
+  # ============================================================================
+  # CASE 5 — NEGATIVE: use-graph-unauthorized. A non-admin readonly user
+  # with NO grant on an EXISTING admin-only graph is denied at bind time
+  # (same #861 BOLA-fix lever as security_graph_bind_authorization_861.yml,
+  # exercised via the mid-session USE GRAPH statement instead of a
+  # --dsn .../graphname bind).
+  # ============================================================================
+- name: p26-use-graph-unauthorized-denied
+  description: |
+    KEY NEGATIVE — p26_ro (readonly, no grant) issues USE GRAPH against
+    p26_admin_only, a graph that EXISTS (created by admin above) but was
+    never granted to p26_ro. Probed live: exit 3, "Error: Access denied:
+    insufficient permissions for graph". stdout_not_contains asserts the
+    subsequent RETURN never actually ran — a server that let this bind
+    through would leak "x":1 and this test would fail, giving the
+    negative real teeth (same evidentiary pattern as
+    security_graph_bind_authorization_861.yml's rg6-readonly-bind-denied).
+  args: [query, -U, p26_ro, -P, 'P26RoAuthzPass!234', '-']
+  stdin: |
+    USE GRAPH p26_admin_only;
+    RETURN 1 AS x
+  expect:
+    exit_code: 3
+    stdout_contains: ['Access denied', 'insufficient permissions for graph']
+    stdout_not_contains: ['"x":1', '"status_class":"00000"']
+  tags: [p26, negative, use-graph, unauthorized, bola]
+
+  # ============================================================================
+  # CASE 6 — NEGATIVE (documented gap, not a fresh regression):
+  # policy-ddl-unauthorized. p26_ro (readonly, no schema grant) attempts
+  # CREATE POLICY. Probed live and confirmed the statement SUCCEEDS and
+  # the policy PERSISTS — src/execution.zig's `.CreatePolicy` dispatch
+  # arm (~L2153) calls `pol_cat.addPolicy(...)` with no preceding
+  # checkPermission()/gps.decide() gate. This is the SAME pre-existing
+  # dispatch-layer gap gps_phase2_decide_comprehensive.yml already
+  # documents for CREATE GRAPH / CREATE INDEX ("NOTE on
+  # schema-permission gating", ~L184-190). Asserting a denial here would
+  # make this spec permanently and spuriously fail against the current
+  # binary; instead this test pins the REAL (currently-permissive)
+  # behavior honestly and the finding is reported separately as a
+  # security-relevant, evidence-backed observation per the task's bug
+  # rule.
+  # ============================================================================
+- name: p26-policy-ddl-unauthorized-limitation-pin
+  description: |
+    LIMITATION-PIN, SECURITY-RELEVANT — a non-admin readonly user with
+    NO schema grant is currently able to CREATE POLICY. Probed live
+    (binary v0.8.0-19-gddc852c2): status_class 00000, "Policy created",
+    and the policy is confirmed persisted via a follow-up admin SHOW
+    POLICIES in the probe session. This pins the CURRENT (permissive)
+    behavior so a future fix that closes the dispatch-layer gap (see
+    description) flips this test — at which point it should be updated
+    to assert denial instead of documenting the gap.
+  args: [query, -U, p26_ro, -P, 'P26RoAuthzPass!234', CREATE POLICY p26_probe_unauthorized_policy ON GRAPH * FOR WRITE USING true]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', 'Policy created']
+  tags: [p26, negative, policy-ddl, limitation, security-gap]
+
+- name: p26-policy-ddl-unauthorized-confirmed-persisted
+  description: |
+    Confirms (as admin) that the policy created by the unauthorized
+    p26_ro session above actually persisted in the catalog — proving
+    the prior test observed a real write, not a client-side echo.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [p26_probe_unauthorized_policy]
+  tags: [p26, negative, policy-ddl, limitation, security-gap]
+
+  # ============================================================================
+  # TEARDOWN
+  # ============================================================================
+- name: p26-cleanup
+  description: Drop all test users/graphs/policies created by this spec.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS p26_probe_unauthorized_policy;
+    DROP POLICY IF EXISTS p26_unknown_verb_policy;
+    DROP USER IF EXISTS p26_ro;
+    DROP GRAPH IF EXISTS p26_setup_graph;
+    DROP GRAPH IF EXISTS p26_admin_only;
+  expect:
+    exit_code: 0
+  tags: [p26, teardown]
+
+tags:
+- gps_decide
+- gps_use_graph
+- security
+- negative
+- p26
