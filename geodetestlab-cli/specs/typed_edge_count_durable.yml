@@ -1,0 +1,216 @@
+version: '1.0'
+name: Regression — typed edge count exact and durable across reopen (geode 8eb24fd2, c0d5d3d5, f7d16c4a)
+description: |
+  Pins the fix (geode commits 8eb24fd2, c0d5d3d5, f7d16c4a) guaranteeing
+  MATCH ()-[r:TYPE]->() RETURN count(r) returns the EXACT per-type edge
+  count in O(1), and that this per-type counter is durable across a
+  graceful server restart (not recomputed by a full scan that could drift
+  or reset).
+
+  Scenario:
+    1. Seed 13 fresh RG21_Person nodes, then create exactly 12 RG21_KNOWS
+       edges and 5 RG21_LIKES edges between them via single-statement
+       MATCH-endpoints CREATE.
+    2. KEY: MATCH ()-[r:RG21_KNOWS]->() RETURN count(r) == 12;
+       MATCH ()-[r:RG21_LIKES]->() RETURN count(r) == 5 — proves the
+       counter is exact and type-scoped (not a mixed/whole-graph count).
+    3. Restart the managed server against the SAME data dir
+       (cleanup: false + restart_server: true) — this forces reopen and
+       exercises whatever durability path backs the per-type counter.
+    4. KEY: re-run both typed counts post-reopen. If the durable counter
+       fix regresses, this would either drift from 12/5 or fall back to
+       a scan-derived value that happens to still be correct by luck —
+       either way, a wrong count here is the tooth of this pin.
+    5. Type isolation: delete exactly 2 RG21_KNOWS edges. KNOWS count must
+       drop to exactly 10 while RG21_LIKES stays at exactly 5 — proves
+       the two type counters are independently maintained, not a shared
+       aggregate that both decrement.
+    6. Negative control: MATCH ()-[r:RG21_NOSUCH]->() RETURN count(r) for
+       a type that was never created must return exactly 0 (not null,
+       not an error).
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4465
+  --data-dir /tmp/probe-r21) before writing this spec:
+    - MATCH ()-[r:RG21_KNOWS]->() RETURN count(r) renders column name
+      "count(r)" (confirmed via `columns: [{"name":"count(r)", ...}]` in
+      the JSON response) — this spec binds stdout_contains to the exact
+      '"count(r)":N' substring.
+    - An alternate count(r:TYPE) form (MATCH ()-[r]->() RETURN
+      count(r:TYPE)) also parses but renders a *different* column name
+      ("count", not "count(r:TYPE)") — this spec deliberately uses the
+      count(r) form since it is the one named in the task contract and
+      has the more specific/unambiguous column name.
+    - Edge creation via MATCH (a:RG21_Person {id: X}), (b:RG21_Person
+      {id: Y}) CREATE (a)-[:RG21_KNOWS]->(b) works as a single statement
+      against already-MATCHed endpoints.
+    - Edge deletion via MATCH (a)-[r:RG21_KNOWS]->(b) DELETE r (endpoints
+      pinned by id) removes exactly one edge.
+    - Counts held at 12 (KNOWS) / 5 (LIKES) across a graceful SIGTERM +
+      restart on the same data dir; after deleting 2 KNOWS edges, KNOWS
+      dropped to exactly 10 while LIKES stayed at 5; RG21_NOSUCH count
+      was exactly 0 — matching the fixed (post-8eb24fd2) contract this
+      spec pins.
+
+  CANARY: REQ=REQ-QUERY-TYPED-EDGE-COUNT-DURABLE-001; FEATURE="TypedEdgeCount"; ASPECT=PerTypeCountDurable; STATUS=TESTED; TEST=geodetestlab/specs/typed_edge_count_durable.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed
+  description: |
+    Seed 13 fresh RG21_Person nodes, then create exactly 12 RG21_KNOWS
+    edges and 5 RG21_LIKES edges between them via single-statement
+    MATCH-endpoints CREATE.
+  query: |
+    CREATE (:RG21_Person {id: 1}), (:RG21_Person {id: 2}), (:RG21_Person {id: 3}), (:RG21_Person {id: 4}), (:RG21_Person {id: 5}), (:RG21_Person {id: 6}), (:RG21_Person {id: 7}), (:RG21_Person {id: 8}), (:RG21_Person {id: 9}), (:RG21_Person {id: 10}), (:RG21_Person {id: 11}), (:RG21_Person {id: 12}), (:RG21_Person {id: 13});
+    MATCH (a:RG21_Person {id: 1}), (b:RG21_Person {id: 2}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 2}), (b:RG21_Person {id: 3}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 3}), (b:RG21_Person {id: 4}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 4}), (b:RG21_Person {id: 5}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 5}), (b:RG21_Person {id: 6}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 6}), (b:RG21_Person {id: 7}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 7}), (b:RG21_Person {id: 8}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 8}), (b:RG21_Person {id: 9}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 9}), (b:RG21_Person {id: 10}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 10}), (b:RG21_Person {id: 11}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 11}), (b:RG21_Person {id: 12}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 12}), (b:RG21_Person {id: 13}) CREATE (a)-[:RG21_KNOWS]->(b);
+    MATCH (a:RG21_Person {id: 1}), (b:RG21_Person {id: 3}) CREATE (a)-[:RG21_LIKES]->(b);
+    MATCH (a:RG21_Person {id: 1}), (b:RG21_Person {id: 4}) CREATE (a)-[:RG21_LIKES]->(b);
+    MATCH (a:RG21_Person {id: 2}), (b:RG21_Person {id: 5}) CREATE (a)-[:RG21_LIKES]->(b);
+    MATCH (a:RG21_Person {id: 3}), (b:RG21_Person {id: 6}) CREATE (a)-[:RG21_LIKES]->(b);
+    MATCH (a:RG21_Person {id: 4}), (b:RG21_Person {id: 7}) CREATE (a)-[:RG21_LIKES]->(b);
+  expected:
+    exit_code: 0
+  tags: [typed-edge-count, durable, setup]
+
+- name: typed-count-knows
+  description: |
+    KEY — MATCH ()-[r:RG21_KNOWS]->() RETURN count(r) must return exactly
+    12. Exact-bound to the probed column name "count(r)".
+  query: MATCH ()-[r:RG21_KNOWS]->() RETURN count(r)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(r)":12'
+  tags: [typed-edge-count, durable, key-assertion, positive-baseline]
+
+- name: typed-count-likes
+  description: |
+    KEY — MATCH ()-[r:RG21_LIKES]->() RETURN count(r) must return exactly
+    5, distinct from the RG21_KNOWS count — proves the count is scoped to
+    the requested type, not the whole-graph edge count.
+  query: MATCH ()-[r:RG21_LIKES]->() RETURN count(r)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(r)":5'
+  tags: [typed-edge-count, durable, key-assertion, positive-baseline]
+
+- name: restart-server-for-reopen
+  description: |
+    Restart the managed server against the SAME data dir (cleanup: false
+    above). On reopen, geode must restore the per-type edge counters from
+    durable state rather than losing or drifting them.
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RESTART
+  tags: [typed-edge-count, durable, restart]
+
+- name: typed-count-after-reopen-knows
+  description: |
+    KEY ASSERTION — durability tooth. RG21_KNOWS count(r) must still be
+    exactly 12 after reopen. A regression in the durable per-type counter
+    (8eb24fd2/c0d5d3d5/f7d16c4a) would surface here as drift, a reset to
+    0, or a value derived from a stale/partial scan.
+  query: MATCH ()-[r:RG21_KNOWS]->() RETURN count(r)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(r)":12'
+  tags: [typed-edge-count, durable, key-assertion, reopen]
+
+- name: typed-count-after-reopen-likes
+  description: |
+    KEY ASSERTION — durability tooth. RG21_LIKES count(r) must still be
+    exactly 5 after reopen, independently of the RG21_KNOWS counter.
+  query: MATCH ()-[r:RG21_LIKES]->() RETURN count(r)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(r)":5'
+  tags: [typed-edge-count, durable, key-assertion, reopen]
+
+- name: delete-two-knows-edges
+  description: |
+    Delete exactly 2 RG21_KNOWS edges (endpoints pinned by id so the
+    deletion targets specific, known edges).
+  query: |
+    MATCH (a:RG21_Person {id: 1})-[r:RG21_KNOWS]->(b:RG21_Person {id: 2}) DELETE r;
+    MATCH (a:RG21_Person {id: 2})-[r:RG21_KNOWS]->(b:RG21_Person {id: 3}) DELETE r;
+  expected:
+    exit_code: 0
+  tags: [typed-edge-count, durable, type-isolation]
+
+- name: type-isolation-knows-after-delete
+  description: |
+    KEY ASSERTION — RG21_KNOWS count(r) must drop to exactly 10 after
+    deleting 2 KNOWS edges.
+  query: MATCH ()-[r:RG21_KNOWS]->() RETURN count(r)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(r)":10'
+  tags: [typed-edge-count, durable, type-isolation, key-assertion]
+
+- name: type-isolation-likes-unaffected
+  description: |
+    KEY ASSERTION — RG21_LIKES count(r) must remain exactly 5 after
+    deleting RG21_KNOWS edges — proves the per-type counters are
+    maintained independently, not as a shared/aggregate count that both
+    decrement when either type is mutated.
+  query: MATCH ()-[r:RG21_LIKES]->() RETURN count(r)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(r)":5'
+  tags: [typed-edge-count, durable, type-isolation, key-assertion]
+
+- name: nonexistent-type-count
+  description: |
+    Negative control — MATCH ()-[r:RG21_NOSUCH]->() RETURN count(r) for a
+    relationship type that was never created must return exactly 0, not
+    null and not an error.
+  query: MATCH ()-[r:RG21_NOSUCH]->() RETURN count(r)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(r)":0'
+  tags: [typed-edge-count, durable, negative-control]
+
+tags:
+- typed-edge-count
+- durable
+- reopen
+- regression
