@@ -403,3 +403,86 @@ tests:
   tags:
   - explain
   - merge
+
+# ---------------------------------------------------------------------------
+# GAP-0867 / GAP-0868 — truthful EXPLAIN estimates + real PROFILE wall-clock
+# timing. The geode_query: blocks above are advisory (the harness enforces
+# exit_code / stdout_contains / stdout_regex, not geode_query), so these add
+# real teeth via stdout assertions against the on-the-wire JSON. A fresh,
+# uniquely-labelled fixture pins the estimate to an exact cardinality.
+# ---------------------------------------------------------------------------
+- name: gap0867-setup-seven-nodes
+  description: Seed EXACTLY 7 nodes of a unique label so the CBO estimate is deterministic
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Gap0867Est), (:Gap0867Est), (:Gap0867Est), (:Gap0867Est), (:Gap0867Est),
+    (:Gap0867Est), (:Gap0867Est)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - gap0867
+  - setup
+
+- name: gap0867-explain-truthful-estimate
+  description: >
+    GAP-0867 — EXPLAIN's LabelScan est_rows equals the REAL label cardinality
+    (7), sourced from collected statistics (StatsRegistry.analyzeTable over
+    the graph store), not a canned/heuristic constant. The totals also carry
+    est_rows=7. Pre-fix the CBO was dead code emitting canned estimates.
+  args:
+  - query
+  - '-'
+  stdin: EXPLAIN MATCH (n:Gap0867Est) RETURN n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"schema":"planned_explain.v1"'
+    stdout_regex:
+    - '"kind":"LabelScan","est_rows":7'
+    - '"totals":\{"est_rows":7'
+  tags:
+  - explain
+  - gap0867
+  - truthful-estimate
+
+- name: gap0868-profile-real-wallclock-timing
+  description: >
+    GAP-0868 — PROFILE reports REAL monotonic wall-clock timing: total_time_ns
+    is a non-zero integer and the LabelScan op carries its own non-zero
+    time_ns, with rows=7 reflecting the actual scan output. Pre-fix the
+    fallback reported a hard-coded time=1 placeholder.
+  args:
+  - query
+  - '-'
+  stdin: PROFILE MATCH (n:Gap0867Est) RETURN n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"profile_version":2'
+    - '"op":"LabelScan"'
+    stdout_regex:
+    - '"total_time_ns":[1-9][0-9]*'
+    - '"rows":7'
+  tags:
+  - profile
+  - gap0868
+  - wallclock-timing
+
+- name: gap0867-cleanup
+  description: Remove the GAP-0867/0868 fixture nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Gap0867Est) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - explain
+  - gap0867
+  - cleanup
