@@ -1,0 +1,190 @@
+version: '1.0'
+name: ORDER BY alias fast path + fresh-store ordered auto-build (geode f2c88ac4, a21d3b58 GAP-0064 FIX C, 06ecb13f)
+description: |
+  Pins three related geode fixes around ORDER BY:
+
+    - f2c88ac4 / a21d3b58 (GAP-0064 FIX C) — a fresh store with NO explicit
+      `CREATE INDEX` must still route `ORDER BY <prop> LIMIT k` through the
+      ordered fast path by lazily auto-building the ordered index on first
+      use. Before the fix, a fresh store either fell back to an unordered
+      scan+sort (masking any correctness bug behind an always-passing
+      "values present" assertion) or mis-sorted; this spec anchors the
+      exact ORDERED sequence so a shuffled/reverse result fails the check.
+    - GAP-0064 FIX C also covers the ALIASED form: `RETURN n.v AS a ...
+      ORDER BY a` must resolve `a` back to the underlying property and
+      route through the SAME ordered fast path as `ORDER BY n.v` — not
+      silently fall back to an unordered/unsorted path because the sort
+      key is an alias rather than a bare property reference.
+    - 06ecb13f — a DESC-ordered scan of a freshly auto-built index must not
+      read one entry past the last element (prev() out-of-bounds) when
+      walking backwards from the tail; DESC LIMIT 3 on a 100-row fresh
+      store exercises exactly that walk-back.
+
+  Seeded once per case: 100 :RG13_N nodes with `v` populated from a FIXED
+  shuffled (non-monotonic) permutation of 1..100 (python random.seed(1301)),
+  so a broken sort is detectable — the raw insertion order carries no
+  ordering signal for ORDER BY to accidentally get right by chance.
+
+  CRITICALLY: this spec contains NO `CREATE INDEX` anywhere. Every ORDER BY
+  below must be served by a lazily auto-built ordered index on a completely
+  fresh store — that auto-build path is exactly what GAP-0064 FIX C added.
+
+  Ordering-anchored assertions: each `stdout_regex` below requires the
+  probed JSON row rendering (`{"n.v":1},{"n.v":2},...` / `{"a":1},{"a":2},...`)
+  to contain the target key/value pairs in STRICT increasing (or
+  decreasing, for DESC) numeric sequence, separated by `\D+` (any run of
+  non-digit characters — safe across the `},{` row separators and never
+  false-matches a multi-digit number, since `\D` cannot consume a digit).
+  A reverse-sorted or shuffled result cannot satisfy this — verified by
+  probing this exact regex against synthetic reversed/shuffled JSON before
+  writing this spec (see task-13-report.md).
+
+  CANARY: REQ=REQ-QUERY-ORDERBY-ALIAS-FRESHSTORE-001; FEATURE="OrderBy"; ASPECT=AliasFastPathAndFreshAutoBuild; STATUS=TESTED; TEST=geodetestlab/specs/regression_orderby_alias_and_freshstore.yml; OWNER=qa; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: info
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    server_address: 127.0.0.1:3141
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+- name: orderby-fresh-seed
+  description: |
+    Seed 100 :RG13_N nodes with v drawn from a fixed shuffled (NOT
+    monotonic) permutation of 1..100, so ORDER BY correctness cannot be
+    accidentally satisfied by insertion order. NO CREATE INDEX is issued —
+    every ORDER BY case below must hit the fresh-store auto-build path.
+  query: >
+    CREATE (:RG13_N {v:38}), (:RG13_N {v:75}), (:RG13_N {v:49}), (:RG13_N {v:21}),
+    (:RG13_N {v:59}), (:RG13_N {v:10}), (:RG13_N {v:45}), (:RG13_N {v:37}),
+    (:RG13_N {v:77}), (:RG13_N {v:90}), (:RG13_N {v:92}), (:RG13_N {v:60}),
+    (:RG13_N {v:88}), (:RG13_N {v:70}), (:RG13_N {v:9}), (:RG13_N {v:50}),
+    (:RG13_N {v:12}), (:RG13_N {v:84}), (:RG13_N {v:15}), (:RG13_N {v:13}),
+    (:RG13_N {v:85}), (:RG13_N {v:80}), (:RG13_N {v:53}), (:RG13_N {v:82}),
+    (:RG13_N {v:36}), (:RG13_N {v:93}), (:RG13_N {v:35}), (:RG13_N {v:1}),
+    (:RG13_N {v:40}), (:RG13_N {v:97}), (:RG13_N {v:28}), (:RG13_N {v:5}),
+    (:RG13_N {v:69}), (:RG13_N {v:22}), (:RG13_N {v:17}), (:RG13_N {v:20}),
+    (:RG13_N {v:76}), (:RG13_N {v:51}), (:RG13_N {v:57}), (:RG13_N {v:44}),
+    (:RG13_N {v:47}), (:RG13_N {v:81}), (:RG13_N {v:65}), (:RG13_N {v:29}),
+    (:RG13_N {v:19}), (:RG13_N {v:2}), (:RG13_N {v:18}), (:RG13_N {v:11}),
+    (:RG13_N {v:24}), (:RG13_N {v:14}), (:RG13_N {v:27}), (:RG13_N {v:89}),
+    (:RG13_N {v:66}), (:RG13_N {v:41}), (:RG13_N {v:78}), (:RG13_N {v:91}),
+    (:RG13_N {v:32}), (:RG13_N {v:31}), (:RG13_N {v:79}), (:RG13_N {v:23}),
+    (:RG13_N {v:68}), (:RG13_N {v:99}), (:RG13_N {v:46}), (:RG13_N {v:48}),
+    (:RG13_N {v:6}), (:RG13_N {v:52}), (:RG13_N {v:30}), (:RG13_N {v:83}),
+    (:RG13_N {v:86}), (:RG13_N {v:33}), (:RG13_N {v:74}), (:RG13_N {v:54}),
+    (:RG13_N {v:39}), (:RG13_N {v:25}), (:RG13_N {v:98}), (:RG13_N {v:72}),
+    (:RG13_N {v:87}), (:RG13_N {v:62}), (:RG13_N {v:7}), (:RG13_N {v:67}),
+    (:RG13_N {v:4}), (:RG13_N {v:56}), (:RG13_N {v:58}), (:RG13_N {v:94}),
+    (:RG13_N {v:100}), (:RG13_N {v:26}), (:RG13_N {v:73}), (:RG13_N {v:71}),
+    (:RG13_N {v:8}), (:RG13_N {v:43}), (:RG13_N {v:61}), (:RG13_N {v:96}),
+    (:RG13_N {v:63}), (:RG13_N {v:34}), (:RG13_N {v:3}), (:RG13_N {v:16}),
+    (:RG13_N {v:95}), (:RG13_N {v:42}), (:RG13_N {v:64}), (:RG13_N {v:55})
+  expected:
+    exit_code: 0
+  tags: [orderby, seed, fresh-store]
+
+- name: orderby-fresh-asc
+  description: |
+    KEY ASSERTION (GAP-0064 FIX C) — `ORDER BY n.v LIMIT 10` on the fresh
+    100-row store above (NO CREATE INDEX anywhere in this spec) must return
+    the ten smallest values, 1..10, IN STRICT ASCENDING ORDER. The regex
+    below anchors each `"n.v":<k>` in increasing sequence, separated by any
+    run of non-digit characters (`\D+`) — it cannot be satisfied by a
+    reverse-sorted or shuffled result: verified by probing this exact
+    pattern against synthetic reversed and shuffled JSON before writing
+    this spec (both produced no match; see task-13-report.md).
+  query: MATCH (n:RG13_N) RETURN n.v ORDER BY n.v LIMIT 10
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"ordered":true'
+    stdout_regex:
+    - '"n\.v":1\D+"n\.v":2\D+"n\.v":3\D+"n\.v":4\D+"n\.v":5\D+"n\.v":6\D+"n\.v":7\D+"n\.v":8\D+"n\.v":9\D+"n\.v":10\D'
+  tags: [orderby, fresh-store, alias, key-assertion, ascending]
+
+- name: orderby-alias-parity
+  description: |
+    KEY ASSERTION (GAP-0064 FIX C, alias routing) — the ALIASED form
+    (`RETURN n.v AS a ... ORDER BY a`) must route through the SAME ordered
+    fast path and return the identical ordered value sequence as the
+    property form in orderby-fresh-asc: 1..10 in strict ascending order,
+    keyed on the alias `a`. A regression that fails to resolve the alias
+    back to the ordered index (falling back to unordered scan+sort, or
+    mis-sorting) would break this ordering-anchored regex the same way it
+    would break orderby-fresh-asc.
+  query: MATCH (n:RG13_N) RETURN n.v AS a ORDER BY a LIMIT 10
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"ordered":true'
+    - '"order_keys":["a"]'
+    stdout_regex:
+    - '"a":1\D+"a":2\D+"a":3\D+"a":4\D+"a":5\D+"a":6\D+"a":7\D+"a":8\D+"a":9\D+"a":10\D'
+  tags: [orderby, fresh-store, alias, key-assertion, ascending, parity]
+
+- name: orderby-desc
+  description: |
+    06ecb13f — DESC-ordered scan of the freshly auto-built index must not
+    read past the last element (prev() out-of-bounds) when walking
+    backwards. `ORDER BY n.v DESC LIMIT 3` on the 100-row fresh store must
+    return 100, 99, 98 IN THAT ORDER — anchored the same ordering-safe way
+    as the ascending cases (digit-boundary-safe via `\D` after each value).
+  query: MATCH (n:RG13_N) RETURN n.v ORDER BY n.v DESC LIMIT 3
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"ordered":true'
+    stdout_regex:
+    - '"n\.v":100\D+"n\.v":99\D+"n\.v":98\D'
+  tags: [orderby, fresh-store, key-assertion, descending]
+
+- name: orderby-alias-desc
+  description: |
+    Aliased DESC parity — `AS a ... ORDER BY a DESC LIMIT 3` must return
+    100, 99, 98 in that order via the alias-routed fast path, guarding the
+    same 06ecb13f prev() OOB fix along the alias resolution path.
+  query: MATCH (n:RG13_N) RETURN n.v AS a ORDER BY a DESC LIMIT 3
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"ordered":true'
+    - '"order_keys":["a"]'
+    stdout_regex:
+    - '"a":100\D+"a":99\D+"a":98\D'
+  tags: [orderby, fresh-store, alias, key-assertion, descending, parity]
+
+tags:
+- orderby
+- alias
+- fresh-store
+- regression
+- query
