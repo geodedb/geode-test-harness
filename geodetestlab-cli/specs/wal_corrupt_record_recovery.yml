@@ -1,0 +1,300 @@
+version: '1.0'
+name: WAL tail-corruption / torn-write recovery — committed prefix survives
+description: |
+  Pins geode's WAL crash-recovery contract for a CORRUPT / TORN trailing
+  record: after committed writes, an UNCLEAN crash (SIGKILL — no graceful
+  shutdown, no checkpoint) followed by physically corrupting the TAIL of
+  every non-empty WAL file, then a reopen, must (a) NOT panic on startup and
+  (b) preserve every committed-before-corruption record. geode's WAL replay
+  is expected to detect the torn/garbage tail, discard trailing bytes back
+  to the last CRC-valid record ("recovery stops at last-good LSN"), and
+  bring the committed prefix back intact.
+
+  WHY THE SETUP HAS TEETH:
+    - UNCLEAN crash: the crash step SIGKILLs the managed server by its
+      unique per-run data dir (GEODE_DATA_DIR, exported into bash steps)
+      BEFORE the harness's graceful stop runs, so no checkpointAll() flushes
+      the store — the committed rows live ONLY in the WAL and MUST be
+      recovered by replay. `set -e` + a `: "${GEODE_DATA_DIR:?}"` guard fail
+      the step loudly rather than ever letting a mistyped/empty path fall
+      through to a graceful restart.
+    - WAL retention: the server runs with `--persist-interval 600000` so the
+      background persistence thread does NOT checkpoint+truncate the WAL out
+      from under us in the ~1s between seed and crash. Without this the WAL
+      would be drained to the store and the tail-corruption would hit an
+      already-empty file — no committed data would actually be at risk, and
+      the test would prove nothing. With it, the committed rows are resident
+      in the WAL at corruption time, so recovery genuinely has to replay a
+      corrupted-tail WAL to pass.
+    - Real corruption: the bash step appends random garbage bytes to the
+      tail of EVERY non-empty `*/wal/graph.wal` under the data dir (geode
+      stores a graph as a pool of ~16 `graphs/<uuid>/` replica slots, of
+      which several hold byte-for-byte copies of the same WAL, so all
+      non-empty ones are corrupted). It asserts it corrupted ≥1 file, so a
+      silent "found nothing to corrupt" can't pass. Appending a garbage /
+      incomplete trailing record is a faithful torn-write simulation and,
+      unlike truncating real bytes, can never destroy an already-durable
+      record (geode preallocates WAL space, so a fixed-size truncate lands
+      unpredictably in real records vs slack) — keeping the committed prefix
+      unambiguously valid, which is the property under test.
+
+  THE ORACLE (honest): the "committed data survives" assertions use a
+  LABEL-LESS oracle — `MATCH (n) RETURN count(n)` and property lookups
+  `MATCH (n) WHERE n.p3id = '...'` — NOT a label-filtered count. This is
+  deliberate: probing showed that after an UNCLEAN (SIGKILL) crash+reopen,
+  the raw node/property data reliably survives (label-less count and value
+  lookups return the full committed set, 4/4 across repeated runs), but a
+  LABEL-FILTERED query (`MATCH (n:P3_A) RETURN count(n)`) returns 0 — the
+  label→node index is not reconstructed on the hard-crash recovery path.
+  So the WAL itself keeps the committed prefix (the contract this spec
+  pins); it is only the label index that is not rebuilt after a hard crash.
+  See the `*-limitation-pin` test below.
+
+  WHAT THIS SPEC PINS:
+    (a) POSITIVE — WAL tail-corruption / torn-write tolerance + committed-
+        prefix survival, proven via the crash-survivable label-less oracle
+        (count + first/last value lookups) after TWO independent
+        crash+corrupt+reopen rounds (append-garbage, then a second
+        incomplete-record torn-write shape).
+    (b) LIMITATION-PIN — a live label-index-reconstruction bug on the
+        UNCLEAN-crash recovery path: `MATCH (n:P3_A) RETURN count(n)` returns
+        0 (not the seeded count) after the hard crash, even though the nodes
+        demonstrably survive under a label-less scan. The EXPECTED contract
+        is that it equals the seeded count, exactly as it does after a
+        GRACEFUL restart (a graceful-restart control passed 4/4 in probing;
+        cf. geode 9a255a83 / regression_label_count_after_reopen.yml, which
+        fixes the FIRST-read-after-GRACEFUL-restart race — a DIFFERENT path).
+        This pin asserts today's BUGGY behavior (== 0) so it self-activates
+        (flips to a failure) the moment geode fixes hard-crash label-index
+        recovery, at which point it should be converted to a positive.
+        This spec does NOT claim label-filtered survival works.
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4470..4474
+  --data-dir /tmp/probe-p3* with --persist-interval 600000, admin seeded via
+  GEODE_ADMIN_PASSWORD as a 3-word passphrase). Corruption modes tried:
+  append 64 random bytes past EOF, and truncate the last N bytes. Both
+  produced a clean recovery log — e.g. `warning(wal): recovery of
+  'graph.wal' discarded 64 trailing byte(s) beyond the last valid record
+  (kept 13 record(s) up to LSN 13; valid_end=57994, file size was 58058);
+  likely a torn write, CRC/AEAD failure, or non-monotonic LSN` — the server
+  reached `server ready` with no panic, the WAL was physically truncated
+  back to valid_end, and a label-less scan returned the full committed set.
+  The label-filtered count returned 0 on the hard-crash path (the pinned
+  limitation) while a graceful restart returned the full count. The
+  label-less oracle used here passed 8/8 across 3 repeated harness runs.
+
+  CANARY: REQ=REQ-WAL-CORRUPT-RECOVERY-001; FEATURE="WalRecovery"; ASPECT=TailCorruptionTolerated; STATUS=TESTED; TEST=geodetestlab/specs/wal_corrupt_record_recovery.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+tests:
+- name: seed-committed
+  description: |
+    Seed 4 committed P3_A nodes, each tagged with a distinct crash-survivable
+    property (p3id = 'p3-1'..'p3-4'). These are the committed-before-
+    corruption rows whose survival across the crash+WAL-tail-corruption this
+    spec pins. With --persist-interval 600000 they stay resident in the WAL
+    (not checkpointed) so the tail corruption genuinely puts committed data
+    on the recovery path.
+  query: "CREATE (:P3_A {p3id:'p3-1'}), (:P3_A {p3id:'p3-2'}), (:P3_A {p3id:'p3-3'}), (:P3_A {p3id:'p3-4'}) RETURN 1"
+  expected:
+    exit_code: 0
+  tags: [wal, recovery, corruption, torn-write, setup]
+
+- name: confirm-label-before-crash
+  description: |
+    Baseline — before any crash, the label-filtered count is correct (4).
+    This establishes that the label index DOES work pre-crash, so the
+    limitation-pin below is specifically about the hard-crash recovery path,
+    not a pre-existing query defect.
+  query: MATCH (n:P3_A) RETURN count(n) AS total
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"total":4'
+  tags: [wal, recovery, positive-baseline]
+
+- name: crash-and-corrupt-tail
+  description: |
+    ROUND 1 — UNCLEAN crash + append-garbage WAL tail corruption. SIGKILL
+    the managed server by its unique data dir (no graceful shutdown, no
+    checkpoint), then append 64 random bytes to the TAIL of every non-empty
+    graph.wal under the data dir (a torn "next record" write). Asserts it
+    corrupted at least one file so a silent no-op cannot pass. restart_server
+    reopens the SAME, un-checkpointed, tail-corrupted data dir — forcing WAL
+    replay of a corrupted-tail log.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "geode serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    corrupted=0
+    while IFS= read -r f; do
+      head -c 64 /dev/urandom >> "$f"
+      corrupted=$((corrupted+1))
+    done < <(find "${GEODE_DATA_DIR}" -path '*/wal/graph.wal' -size +0c)
+    test "$corrupted" -gt 0
+    echo "CORRUPTED_${corrupted}_WAL_TAILS"
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CORRUPTED_
+  tags: [wal, recovery, corruption, torn-write, crash, restart]
+
+- name: recovers-no-panic
+  description: |
+    KEY — the server reopened the tail-corrupted, un-checkpointed data dir
+    successfully (the harness reaching a working server here already proves
+    startup did NOT panic/segfault on the corrupt WAL), and a trivial query
+    executes. geode's WAL replay discarded the torn tail back to the last
+    valid record and came up clean.
+  query: RETURN 1 AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"x":1'
+  tags: [wal, recovery, corruption, key-assertion]
+
+- name: committed-data-survives
+  description: |
+    KEY (positive) — every committed-before-corruption row survived. Uses a
+    LABEL-LESS count (MATCH (n) RETURN count(n)) because that oracle is
+    reliable across the hard-crash recovery path; it must equal the seeded
+    count of 4, proving the WAL kept the committed prefix through the tail
+    corruption. (A label-filtered count is NOT used here — see the
+    limitation-pin below for why.)
+  query: MATCH (n) RETURN count(n) AS total
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"total":4'
+  tags: [wal, recovery, corruption, key-assertion, positive]
+
+- name: committed-value-survives-first
+  description: |
+    KEY (positive) — the FIRST committed record's property value survived
+    the crash+corruption verbatim (label-less property lookup by p3id).
+  query: MATCH (n) WHERE n.p3id = 'p3-1' RETURN n.p3id AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - p3-1
+  tags: [wal, recovery, corruption, key-assertion, positive]
+
+- name: committed-value-survives-last
+  description: |
+    KEY (positive) — the LAST committed record's value survived too. Teeth:
+    proves recovery kept the committed prefix all the way through the final
+    pre-crash record, not just the earliest ones, while still discarding the
+    corrupt trailing garbage.
+  query: MATCH (n) WHERE n.p3id = 'p3-4' RETURN n.p3id AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - p3-4
+  tags: [wal, recovery, corruption, key-assertion, positive]
+
+- name: label-index-after-crash-limitation-pin
+  description: |
+    LIMITATION-PIN (honest, negative) — pins a LIVE bug: after the UNCLEAN
+    (SIGKILL) crash + reopen, the label-filtered count returns 0 instead of
+    the seeded 4, even though the nodes demonstrably survived (the label-less
+    assertions above all passed). The label→node index is not reconstructed
+    on the hard-crash recovery path.
+    EXPECTED contract: this should return 4, exactly as it does BEFORE the
+    crash (see confirm-label-before-crash) and after a GRACEFUL restart (a
+    graceful-restart control returned the full count 4/4 in probing; cf.
+    geode 9a255a83 / regression_label_count_after_reopen.yml, which fixes the
+    first-read-after-GRACEFUL-restart race — a distinct path).
+    This test asserts today's BUGGY value (0) so it SELF-ACTIVATES: when
+    geode fixes hard-crash label-index recovery this will flip to a failure,
+    signalling that it should be converted into a positive assertion (== 4).
+    This spec does NOT claim label-filtered survival works.
+  query: MATCH (n:P3_A) RETURN count(n) AS total
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"total":0'
+  tags: [wal, recovery, corruption, limitation-pin, known-bug, negative]
+
+- name: torn-write-crash-and-corrupt
+  description: |
+    ROUND 2 (torn-write-tolerated) — a second independent UNCLEAN crash +
+    tail corruption, this time appending a short incomplete-record garbage
+    chunk (13 bytes) to simulate a process that died having written only the
+    first few bytes of a new WAL record (a torn mid-record write). Again
+    asserts ≥1 file corrupted; restart_server reopens the twice-corrupted
+    data dir.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "geode serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    corrupted=0
+    while IFS= read -r f; do
+      head -c 13 /dev/urandom >> "$f"
+      corrupted=$((corrupted+1))
+    done < <(find "${GEODE_DATA_DIR}" -path '*/wal/graph.wal' -size +0c)
+    test "$corrupted" -gt 0
+    echo "TORN_WRITE_${corrupted}_WAL_TAILS"
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - TORN_WRITE_
+  tags: [wal, recovery, corruption, torn-write, crash, restart]
+
+- name: torn-write-recovers-no-panic
+  description: |
+    KEY — after the second torn-write corruption + reopen, the server is
+    again up with no startup panic and serves a trivial query.
+  query: RETURN 1 AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"x":1'
+  tags: [wal, recovery, corruption, torn-write, key-assertion]
+
+- name: torn-write-committed-data-survives
+  description: |
+    KEY (positive) — the committed prefix still fully survives after the
+    SECOND crash+corruption round (label-less count == 4). Proves tolerance
+    is repeatable, not a one-off.
+  query: MATCH (n) RETURN count(n) AS total
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"total":4'
+  tags: [wal, recovery, corruption, torn-write, key-assertion, positive]
+
+tags:
+- wal
+- recovery
+- corruption
+- torn-write
+- crash-durability
+- regression
