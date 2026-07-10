@@ -1,0 +1,262 @@
+version: '1.0'
+name: Admin auth after crash reopen — persisted credential wins over env (geode 90b3a75a GAP-0061, 88f82375)
+description: |
+  Pins geode commit 90b3a75a (GAP-0061) + 88f82375: after a crash+reopen,
+  the persisted admin credential loads via geode's engine-direct fallback,
+  the admin authenticates with it, and — critically — a PERSISTED
+  credential WINS over the GEODE_ADMIN_PASSWORD env var on restart. This
+  is the harness's own managed test server: it always boots with
+  GEODE_ADMIN_PASSWORD=GeodeTestPassword123! in its env
+  (server.py:env.setdefault). Once the admin's password has been rotated
+  and persisted, that same env var must NOT resurrect the old password on
+  a later boot of the same data dir.
+
+  WHY A HARD KILL (the teeth): a graceful shutdown always flushes/
+  checkpoints, so a graceful restart would pass identically whether or
+  not the persisted-wins-over-env contract holds — the env var is only
+  ever consulted at first-boot / when no persisted credential exists, so
+  the interesting case is specifically "an already-persisted rotation
+  survives an UNCLEAN process death and reopen with the stale env still
+  present". This spec therefore SIGKILLs the managed server (uncatchable,
+  no checkpoint) immediately after the rotation, via a `type: bash` step,
+  then relies on the harness's `restart_server: true` to reopen the SAME
+  data dir under the SAME (now-stale) GEODE_ADMIN_PASSWORD env.
+
+  Scenario:
+    1. Baseline: the original env-seeded admin password
+       (GeodeTestPassword123!) authenticates.
+    2. Rotate the admin (`geode`) user's OWN password to
+       `Rg10_Admin_2026!` via `user reset-password geode --new-password
+       Rg10_Admin_2026!` (an ACKED admin-driven security mutation; the
+       harness's CLI-to-query translation converts this to
+       `CALL geode.auth.user_reset_password('geode', 'Rg10_Admin_2026!')`,
+       executed with the harness's auto-injected -U/-P admin flags, which
+       at this instant still carry the OLD (still-valid) env password).
+    3. Hard-crash IMMEDIATELY (no query tests stacked in between, to
+       minimize the checkpoint-mask window): SIGKILL the managed server
+       via a `type: bash` step that pkills the process by its unique
+       per-run data dir, then `restart_server: true` reopens the SAME
+       (un-checkpointed) data dir under the SAME env
+       (GEODE_ADMIN_PASSWORD=GeodeTestPassword123! — unchanged, stale).
+    4. KEY (positive): after the crash+restart, `auth login` with the
+       NEW, rotated password (`Rg10_Admin_2026!`, passed EXPLICITLY as
+       CLI args, not via harness auto-injection — auto-injection is now
+       stale/wrong post-rotation) succeeds — the persisted credential
+       loaded via engine-direct fallback and authenticated.
+    5. KEY (negative): after the crash+restart, `auth login` with the
+       OLD/env password (`GeodeTestPassword123!`, also passed explicitly)
+       is REJECTED (exit 3, "Invalid username or password", and must NOT
+       show "Successfully authenticated") — the stale env var did not
+       resurrect the old credential or override the persisted one.
+    6. Negative control: a garbage password is also rejected post-crash.
+
+  IMPORTANT — why explicit `auth login --user/--password` and not ordinary
+  query/command tests after the rotation: the harness auto-injects `-U
+  geode -P <env admin password>` into every ordinary CLI/query test
+  (executor.py `_build_cli_command`, reading `env["GEODE_ADMIN_PASSWORD"]`
+  fresh per test, never updated after a live rotation). Once the admin's
+  password is rotated, any subsequent ordinary test relying on that
+  auto-injection would authenticate with the now-WRONG stale password and
+  fail on its own account, independent of the crash-reopen property this
+  spec targets. `auth login` is a documented harness special case
+  (executor.py `_LOCAL_COMMANDS` handling for `args[0] == "auth" and
+  args[1] == "login"`) that does NOT get admin creds injected — the
+  test's own --user/--password always win — so it is the correct
+  instrument to assert the admin's actual live credential state.
+  Confirmed by code read: harness lifecycle itself (`stop_server` in
+  server.py, and `restart_server: true` in runner.py) is purely
+  signal-based (SIGTERM/SIGKILL + re-exec) and needs NO authentication,
+  so rotating the built-in admin's password mid-spec does not wedge the
+  harness's own server management — only ordinary auto-injected-cred
+  tests would break, and this spec deliberately runs none of those after
+  the rotation.
+
+  Probed against a scratch server (geode serve --listen
+  127.0.0.1:4452 --data-dir /tmp/probe-r10, GEODE_ADMIN_PASSWORD=
+  GeodeTestPassword123! set at boot):
+    - Baseline login as geode/GeodeTestPassword123! succeeded.
+    - Live rotation via CALL geode.auth.user_reset_password('geode',
+      'Rg10_Admin_2026!') (authenticated with the still-valid old
+      password) succeeded: {"status":"Password reset for geode"}.
+    - While the server kept running (env unchanged), the OLD password
+      was immediately rejected (exit 3, Authentication failed) and the
+      NEW password worked (exit 0) — confirms auth is checked against
+      the live persisted credential, not the env var.
+    - Real crash: `pkill -9 -f "geode serve.*probe-r10"`, then restarted
+      the SAME binary/data-dir/env (GEODE_ADMIN_PASSWORD still
+      GeodeTestPassword123!, unchanged). Startup log printed:
+      "[startup] GEODE_ADMIN_PASSWORD is set but IGNORED: a persisted
+      admin credential already exists (env seeds the admin only on first
+      boot; rotate via ALTER USER or 'geode user reset-password')". Post-
+      reopen: OLD/env password rejected (exit 3), NEW/persisted password
+      authenticated (exit 0). This is exactly the 88f82375 contract:
+      persisted credential wins over env on reopen. No regression
+      observed on the current binary.
+
+  CANARY: REQ=REQ-SEC-ADMIN-AUTH-CRASH-REOPEN-001; FEATURE="AdminAuthDurability"; ASPECT=PersistedCredentialAfterCrash; STATUS=TESTED; TEST=geodetestlab/specs/regression_admin_auth_after_crash_reopen.yml; OWNER=security; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: baseline-admin-auth-works
+  description: |
+    Pre-mutation baseline — the original env-seeded admin password
+    (GeodeTestPassword123!, the harness's default GEODE_ADMIN_PASSWORD)
+    authenticates before any rotation.
+  args:
+  - auth
+  - login
+  - --user
+  - geode
+  - --password
+  - GeodeTestPassword123!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [security, admin-auth, crash-recovery, positive-baseline]
+
+- name: rotate-admin-password
+  description: |
+    ACKED admin-driven security mutation — the admin (`geode`) rotates
+    its OWN password. `user reset-password geode --new-password <new>`
+    converts via the harness's CLI-to-query translation into
+    CALL geode.auth.user_reset_password('geode', 'Rg10_Admin_2026!'),
+    authenticated with the harness's auto-injected admin creds (still
+    the OLD, currently-valid env password at the instant this call is
+    authorized). This is the mutation whose crash-durability the rest of
+    this spec pins.
+  args:
+  - user
+  - reset-password
+  - geode
+  - --new-password
+  - Rg10_Admin_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - 'Password reset for geode'
+  tags: [security, admin-auth, crash-recovery, key-assertion]
+
+- name: crash-kill-and-restart
+  description: |
+    HARD CRASH — immediately after the rotation (no query tests stacked
+    in between, to minimize the checkpoint-mask window), SIGKILL the
+    managed server (uncatchable; no graceful shutdown, no checkpoint) so
+    the rotation's durability rests solely on whatever was already
+    synchronously persisted, then let the harness restart it on the SAME
+    data dir with the SAME (now-stale) GEODE_ADMIN_PASSWORD env still in
+    effect. The server is targeted by its unique per-run data dir
+    (GEODE_DATA_DIR, exported into bash steps); `: "${GEODE_DATA_DIR:?}"`
+    guards against an empty/unset variable ever broadening the pkill
+    pattern to match every geode process on the box. `set -e` fails the
+    step loudly if no server matched. After this kill, the harness's
+    graceful stop (SIGTERM-based, needs no auth) reaps an already-dead
+    process and cannot checkpoint; `restart_server: true` then reopens
+    the un-checkpointed data dir.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "geode serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags: [security, admin-auth, crash-recovery, crash, restart]
+
+- name: persisted-password-works
+  description: |
+    KEY ASSERTION (positive) — after the UNCLEAN crash + restart, the
+    NEW (rotated) admin password authenticates, passed EXPLICITLY as
+    --user/--password (harness's `auth login` special-case does not
+    inject admin creds, so this reflects the server's real, live
+    credential state, not harness bookkeeping). This only holds if the
+    persisted admin credential was loaded via geode's engine-direct
+    fallback on reopen — the 90b3a75a/GAP-0061 guarantee. A regression
+    here would mean the rotated credential was lost on crash-reopen.
+  args:
+  - auth
+  - login
+  - --user
+  - geode
+  - --password
+  - Rg10_Admin_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [security, admin-auth, crash-recovery, key-assertion]
+
+- name: env-password-rejected
+  description: |
+    KEY ASSERTION (negative) — after the UNCLEAN crash + restart, the
+    OLD/env password (GeodeTestPassword123!, still set in the managed
+    server's process env — the harness never changes it after a live
+    rotation) must NOT authenticate. If the 88f82375 fix had regressed —
+    i.e. the stale env var won over the persisted rotation on reopen —
+    this old credential would incorrectly succeed. This test must catch
+    that: exit 3, "Invalid username or password", and never "Successfully
+    authenticated".
+  args:
+  - auth
+  - login
+  - --user
+  - geode
+  - --password
+  - GeodeTestPassword123!
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Invalid username or password
+    stdout_not_contains:
+    - Successfully authenticated
+  tags: [security, admin-auth, crash-recovery, key-assertion, negative-control]
+
+- name: garbage-password-rejected
+  description: |
+    Negative control — a password that was never valid (neither the old
+    env password nor the new persisted one) is rejected post-crash,
+    confirming the server isn't in some fallback no-auth or accept-any
+    state after the unclean reopen.
+  args:
+  - auth
+  - login
+  - --user
+  - geode
+  - --password
+  - Definitely_Not_A_Valid_Password_999
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Invalid username or password
+    stdout_not_contains:
+    - Successfully authenticated
+  tags: [security, admin-auth, crash-recovery, negative-baseline]
+
+tags:
+- security
+- admin-auth
+- crash-recovery
+- auth
+- regression
