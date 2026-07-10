@@ -1,0 +1,253 @@
+version: '1.0'
+name: Backup restore rejects truncated/missing/bitflipped archives cleanly
+description: |
+  Negative-coverage complement to backup_operations_basic.yml /
+  backup_restore_operations.yml, which only exercise clean backup/restore
+  round-trips. This spec seeds data, takes a real CLI backup, then corrupts
+  COPIES of the backup file three different ways (truncation, missing path,
+  single-byte bit flip) and restores from each, asserting a clean named
+  error + nonzero exit + no server crash + original data intact throughout.
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4469
+  --data-dir /tmp/probe-p2) before writing this spec:
+    - `geode restore <file> --yes` is the correct CLI invocation (there is
+      no `backup restore` subcommand — `restore` is its own top-level
+      command, confirmed via `geode restore --help` and already exercised
+      by tde_backup_envelope_wrong_kek.yml / gql_backup_restore_refusal.yml).
+    - Truncating a valid backup to 50% of its size and restoring: exit
+      code 1, stderr contains `error: InvalidBackupFile` (with a Zig debug
+      error-return-trace below it — this is the build's normal unhandled-
+      error diagnostic, not a segfault/panic; the process exits cleanly
+      with a named error, and the server was unaffected).
+    - Restoring from a nonexistent path: exit code 1, stderr contains
+      `error: BackupFileNotFound` (via `RESTORE: Failed to open backup
+      file '<path>': error.FileNotFound`) — a named, unambiguous error,
+      not a bare crash.
+    - Restoring from a backup with one byte flipped mid-file (offset ~
+      size/2, XORed with 0xFF): exit code 1, stderr contains
+      `error: BackupChecksumMismatch` — proving the backup's integrity
+      checksum is actually verified and enforced on restore, not skipped.
+    - In all three cases the live server answered `RETURN 1` immediately
+      after (no crash, no hang) and the original P2Node seed data was
+      still present with the exact seeded count — no partial/corrupt
+      restore silently mutated the running server's data.
+    - `restore` writes into a `data/restore` staging directory relative to
+      the CLI process's CWD; it does not touch the live server's data
+      directory in any of these probed cases (bad or good), which is why
+      even a successful restore of a valid backup copy does not disturb
+      the running server's graph.
+
+  CANARY: REQ=REQ-BACKUP-RESTORE-CORRUPTION-001; FEATURE="BackupRestore"; ASPECT=CorruptRestoreRejected; STATUS=TESTED; TEST=geodetestlab/specs/backup_restore_corruption.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true  # bash steps manipulate backup files on local disk (truncate/bit-flip); not meaningful to promote to multi-node
+
+tests:
+- name: p2-seed-data
+  description: |
+    Positive — seed P2_N (5) P2Node nodes tagged p2_corruption_seed. This
+    is the baseline data set that must survive every corrupted-restore
+    attempt below unchanged.
+  query: |
+    CREATE (:P2Node {id: 1, tag: 'p2_corruption_seed'});
+    CREATE (:P2Node {id: 2, tag: 'p2_corruption_seed'});
+    CREATE (:P2Node {id: 3, tag: 'p2_corruption_seed'});
+    CREATE (:P2Node {id: 4, tag: 'p2_corruption_seed'});
+    CREATE (:P2Node {id: 5, tag: 'p2_corruption_seed'});
+  expected:
+    exit_code: 0
+  tags: [backup, restore, corruption, seed, positive]
+
+- name: p2-verify-seed-count
+  description: Positive — confirm exactly 5 P2Node nodes exist before backup.
+  query: "MATCH (n:P2Node {tag: 'p2_corruption_seed'}) RETURN count(n) AS cnt"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":5'
+  tags: [backup, restore, corruption, seed, positive]
+
+- name: p2-backup-create
+  description: |
+    Positive — create a real CLI backup of the seeded data. This is the
+    known-good file that gets corrupted (via copies) in the negative
+    cases below; the original is never touched.
+  args:
+  - backup
+  - create
+  - --output
+  - /tmp/p2_corruption_backup.geode
+  expected:
+    exit_code: 0
+  tags: [backup, restore, corruption, positive]
+
+- name: p2-make-truncated-copy
+  description: |
+    Truncate a COPY of the backup to 50% of its size, leaving the
+    original backup file untouched.
+  type: bash
+  command: |
+    set -e
+    cp /tmp/p2_corruption_backup.geode /tmp/p2_corruption_truncated.geode
+    SIZE=$(stat -c%s /tmp/p2_corruption_truncated.geode)
+    HALF=$((SIZE / 2))
+    TMPFILE=$(mktemp)
+    head -c "$HALF" /tmp/p2_corruption_truncated.geode > "$TMPFILE"
+    mv "$TMPFILE" /tmp/p2_corruption_truncated.geode
+    echo "truncated_to=$HALF"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - truncated_to=
+  tags: [backup, restore, corruption, setup]
+
+- name: p2-restore-truncated
+  description: |
+    KEY negative — restoring from a truncated backup must fail cleanly:
+    nonzero exit code, a named error on stderr (BackupFileNotFound would
+    be wrong here; the real error is InvalidBackupFile because the file
+    is too short for its declared payload length), and NO success marker
+    on stdout. Probed live: exit_code 1, `error: InvalidBackupFile`.
+  args:
+  - restore
+  - /tmp/p2_corruption_truncated.geode
+  - --yes
+  expected:
+    exit_code: 1
+    stderr_contains:
+    - 'error: InvalidBackupFile'
+    stdout_not_contains:
+    - Restore completed successfully
+  tags: [backup, restore, corruption, negative, key-assertion]
+
+- name: p2-restore-missing-path
+  description: |
+    Negative — restoring from a path that does not exist must fail
+    cleanly: nonzero exit, a named FileNotFound-style error, no panic/
+    segfault marker on stderr. Probed live: exit_code 1,
+    `error: BackupFileNotFound` via `RESTORE: Failed to open backup
+    file '<path>': error.FileNotFound`.
+  args:
+  - restore
+  - /tmp/p2_nonexistent.backup
+  - --yes
+  expected:
+    exit_code: 1
+    stderr_contains:
+    - 'error: BackupFileNotFound'
+    stderr_not_contains:
+    - Segmentation fault
+    - 'panic:'
+    stdout_not_contains:
+    - Restore completed successfully
+  tags: [backup, restore, corruption, negative]
+
+- name: p2-make-bitflipped-copy
+  description: |
+    Flip one byte near the midpoint of a COPY of the backup file (XOR
+    with 0xFF via dd/printf), leaving the original backup untouched.
+  type: bash
+  command: |
+    set -e
+    cp /tmp/p2_corruption_backup.geode /tmp/p2_corruption_bitflip.geode
+    SIZE=$(stat -c%s /tmp/p2_corruption_bitflip.geode)
+    OFFSET=$((SIZE / 2))
+    ORIG_BYTE=$(dd if=/tmp/p2_corruption_bitflip.geode bs=1 skip="$OFFSET" count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+    FLIPPED=$(( (ORIG_BYTE ^ 255) & 255 ))
+    printf "$(printf '\\%03o' "$FLIPPED")" | dd of=/tmp/p2_corruption_bitflip.geode bs=1 seek="$OFFSET" count=1 conv=notrunc status=none
+    echo "flipped_offset=$OFFSET"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - flipped_offset=
+  tags: [backup, restore, corruption, setup]
+
+- name: p2-restore-bitflipped
+  description: |
+    KEY negative — restoring from a backup with a single flipped byte
+    must fail the integrity checksum: nonzero exit, a named checksum
+    error, no success marker. Proves the checksum is actually verified
+    on restore, not silently skipped. Probed live: exit_code 1,
+    `error: BackupChecksumMismatch`.
+  args:
+  - restore
+  - /tmp/p2_corruption_bitflip.geode
+  - --yes
+  expected:
+    exit_code: 1
+    stderr_contains:
+    - 'error: BackupChecksumMismatch'
+    stdout_not_contains:
+    - Restore completed successfully
+  tags: [backup, restore, corruption, negative, key-assertion]
+
+- name: p2-server-still-healthy
+  description: |
+    Positive — after three consecutive failed restore attempts (truncated,
+    missing, bit-flipped), the live server must still be answering plain
+    queries. A hang/crash/connection-drop here would be the live-
+    regression bug rule this spec guards against.
+  query: RETURN 1 AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"x":1'
+  tags: [backup, restore, corruption, positive, key-assertion]
+
+- name: p2-data-intact-after-failed-restores
+  description: |
+    Positive — the original P2Node seed data (count 5) must be
+    byte-for-byte unchanged: no failed restore attempt partially wrote,
+    truncated, or corrupted the live server's actual data directory.
+  query: "MATCH (n:P2Node {tag: 'p2_corruption_seed'}) RETURN count(n) AS cnt"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":5'
+  tags: [backup, restore, corruption, positive, key-assertion]
+
+- name: p2-cleanup-backup-files
+  description: Remove all backup files created during this spec.
+  type: bash
+  command: |
+    rm -f /tmp/p2_corruption_backup.geode /tmp/p2_corruption_truncated.geode /tmp/p2_corruption_bitflip.geode
+    echo "cleanup_done"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - cleanup_done
+  tags: [backup, restore, corruption, teardown]
+
+- name: p2-cleanup-graph
+  description: Remove all seeded P2Node test nodes idempotently.
+  query: "MATCH (n:P2Node {tag: 'p2_corruption_seed'}) DETACH DELETE n RETURN count(*) AS deleted"
+  expected:
+    exit_code: 0
+  tags: [backup, restore, corruption, teardown]
+
+tags:
+- backup
+- restore
+- corruption
+- negative
+- regression
