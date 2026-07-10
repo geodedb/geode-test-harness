@@ -1,0 +1,176 @@
+version: '1.0'
+name: WHERE Clause — Negative Paths (type mismatch / missing property / bad operator / unbound variable)
+description: |
+  Covers WHERE clause negative/error paths not exercised by
+  where_clause_operators.yml (positive-only: =, <>, !=, >, >=, <, AND, OR).
+  `geode query` always exits 0 for GQL-level outcomes, so exit_code alone
+  proves nothing here; every case that claims a real rejection is paired
+  with stdout_not_contains '"status_class":"00000"' to prove it did NOT
+  silently succeed where an error was observed.
+
+  Probed on a scratch server (geode serve --listen 127.0.0.1:4482
+  --data-dir /tmp/probe-p15):
+
+    - incompatible-compare (`WHERE n.s < 5`, comparing a string property
+      against an integer literal) — LIMITATION-PIN. No error. status_class
+      00000, zero rows returned. The engine treats the incomparable `<`
+      as simply false rather than raising a type error. Cross-checked: the
+      same string/int mismatch under `<>` (not-equal) DOES return the row
+      (a string is trivially not-equal to an integer), confirming this is
+      consistent typed comparison semantics, not a crash or wrong-result
+      bug — `<`/`>` on incomparable types is false, `<>` on incomparable
+      types is true. Verified deterministic across repeated probes.
+
+    - nonexistent-property (boundary, `WHERE n.nosuch = 1`, a property
+      never set on any P15_N node) — LIMITATION-PIN/null-semantics. No
+      error. status_class 00000, zero rows returned — accessing a
+      never-set property evaluates to NULL, and `NULL = 1` is
+      null/false, so the row is filtered out silently rather than the
+      query being rejected for referencing an undefined property.
+      Verified deterministic across repeated probes.
+
+    - invalid-operator (KEY NEGATIVE, `WHERE n.i <> <> 1`, a doubled
+      operator token) — genuine rejection. status_class 42000, error
+      "parse error". This is a real parse-time syntax error, not a
+      silent-accept.
+
+    - unbound-variable (`MATCH (n:P15_N) WHERE m.i = 1 RETURN n`, `m` is
+      never bound by any MATCH pattern) — LIMITATION-PIN, NOT the naming
+      error the brief hypothesized. Probed real behavior: status_class
+      00000, zero rows returned, no error mentioning `m` at all. The
+      engine silently resolves the unbound variable's property access to
+      NULL (same null-semantics as nonexistent-property above) rather
+      than rejecting the query for referencing an undeclared variable.
+      Confirmed with `m` also referenced in RETURN (`RETURN m`): still
+      00000/zero rows, no naming error. Verified deterministic across
+      repeated probes.
+
+  CANARY: REQ=REQ-WHERE-CLAUSE-NEGATIVE-001; FEATURE="WhereClause"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/where_clause_negative.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: setup-create-node
+  description: |
+    Prerequisite (positive) — seed a single P15_N node with a string
+    property (s) and an integer property (i), giving the negative probes
+    below real data to filter against.
+  query: "CREATE (:P15_N {s: 'x', i: 1})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [where-clause, setup, positive]
+
+- name: setup-valid-where-works
+  description: |
+    Prerequisite (positive) — a normal, valid WHERE filter on the seeded
+    integer property must match the row, proving the baseline WHERE path
+    itself works before we probe its negative edges.
+  query: "MATCH (n:P15_N) WHERE n.i = 1 RETURN n.s AS s"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"s":"x"'
+    row_count: 1
+  tags: [where-clause, setup, positive]
+
+- name: incompatible-compare
+  description: |
+    LIMITATION-PIN — WHERE n.s < 5 compares a string property against an
+    integer literal. Does NOT error on this build. Probed real behavior:
+    status_class 00000, zero rows returned — the incomparable `<` is
+    treated as false rather than raising a type-mismatch error. Asserted
+    as the real (accepted) behavior, not claimed as a rejection.
+  query: "MATCH (n:P15_N) WHERE n.s < 5 RETURN n.s AS s"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    row_count: 0
+  tags: [where-clause, negative, incompatible-compare, limitation-pin, silent-accept]
+
+- name: nonexistent-property
+  description: |
+    Boundary / LIMITATION-PIN — WHERE n.nosuch = 1 references a property
+    that was never set on any P15_N node. Does NOT error on this build.
+    Probed real behavior: status_class 00000, zero rows returned — the
+    missing property evaluates to NULL and NULL = 1 is null/false, so the
+    row is filtered out silently (null semantics) rather than the query
+    being rejected. Asserted as the real (accepted) behavior.
+  query: "MATCH (n:P15_N) WHERE n.nosuch = 1 RETURN n.s AS s"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    row_count: 0
+  tags: [where-clause, negative, nonexistent-property, boundary, limitation-pin, silent-accept]
+
+- name: invalid-operator
+  description: |
+    KEY NEGATIVE — WHERE n.i <> <> 1 (a doubled/garbage operator token)
+    must be rejected as a syntax error. Probed real behavior: status_class
+    42000, error "parse error" — a genuine parse-time rejection, not a
+    silent-accept.
+  query: "MATCH (n:P15_N) WHERE n.i <> <> 1 RETURN n.s AS s"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - parse error
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [where-clause, negative, invalid-operator, key-assertion]
+
+- name: unbound-variable
+  description: |
+    LIMITATION-PIN — MATCH (n:P15_N) WHERE m.i = 1 RETURN n references
+    `m`, a variable never bound by any MATCH pattern in this query. The
+    brief hypothesized this should error naming `m`; probed real behavior
+    says otherwise: status_class 00000, zero rows returned, no error
+    mentioning `m`. The engine resolves the unbound variable's property
+    access to NULL (the same null-semantics observed in
+    nonexistent-property above) and silently filters every row, rather
+    than rejecting the query for referencing an undeclared variable.
+    Asserted as the real (accepted) behavior, not claimed as a rejection.
+  query: "MATCH (n:P15_N) WHERE m.i = 1 RETURN n"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    row_count: 0
+  tags: [where-clause, negative, unbound-variable, limitation-pin, silent-accept]
+
+- name: cleanup-test-data
+  description: Clean up all P15 test data.
+  query: "MATCH (n:P15_N) DETACH DELETE n"
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- where-clause
+- negative-paths
+- incompatible-compare
+- nonexistent-property
+- invalid-operator
+- unbound-variable
+- silent-accept
+- limitation-pin
