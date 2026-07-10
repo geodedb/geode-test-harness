@@ -372,16 +372,22 @@ geodetestlab-install:
 # Test Commands
 # ==============================================================================
 
-# Run the full geodetestlab spec suite (managed servers per spec)
+# Run the full geodetestlab spec suite (managed servers per spec).
+# Failures are streamed live to reports/test-failures.md (tail -f it during a
+# run; point an agent at it afterward to fix the failures).
 test: .check-geodetestlab
 	@echo "Running full spec suite ($(shell ls $(SPECS_DIR)/*.yml 2>/dev/null | wc -l) specs)..."
 	@mkdir -p reports
-	$(GEODETESTLAB) run --specs $(SPECS_DIR) --output reports/results.json -j $(PARALLEL_WORKERS)
+	$(GEODETESTLAB) run --specs $(SPECS_DIR) --output reports/results.json \
+		--failure-file reports/test-failures.md -j $(PARALLEL_WORKERS)
+	@echo "Failure detail (if any): reports/test-failures.md"
 
 # Run full suite with verbose output
 test-verbose: .check-geodetestlab
 	@mkdir -p reports
-	$(GEODETESTLAB) run --specs $(SPECS_DIR) --output reports/results.json -v -j $(PARALLEL_WORKERS)
+	$(GEODETESTLAB) run --specs $(SPECS_DIR) --output reports/results.json \
+		--failure-file reports/test-failures.md -v -j $(PARALLEL_WORKERS)
+	@echo "Failure detail (if any): reports/test-failures.md"
 
 # Run a single spec by name (e.g. make test-spec SPEC=per_graph_storage.yml)
 test-spec: .check-geodetestlab

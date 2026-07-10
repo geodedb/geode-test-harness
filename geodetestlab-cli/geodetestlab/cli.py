@@ -25,6 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from lib.cli_formatters import _show_rich_summary  # noqa: E402
 from lib.cli_workers import _run_single_spec  # noqa: E402
+from lib.failure_log import (  # noqa: E402
+    append_failure,
+    finalize_failure_log,
+    init_failure_log,
+)
 from lib.runner import RunnerError, _kill_stale_servers, run_tests  # noqa: E402
 from lib.spec import SpecValidationError, load_spec  # noqa: E402
 from lib.utils import SecretResolutionError, resolve_secrets  # noqa: E402
@@ -192,6 +197,17 @@ def run(
         None,
         help="Optional path to write a full machine‑readable report JSON",
     ),
+    failure_file: str | None = typer.Option(
+        None,
+        "--failure-file",
+        help=(
+            "Path to a human/agent-readable file that captures every test "
+            "FAILURE with detail, written live as failures occur (tail -f it "
+            "during a run; point an agent at it afterward). Defaults to "
+            "'<report-dir>/test-failures.md' (or reports/test-failures.md), or "
+            "$GEODE_FAILURE_FILE. Pass an empty string to disable."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False,
         help="Do not execute commands or start servers, just enumerate cases",
@@ -260,6 +276,19 @@ def run(
     if output is not None and report_json is None:
         report_json = output
 
+    # Resolve the streaming failure-file path. Precedence: explicit --failure-file
+    # (empty string disables), then $GEODE_FAILURE_FILE, then a default next to
+    # the JSON report, else reports/test-failures.md.
+    if failure_file is None:
+        env_ff = os.environ.get("GEODE_FAILURE_FILE")
+        if env_ff is not None:
+            failure_file = env_ff
+        elif report_json is not None:
+            failure_file = str(report_json.parent / "test-failures.md")
+        else:
+            failure_file = "reports/test-failures.md"
+    failure_file = failure_file or None  # empty string -> disabled
+
     # Validate that exactly one of --spec or --specs is provided
     if spec is None and specs is None:
         console_err.print("Error: Either --spec (file) or --specs (directory) must be provided", style="red")
@@ -316,6 +345,30 @@ def run(
     total_exit_code = 0
     aggregate_summary: dict[str, int] = {"total": 0, "passed": 0, "failed": 0, "skipped": 0}
     all_results: list[dict[str, Any]] = []
+    # Spec-level errors (schema error / runner crash / worker exception) — no
+    # per-test results to scan, so track them separately for the failure file.
+    spec_error_entries: list[dict[str, str]] = []
+
+    def _record_spec_error(spec_path: str, message: str) -> None:
+        append_failure(
+            failure_file,
+            spec=spec_path,
+            test_name="<spec-level error>",
+            error=message,
+            kind="spec",
+        )
+        spec_error_entries.append({"spec": spec_path, "test": "<spec-level error>", "error": message})
+
+    # Truncate + header the streaming failure file once, before any worker runs.
+    # Individual failures are then appended live (flock-guarded) from within each
+    # spec's run — including across the parallel ProcessPoolExecutor workers.
+    _ff_target = str(spec) if spec is not None else (str(specs) if specs is not None else "")
+    init_failure_log(
+        failure_file,
+        target=_ff_target,
+        transport=",".join(transports_to_run),
+        binary=geode_binary or "",
+    )
 
     # Run specs for each transport
     for current_transport in transports_to_run:
@@ -383,6 +436,7 @@ def run(
                         verbose,
                         current_transport,
                         force_cluster_size,
+                        failure_file,
                     ): spec_file
                     for spec_file in spec_files
                 }
@@ -403,11 +457,13 @@ def run(
                         if interrupted:
                             break  # type: ignore[unreachable]
                         console_err.print(f"Spec {spec_file} generated exception: {exc}", style="red")
+                        _record_spec_error(str(spec_file), f"worker exception: {exc}")
                         total_exit_code = max(total_exit_code, 3)
                         continue
 
                     if result["error"]:
                         console_err.print(result["error"], style="red")
+                        _record_spec_error(str(spec_file), str(result["error"]))
 
                     summary = result["summary"]
                     failed_count = summary.get("failed", 0)
@@ -542,12 +598,14 @@ def run(
 
                 try:
                     spec_obj = load_spec(spec_file)
-                except SpecValidationError:
+                except SpecValidationError as exc:
                     console_err.print(f"SCHEMA_ERROR in {spec_file}", style="red")
+                    _record_spec_error(str(spec_file), f"SCHEMA_ERROR: {exc}")
                     total_exit_code = max(total_exit_code, 2)
                     continue
-                except Exception:
+                except Exception as exc:
                     console_err.print(f"SCHEMA_ERROR in {spec_file}", style="red")
+                    _record_spec_error(str(spec_file), f"SCHEMA_ERROR: {exc}")
                     total_exit_code = max(total_exit_code, 2)
                     continue
 
@@ -556,6 +614,7 @@ def run(
                     secrets, env_vars = resolve_secrets(spec_obj)
                 except SecretResolutionError as exc:
                     console_err.print(str(exc), style="red")
+                    _record_spec_error(str(spec_file), f"SECRET_ERROR: {exc}")
                     total_exit_code = max(total_exit_code, 4)
                     continue
 
@@ -579,6 +638,7 @@ def run(
                         "verbose": verbose,
                         "transport": current_transport,
                         "force_cluster_size": force_cluster_size,
+                        "failure_file": failure_file,
                     }
                     exit_code, summary = run_tests(**run_kwargs)
                     failed_count = summary.get("failed", 0)
@@ -598,6 +658,10 @@ def run(
                         _kill_geode_processes()
                         if not ci and verbose:
                             console.print(f"  [dim]Retrying {spec_file.name}...[/dim]")
+                        # Don't re-stream retry failures — the first attempt already
+                        # streamed live, and the authoritative post-retry list is
+                        # written to the failure file's Final section.
+                        run_kwargs["failure_file"] = None
                         exit_code, summary = run_tests(**run_kwargs)
                         failed_count = summary.get("failed", 0)
                         total_count = summary.get("total", 0)
@@ -627,6 +691,7 @@ def run(
                         sys.stdout.flush()
                 except RunnerError as exc:
                     console_err.print(str(exc), style="red")
+                    _record_spec_error(str(spec_file), f"RUNNER_ERROR: {exc}")
                     total_exit_code = max(total_exit_code, 3)
                     continue
 
@@ -638,6 +703,27 @@ def run(
         }
         report_json.parent.mkdir(parents=True, exist_ok=True)
         report_json.write_text(json.dumps(report_data, indent=2))
+
+    # Finalize the streaming failure file: append the authoritative post-retry
+    # failure list (per-test failures scanned from the aggregated results, plus
+    # any spec-level errors) so an agent has one clean checklist to work from.
+    _failed_entries: list[dict[str, str]] = []
+    for _spec_entry in all_results:
+        for _r in _spec_entry.get("results", []):
+            if not _r.get("passed", True) and not _r.get("skip_reason"):
+                _failed_entries.append(
+                    {
+                        "spec": _spec_entry.get("spec", "?"),
+                        "test": _r.get("name", "?"),
+                        "error": _r.get("error", ""),
+                    }
+                )
+    _failed_entries.extend(spec_error_entries)
+    finalize_failure_log(
+        failure_file,
+        aggregate=aggregate_summary,
+        failed_entries=_failed_entries,
+    )
 
     # Print final single‑line JSON summary
     print(json.dumps({"summary": aggregate_summary}, separators=(",", ":")))

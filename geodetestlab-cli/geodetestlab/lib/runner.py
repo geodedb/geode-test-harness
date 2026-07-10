@@ -37,6 +37,7 @@ from .executor import (
     run_plaintext_verification,
     run_single_test,
 )
+from .failure_log import append_failure
 from .runner_types import DEFAULT_ADMIN_PASSWORD, RunnerError, RunSummary, TestResult
 from .server import (
     ServerError,
@@ -84,6 +85,40 @@ _TRANSIENT_PATTERNS = (
     "too many connections",
     "work queue full",
 )
+
+
+def _summarize_expected(test_case: TestCase) -> str:
+    """Compact, human/agent-readable summary of a test's expectations.
+
+    Surfaces the assertion the test intended (exit code, required/forbidden
+    substrings, regexes) so a failure record shows expected-vs-actual even when
+    the check layer records pass/fail without a reason string.
+    """
+    exp = test_case.expected
+    parts: list[str] = []
+    if exp.exit_code is not None:
+        parts.append(f"exit_code == {exp.exit_code}")
+    for label, val in (
+        ("stdout_contains", exp.stdout_contains),
+        ("stdout_not_contains", exp.stdout_not_contains),
+        ("stderr_contains", exp.stderr_contains),
+        ("stderr_not_contains", exp.stderr_not_contains),
+        ("stdout_regex", exp.stdout_regex),
+        ("output_contains", exp.output_contains),
+    ):
+        if val:
+            parts.append(f"{label}: {val}")
+    if exp.stdout_exact is not None:
+        parts.append(f"stdout_exact: {exp.stdout_exact!r}")
+    if exp.result_contains:
+        parts.append(f"result_contains: {exp.result_contains}")
+    if test_case.query:
+        parts.insert(0, f"query: {test_case.query}")
+    if test_case.command:
+        parts.insert(0, f"command: {test_case.command}")
+    elif test_case.args:
+        parts.insert(0, f"args: {test_case.args}")
+    return "\n".join(parts)
 
 
 def _is_transient_failure(result: TestResult, test_case: TestCase) -> bool:
@@ -621,6 +656,8 @@ def _run_plaintext_checks(
     dry_run: bool,
     verbose: bool,
     summary: RunSummary,
+    failure_file: str | None = None,
+    spec_path: str = "",
 ) -> None:
     if spec.plaintext_verification.enabled and data_dir and not dry_run:
         violations = run_plaintext_verification(
@@ -639,6 +676,13 @@ def _run_plaintext_checks(
             summary.total += 1
             summary.failed += 1
             summary.results.append(result)
+            append_failure(
+                failure_file,
+                spec=spec_path,
+                test_name="plaintext_verification",
+                error=result.error,
+                plaintext_violations=violations,
+            )
 
 
 def _generate_report(
@@ -711,6 +755,7 @@ def run_tests(
     verbose: bool = False,
     transport: str = "quic",
     force_cluster_size: int = 1,
+    failure_file: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     summary = RunSummary()
     start_time = time.time()
@@ -871,6 +916,19 @@ def run_tests(
                 summary.passed += 1
             else:
                 summary.failed += 1
+                # Stream the failure to the tailable failure file the instant it
+                # is recorded (flock-guarded; safe across processes/threads).
+                append_failure(
+                    failure_file,
+                    spec=spec_path,
+                    test_name=test_case.name,
+                    error=result.error,
+                    output=result.output,
+                    expected=_summarize_expected(test_case),
+                    duration_ms=result.duration_ms,
+                    cluster_node=result.cluster_node,
+                    plaintext_violations=result.plaintext_violations,
+                )
             summary.results.append(result)
 
             if verbose and not ci_mode:
@@ -979,7 +1037,7 @@ def run_tests(
                     )
                     _record_result(test_case, result)
 
-        _run_plaintext_checks(spec, data_dir, dry_run, verbose, summary)
+        _run_plaintext_checks(spec, data_dir, dry_run, verbose, summary, failure_file, spec_path)
 
     finally:
         if _shared_http is not None:
