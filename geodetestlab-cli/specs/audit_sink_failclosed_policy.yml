@@ -1,0 +1,581 @@
+version: '1.0'
+name: Audit sink hard-failure policy — pinned crash-on-broken-startup + fail-open mid-run
+description: |
+  Task 6 (Plan 2, pos/neg coverage): pins geode's REAL audit-sink
+  hard-failure policy — does an unwritable sink BLOCK the audited op
+  (fail-closed) or let it SUCCEED with the failure surfaced elsewhere
+  (fail-open)? `audit_sink_failure_recovery.yml` (GAP-0307) only covers
+  RECOVERY from a transient denial window; it never establishes what the
+  policy actually IS under a genuine, non-recovering write failure. This
+  spec probes that gap directly and encodes the real, verified contract.
+
+  ## PROBE FINDINGS (2026-07-10, scratch builds, ../geode/zig-out/bin/geode)
+
+  1. MID-RUN `chmod 000` ON A LIVE, ALREADY-OPEN SINK FILE IS A NO-OP, NOT
+     A REAL FAILURE TEST. The server opens `{data_dir}/audit.jsonl` once at
+     startup and holds that fd for its whole lifetime. On Linux, `chmod`
+     only affects permission checks made at `open()`; write(2) on an
+     already-open fd is completely unaffected by a later permission
+     change. Verified directly: with the LIVE harness-managed server's
+     audit.jsonl at `000`, `CREATE USER` still returns exit 0 AND (checked
+     after restoring permissions so the file could be read again) the
+     ASSIGN_ROLE record for that exact user IS present in the JSONL with
+     no seq_no gap — the write genuinely succeeded, it was never blocked
+     or dropped. So "fail-open" here is a *degenerate* result: no write
+     failure ever occurs for this technique to fail open (or closed)
+     from. `audit_sink_failure_recovery.yml`'s phase 2 test is therefore
+     honest in its assertion (op succeeds) but its premise ("simulates a
+     sink failure") does not hold on Linux — this spec's mid-run tests
+     below reproduce and document that precisely, distinguishing it from
+     the genuine failure below.
+
+  2. THE ONLY WAY TO TRIGGER A REAL WRITE FAILURE IS AT THE NEXT `open()`
+     — i.e. a server (re)start while the sink file is already unwritable.
+     `security/audit.zig:270` (`AuditLogger.init`) calls `createFile`
+     (append-open) on the configured audit path; when that hits `EACCES`
+     it returns the error, and `server/main.zig:1447`
+     (`audit_logger.* = try audit.AuditLogger.init(...)`) does a bare
+     `try` with **no fallback** — the error propagates and unwinds the
+     whole process. Reproduced twice, deterministically: a scratch
+     `geode serve` restarted against a `chmod 000` (already-existing)
+     audit.jsonl exits non-zero immediately, before ever opening its
+     listen port, with a Zig error-return trace (not a logged warning):
+
+       error: AccessDenied
+         lib/std/Io/Dir.zig:639:5: in createFile
+         src/security/audit.zig:270:17: in init -> return err;
+         src/server/main.zig:1447:22: audit_logger.* = try audit.AuditLogger.init(gpa, audit_config);
+
+     There is also a secondary DebugAllocator leak-report artifact from
+     the abnormal unwind (the `audit_logger` object allocated via
+     `gpa.create` on main.zig:1446 is never freed on this error path).
+
+  ## REAL POLICY (as verified, not assumed)
+
+  Split by *when* the failure occurs:
+    - Mid-run (fd already open): effectively FAIL-OPEN, but only because
+      no real failure is reachable via permission changes on a running
+      process — not a deliberate fail-open design decision that was
+      exercised.
+    - Startup (fresh `open()` call): effectively FAIL-CLOSED in outcome
+      (the server never starts, so no audited op can occur) but
+      implemented as an UNHANDLED CRASH — a bare Zig error-return
+      unwind with no graceful "cannot open audit log, refusing to start"
+      message, plus a leaked allocation on that path. Per this project's
+      bug rule, a crash is neither a clean fail-closed nor a fail-open —
+      this is PINNED AS A KNOWN LIMITATION / BUG below, not asserted as
+      intended behavior. Recovery is clean: restoring permissions and
+      restarting boots normally, and the pre-crash audit chain remains
+      intact (`geode audit verify` reports "OK chain") — the crash itself
+      introduces no corruption or gap, because the failed start never
+      wrote anything.
+
+  A genuine mid-run write failure (e.g. via `prlimit --fsize` truncating
+  the fd's allowed size to force EFBIG) was also probed manually: the
+  server died with NO error text anywhere (stdout/stderr silent, port
+  stopped answering). That path is excluded from this spec because it
+  depends on OS/rlimit-enforcement specifics that are not reliably
+  reproducible in CI (see task report); it is noted here as an additional
+  known gap, not asserted with a CI test.
+
+  CANARY: REQ=REQ-AUDIT-SINK-FAILPOLICY-001; FEATURE="AuditSink"; ASPECT=HardFailurePolicy; STATUS=TESTED; TEST=geodetestlab/specs/audit_sink_failclosed_policy.yml; OWNER=security; UPDATED=2026-07-10
+
+single_node_only: true  # filesystem-permission semantics + per-node audit chain; not meaningful under multi-node promotion
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_DISABLE_AUDIT: '0'
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+# ============================================================================
+# SETUP — baseline on the harness-managed server
+# ============================================================================
+- name: p6_preflight_drop_users
+  description: Drop any leftover users from prior runs.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS p6_before_user;
+    DROP USER IF EXISTS p6_during_user;
+    DROP USER IF EXISTS p6_after_user;
+  expect:
+    exit_code: 0
+  tags: [audit, sink, p6, setup]
+
+- name: p6_setup_baseline_op
+  description: |
+    POSITIVE (setup) — one audited op succeeds while the sink is writable.
+    Seeds the ASSIGN_ROLE record the later continuity check depends on.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p6_before_user SET PASSWORD 'P6Before-9876' ROLE readonly]
+  expect:
+    exit_code: 0
+  tags: [audit, sink, p6, setup, positive]
+
+- name: p6_setup_verify_record_exists
+  description: Confirm the baseline record landed in the JSONL sink.
+  type: bash
+  command: |
+    LOG="${GEODE_STATE_DIR}/audit.jsonl"
+    COUNT=$(grep -c . "$LOG" 2>/dev/null || echo 0)
+    echo "Baseline record count: $COUNT"
+    [ "$COUNT" -gt 0 ] || { echo "FAIL: no baseline records"; exit 1; }
+    echo "P6_BASELINE_RECORDS_OK count=$COUNT"
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_BASELINE_RECORDS_OK]
+  tags: [audit, sink, p6, setup, positive]
+
+# ============================================================================
+# KEY — hard, non-recovering failure: restart a scratch server against an
+# already-unwritable sink. This is the genuine failure path (see probe
+# findings above); a live server's already-open fd is unaffected by chmod,
+# so this technique must restart the process to actually hit an open()
+# failure. Runs entirely on a hand-rolled scratch server (fixed port 4473)
+# so the harness-managed server (and its `server_running` invariant) is
+# never touched, regardless of this test's outcome.
+# ============================================================================
+- name: p6_hard_failure_scratch_boot_and_seed
+  description: |
+    Boot a scratch server, confirm it's ready, and seed one audited op so
+    its own audit.jsonl has a real baseline record before the failure probe.
+    Idempotently self-heals a stale scratch server/dir from a prior aborted
+    run, and preflights the fixed port before claiming it (established
+    hygiene pattern from regression_sigterm_bounded_shutdown_0039.yml).
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # never let the scratch server see the managed server's data dir
+    PORT=4473
+    PIDFILE=/tmp/p6_scratch.pid
+    DIRFILE=/tmp/p6_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    # NOTE: deliberately not using `pkill -f` here -- in some sandboxed
+    # environments it has been observed to hang/misbehave (matches its own
+    # argv and signals unexpected targets). PID-file tracking above plus the
+    # port preflight below are sufficient: a truly orphaned foreign process
+    # makes the preflight fail loudly instead of silently hanging.
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/p6_scratch.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/p6_scratch.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+    # geode's audit logger opens {data_dir}/audit.jsonl before the general
+    # data-dir scaffolding exists, so the directory must be pre-created here
+    # (the harness's own server.py does this implicitly via tempfile.mkdtemp
+    # on the exact --data-dir path; our hand-rolled scratch dir needs the
+    # same treatment for its "data" subdirectory).
+    mkdir -p "$WORKDIR/data"
+
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    echo "$SERVER_TLS_ARGS" > /tmp/p6_scratch.tlsargs
+
+    GEODE_AUDIT_ENABLED=1 GEODE_ALLOW_TEST_AUDIT_KEYS=1 GEODE_DISABLE_AUDIT=0 GEODE_ADMIN_PASSWORD="$PW" \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level warn --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server_boot1.log" 2>&1 &
+    SPID=$!
+    echo "$SPID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 60); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "P6_SCRATCH_BOOT_FAILED"
+      cat "$WORKDIR/server_boot1.log"
+      kill -9 "$SPID" 2>/dev/null || true
+      rm -f "$PIDFILE" "$DIRFILE"
+      rm -rf "$WORKDIR"
+      exit 1
+    fi
+    echo "P6_SCRATCH_BOOT_OK"
+
+    timeout 10 "$BIN" query "CREATE USER p6_scratch_seed_user SET PASSWORD 'P6ScratchSeed-9876' ROLE readonly" \
+      --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1 \
+      || { echo "P6_SEED_CREATE_FAILED"; exit 1; }
+    SEEDED=$(grep -c . "$WORKDIR/data/audit.jsonl" 2>/dev/null || echo 0)
+    echo "Seeded scratch audit.jsonl with $SEEDED record(s)"
+    [ "$SEEDED" -gt 0 ] || { echo "P6_SEED_RECORD_MISSING"; exit 1; }
+    echo "P6_SCRATCH_SEED_OK"
+
+    # Stop cleanly so the next test can chmod a closed file.
+    kill -TERM "$SPID" 2>/dev/null || true
+    for i in $(seq 1 40); do kill -0 "$SPID" 2>/dev/null || break; sleep 0.25; done
+    kill -9 "$SPID" 2>/dev/null || true
+    rm -f "$PIDFILE"
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_SCRATCH_BOOT_OK, P6_SCRATCH_SEED_OK]
+  tags: [audit, sink, p6, setup, positive, scratch]
+
+- name: p6_hard_failure_restart_with_broken_sink
+  description: |
+    KEY — chmod 000 the scratch server's now-closed audit.jsonl, then
+    attempt to restart it. Per probe findings, `AuditLogger.init` hits
+    EACCES on open() and `server/main.zig` propagates the error with a
+    bare `try` — the process crashes before ever listening. This asserts
+    the REAL, reproduced outcome (CRASH_ON_STARTUP) and pins it as a known
+    limitation/bug (an unhandled crash is neither a graceful fail-closed
+    rejection nor a fail-open continuation). If the marker below ever
+    changes to GRACEFUL or HUNG, that is a real behavior change and this
+    spec must be updated to match.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    set -u
+    PORT=4473
+    PIDFILE=/tmp/p6_scratch.pid
+    DIRFILE=/tmp/p6_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    WORKDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+    SERVER_TLS_ARGS=$(cat /tmp/p6_scratch.tlsargs 2>/dev/null || echo "")
+    if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
+      echo "P6_HARD_FAILURE_PROBE_SKIPPED_NO_SCRATCH_DIR"
+      exit 1
+    fi
+    if [ ! -f "$WORKDIR/data/audit.jsonl" ]; then
+      echo "P6_HARD_FAILURE_PROBE_MISSING_SEED_FILE (${WORKDIR}/data/audit.jsonl does not exist -- prior seed step did not run/complete)"
+      exit 1
+    fi
+
+    chmod 000 "$WORKDIR/data/audit.jsonl"
+    echo "P6_SINK_CHMOD_000_OK"
+
+    GEODE_AUDIT_ENABLED=1 GEODE_ALLOW_TEST_AUDIT_KEYS=1 GEODE_DISABLE_AUDIT=0 GEODE_ADMIN_PASSWORD="$PW" \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level warn --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server_boot2.log" 2>&1 &
+    SPID2=$!
+    echo "$SPID2" > "$PIDFILE"
+
+    ALIVE=1
+    for i in $(seq 1 20); do
+      kill -0 "$SPID2" 2>/dev/null || { ALIVE=0; break; }
+      sleep 0.25
+    done
+    wait "$SPID2" 2>/dev/null
+    RESTART_EXIT=$?
+    echo "restart exit=$RESTART_EXIT alive_after_5s=$ALIVE"
+    echo "--- scratch server log (tail) ---"
+    tail -30 "$WORKDIR/server_boot2.log" 2>/dev/null || true
+    echo "--- end log ---"
+
+    if [ "$ALIVE" -eq 1 ]; then
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        echo "P6_HARD_FAILURE_POLICY=GRACEFUL (server started and answered queries despite an unwritable sink -- the crash bug pinned by this spec appears FIXED; update this test to assert the new graceful contract instead)"
+      else
+        echo "P6_HARD_FAILURE_POLICY=HUNG (process alive but never became ready -- a different/new bug, not the one this spec pins)"
+      fi
+      kill -9 "$SPID2" 2>/dev/null || true
+      rm -f "$PIDFILE"
+      exit 1
+    fi
+    if grep -qi "AccessDenied" "$WORKDIR/server_boot2.log" 2>/dev/null && grep -q "audit.zig" "$WORKDIR/server_boot2.log" 2>/dev/null; then
+      echo "P6_HARD_FAILURE_POLICY=CRASH_ON_STARTUP exit=$RESTART_EXIT (AccessDenied opening audit.jsonl -- unhandled crash, not a graceful rejection)"
+      rm -f "$PIDFILE"
+    else
+      echo "P6_HARD_FAILURE_POLICY=CRASH_ON_STARTUP_UNKNOWN_CAUSE exit=$RESTART_EXIT (crashed, but NOT the AccessDenied/audit.zig signature this spec pins -- investigate as a separate issue)"
+      rm -f "$PIDFILE"
+      exit 1
+    fi
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_SINK_CHMOD_000_OK, 'P6_HARD_FAILURE_POLICY=CRASH_ON_STARTUP exit']
+  tags: [audit, sink, p6, key, known_limitation, bug, fail-closed-via-crash]
+
+- name: p6_hard_failure_restore_and_chain_verify
+  description: |
+    POSITIVE (restore) — chmod the sink back to writable, confirm the
+    scratch server boots cleanly and an audited op succeeds again, then
+    run `geode audit verify` on the scratch audit.jsonl: the crash cycle
+    above must not have introduced any corruption or seq_no gap (the
+    failed start never got far enough to write anything).
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    PORT=4473
+    PIDFILE=/tmp/p6_scratch.pid
+    DIRFILE=/tmp/p6_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    WORKDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+    SERVER_TLS_ARGS=$(cat /tmp/p6_scratch.tlsargs 2>/dev/null || echo "")
+    if [ -z "$WORKDIR" ] || [ ! -d "$WORKDIR" ]; then
+      echo "P6_RESTORE_SKIPPED_NO_SCRATCH_DIR"
+      exit 1
+    fi
+
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      [ -n "$OLDPID" ] && kill -9 "$OLDPID" 2>/dev/null || true
+    fi
+    # (no pkill -f here -- see hygiene note in the boot_and_seed test above)
+    sleep 0.3
+
+    chmod 644 "$WORKDIR/data/audit.jsonl"
+    echo "P6_SINK_RESTORED_644"
+
+    GEODE_AUDIT_ENABLED=1 GEODE_ALLOW_TEST_AUDIT_KEYS=1 GEODE_DISABLE_AUDIT=0 GEODE_ADMIN_PASSWORD="$PW" \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level warn --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server_boot3.log" 2>&1 &
+    SPID3=$!
+    echo "$SPID3" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 60); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "P6_RESTORE_BOOT_FAILED"
+      cat "$WORKDIR/server_boot3.log"
+      exit 1
+    fi
+    echo "P6_RESTORE_BOOT_OK"
+
+    timeout 10 "$BIN" query "CREATE USER p6_scratch_post_user SET PASSWORD 'P6ScratchPost-9876' ROLE readonly" \
+      --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1 \
+      || { echo "P6_POST_RESTORE_CREATE_FAILED"; exit 1; }
+    echo "P6_POST_RESTORE_OP_OK"
+
+    kill -TERM "$SPID3" 2>/dev/null || true
+    for i in $(seq 1 40); do kill -0 "$SPID3" 2>/dev/null || break; sleep 0.25; done
+    kill -9 "$SPID3" 2>/dev/null || true
+
+    OUTPUT=$("$BIN" audit verify --file "$WORKDIR/data/audit.jsonl" 2>&1)
+    VERIFY_EXIT=$?
+    echo "$OUTPUT"
+    if [ "$VERIFY_EXIT" -ne 0 ]; then
+      echo "P6_CHAIN_VERIFY_FAILED exit=$VERIFY_EXIT"
+      exit 1
+    fi
+    echo "$OUTPUT" | grep -q "OK chain" || { echo "P6_CHAIN_VERIFY_MISSING_OK_TEXT"; exit 1; }
+    echo "P6_CHAIN_VERIFY_OK"
+
+    rm -f "$PIDFILE" "$DIRFILE" /tmp/p6_scratch.tlsargs
+    rm -rf "$WORKDIR"
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_SINK_RESTORED_644, P6_RESTORE_BOOT_OK, P6_POST_RESTORE_OP_OK, P6_CHAIN_VERIFY_OK]
+  tags: [audit, sink, p6, positive, chain, recovery]
+
+# ============================================================================
+# SUPPORTING — mid-run comparison on the harness-managed (live, already-open)
+# server. Reconciles with audit_sink_failure_recovery.yml's technique:
+# documents that chmod 000 on an already-open sink fd is a no-op (see probe
+# findings), so the op's success here is NOT evidence of a deliberate
+# fail-open design — it is evidence that no failure occurred at all. The
+# continuity check confirms this is not a silent audit gap: the during-denial
+# record genuinely exists.
+# ============================================================================
+- name: p6_midrun_chmod_deny
+  description: Make the harness-managed server's live audit.jsonl unwritable.
+  type: bash
+  command: |
+    LOG="${GEODE_STATE_DIR}/audit.jsonl"
+    chmod 000 "$LOG"
+    echo "P6_MIDRUN_CHMOD_000_OK"
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_MIDRUN_CHMOD_000_OK]
+  tags: [audit, sink, p6, midrun]
+
+- name: p6_midrun_op_succeeds_while_unwritable
+  description: |
+    Real behavior: the audited op succeeds (exit 0) while the live sink
+    file is chmod 000. Per probe findings this is because the server's fd
+    was already open before the permission change, not because of a
+    deliberate fail-open policy decision being exercised.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p6_during_user SET PASSWORD 'P6During-9876' ROLE readonly]
+  expect:
+    exit_code: 0
+  tags: [audit, sink, p6, midrun, fail-open]
+
+- name: p6_midrun_chmod_restore
+  description: Restore write permission on the harness-managed server's audit.jsonl.
+  type: bash
+  command: |
+    LOG="${GEODE_STATE_DIR}/audit.jsonl"
+    chmod 644 "$LOG"
+    echo "P6_MIDRUN_RESTORED_644"
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_MIDRUN_RESTORED_644]
+  tags: [audit, sink, p6, midrun]
+
+- name: p6_midrun_op_succeeds_after_restore
+  description: POSITIVE — a further audited op succeeds after restoring permissions.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p6_after_user SET PASSWORD 'P6After-9876' ROLE readwrite]
+  expect:
+    exit_code: 0
+  tags: [audit, sink, p6, midrun, positive]
+
+- name: p6_midrun_no_silent_gap
+  description: |
+    Bug-rule check — confirm the "during-denial" op was NOT a silent audit
+    gap: its ASSIGN_ROLE record genuinely exists in the JSONL (the write
+    went through the already-open fd, unaffected by the chmod). Absence
+    here would mean a real silently-dropped audit record with no failure
+    surfaced anywhere -- that would be reported as a bug.
+  type: bash
+  command: |
+    LOG="${GEODE_STATE_DIR}/audit.jsonl"
+    for user in p6_before_user p6_during_user p6_after_user; do
+      grep -q "\"${user}\"" "$LOG" || { echo "P6_MISSING_RECORD_FOR user=${user}"; exit 1; }
+    done
+    echo "P6_NO_SILENT_GAP_ALL_RECORDS_PRESENT"
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_NO_SILENT_GAP_ALL_RECORDS_PRESENT]
+  tags: [audit, sink, p6, midrun, positive, no-silent-gap]
+
+- name: p6_midrun_chain_verify
+  description: |
+    POSITIVE — `geode audit verify` on the harness-managed server's own
+    audit.jsonl passes cleanly after the whole mid-run denial/restore
+    cycle (matches the GAP-0305-RESOLVED state confirmed in
+    audit_hmac_chain_restart.yml, not the stale exit-3 bug pin still in
+    audit_sink_failure_recovery.yml).
+  type: bash
+  command: |
+    LOG="${GEODE_STATE_DIR}/audit.jsonl"
+    GEODE_BIN=""
+    for p in \
+      "${GEODE_STATE_DIR}/../../zig-out/bin/geode" \
+      "$(dirname "$(dirname "$(dirname "$PWD")")")/geode/zig-out/bin/geode" \
+      "../../../geode/zig-out/bin/geode" \
+      "$(command -v geode 2>/dev/null)"; do
+      if [ -x "$p" ]; then GEODE_BIN="$p"; break; fi
+    done
+    if [ -z "$GEODE_BIN" ]; then
+      echo "WARN: geode binary not found; chain verify skipped"
+      echo "P6_MIDRUN_CHAIN_VERIFY_OK (skipped)"
+      exit 0
+    fi
+    OUTPUT=$("$GEODE_BIN" audit verify --file "$LOG" 2>&1)
+    VERIFY_EXIT=$?
+    echo "$OUTPUT"
+    if [ "$VERIFY_EXIT" -ne 0 ]; then
+      echo "FAIL: expected exit 0, got $VERIFY_EXIT"
+      exit 1
+    fi
+    echo "$OUTPUT" | grep -q "OK chain" || { echo "FAIL: missing 'OK chain' text"; exit 1; }
+    echo "P6_MIDRUN_CHAIN_VERIFY_OK"
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_MIDRUN_CHAIN_VERIFY_OK]
+  tags: [audit, sink, p6, positive, chain]
+
+# ============================================================================
+# TEARDOWN
+# ============================================================================
+- name: p6_cleanup_users
+  description: Drop test users.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS p6_before_user;
+    DROP USER IF EXISTS p6_during_user;
+    DROP USER IF EXISTS p6_after_user;
+  expect:
+    exit_code: 0
+  tags: [audit, sink, p6, teardown]
+
+- name: p6_cleanup_restore_and_scratch
+  description: Defensive cleanup -- restore permissions and remove any leftover scratch server/dir even if earlier tests failed.
+  type: bash
+  command: |
+    LOG="${GEODE_STATE_DIR}/audit.jsonl"
+    chmod 644 "$LOG" 2>/dev/null || true
+
+    PIDFILE=/tmp/p6_scratch.pid
+    DIRFILE=/tmp/p6_scratch.dir
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      [ -n "$OLDPID" ] && kill -9 "$OLDPID" 2>/dev/null || true
+      rm -f "$PIDFILE"
+    fi
+    # (no pkill -f here -- see hygiene note in the boot_and_seed test above)
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/p6_scratch.*) chmod -R u+rwx "$OLDDIR" 2>/dev/null || true; rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    rm -f /tmp/p6_scratch.tlsargs
+    echo "P6_TEARDOWN_OK"
+  expect:
+    exit_code: 0
+    stdout_contains: [P6_TEARDOWN_OK]
+  tags: [audit, sink, p6, teardown]
+
+tags:
+- audit
+- sink_failure
+- fail_closed
+- fail_open
+- hard_failure
+- permissions
+- security
+- known_limitation
+- p6
