@@ -1,0 +1,274 @@
+version: '1.0'
+name: Index DDL — Negative Paths (duplicate name / drop-missing / bad type)
+description: |
+  Covers index DDL negative/error paths not exercised by
+  geode_index_comprehensive.yml (39 tests, all happy-path): duplicate index
+  name, DROP INDEX on a nonexistent index, CREATE INDEX on a nonexistent
+  label/property, and an invalid index-type keyword. Every negative asserts
+  the REAL observed status_class/error text via stdout_contains (the
+  `geode_query: {status_class: ...}` YAML block is dead code — GeodeQueryAssert
+  has no status_class field, so it is silently ignored — never rely on it).
+  `geode query` always exits 0 for GQL-level outcomes, so exit_code alone
+  proves nothing here; every case is paired with stdout_not_contains
+  '"status_class":"00000"' to prove it did NOT silently succeed where a
+  real error was observed.
+
+  IMPORTANT — crash finding (documented, NOT encoded as a repeated test
+  step): probing on a scratch server (geode serve --listen 127.0.0.1:4479
+  --data-dir /tmp/probe-p9d) showed that a SINGLE duplicate CREATE INDEX
+  (no IF NOT EXISTS) returns a clean 42P07 "Duplicate index name" error with
+  no crash — this is what the `duplicate-name` test below exercises, once.
+  However, REPEATING the identical failing CREATE INDEX statement ~4-5
+  times in a row against the same server reliably segfaults the server via
+  a double-free in catalog.zig:777 addIndex (Zig debug allocator: "Second
+  free" / "Invalid free", reached through
+  execution.zig:1529 cat.addIndex(index_info) catch |err| { ... }). This
+  spec deliberately issues the duplicate CREATE INDEX exactly ONCE (the
+  documented, non-crashing behavior) and does not attempt to reproduce the
+  repeated-duplicate crash inline, per the bug rule (crashes are reported,
+  not baked into a passing assertion). See p9-report.md for the full crash
+  repro (candidate GAP: repeated duplicate-name CREATE INDEX -> server
+  segfault).
+
+  Two additional silent-accept findings (limitation-pinned, not asserted as
+  errors): CREATE INDEX on a label that has never had any nodes
+  (P9_NoSuchLabel) succeeds silently (status_class 00000) and the index is
+  registered and shown by SHOW INDEXES — this build allows pre-declaring an
+  index on a not-yet-existent label/schema rather than rejecting it.
+  Likewise CREATE INDEX on an existing label but a property name that has
+  never been set on any node (P9_N.nosuchprop) also succeeds silently and
+  is registered. Both are asserted as their real (accepted) behavior with
+  an explanatory limitation-pin, per the P5/P7/P8 DDL-silent-accept pattern
+  from prior specs — this is NOT claimed as a rejection.
+
+  CANARY: REQ=REQ-INDEX-DDL-ERRORS-001; FEATURE="IndexDDL"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/index_ddl_errors.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: setup-create-node
+  description: |
+    Prerequisite — create one P9_N node with property k so the label and
+    property both genuinely exist before the positive CREATE INDEX below.
+  query: "CREATE (:P9_N {k: 1})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, setup, positive]
+
+- name: setup-create-index
+  description: |
+    setup (positive) — CREATE INDEX p9_idx ON P9_N (k) must succeed on a
+    genuinely existing label/property.
+  query: "CREATE INDEX p9_idx ON P9_N (k)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, setup, positive]
+
+- name: setup-show-indexes-lists-it
+  description: |
+    SHOW INDEXES must list p9_idx immediately after creation.
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - p9_idx
+  tags: [index, ddl, setup, positive]
+
+- name: duplicate-name
+  description: |
+    KEY NEGATIVE — an identical CREATE INDEX p9_idx ON P9_N (k), issued
+    again with NO IF NOT EXISTS, must be rejected. Probed real behavior on
+    this build: a single duplicate attempt returns status_class 42P07 with
+    error "Duplicate index name" (real rejection, not a silent-accept).
+    Do NOT repeat this exact statement multiple times in a row against a
+    live server — probing showed repeated identical duplicate CREATE INDEX
+    attempts (~4-5x) reliably segfault the server via a double-free in
+    catalog.zig addIndex. This test issues the statement exactly once, the
+    documented non-crashing behavior.
+  query: "CREATE INDEX p9_idx ON P9_N (k)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42P07"'
+    - Duplicate index name
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, negative, duplicate, key-assertion]
+
+- name: if-not-exists-ok
+  description: |
+    positive — the same CREATE INDEX p9_idx, but WITH IF NOT EXISTS, must
+    be a clean no-op success (status_class 00000), confirming IF NOT
+    EXISTS is honored and distinct from the bare-duplicate rejection above.
+  query: "CREATE INDEX IF NOT EXISTS p9_idx ON P9_N (k)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, positive]
+
+- name: drop-nonexistent
+  description: |
+    negative — DROP INDEX on an index name that was never created
+    (p9_nosuch) must be rejected. Probed real behavior: status_class 58000,
+    error "IndexNotFound".
+  query: "DROP INDEX p9_nosuch"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - IndexNotFound
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, negative, drop, key-assertion]
+
+- name: drop-nonexistent-if-exists-clean
+  description: |
+    positive — the same DROP INDEX target, but WITH IF EXISTS, must be a
+    clean no-op success (status_class 00000) instead of an error.
+  query: "DROP INDEX IF EXISTS p9_nosuch"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, positive]
+
+- name: index-on-nonexistent-label
+  description: |
+    LIMITATION-PIN — CREATE INDEX on a label that has never had any nodes
+    created (P9_NoSuchLabel) does NOT error on this build. Probed real
+    behavior: status_class 00000 (silent accept), and the index is
+    registered — SHOW INDEXES lists p9_bad_label_idx against table
+    P9_NoSuchLabel afterward. This build allows pre-declaring an index on a
+    not-yet-existent label/schema rather than rejecting it (consistent
+    with the P5/P7/P8 DDL-silent-accept pattern from prior specs). This is
+    asserted as the real (accepted) behavior, not claimed as a rejection.
+  query: "CREATE INDEX p9_bad_label_idx ON P9_NoSuchLabel (x)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, limitation-pin, silent-accept]
+
+- name: index-on-nonexistent-label-is-registered
+  description: |
+    Follow-up proof for the limitation-pin above — SHOW INDEXES must
+    actually list p9_bad_label_idx against P9_NoSuchLabel, confirming the
+    prior CREATE INDEX was a genuine accept (metadata registered), not
+    merely a no-op success with nothing recorded.
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - p9_bad_label_idx
+    - P9_NoSuchLabel
+  tags: [index, ddl, limitation-pin, silent-accept]
+
+- name: index-on-nonexistent-property
+  description: |
+    LIMITATION-PIN — CREATE INDEX on the EXISTING label P9_N but a
+    property that has never been set on any node (nosuchprop) also does
+    NOT error on this build. Probed real behavior: status_class 00000
+    (silent accept), and the index is registered — SHOW INDEXES lists
+    p9_bad_prop_idx against table P9_N, columns nosuchprop. Asserted as
+    the real (accepted) behavior, not claimed as a rejection.
+  query: "CREATE INDEX p9_bad_prop_idx ON P9_N (nosuchprop)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, limitation-pin, silent-accept]
+
+- name: index-on-nonexistent-property-is-registered
+  description: |
+    Follow-up proof for the limitation-pin above — SHOW INDEXES must list
+    p9_bad_prop_idx against P9_N, confirming the prior CREATE INDEX was a
+    genuine accept, not merely a no-op with nothing recorded.
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - p9_bad_prop_idx
+  tags: [index, ddl, limitation-pin, silent-accept]
+
+- name: invalid-index-type-banana
+  description: |
+    KEY NEGATIVE — CREATE BANANA INDEX (an invalid index-type keyword in
+    place of the INDEX keyword) must be a syntax error. Probed real
+    behavior: status_class 42000, error "expected token 'l_paren', got
+    'identifier' at line 1 col 8" — the parser rejects BANANA as an
+    unexpected identifier where a parenthesized column list was expected,
+    i.e. a genuine parse-level rejection, not a silent-accept.
+  query: "CREATE BANANA INDEX p9_banana_idx ON P9_N (k)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - expected token
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, negative, invalid-type, key-assertion]
+
+- name: invalid-index-using-type-banana
+  description: |
+    negative — CREATE INDEX ... USING banana (an invalid index
+    implementation keyword after USING) must also be a syntax error.
+    Probed real behavior: status_class 42000, error "parse error".
+  query: "CREATE INDEX p9_using_banana_idx ON P9_N USING banana (k)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - parse error
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, negative, invalid-type]
+
+- name: cleanup-drop-index
+  description: Drop the index created for this suite.
+  query: "DROP INDEX p9_idx"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [index, ddl, cleanup]
+
+- name: cleanup-test-data
+  description: Clean up all P9 test data.
+  query: "MATCH (n) DETACH DELETE n"
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- index
+- ddl
+- negative-paths
+- duplicate-name
+- drop-missing
+- invalid-type
+- silent-accept
+- limitation-pin
