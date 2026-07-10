@@ -1,0 +1,374 @@
+version: '1.0'
+name: Vector Index Negative Paths (dim/metric/dropped/malformed/k)
+description: >
+  Plan 2, Task 7 — negative-path coverage for vector index DDL and KNN.
+  `vector_hnsw_comprehensive.yml` / `vector_operations_basic.yml` are
+  happy-path only. The deprecated `specs/legacy/vector_operations_comprehensive.yml`
+  test 11 ("vector_function_error_handling") asserted that a dimension-
+  mismatched vector_l2/vector_cosine call returns exit_code 1 with "error"
+  in the output — that assertion does NOT hold on the current binary (see
+  PROBE FINDINGS). This spec replaces that stale assertion with the real,
+  verified behavior and adds the additionally-required index/metric/KNN
+  negative paths.
+
+
+  ## PROBE FINDINGS (2026-07-10, scratch server, ../geode/zig-out/bin/geode, port 4474)
+
+
+  1. WRONG-DIMENSION INSERT IS SILENTLY ACCEPTED — BUG. Inserting a
+     3-component vectorf32 value into a property (`emb`) that already
+     holds 4-component vectors under an HNSW index returns
+     `status_class":"00000"` (success), not a rejection. The mismatched
+     vector is stored as-is (verified: a same-vector-space cosine
+     comparison against it returns NULL rather than a number, proving the
+     stored value genuinely has a different dimension, not a coerced/
+     padded one). This is a data-integrity risk per the bug rule and is
+     pinned honestly below (`p7_wrong_dimension_insert_limitation_pin`),
+     not asserted as intended behavior.
+
+  2. INVALID METRIC NAME IS SILENTLY ACCEPTED — BUG. `CREATE INDEX ...
+     USING HNSW WITH (metric = 'banana', ...)` returns success and the
+     index shows up in `SHOW INDEXES` with `type: vector` — identical to
+     a valid-metric index. No validation of the `metric` value occurs at
+     DDL time. Pinned honestly below
+     (`p7_invalid_metric_create_limitation_pin`).
+
+  3. KNN AFTER DROPPING THE INDEX STILL WORKS — DOCUMENTED FALLBACK, NOT A
+     BUG. The KNN query pattern used throughout this codebase
+     (`MATCH (n) RETURN n.id, vector_cosine(n.emb, $q) AS dist ORDER BY
+     dist ... LIMIT k`) is a plain function-scored full graph scan; the
+     HNSW index is an optimizer aid only, never a hard dependency for
+     query correctness. Dropping the index and re-running the identical
+     KNN query still returns exit 0 with correct results (full scan
+     fallback). This is asserted as genuine, working behavior.
+
+  4. MALFORMED VECTOR LITERAL (non-numeric component) IS SILENTLY SWALLOWED
+     TO NULL — BUG. `vectorf32("[1.0, 'x', 2.0]")` (and `CREATE (n {emb:
+     vectorf32(...)})` with the same malformed literal) both return
+     `status_class":"00000"` (success) with the value/property set to
+     NULL. There is no parse error, no warning, no diagnostic anywhere —
+     the malformed input is silently discarded. This is a worse outcome
+     than a clean rejection (silent data loss) and is pinned honestly
+     below (`p7_malformed_vector_literal_limitation_pin`).
+
+  5. `LIMIT 0` (k=0) is genuine, correct behavior: an empty result set,
+     `status_class":"00000"`. `LIMIT -1` (k=-1) is a genuine GQL syntax
+     error: `status_class":"42000"` with
+     `"expected token 'integer_lit', got 'minus'"`. Both are asserted as
+     real (not guessed) below. Note: the `query` CLI subcommand always
+     exits 0 regardless of GQL-level success/failure — errors are
+     signalled exclusively via the JSON body's `status_class`/`error`
+     fields, never via process exit code. Every negative assertion below
+     therefore checks `stdout_contains`/`stdout_not_contains` on those
+     JSON fields rather than `exit_code`.
+
+  Also note: `vector_cosine` returns cosine SIMILARITY (1 = identical,
+  0 = orthogonal), matching `docs/TYPE_QUICK_REFERENCE.md` and
+  `docs/API_REFERENCE_GENERATED.md` ("Cosine similarity (NULL if
+  zero-norm)") — NOT cosine distance as an inline comment in
+  `vector_hnsw_comprehensive.yml` claims. This spec's setup/KNN assertions
+  are written against the verified similarity semantics (ORDER BY ... DESC
+  for nearest-first).
+
+  CANARY: REQ=REQ-VECTOR-INDEX-ERRORS-001; FEATURE="VectorIndex"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/vector_index_errors.yml; OWNER=qa; UPDATED=2026-07-10
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- vector
+- index
+- negative-paths
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: p7_teardown_canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:P7Vec) DETACH DELETE n
+    MATCH (n:P7BadMetric) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [vector, setup, canary]
+
+  # --------------------------------------------------------------- setup --
+- name: p7_setup_create_index
+  description: "Positive setup: create a valid HNSW vector index, dim=4, cosine metric"
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS p7_vec_idx
+    ON P7Vec (emb)
+    USING HNSW
+    WITH (metric = 'cosine', ef_construction = 200, M = 16)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, positive, ddl]
+
+- name: p7_setup_show_index
+  description: SHOW INDEXES contains the newly-created p7_vec_idx
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - p7_vec_idx
+  tags: [vector, setup, positive, show]
+
+- name: p7_setup_insert_valid_vectors
+  description: "Positive setup: insert 3 valid dim=4 vectors under the indexed label"
+  args: [query, '-']
+  stdin: |
+    CREATE (n1:P7Vec {id: 1, emb: vectorf32('[1.0, 0.0, 0.0, 0.0]')})
+    CREATE (n2:P7Vec {id: 2, emb: vectorf32('[0.0, 1.0, 0.0, 0.0]')})
+    CREATE (n3:P7Vec {id: 3, emb: vectorf32('[0.9, 0.1, 0.0, 0.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, positive, insert]
+
+- name: p7_setup_knn_works
+  description: >
+    Positive: one KNN query works end-to-end. vector_cosine returns
+    similarity (1=identical); ORDER BY dist DESC ranks nearest first, so
+    id=1 (exact match against the query vector) must be first.
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:P7Vec)
+    RETURN n.id AS id, vector_cosine(n.emb, vectorf32('[1.0, 0.0, 0.0, 0.0]')) AS dist
+    ORDER BY dist DESC
+    LIMIT 3
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"id":1'
+  tags: [vector, setup, positive, knn]
+
+  # ------------------------------------------------- wrong-dimension insert --
+- name: p7_wrong_dimension_insert_limitation_pin
+  description: >
+    KEY negative (per task brief) — insert a dim=3 vector into the dim=4,
+    HNSW-indexed `emb` property. EXPECTED: rejected (dimension mismatch
+    error). ACTUAL (verified): silently ACCEPTED — status_class 00000,
+    exit 0, no error, no warning. This is a data-integrity bug: the store
+    now holds mixed-dimension vectors under one index/property with no
+    signal to the caller. Pinned honestly, not hidden. If this behavior
+    changes to a genuine rejection, this test (and its
+    known_limitation/bug tags) must be updated to match.
+  args: [query, '-']
+  stdin: >-
+    CREATE (n4:P7Vec {id: 4, emb: vectorf32('[1.0, 2.0, 3.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dimension, known_limitation, bug]
+
+- name: p7_wrong_dimension_stored_value_evidence
+  description: >
+    Evidence for the pin above: the stored dim=3 vector is NOT silently
+    coerced/padded to dim=4 — a same-space cosine comparison against it
+    returns NULL (geode's documented behavior for dimension-mismatched
+    vector ops, see docs/API_REFERENCE_GENERATED.md), proving the bad
+    dimension really made it into the store.
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:P7Vec {id: 4})
+    RETURN vector_cosine(n.emb, vectorf32('[1.0, 0.0, 0.0, 0.0]')) AS dist
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"dist":null'
+  tags: [vector, dimension, known_limitation, bug, evidence]
+
+  # ----------------------------------------------------------- invalid metric --
+- name: p7_invalid_metric_create_limitation_pin
+  description: >
+    Negative — CREATE INDEX with an invalid distance metric name
+    ('banana'). EXPECTED: rejected (unknown metric error). ACTUAL
+    (verified): silently ACCEPTED — status_class 00000, exit 0, no
+    validation of the metric value occurs at DDL time. Pinned honestly.
+    If this behavior changes to a genuine rejection, update this test and
+    its known_limitation/bug tags to match.
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS p7_bad_metric_idx
+    ON P7BadMetric (emb)
+    USING HNSW
+    WITH (metric = 'banana', ef_construction = 200, M = 16)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, metric, known_limitation, bug, ddl]
+
+- name: p7_invalid_metric_show_index_evidence
+  description: Evidence -- SHOW INDEXES confirms p7_bad_metric_idx was actually created despite the invalid metric.
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - p7_bad_metric_idx
+  tags: [vector, metric, known_limitation, bug, evidence]
+
+  # ------------------------------------------------------- knn-on-dropped-index --
+- name: p7_knn_dropped_index_drop
+  description: Drop the p7_vec_idx HNSW index before re-running the KNN pattern.
+  args: [query, '-']
+  stdin: DROP INDEX p7_vec_idx
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dropped-index]
+
+- name: p7_knn_dropped_index_show_absent
+  description: p7_vec_idx no longer appears in SHOW INDEXES after DROP.
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - p7_vec_idx
+  tags: [vector, dropped-index]
+
+- name: p7_knn_on_dropped_index
+  description: >
+    Negative-shaped case, verified real outcome = documented fallback
+    scan, not an error. The KNN query pattern
+    (MATCH ... ORDER BY vector_cosine(...) LIMIT k) is a function-scored
+    full graph scan; the HNSW index was only ever an optimizer aid, never
+    a hard dependency. Re-running the identical KNN query after DROP
+    INDEX still succeeds with correct results -- this is asserted as
+    genuine working behavior (not a bug).
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:P7Vec)
+    RETURN n.id AS id, vector_cosine(n.emb, vectorf32('[1.0, 0.0, 0.0, 0.0]')) AS dist
+    ORDER BY dist DESC
+    LIMIT 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"id":1'
+  tags: [vector, dropped-index, fallback-scan, documented]
+
+  # ------------------------------------------------ malformed vector literal --
+- name: p7_malformed_vector_literal_limitation_pin
+  description: >
+    Negative -- vectorf32 literal with a non-numeric component
+    ([1.0, 'x', 2.0]). EXPECTED: parse/type error. ACTUAL (verified):
+    silently returns NULL -- status_class 00000, exit 0, no parse error,
+    no diagnostic anywhere. Worse than a clean rejection because the bad
+    input is silently discarded rather than surfaced. Pinned honestly. If
+    this behavior changes to a genuine rejection, update this test and
+    its known_limitation/bug tags to match.
+  args: [query, '-']
+  stdin: |
+    RETURN vectorf32("[1.0, 'x', 2.0]") AS v
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"v":null'
+  tags: [vector, malformed-literal, known_limitation, bug]
+
+- name: p7_malformed_vector_literal_create_evidence
+  description: >
+    Evidence for the pin above in a storage context: CREATE-ing a node
+    with the same malformed vector literal as a property value silently
+    stores NULL rather than failing the write.
+  args: [query, '-']
+  stdin: |
+    CREATE (n5:P7Vec {id: 5, emb: vectorf32("[1.0, 'x', 2.0]")})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, malformed-literal, known_limitation, bug, evidence]
+
+- name: p7_malformed_vector_literal_stored_value_evidence
+  description: Confirms the property stored for n5 is genuinely NULL, not a partially-parsed vector.
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:P7Vec {id: 5}) RETURN n.emb AS emb
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"emb":null'
+  tags: [vector, malformed-literal, known_limitation, bug, evidence]
+
+  # ------------------------------------------------------------------ k=0/k=-1 --
+- name: p7_knn_k_zero
+  description: >
+    Negative-shaped case, verified real outcome = empty result set (not
+    an error). LIMIT 0 (k=0) on a KNN-pattern query returns an empty rows
+    array with status_class 00000 -- this is correct, expected SQL/GQL
+    LIMIT semantics, not a bug.
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:P7Vec)
+    RETURN n.id AS id, vector_cosine(n.emb, vectorf32('[1.0, 0.0, 0.0, 0.0]')) AS dist
+    ORDER BY dist DESC
+    LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [vector, knn, k-boundary]
+
+- name: p7_knn_k_negative
+  description: >
+    Negative -- LIMIT -1 (k=-1) on a KNN-pattern query. Verified real
+    outcome: genuine GQL syntax error, status_class 42000, "expected
+    token 'integer_lit', got 'minus'". Real failure signal is the
+    status_class/error JSON fields (the query CLI subcommand always
+    exits 0); asserted here via stdout_contains/stdout_not_contains, not
+    exit_code.
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:P7Vec)
+    RETURN n.id AS id, vector_cosine(n.emb, vectorf32('[1.0, 0.0, 0.0, 0.0]')) AS dist
+    ORDER BY dist DESC
+    LIMIT -1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - error
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, knn, k-boundary, negative]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: p7_teardown
+  description: Remove all P7 test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:P7Vec) DETACH DELETE n
+    MATCH (n:P7BadMetric) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [vector, cleanup, canary]
