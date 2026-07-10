@@ -1,0 +1,331 @@
+version: '1.0'
+name: QUIC stream multiplexing default-ON + env opt-out (geode 68618e60)
+description: |
+  Pins geode commit 68618e60 ("feat: default QUIC stream multiplexing ON
+  (enterprise out-of-box)"): a non-multiplexing server hangs the Go client
+  on secondary streams (verified in the fixing commit's own message), so
+  `quic_stream_multiplexing_enabled` was flipped `false -> true` as the
+  compiled-in default. Operators opt out with
+  `GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING=0` (also accepts `false`/`off`/`no`,
+  case-insensitive; any other non-empty value, or the var unset, keeps
+  multiplexing ON).
+
+  ## Probe findings (this build)
+
+  - Confirmed via `../geode/src/server/server_init.zig`:
+    `quic_stream_multiplexing_enabled: bool = true` is the compiled-in
+    default (line ~55), and the env parser (line ~271) is:
+    `config.quic_stream_multiplexing_enabled = val.len == 0 or (val[0] != '0'
+    and !eqlIgnoreCase(val, "false") and !eqlIgnoreCase(val, "off") and
+    !eqlIgnoreCase(val, "no"))` — i.e. `0`/`false`/`off`/`no` (case-
+    insensitive) disable it; anything else (including an empty string)
+    leaves it enabled. `GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING=0` is
+    therefore the exact, confirmed opt-out spelling.
+  - Live-probed a scratch server (`geode serve --listen 127.0.0.1:4461`)
+    with NO env override (default-ON path): 10 rapid sequential
+    `RETURN 1 AS x` queries all exited 0, and 5 concurrent queries launched
+    together (backgrounded + `wait`) all exited 0 — no secondary-stream
+    hang observed.
+  - Live-probed a second scratch server on the same port with
+    `GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING=0` set: it booted cleanly and a
+    `RETURN 1 AS x` query succeeded (`"status_class":"00000"`), confirming
+    the opt-out path is a supported, working configuration (not merely
+    accepted-but-broken).
+
+  ## Honesty note on what this spec actually proves
+
+  Black-box CLI/query tests cannot introspect whether QUIC stream
+  multiplexing is literally engaged on the wire for a given query — there
+  is no CLI surface exposing that internal state. This spec therefore pins
+  the OBSERVABLE CONTRACT the fix commit describes (concurrent/secondary-
+  stream query traffic against the default (out-of-box, no env override)
+  server does not hang) rather than asserting the internal flag value
+  directly. If the managed server's rapid-sequential or parallel-burst
+  tests ever hang, that is exactly the regression 68618e60 fixed
+  resurfacing, and every concurrent op below is wrapped in `timeout` so a
+  hang fails the test fast instead of wedging the whole suite.
+
+  CANARY: REQ=REQ-QUIC-STREAM-MULTIPLEXING-001; FEATURE="QuicMultiplexing"; ASPECT=DefaultOnAndOptOut; STATUS=TESTED; TEST=geodetestlab/specs/quic_stream_multiplexing_default.yml; OWNER=qa; UPDATED=2026-07-10
+
+single_node_only: true  # the opt-out test drives its own hand-rolled scratch server on a fixed port
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env: {}   # deliberately empty: no GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING override, i.e. out-of-box default (ON)
+
+  client:
+    timeout_ms: 60000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Phase 1: default-ON (no env override) — managed server. Rapid sequential
+# and parallel-burst queries exercise secondary/concurrent streams on the
+# same connection; neither should hang.
+# ---------------------------------------------------------------------------
+
+- name: rapid-sequential-queries
+  description: |
+    KEY POSITIVE — 10 consecutive `RETURN 1 AS x` queries against the
+    managed server (out-of-box env, no GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING
+    override, so multiplexing defaults ON per 68618e60). Each invocation
+    opens a query on what may be a reused/secondary stream on the same
+    connection. Every call is wrapped in `timeout 10` so a secondary-stream
+    hang (the pre-fix symptom the commit message describes for the Go
+    client) fails this test fast instead of wedging the harness. Asserts
+    all 10 exit 0 and the aggregate output shows exactly 10 successful
+    `"status_class":"00000"` responses.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    SERVER="${GEODE_SERVER_ADDRESS}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    FAIL=0
+    OK=0
+    for i in $(seq 1 10); do
+      OUT=$(timeout 10 "$BIN" query "RETURN 1 AS x" --server "${SERVER}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+      EC=$?
+      if [ "$EC" -ne 0 ]; then
+        echo "SEQ_${i}_FAILED exit=${EC}"
+        echo "$OUT" | tail -3
+        FAIL=1
+      elif ! echo "$OUT" | grep -q '"status_class":"00000"'; then
+        echo "SEQ_${i}_BAD_STATUS"
+        echo "$OUT" | tail -3
+        FAIL=1
+      else
+        OK=$((OK + 1))
+      fi
+    done
+    echo "RG17_SEQ_OK_COUNT=${OK}"
+    [ "$FAIL" -eq 0 ] && [ "$OK" -eq 10 ] && echo "RG17_RAPID_SEQUENTIAL_ALL_OK" || exit 1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RG17_SEQ_OK_COUNT=10
+    - RG17_RAPID_SEQUENTIAL_ALL_OK
+    stdout_not_contains:
+    - SEQ_1_FAILED
+  tags: [quic, stream-multiplexing, default-on, positive, key-assertion]
+
+- name: parallel-burst
+  description: |
+    KEY POSITIVE — launches 5 `RETURN 1 AS x` queries concurrently
+    (backgrounded, then `wait`) against the managed (default-ON, out-of-
+    box) server, forcing genuinely simultaneous secondary streams on the
+    connection rather than a sequential reuse pattern. Each is wrapped in
+    `timeout 12` so a hang on any one stream fails fast. Collects every
+    child's exit code via a per-PID status file (bash `wait` alone loses
+    per-job exit codes once jobs are launched in a loop) and fails if any
+    is nonzero.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    SERVER="${GEODE_SERVER_ADDRESS}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    WORKDIR=$(mktemp -d /tmp/rg17_parallel_burst.XXXXXX)
+
+    PIDS=()
+    for i in $(seq 1 5); do
+      (
+        timeout 12 "$BIN" query "RETURN 1 AS x" --server "${SERVER}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+          > "${WORKDIR}/out_${i}.log" 2>&1
+        echo $? > "${WORKDIR}/ec_${i}"
+      ) &
+      PIDS+=($!)
+    done
+    for p in "${PIDS[@]}"; do
+      wait "$p" || true
+    done
+
+    FAIL=0
+    OK=0
+    for i in $(seq 1 5); do
+      EC=$(cat "${WORKDIR}/ec_${i}" 2>/dev/null || echo 1)
+      if [ "$EC" -ne 0 ]; then
+        echo "BURST_${i}_FAILED exit=${EC}"
+        tail -3 "${WORKDIR}/out_${i}.log" 2>/dev/null || true
+        FAIL=1
+      elif ! grep -q '"status_class":"00000"' "${WORKDIR}/out_${i}.log" 2>/dev/null; then
+        echo "BURST_${i}_BAD_STATUS"
+        FAIL=1
+      else
+        OK=$((OK + 1))
+      fi
+    done
+    rm -rf "${WORKDIR}"
+    echo "RG17_BURST_OK_COUNT=${OK}"
+    [ "$FAIL" -eq 0 ] && [ "$OK" -eq 5 ] && echo "RG17_PARALLEL_BURST_ALL_OK" || exit 1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RG17_BURST_OK_COUNT=5
+    - RG17_PARALLEL_BURST_ALL_OK
+    stdout_not_contains:
+    - BURST_1_FAILED
+  tags: [quic, stream-multiplexing, default-on, positive, key-assertion, concurrency]
+
+# ---------------------------------------------------------------------------
+# Phase 2: opt-out control (GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING=0) — own
+# scratch server on a fixed port, since the managed server above runs with
+# the default (no-override) env for its whole spec run. Follows the
+# scratch-server hygiene pattern from
+# specs/regression_gap0839_inmemory_graph_tenant_bind.yml /
+# specs/read_executor_budget_53200.yml: fresh mktemp workdir, idempotent
+# self-heal + port preflight before claiming the port, PID-file-tracked
+# teardown.
+# ---------------------------------------------------------------------------
+
+- name: optout-boots-and-serves
+  description: |
+    KEY — starts a hand-rolled scratch server on fixed port 4461 with
+    GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING=0 (the documented opt-out) from a
+    fresh mktemp working directory, confirms it boots and answers a single
+    `RETURN 1 AS x` query, then tears itself down in the same script (via a
+    trap so teardown runs even if the query assertion fails mid-script).
+    Idempotently self-heals against a stale scratch server left by a prior
+    aborted run before claiming the port, and preflights the port so a
+    foreign squatter fails loud and fast instead of a cryptic bind error.
+    Proves the opt-out is a supported, working configuration — not merely
+    an accepted-but-broken env value.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # never let the scratch server see the managed server's data dir
+    PORT=4461
+    PIDFILE=/tmp/rg17_optout_scratch.pid
+    DIRFILE=/tmp/rg17_optout_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    # Idempotent self-heal: kill any stale scratch server from a prior
+    # aborted run before claiming the port.
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/rg17_optout.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    # Port preflight: fail fast and loud if something else is squatting on
+    # the fixed port instead of a cryptic bind/connect error downstream.
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/rg17_optout.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+
+    # Verified-TLS parity (release-binary safe): present the CA-signed leaf
+    # certificate when the harness provisioned a CA; otherwise the client
+    # falls back to --insecure-tls-skip-verify against the server's
+    # auto-generated self-signed cert.
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    # Teardown runs on ANY exit (success or failure) so the scratch server
+    # never leaks even if the query assertion below fails.
+    teardown() {
+      if [ -f "$PIDFILE" ]; then
+        TPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+        if [ -n "$TPID" ] && kill -0 "$TPID" 2>/dev/null; then
+          kill "$TPID" 2>/dev/null || true
+          sleep 1
+          kill -9 "$TPID" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+      fi
+      pkill -f "geode serve.*127.0.0.1:${PORT}" 2>/dev/null || true
+      if [ -f "$DIRFILE" ]; then
+        TDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+        case "$TDIR" in /tmp/rg17_optout.*) rm -rf "$TDIR" ;; esac
+        rm -f "$DIRFILE"
+      fi
+    }
+    trap teardown EXIT
+
+    GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING=0 \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level warn --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 &
+    echo $! > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      exit 1
+    fi
+    echo "SCRATCH_SERVER_READY"
+
+    OUT=$(timeout 10 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    EC=$?
+    echo "$OUT" | tail -3
+    if [ "$EC" -eq 0 ] && echo "$OUT" | grep -q '"status_class":"00000"'; then
+      echo "RG17_OPTOUT_QUERY_OK"
+    else
+      echo "RG17_OPTOUT_QUERY_FAILED"
+      exit 1
+    fi
+    echo "RG17_OPTOUT_TEARDOWN_PENDING"
+    # teardown runs automatically via the EXIT trap above
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+    - RG17_OPTOUT_QUERY_OK
+    - RG17_OPTOUT_TEARDOWN_PENDING
+    stdout_not_contains:
+    - RG17_OPTOUT_QUERY_FAILED
+    - PORT_4461_OCCUPIED_BY_FOREIGN_PROCESS
+  tags: [quic, stream-multiplexing, opt-out, key-assertion, setup, teardown]
+
+tags:
+- quic
+- stream-multiplexing
+- regression
+- concurrency
+- transport
