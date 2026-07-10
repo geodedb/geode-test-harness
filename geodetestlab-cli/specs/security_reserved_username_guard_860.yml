@@ -1,0 +1,181 @@
+version: '1.0'
+name: Reserved-Username Guard — CREATE USER and auth-bypass prevention (#860)
+description: |
+  Pins the NEW-8 reserved-username guard (geode security issue #860),
+  closed across three commits:
+
+    - 0b367c70 — closes the principal-envelope auth-bypass. Gates the
+      envelope-trust decision behind shouldTrustEnvelope(), which trusts
+      ONLY the "geode-cluster" federation identity. Adds
+      user_management.RESERVED_USERNAMES = &.{"geode-cluster"} and
+      enforces it in createUser()/createUserWithHash() — without this
+      reservation an attacker could `CREATE USER "geode-cluster"`,
+      authenticate normally, and impersonate the federation node to
+      bypass the envelope-trust gate entirely.
+    - fcd30e62 — closes the residual bypass in loader/bootstrap paths:
+      lookupPersistentAuthUser, listPersistentAuthUsers,
+      loadAllUsersFromResolver, and bootstrapDefaultAdmin (server/main.zig,
+      user_management.zig, auth_graph_manager.zig) all now skip/reject
+      "geode-cluster" before it can be seeded into user_store from disk
+      or persisted via GEODE_ADMIN_USERNAME misconfiguration.
+    - 6e88807e — defense-in-depth: AuthGraphManager.createUser (the
+      lower-level graph-persistence function reached via
+      user_management.createUser -> persistent_writer.create_fn ->
+      writerCreateUser) also checks RESERVED_USERNAMES directly, so a
+      future direct call site cannot re-open the graph-persistence half
+      of the bypass.
+
+  Source of truth: user_management.zig defines exactly ONE reserved
+  name — RESERVED_USERNAMES: []const []const u8 = &.{"geode-cluster"}
+  (line 79) — checked with exact std.mem.eql byte comparison (no
+  case-folding, no prefix/substring matching). This spec exercises that
+  single entry; it does not invent additional reserved names.
+
+  Wire behavior note (probed against a live server): `CALL
+  geode.auth.user_create(...)` — the procedure both `user create` (via
+  the harness's CLI-arg-to-CALL conversion, GAP-0270) and `CREATE USER`
+  DDL route through — reports failures as status_class 00000 with a
+  `status` column of `"error: <ErrorName>"` in the result row, NOT as a
+  nonzero process exit code (matching the existing `already exists` /
+  `built-in` pattern in geode_auth_ddl.yml). The guard is therefore
+  verified via stdout content, not exit code, for the CREATE USER path.
+  `auth login` against a name that was never actually created (because
+  the guard refused it) fails at the transport/session layer instead,
+  which DOES set a nonzero exit code with the standard generic
+  "Invalid username or password" message — the same message an
+  incorrect password produces, so the guard does not leak whether
+  "geode-cluster" exists as a distinct identity.
+
+  Scenario:
+    1. CREATE USER on the reserved federation identity ("geode-cluster")
+       must be refused — status column carries "error: ReservedUsername",
+       exit_code 0, and the success marker "created" must NOT appear.
+    2. `auth login` as "geode-cluster" (a password chosen to match what
+       the refused create attempt would have set) must be rejected with
+       the generic invalid-credentials error and a nonzero exit code —
+       confirming the reserved identity was never persisted as a usable
+       credential, i.e. no auth-bypass via a reserved principal.
+    3. Positive control: an ordinary user ("rg8_normal") creates and logs
+       in successfully, proving the guard is scoped to the reserved name
+       and does not collaterally block normal CREATE USER / auth flows.
+
+  CANARY: REQ=REQ-SEC-RESERVED-USERNAME-001; FEATURE="ReservedUsernameGuard"; ASPECT=CreateUserRejection; STATUS=TESTED; TEST=geodetestlab/specs/security_reserved_username_guard_860.yml; OWNER=security; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: create-reserved-user-refused-geode-cluster
+  description: |
+    KEY NEGATIVE — CREATE USER on the reserved federation identity
+    "geode-cluster" (the sole entry in RESERVED_USERNAMES,
+    user_management.zig:79) must be refused. The CALL procedure reports
+    the rejection as a status-column error (exit_code 0 per the wire
+    contract — see description), not a process failure, so this asserts
+    on stdout content: the ReservedUsername error name must appear and
+    the "created" success marker must NOT appear. If this ever regresses
+    (create succeeds), the federation identity becomes forgeable and the
+    principal-envelope trust gate (0b367c70) can be bypassed by an
+    attacker who creates a normal user named "geode-cluster" and
+    authenticates through it.
+  args:
+  - user
+  - create
+  - geode-cluster
+  - reserved@test.example.com
+  - --password
+  - ReservedGuard_Pass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - error: ReservedUsername
+    - geode-cluster
+    stdout_not_contains:
+    - created
+  tags: [reserved-username, security, negative, key-assertion]
+
+- name: auth-as-reserved-rejected
+  description: |
+    NEGATIVE — since the create above must have been refused,
+    "geode-cluster" was never persisted with a usable credential.
+    `auth login` as "geode-cluster" must therefore fail at the
+    transport/session layer with a nonzero exit code and the standard
+    generic invalid-credentials message (the same message a wrong
+    password produces for a real user — no existence leak). This is the
+    auth-bypass check: if this ever logged in successfully, an attacker
+    would hold a session authenticated as the federation identity and
+    could ride the principal-envelope trust gate (0b367c70).
+  args:
+  - auth
+  - login
+  - --user
+  - geode-cluster
+  - --password
+  - ReservedGuard_Pass_2026!
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Invalid username or password
+    stdout_not_contains:
+    - Successfully authenticated
+  tags: [reserved-username, security, negative, auth-bypass, key-assertion]
+
+- name: ordinary-user-ok
+  description: |
+    POSITIVE CONTROL — an ordinary, non-reserved username must create
+    successfully. Proves the guard is scoped to the exact reserved name
+    and does not collaterally reject normal CREATE USER traffic.
+  args:
+  - user
+  - create
+  - rg8_normal
+  - normal@test.example.com
+  - --password
+  - NormalUser_Pass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - created rg8_normal
+  tags: [reserved-username, security, positive-control, setup]
+
+- name: ordinary-user-login-succeeds
+  description: |
+    POSITIVE CONTROL (end-to-end) — the ordinary user created above can
+    authenticate normally, confirming the reserved-username guard has no
+    collateral effect on real auth flows.
+  args:
+  - auth
+  - login
+  - --user
+  - rg8_normal
+  - --password
+  - NormalUser_Pass_2026!
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [reserved-username, security, positive-control]
+
+tags:
+- security
+- reserved-username
+- authn
+- auth-bypass
