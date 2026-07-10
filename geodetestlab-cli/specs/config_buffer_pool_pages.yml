@@ -1,0 +1,365 @@
+version: '1.0'
+name: GEODE_BUFFER_POOL_PAGES override boots + serves; garbage value falls back cleanly (geode 1b9ee266)
+description: |
+  Pins geode commit 1b9ee266 ("fix(read): make engine buffer pool size
+  operator-configurable via GEODE_BUFFER_POOL_PAGES"). Before this commit
+  the `buffer_pool_pages` field passed to `StorageAdapter.init` in
+  `initGlobalAdapter` was always the `GraphConfig` default (1024 pages /
+  8 MB), giving operators no lever to size the engine page cache for large
+  working sets. The fix reads `GEODE_BUFFER_POOL_PAGES` via the existing
+  `envU64(name, default)` helper (`../geode/src/graph_store.zig:14245`) and
+  wires it into `GraphConfig.buffer_pool_pages`
+  (`../geode/src/graph_store.zig`, `initGlobalAdapter`). Default behavior
+  (no env var set) is unchanged: 1024 pages.
+
+  ## Probe findings (source read + live scratch-server probe, port 4463/4464)
+
+  - Env var confirmed EXACTLY `GEODE_BUFFER_POOL_PAGES`. Default 1024
+    pages (8 MB at the default 8 KB page size); commit message notes
+    values above 65536 exceed the auto-size cap for RAM-rich environments.
+  - `envU64` implementation (`../geode/src/graph_store.zig:14245-14251`):
+    ```
+    fn envU64(name: [*:0]const u8, default: u64) u64 {
+        if (std.c.getenv(name)) |raw_z| {
+            const raw = std.mem.span(raw_z);
+            return std.fmt.parseInt(u64, raw, 10) catch default;
+        }
+        return default;
+    }
+    ```
+    A non-numeric value hits `std.fmt.parseInt(...) catch default` — this
+    is a clean, in-process catch, NOT a thrown/propagated error and NOT a
+    startup config-validation gate. There is no separate "reject the whole
+    process" path for a bad buffer-pool value: the CONTRACT here is
+    silent fallback to the 1024 default, confirmed live below.
+  - Live-probed a scratch server (port 4463) with
+    `GEODE_BUFFER_POOL_PAGES=8192`: server booted cleanly
+    (`[startup] server ready`) and a full create/read/update/delete cycle
+    on `RG19_N` nodes round-tripped correctly. Killed (SIGTERM) and
+    restarted against the same data dir with the same override still set:
+    the previously-created node was still present and readable — ordinary
+    WAL/checkpoint persistence, unaffected by the pool-size knob.
+  - Live-probed `GEODE_BUFFER_POOL_PAGES=garbage` (non-numeric) on a fresh
+    scratch server (ports 4463 and 4464, separate runs): the server BOOTS
+    NORMALLY (`[startup] server ready (484ms total)` observed), accepts
+    connections, and serves `RETURN 1 AS x` plus a CREATE/count(n) round
+    trip on `RG19_Garbage` nodes correctly — i.e. it silently falls back
+    to the 1024-page default and behaves exactly like a normal server.
+    A `timeout 6 ... serve ...` run confirmed the process stays alive
+    handling requests until an external SIGTERM (sent via `timeout`'s own
+    signal), then shuts down cleanly through the normal
+    "draining 0 connections" -> "data flush complete" path. The only
+    output on exit was this build's known DebugAllocator leaked-address
+    report (an established debug-build teardown artifact seen elsewhere
+    in this suite, e.g. `regression_sigterm_bounded_shutdown_0039.yml`'s
+    probe notes) — NOT a panic, NOT a segfault, NOT a stack unwind from an
+    unhandled error. No live 1b9ee266 regression observed: garbage falls
+    back gracefully, exactly as the fixing commit's "Bad/missing values
+    fall back to 1024" note describes.
+
+  ## Honesty note on what this spec actually proves
+
+  `buffer_pool_pages` sizes an internal engine page cache; there is no
+  black-box way to observe "the pool really has N pages" from the CLI/GQL
+  surface this harness drives. This spec therefore pins the OBSERVABLE
+  contract only: (1) the server accepts a `GEODE_BUFFER_POOL_PAGES`
+  override, boots, and serves a full CRUD cycle correctly under it, and
+  that data survives a graceful restart with the override still applied;
+  (2) a garbage (non-numeric) value does not crash/panic the server — it
+  falls back to the default and continues to serve correctly. It does
+  NOT and CANNOT assert the actual configured pool size in pages.
+
+  CANARY: REQ=REQ-CONFIG-BUFFER-POOL-PAGES-001; FEATURE="BufferPoolConfig"; ASPECT=OverrideAndFallback; STATUS=TESTED; TEST=geodetestlab/specs/config_buffer_pool_pages.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_BUFFER_POOL_PAGES: '8192'
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Phase 1 (KEY, positive): the managed server is running with
+# GEODE_BUFFER_POOL_PAGES=8192 the whole spec — a full CRUD cycle on
+# RG19_N nodes must all be green, proving the override boots the server
+# and it serves correctly under it.
+# ---------------------------------------------------------------------------
+
+- name: crud-under-override-create
+  description: |
+    KEY — create an RG19_N node while the managed server runs with
+    GEODE_BUFFER_POOL_PAGES=8192. A bad wire-up of the override (e.g. a
+    crash on a non-default pool size) would fail here first.
+  query: "CREATE (:RG19_N {id: 1, val: 'alpha'})"
+  expected:
+    exit_code: 0
+  tags: [config, buffer-pool-pages, crud, key-assertion]
+
+- name: crud-under-override-read
+  description: Read back the node created above; confirms basic read path under the override.
+  query: "MATCH (n:RG19_N {id: 1}) RETURN n.val AS val"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":"alpha"'
+  tags: [config, buffer-pool-pages, crud]
+
+- name: crud-under-override-update
+  description: Update the node's property under the override.
+  query: "MATCH (n:RG19_N {id: 1}) SET n.val = 'beta'"
+  expected:
+    exit_code: 0
+  tags: [config, buffer-pool-pages, crud]
+
+- name: crud-under-override-read-after-update
+  description: Confirm the update round-tripped under the override.
+  query: "MATCH (n:RG19_N {id: 1}) RETURN n.val AS val"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":"beta"'
+  tags: [config, buffer-pool-pages, crud]
+
+- name: crud-under-override-delete
+  description: Delete the node under the override.
+  query: "MATCH (n:RG19_N {id: 1}) DETACH DELETE n"
+  expected:
+    exit_code: 0
+  tags: [config, buffer-pool-pages, crud]
+
+- name: crud-under-override-verify-deleted
+  description: |
+    Verify the delete took effect — closes the CRUD cycle. All five
+    crud-under-override-* tests passing green is the "override boots +
+    serves" proof for this spec.
+  query: "MATCH (n:RG19_N {id: 1}) RETURN count(n) AS cnt"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":0'
+  tags: [config, buffer-pool-pages, crud]
+
+# ---------------------------------------------------------------------------
+# Phase 2: restart the managed server (same data dir, cleanup: false,
+# same GEODE_BUFFER_POOL_PAGES=8192 env from cli.server.env) and confirm
+# data survives — ordinary WAL/checkpoint persistence is unaffected by the
+# pool-size override.
+# ---------------------------------------------------------------------------
+
+- name: seed-before-restart
+  description: Seed a node to verify persistence across a restart under the override.
+  query: "CREATE (:RG19_N {id: 2, val: 'survives'})"
+  expected:
+    exit_code: 0
+  tags: [config, buffer-pool-pages, restart, setup]
+
+- name: restart-server-under-override
+  description: |
+    Graceful restart of the managed server against the same data dir
+    (cleanup: false) with GEODE_BUFFER_POOL_PAGES=8192 still set via
+    cli.server.env. Proves the override survives a server lifecycle
+    restart, not just first boot.
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RESTART
+  tags: [config, buffer-pool-pages, restart]
+
+- name: survives-restart-verify
+  description: |
+    KEY — the node seeded before the restart must still be readable after
+    reopen under the same buffer-pool override. Confirms the override does
+    not corrupt or lose data across a restart cycle.
+  query: "MATCH (n:RG19_N {id: 2}) RETURN n.val AS val"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":"survives"'
+  tags: [config, buffer-pool-pages, restart, key-assertion]
+
+# ---------------------------------------------------------------------------
+# Phase 3 (negative -> graceful): GEODE_BUFFER_POOL_PAGES=garbage on a
+# scratch server. Probed live (see description above): envU64's
+# `parseInt(...) catch default` means a non-numeric value falls back
+# silently to the 1024-page default — the server boots normally and
+# serves queries correctly. This test asserts exactly that observed
+# contract: boots + serves, with NO panic/segfault/crash text anywhere
+# in the captured server log. Follows the established scratch-server
+# hygiene pattern (fresh mktemp workdir, idempotent self-heal + port
+# preflight, PID-file/trap-tracked teardown, no self-matching pkill
+# pattern) from regression_sigterm_bounded_shutdown_0039.yml /
+# read_executor_budget_53200.yml.
+# ---------------------------------------------------------------------------
+
+- name: garbage-value-fallback
+  description: |
+    Starts a scratch server on a fixed port with
+    GEODE_BUFFER_POOL_PAGES=garbage (non-numeric). Probed contract:
+    envU64's parseInt(...) catch default means this falls back silently
+    to the 1024-page default rather than rejecting startup with a config
+    error — asserted here as SCRATCH_SERVER_READY plus a successful
+    query/CRUD round trip on RG19_Garbage nodes. The bug-rule tripwire is
+    the absence of panic/segfault/crash markers in the captured server
+    log; this is NOT asserting the internal pool size (unobservable from
+    the CLI/GQL surface), only that a garbage override does not crash the
+    process and the server continues to serve correctly.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # never let the scratch server see the managed server's data dir
+    PORT=4463
+    PIDFILE=/tmp/rg19_garbage_scratch.pid
+    DIRFILE=/tmp/rg19_garbage_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    # Idempotent self-heal: kill any stale scratch server from a prior
+    # aborted run before claiming the port.
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/rg19_garbage.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    # Port preflight: fail fast and loud if something else is squatting on
+    # the fixed port instead of a cryptic bind/connect error downstream.
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/rg19_garbage.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+
+    # Verified-TLS parity (release-binary safe): present the CA-signed leaf
+    # certificate when the harness provisioned a CA; otherwise the client
+    # falls back to --insecure-tls-skip-verify against the server's
+    # auto-generated self-signed cert.
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_BUFFER_POOL_PAGES=garbage \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level info --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 < /dev/null &
+    SPID=$!
+    echo "$SPID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      kill -9 "$SPID" 2>/dev/null || true
+      rm -f "$PIDFILE"
+      case "$WORKDIR" in /tmp/rg19_garbage.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+      exit 1
+    fi
+    echo "SCRATCH_SERVER_READY"
+
+    # CRUD round trip under the garbage override — proves it's serving
+    # correctly, not just accepting a health-check ping.
+    CRUD_OK=1
+    timeout 10 "$BIN" query "CREATE (:RG19_Garbage {id: 1, val: 'fallback'})" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1 || CRUD_OK=0
+    COUNT_OUT=$(timeout 10 "$BIN" query "MATCH (n:RG19_Garbage) RETURN count(n) AS cnt" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>/dev/null || echo "QUERY_FAILED")
+    case "$COUNT_OUT" in
+      *'"cnt":1'*) ;;
+      *) CRUD_OK=0 ;;
+    esac
+
+    if [ "$CRUD_OK" -eq 1 ]; then
+      echo "GARBAGE_VALUE_FALLBACK_SERVED_OK"
+    else
+      echo "GARBAGE_VALUE_CRUD_FAILED"
+      echo "$COUNT_OUT"
+    fi
+
+    # Graceful shutdown (SIGTERM, not SIGKILL) to capture the exit path in
+    # the log for the crash/panic tripwire check below.
+    kill -TERM "$SPID" 2>/dev/null || true
+    for i in $(seq 1 100); do
+      kill -0 "$SPID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$SPID" 2>/dev/null || true
+
+    # Bug-rule tripwire: a genuine 1b9ee266 regression would show up here
+    # as a panic/segfault/unhandled-error trace instead of the normal
+    # shutdown sequence. DebugAllocator leak-address reports on exit are a
+    # known, unrelated debug-build teardown artifact (see
+    # regression_sigterm_bounded_shutdown_0039.yml probe notes) — NOT a
+    # crash signature — so they are deliberately not matched below.
+    if grep -qiE "panic|segmentation fault|segfault|SIGSEGV|SIGABRT|unhandled error|stack trace" "$WORKDIR/server.log"; then
+      echo "CRASH_SIGNATURE_DETECTED_IN_LOG"
+      cat "$WORKDIR/server.log"
+    else
+      echo "NO_CRASH_SIGNATURE"
+    fi
+
+    rm -f "$PIDFILE"
+    case "$WORKDIR" in /tmp/rg19_garbage.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+
+    [ "$READY" -eq 1 ] && [ "$CRUD_OK" -eq 1 ]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+    - GARBAGE_VALUE_FALLBACK_SERVED_OK
+    - NO_CRASH_SIGNATURE
+    stdout_not_contains:
+    - SCRATCH_SERVER_TIMEOUT
+    - PORT_4463_OCCUPIED_BY_FOREIGN_PROCESS
+    - GARBAGE_VALUE_CRUD_FAILED
+    - CRASH_SIGNATURE_DETECTED_IN_LOG
+  tags: [config, buffer-pool-pages, negative, garbage-value, key-assertion]
+
+tags:
+- config
+- buffer-pool-pages
+- gap-1b9ee266
+- regression
