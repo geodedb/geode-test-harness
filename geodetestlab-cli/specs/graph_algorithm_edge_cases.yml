@@ -1,0 +1,434 @@
+version: '1.0'
+name: Graph Algorithm Edge Cases — disconnected / DAG / empty-graph / unsatisfiable-filter boundaries
+description: |
+  geode_graph_algorithms.yml and geode_advanced_math_algorithms.yml are
+  positive-only: shortestPath, allShortestPaths, variable-length paths, and
+  the `detect-cycles` pattern (`MATCH p = (n)-[*]-(n) WHERE length(p) > 0`)
+  are only ever exercised over small, fully-connected, real-path-having
+  graphs. Neither spec probes what happens at the algorithm boundaries: a
+  shortestPath query across two DISCONNECTED components, cycle detection
+  over a genuine DAG (no cycle), an algorithm call against a fresh label
+  with ZERO nodes, or a variable-length path with an impossible property
+  filter. This spec adds those four boundary cases plus the anomalies and
+  a real bug discovered while probing them.
+
+  Probed LIVE on a scratch server (geode serve --listen 127.0.0.1:4486
+  --data-dir /tmp/probe-p19, GEODE_ADMIN_PASSWORD=GeodeTestPassword123!,
+  killable with -9) before shipping any query below. Graph: P19_Node with
+  three WEAKLY-CONNECTED components — {A-B-C} (a chain, P19_EDGE, weighted)
+  and {X-Y} (a second chain, P19_EDGE, disconnected from the first) prove
+  the disconnected-component case; {F,G,H} (P19_DAG: F->G, G->H, F->H — a
+  genuine acyclic DAG, verified by exhaustive path enumeration) proves the
+  DAG/no-cycle case.
+
+  `geode query` always exits 0 for GQL-level outcomes; every case below is
+  exit_code 0. Real signal comes from the JSON body, asserted via
+  stdout_contains (never the dead/unwired `geode_query:`/`row_count:`
+  block — checks.py has no such assertion type; see assertions.py's own
+  module docstring, which says as much).
+
+  KEY findings (probed reality, not assumption):
+
+    - disconnected-shortest-path: `MATCH p = shortestPath((a)-[*]-(b)) ...`
+      across two DISCONNECTED components does NOT return 0 rows. It
+      returns exactly 1 row with `p` bound to NULL (Neo4j-style
+      "no path found" semantics), and `length(NULL)` evaluates to `0`
+      (not NULL and not an error) — LIMITATION-PIN, not a crash, not a
+      hang. `count(p)` over that same row correctly evaluates to 0
+      (standard NULL-exclusion in aggregates), giving a true "no path"
+      signal once you know to aggregate rather than count raw rows.
+
+    - algorithm-on-empty-graph: a plain (non-shortestPath) variable-length
+      MATCH against a label with 0 nodes ever created returns genuinely
+      0 rows (`"rows":[]`) — the expected, correct boundary behavior.
+      BUT wrapping the same empty-label query in `shortestPath(...)`
+      reproduces the exact same "1 row, p=NULL, length=0" anomaly as the
+      disconnected case above — the phantom row is a property of
+      `shortestPath()` itself, not of disconnectedness specifically.
+
+    - cycle-detect-on-dag: **REAL BUG, evidence below.** The existing
+      positive spec's own `detect-cycles` technique — reusing the same
+      pattern variable at both ends of a relationship pattern
+      (`(n)-[*]->(n)`) to mean "back to the same node" — does NOT enforce
+      that constraint at all. Over the verified-acyclic {F,G,H} DAG,
+      `MATCH p = (n:P19_Node {id:'F'})-[:P19_DAG*]->(n) RETURN count(p)`
+      returns 3 (matching the UNFILTERED total path count from F), i.e.
+      identical to what `(n)-[*]->(m)` with `m` totally unconstrained
+      would return. Every one of those 3 "paths" ends at G or H, never
+      back at F — confirmed by projecting `nodes(p)` per row. The engine
+      silently ignores the repeated-variable endpoint constraint; it does
+      NOT wrongly detect a cycle in the sense of returning a bogus loop
+      edge, but it DOES wrongly count non-cyclic paths as if the cycle
+      check passed. A DIFFERENT technique — explicit `id(n) = id(m)` in a
+      WHERE clause, checked on a non-aggregated projection — correctly
+      returns 0 rows for the same DAG, proving no cycle exists and giving
+      a working cycle-check idiom.
+
+    - unsatisfiable-filter: **REAL BUG, evidence below.** A variable-length
+      path with an impossible property filter
+      (`WHERE all(x IN r WHERE x.weight > 999)` when every real edge has
+      weight 2) correctly returns 0 rows when the result is projected
+      directly (`RETURN p` -> `"rows":[]`). But `RETURN count(p) AS total`
+      over the IDENTICAL MATCH + WHERE returns 2 — the full unfiltered
+      path count — as if the WHERE clause were never applied. This
+      reproduces for both the cycle-check query above and this filter
+      query, so it is a general defect: **aggregate functions (count) over
+      a variable-length relationship pattern silently ignore the WHERE
+      clause**, while non-aggregated projections correctly respect it.
+      This is invisible in geode_graph_algorithms.yml's own
+      `variable-length-with-filter` test because that test only asserts
+      `stdout_contains: [length]`, never a row/aggregate count. Documented
+      here as a real, reproducible wrong-result bug, not a hang or crash.
+
+  CANARY: REQ=REQ-GRAPH-ALGO-EDGE-001; FEATURE="GraphAlgorithms"; ASPECT=EdgeCases; STATUS=TESTED; TEST=geodetestlab/specs/graph_algorithm_edge_cases.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+# Build three weakly-connected components under label P19_Node:
+#   {A -> B -> C}   chain, P19_EDGE, weight 2 on every edge (component 1)
+#   {X -> Y}        chain, P19_EDGE (component 2 — disconnected from 1)
+#   {F -> G, G -> H, F -> H}  P19_DAG — genuinely acyclic (component 3)
+setup:
+- args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:P19_Node {id: 'A'})
+    CREATE (b:P19_Node {id: 'B'})
+    CREATE (c:P19_Node {id: 'C'})
+    CREATE (x:P19_Node {id: 'X'})
+    CREATE (y:P19_Node {id: 'Y'})
+    CREATE (f:P19_Node {id: 'F'})
+    CREATE (g:P19_Node {id: 'G'})
+    CREATE (h:P19_Node {id: 'H'})
+  expected:
+    exit_code: 0
+- args:
+  - query
+  - '-'
+  stdin: "MATCH (a:P19_Node {id: 'A'}), (b:P19_Node {id: 'B'}) CREATE (a)-[:P19_EDGE {weight: 2}]->(b)"
+  expected:
+    exit_code: 0
+- args:
+  - query
+  - '-'
+  stdin: "MATCH (b:P19_Node {id: 'B'}), (c:P19_Node {id: 'C'}) CREATE (b)-[:P19_EDGE {weight: 2}]->(c)"
+  expected:
+    exit_code: 0
+- args:
+  - query
+  - '-'
+  stdin: "MATCH (x:P19_Node {id: 'X'}), (y:P19_Node {id: 'Y'}) CREATE (x)-[:P19_EDGE {weight: 2}]->(y)"
+  expected:
+    exit_code: 0
+- args:
+  - query
+  - '-'
+  stdin: "MATCH (f:P19_Node {id: 'F'}), (g:P19_Node {id: 'G'}) CREATE (f)-[:P19_DAG]->(g)"
+  expected:
+    exit_code: 0
+- args:
+  - query
+  - '-'
+  stdin: "MATCH (g:P19_Node {id: 'G'}), (h:P19_Node {id: 'H'}) CREATE (g)-[:P19_DAG]->(h)"
+  expected:
+    exit_code: 0
+- args:
+  - query
+  - '-'
+  stdin: "MATCH (f:P19_Node {id: 'F'}), (h:P19_Node {id: 'H'}) CREATE (f)-[:P19_DAG]->(h)"
+  expected:
+    exit_code: 0
+
+tests:
+- name: setup-verify
+  description: |
+    Positive control — confirms all 8 nodes across the 3 weakly-connected
+    components built by the top-level `setup:` block actually exist
+    before the boundary probes below rely on them.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:P19_Node) RETURN count(n) AS total"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":8'
+  tags: [graph-algorithms, setup]
+
+- name: disconnected-shortest-path
+  description: |
+    KEY BOUNDARY — shortestPath between A (component 1) and X (component
+    2), two nodes in DIFFERENT weakly-connected components with no edge
+    path between them at all. Probed real behavior: exit 0, no crash, no
+    hang. NOT 0 rows as might be assumed — exactly 1 row is returned with
+    `p` bound to NULL, and `length(p)` evaluates to 0 (not NULL). This is
+    the real, honest "no path" signal this engine gives for shortestPath;
+    asserted as observed (LIMITATION-PIN: length(NULL)=0 rather than NULL
+    or an error is a minor surprise, but the overall shape — a null path,
+    not a bogus non-null one — is correct and safe).
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = shortestPath((a:P19_Node {id: 'A'})-[*]-(b:P19_Node {id: 'X'})) RETURN p, length(p) AS len"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"p":null'
+    - '"len":0'
+  tags: [graph-algorithms, boundary, shortest-path, disconnected, key, limitation-pin]
+
+- name: disconnected-shortest-path-aggregate-confirms
+  description: |
+    Companion to the KEY assertion above — `count(p)` over the identical
+    query correctly evaluates to 0 (aggregates exclude NULL by standard
+    semantics), giving a genuine "zero real paths found" signal on top of
+    the raw null-path row. Confirms the disconnected-component case is
+    real "no path", not a wrong non-null path.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = shortestPath((a:P19_Node {id: 'A'})-[*]-(b:P19_Node {id: 'X'})) RETURN count(p) AS total"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":0'
+  tags: [graph-algorithms, boundary, shortest-path, disconnected, key]
+
+- name: disconnected-shortest-path-rerun-confirms
+  description: |
+    Rerun with a DIFFERENT node pair from the same two disconnected
+    components (B and Y instead of A and X) — confirms the null-path/
+    length-0 result is deterministic disconnected-component behavior, not
+    a one-off tied to the specific A/X node pair.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = shortestPath((a:P19_Node {id: 'B'})-[*]-(b:P19_Node {id: 'Y'})) RETURN p, length(p) AS len"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"p":null'
+    - '"len":0'
+  tags: [graph-algorithms, boundary, shortest-path, disconnected, key]
+
+- name: cycle-detect-on-dag-samevar-technique-bug
+  description: |
+    BUG WITH EVIDENCE — the existing positive spec's own `detect-cycles`
+    idiom (geode_graph_algorithms.yml) reuses the same pattern variable at
+    both ends of a relationship pattern, `(n)-[*]->(n)`, to mean "back to
+    the same node". Applied here to the verified-acyclic {F,G,H} DAG:
+    `MATCH p = (n:P19_Node {id:'F'})-[:P19_DAG*]->(n) RETURN count(p)`
+    returns 3 — identical to the UNFILTERED total path count from F
+    (confirmed by the companion query below). Projecting `nodes(p)` per
+    row shows every one of those 3 "paths" ends at G or H, never back at
+    F. The repeated-variable endpoint constraint is silently NOT enforced
+    by the engine — it does not crash or hang, but the technique itself
+    is broken for detecting real cycles. Asserted as the REAL (wrong)
+    count, honestly, as bug evidence — NOT as a correct "cycle found"
+    result.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = (n:P19_Node {id: 'F'})-[:P19_DAG*]->(n) RETURN count(p) AS total"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":3'
+  tags: [graph-algorithms, boundary, cycle-detection, dag, bug, wrong-result]
+
+- name: cycle-detect-on-dag-samevar-technique-bug-baseline
+  description: |
+    Evidence companion — the UNFILTERED total path count from F (no
+    endpoint constraint at all) is also 3, proving the previous test's
+    `(n)-[*]->(n)` pattern applied zero additional filtering versus a
+    fully unconstrained `(n)-[*]->(m)`. This is the concrete evidence the
+    repeated-variable constraint above was silently dropped.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = (n:P19_Node {id: 'F'})-[:P19_DAG*]->(m) RETURN count(p) AS total"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":3'
+  tags: [graph-algorithms, boundary, cycle-detection, dag, bug, wrong-result]
+
+- name: cycle-detect-on-dag-correct-technique
+  description: |
+    REQUIRED BOUNDARY, correctly answered — using explicit `id(n) = id(m)`
+    comparison in a WHERE clause, checked on a NON-aggregated projection
+    (`RETURN p`, not `count(p)` — see unsatisfiable-filter-aggregate-bug
+    below for why aggregates over variable-length patterns can't be
+    trusted with a WHERE clause), correctly reports the {F,G,H} DAG has
+    NO cycle: 0 rows. This is the technique that should be used instead of
+    the broken same-variable-reuse idiom above.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = (n:P19_Node {id: 'F'})-[:P19_DAG*]->(m) WHERE id(n) = id(m) RETURN p"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [graph-algorithms, boundary, cycle-detection, dag, key]
+
+- name: algorithm-on-empty-graph
+  description: |
+    REQUIRED BOUNDARY — a variable-length path algorithm call against
+    P19_NeverCreated, a label with ZERO nodes ever created in this spec
+    (or, by convention, anywhere in the suite). Real behavior: exit 0, no
+    crash, no hang, genuinely 0 rows (`"rows":[]`) — the plain
+    (non-shortestPath) variable-length MATCH correctly returns nothing
+    when there is nothing to match, unlike the shortestPath-specific
+    phantom-null-row behavior documented next.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = (a:P19_NeverCreated)-[:P19_NEVER_EDGE*1..3]->(b:P19_NeverCreated) RETURN p"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [graph-algorithms, boundary, empty-graph, key]
+
+- name: algorithm-on-empty-graph-shortestpath-anomaly
+  description: |
+    Companion — wrapping the SAME empty-label query in shortestPath()
+    reproduces the identical "1 row, p=NULL, length=0" phantom-row anomaly
+    seen in the disconnected-component case above, confirming that
+    behavior is a property of shortestPath() itself (returns a null-path
+    row rather than 0 rows on "no path"), not something specific to
+    disconnected-but-present nodes. LIMITATION-PIN, consistent with the
+    disconnected-shortest-path finding.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = shortestPath((a:P19_NeverCreated)-[*]-(b:P19_NeverCreated)) RETURN p, length(p) AS len"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"p":null'
+    - '"len":0'
+  tags: [graph-algorithms, boundary, empty-graph, shortest-path, limitation-pin]
+
+- name: unsatisfiable-filter-satisfiable-control
+  description: |
+    Positive control — the SAME variable-length filter mechanism used
+    below (`all(x IN r WHERE x.weight ...)`), but with a condition every
+    real edge actually satisfies (weight 2 < 999). Confirms real paths
+    (A->B length 1, A->B->C length 2) are found and returned when the
+    filter is satisfiable, proving the 0-row result in the next test is a
+    genuine filter exclusion and not a broken/dead query.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = (:P19_Node {id: 'A'})-[r:P19_EDGE*1..3]->(:P19_Node) WHERE all(x IN r WHERE x.weight < 999) RETURN length(p) AS len"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"len":1'
+    - '"len":2'
+  tags: [graph-algorithms, variable-length, filter, positive-control]
+
+- name: unsatisfiable-filter
+  description: |
+    REQUIRED BOUNDARY — the identical variable-length path pattern with an
+    IMPOSSIBLE property filter (`x.weight > 999`, when every real edge has
+    weight 2). Projected directly (`RETURN p`, non-aggregated), this
+    correctly returns 0 rows (`"rows":[]`) — exit 0, no crash, no hang.
+    This is the real, correct empty result for an unsatisfiable
+    variable-length filter. See unsatisfiable-filter-aggregate-bug for why
+    this must be checked via direct projection, not `count(p)`.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = (:P19_Node {id: 'A'})-[r:P19_EDGE*1..3]->(:P19_Node) WHERE all(x IN r WHERE x.weight > 999) RETURN p"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [graph-algorithms, boundary, variable-length, filter, unsatisfiable, key]
+
+- name: unsatisfiable-filter-aggregate-bug
+  description: |
+    BUG WITH EVIDENCE — `RETURN count(p) AS total` over the IDENTICAL
+    MATCH + WHERE from unsatisfiable-filter above (impossible weight > 999
+    filter) returns 2, not 0 — the full UNFILTERED path count (confirmed
+    by unsatisfiable-filter-satisfiable-control finding exactly 2 real
+    paths). The WHERE clause is silently ignored when its result feeds an
+    aggregate over a variable-length relationship pattern, while the
+    non-aggregated projection in unsatisfiable-filter correctly respects
+    it. This reproduces the identical shape of bug seen in
+    cycle-detect-on-dag-samevar-technique-bug above (aggregate + WHERE +
+    variable-length = WHERE ignored) and is invisible in
+    geode_graph_algorithms.yml's own `variable-length-with-filter` test,
+    which never asserts a row or aggregate count. Asserted as the REAL
+    (wrong) count, honestly, as bug evidence.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH p = (:P19_Node {id: 'A'})-[r:P19_EDGE*1..3]->(:P19_Node) WHERE all(x IN r WHERE x.weight > 999) RETURN count(p) AS total"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":2'
+  tags: [graph-algorithms, boundary, variable-length, filter, bug, wrong-result]
+
+- name: server-stable-after-algo-probes
+  description: |
+    Recovery check — after all the boundary probes above (disconnected
+    shortestPath, the broken same-variable cycle-detection technique, the
+    empty-graph queries, and the unsatisfiable-filter aggregate bug), the
+    server must still answer a trivial query. Proves none of the preceding
+    algorithm-boundary paths left the server in a degraded state.
+  args:
+  - query
+  - '-'
+  stdin: "RETURN 'p19-recover' AS probe"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - p19-recover
+  tags: [graph-algorithms, recovery, server-stability]
+
+tags:
+- graph
+- algorithms
+- boundary
+- shortest-path
+- cycle-detection
+- disconnected-components
+- empty-graph
+- variable-length-path
+- regression
