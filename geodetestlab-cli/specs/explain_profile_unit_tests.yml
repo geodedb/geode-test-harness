@@ -405,11 +405,22 @@ tests:
   - merge
 
 # ---------------------------------------------------------------------------
-# GAP-0867 / GAP-0868 — truthful EXPLAIN estimates + real PROFILE wall-clock
-# timing. The geode_query: blocks above are advisory (the harness enforces
-# exit_code / stdout_contains / stdout_regex, not geode_query), so these add
-# real teeth via stdout assertions against the on-the-wire JSON. A fresh,
-# uniquely-labelled fixture pins the estimate to an exact cardinality.
+# GAP-0867 — truthful EXPLAIN estimates. The geode_query: blocks above are
+# advisory (the harness enforces exit_code / stdout_contains / stdout_regex,
+# not geode_query), so these add real teeth via stdout assertions against the
+# on-the-wire JSON. A fresh, uniquely-labelled fixture pins the estimate to an
+# exact cardinality.
+#
+# GAP-0868 scope note: GAP-0868 replaced a hard-coded time=1 placeholder in
+# statement_handlers.zig::executeProfile — reached ONLY for non-Query PROFILE
+# statements (SHOW/DDL) or reads demoted by the concrete-tenant guard. Probing
+# the release binary shows those PROFILE classes are served over the QUIC/gRPC
+# transports by the server's synthetic buildProfilePayload (profile_version 1,
+# constant per-op ns like 10/20/30), NOT by executeProfile — so GAP-0868's
+# CLOCK_MONOTONIC time_ms path is not reachable black-box and stays covered by
+# geode's test-gap0868 CI. The planned-read timing test below asserts the
+# PRE-EXISTING RuntimeTrace path (profile_version 2), which the GAP-0868 commit
+# itself documents as unaffected — it is NOT credited as GAP-0868 coverage.
 # ---------------------------------------------------------------------------
 - name: gap0867-setup-seven-nodes
   description: Seed EXACTLY 7 nodes of a unique label so the CBO estimate is deterministic
@@ -450,12 +461,16 @@ tests:
   - gap0867
   - truthful-estimate
 
-- name: gap0868-profile-real-wallclock-timing
+- name: profile-planned-read-real-timing
   description: >
-    GAP-0868 — PROFILE reports REAL monotonic wall-clock timing: total_time_ns
-    is a non-zero integer and the LabelScan op carries its own non-zero
-    time_ns, with rows=7 reflecting the actual scan output. Pre-fix the
-    fallback reported a hard-coded time=1 placeholder.
+    PROFILE on a planned-read (MATCH) reports REAL monotonic timing:
+    total_time_ns AND the profiled LabelScan op's OWN time_ns are both non-zero
+    integers (profile_version 2 RuntimeTrace), with rows=7 reflecting the actual
+    scan output — a per-op zero (a fake/placeholder timer) would fail the
+    per-op regex. NOTE: this is the PRE-EXISTING planned-read RuntimeTrace path,
+    NOT GAP-0868's executeProfile fallback (which is not reachable over network
+    transports — see the scope note above); it is not credited as GAP-0868
+    coverage.
   args:
   - query
   - '-'
@@ -468,14 +483,14 @@ tests:
     - '"op":"LabelScan"'
     stdout_regex:
     - '"total_time_ns":[1-9][0-9]*'
+    - '"time_ns":[1-9][0-9]*'
     - '"rows":7'
   tags:
   - profile
-  - gap0868
-  - wallclock-timing
+  - planned-read-timing
 
 - name: gap0867-cleanup
-  description: Remove the GAP-0867/0868 fixture nodes
+  description: Remove the GAP-0867 fixture nodes
   args:
   - query
   - '-'
