@@ -1,0 +1,213 @@
+version: '1.0'
+name: 'Shell Error Handling — Session Survives Meta/Source/Malformed Errors (REQ-SHELL-ERROR-HANDLING-001)'
+description: |
+  CANARY: REQ=REQ-SHELL-ERROR-HANDLING-001; FEATURE="Shell"; ASPECT=ErrorRecovery; STATUS=TESTED; TEST=geodetestlab/specs/shell_error_handling.yml; OWNER=qa; UPDATED=2026-07-10
+
+  Shell coverage (`shell_comprehensive_tests.yml`, `shell_source_batch.yml`,
+  `shell_reconnection.yml`, `shell_session_stability.yml`) is almost entirely
+  positive-path. This spec adds the negative/error-recovery surface: an
+  unknown meta-command, `\source` of a nonexistent file, and a malformed GQL
+  statement — each fed to a single interactive shell session via stdin, with
+  a follow-up statement in the SAME session proving the session survives.
+
+  Probing method (mirrors `shell_plain_mode.yml`'s black-box discipline):
+  plain-mode REPL (`geode shell --plain`) reads line-based stdin with no
+  terminal control sequences, so piped stdin drives the REAL REPL loop (not
+  `geode query`). Probed directly against a scratch server (port 4492,
+  `/tmp/probe-p25`) before writing any assertion below.
+
+  PROBED FINDINGS (scratch server, port 4492, 2026-07-10):
+
+  1. Meta-command prefix is `\` (or `/`); dispatch lives in
+     `src/client/repl/repl_dispatch.zig` `handleMetaCommand`. An unrecognized
+     command (`\banana`) does NOT crash or kill the session — it prints
+     `Error [GEODE-E2001]: Unknown command '\banana'` to stderr (merged into
+     the captured output here) and returns straight to the `geode>` prompt.
+     The very next line in the same stdin stream (a valid `RETURN ... AS
+     marker;`) executes normally and its result table appears.
+
+  2. `\source <missing-file>` (source_dispatch in the same file,
+     `executeSourceFile`) attempts `std.Io.Dir.cwd().openFile` on the given
+     path. When the file does not exist it prints
+     `Error [GEODE-E2005]: Cannot open file '<path>': FileNotFound` and
+     returns — again without killing the session. The subsequent query in
+     the same session still runs and returns its result.
+
+  3. A malformed/garbage GQL statement (not GQL at all, e.g.
+     `THIS IS NOT VALID GQL @#$%^;`) round-trips through the parser and
+     server, which reject it with `Error: parse error` followed by
+     `Error: QueryExecutionFailed` printed to the shell. The REPL loop does
+     not exit or hang — the next statement in the same stdin stream
+     executes and returns its result.
+
+  4. A clean session (one valid query, then `\q`) exits 0 and prints
+     `Goodbye!` — the baseline this spec's negatives are contrasted against.
+
+  Conclusion: all three probed error classes are handled gracefully by the
+  plain-mode REPL — the error is surfaced AND the session survives to
+  execute a subsequent command. No bug/limitation-pin is needed; this spec
+  asserts the real (good) behavior and would catch a regression where an
+  error class started killing the session.
+
+  Seed: none (deterministic, single-shot sessions). Prefix: `P25_`/`p25_`.
+  Runtime: Python 3.11 / geode binary (server: `../geode/zig-out/bin/geode`).
+
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir: null
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+# ---------------------------------------------------------------------------
+# 1. unknown-meta-command (KEY negative)
+# ---------------------------------------------------------------------------
+- name: unknown-meta-command
+  description: |
+    KEY negative, probed real behavior: an unrecognized backslash
+    meta-command (\banana) does not crash the shell or kill the session.
+    It prints Error [GEODE-E2001]: Unknown command '\banana' to the error
+    stream and returns to the prompt. The very next line in the SAME
+    stdin stream — a valid RETURN query — still executes and its result
+    is present in the output, proving the session survives.
+  type: bash
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$(printf '\\banana\nRETURN '"'"'P25_META_SURVIVED'"'"' AS marker;\n\\q\n' | \
+      "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" \
+        ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1); RC=$?
+    echo "$OUT" | grep -q "Error \[GEODE-E2001\]: Unknown command '\\\\banana'" || { echo "error_shown=FAIL"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "P25_META_SURVIVED" || { echo "session_survives=FAIL"; echo "$OUT"; exit 1; }
+    [ "$RC" -eq 0 ] && echo "unknown_meta=ok" || { echo "exit=FAIL rc=$RC"; echo "$OUT"; exit 1; }
+  timeout_ms: 45000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - unknown_meta=ok
+  tags:
+  - shell
+  - error-handling
+  - meta-command
+  - negative
+  - probed
+
+# ---------------------------------------------------------------------------
+# 2. source-missing-file (negative)
+# ---------------------------------------------------------------------------
+- name: source-missing-file
+  description: |
+    Negative, probed real behavior: \source of a file that does not exist
+    (/tmp/p25_nosuch.gql) does not crash or kill the session. It prints
+    Error [GEODE-E2005]: Cannot open file '...': FileNotFound and returns
+    to the prompt. The next command in the same stdin stream — a valid
+    RETURN query — still executes, proving the session survives.
+  type: bash
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    rm -f /tmp/p25_nosuch.gql
+    OUT=$(printf '\\source /tmp/p25_nosuch.gql\nRETURN '"'"'P25_SOURCE_SURVIVED'"'"' AS marker;\n\\q\n' | \
+      "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" \
+        ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1); RC=$?
+    echo "$OUT" | grep -q "Error \[GEODE-E2005\]: Cannot open file '/tmp/p25_nosuch.gql'" || { echo "error_shown=FAIL"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "P25_SOURCE_SURVIVED" || { echo "session_survives=FAIL"; echo "$OUT"; exit 1; }
+    [ "$RC" -eq 0 ] && echo "source_missing=ok" || { echo "exit=FAIL rc=$RC"; echo "$OUT"; exit 1; }
+  timeout_ms: 45000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - source_missing=ok
+  tags:
+  - shell
+  - error-handling
+  - source
+  - negative
+  - probed
+
+# ---------------------------------------------------------------------------
+# 3. malformed-query-session-survives (KEY negative)
+# ---------------------------------------------------------------------------
+- name: malformed-query-session-survives
+  description: |
+    KEY negative, probed real behavior: a garbage GQL statement (not GQL
+    at all) does not crash the shell or hang the session. The parser and
+    server reject it with Error: parse error / Error: QueryExecutionFailed
+    printed to the shell, and the REPL loop keeps running. A valid
+    RETURN query issued right after in the SAME stdin stream still
+    executes and its result is present, proving the session survives.
+  type: bash
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$(printf 'THIS IS NOT VALID GQL @#$%%^;\nRETURN '"'"'P25_MALFORMED_SURVIVED'"'"' AS marker;\n\\q\n' | \
+      "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" \
+        ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1); RC=$?
+    echo "$OUT" | grep -q "Error: parse error" || { echo "error_shown=FAIL"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "P25_MALFORMED_SURVIVED" || { echo "session_survives=FAIL"; echo "$OUT"; exit 1; }
+    [ "$RC" -eq 0 ] && echo "malformed_query=ok" || { echo "exit=FAIL rc=$RC"; echo "$OUT"; exit 1; }
+  timeout_ms: 45000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - malformed_query=ok
+  tags:
+  - shell
+  - error-handling
+  - malformed-query
+  - negative
+  - probed
+
+# ---------------------------------------------------------------------------
+# 4. exit-code-clean (positive baseline)
+# ---------------------------------------------------------------------------
+- name: exit-code-clean
+  description: |
+    Positive baseline this spec's negatives are contrasted against: a
+    clean session (one valid query, then \q) exits 0 and prints
+    "Goodbye!" — no error path involved at all.
+  type: bash
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$(printf 'RETURN '"'"'P25_CLEAN'"'"' AS marker;\n\\q\n' | \
+      "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" \
+        ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1); RC=$?
+    echo "$OUT" | grep -q "P25_CLEAN" || { echo "result=FAIL"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "Goodbye!" || { echo "goodbye=FAIL"; echo "$OUT"; exit 1; }
+    [ "$RC" -eq 0 ] && echo "exit_clean=ok" || { echo "exit=FAIL rc=$RC"; echo "$OUT"; exit 1; }
+  timeout_ms: 45000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - exit_clean=ok
+  tags:
+  - shell
+  - error-handling
+  - exit-code
+  - positive
+  - probed
