@@ -1,0 +1,233 @@
+version: '1.0'
+name: ORDER BY — Negative Paths (bad column / bad direction / mixed types / ordinal)
+description: |
+  Covers ORDER BY negative/error paths not exercised by
+  order_by_sorting_comprehensive.yml (16 tests, all happy-path): a
+  nonexistent property as sort key, an invalid direction keyword, mixed
+  incomparable types in one sort column, and an out-of-range positional
+  ordinal. `geode query` always exits 0 for GQL-level outcomes, so
+  exit_code alone proves nothing here; every case that claims a real
+  rejection is paired with stdout_not_contains '"status_class":"00000"'
+  to prove it did NOT silently succeed where an error was observed.
+
+  Probed on a scratch server (geode serve --listen 127.0.0.1:4480
+  --data-dir /tmp/probe-p13):
+
+    - nonexistent-column (`ORDER BY n.nosuch`) — LIMITATION-PIN. No error.
+      status_class 00000, `"ordered":true`, `"order_keys":["n.nosuch"]`
+      echoed back verbatim (proving the parser/planner accepted the bogus
+      property name without validating it exists), and the returned rows
+      are NOT sorted by v (5,2,8,1,9 insertion order becomes 8,9,5,2,1) —
+      i.e. every row is treated as an equal/null sort key and the result
+      falls back to a fixed internal scan order rather than erroring.
+      Verified deterministic/repeatable across two consecutive identical
+      queries.
+
+    - invalid-direction (KEY NEGATIVE, `ORDER BY n.v ASCENDING`) — genuine
+      rejection. status_class 42000, error "parse error". ASCENDING is
+      not a recognized direction keyword (only ASC/DESC are), so this is
+      a real parse-time syntax error, not a silent accept.
+
+    - mixed-incomparable-types (`ORDER BY n.v` over ints + one string) —
+      LIMITATION-PIN. No error. status_class 00000. Real observed
+      behavior is a documented total order: numeric values sort among
+      themselves ascending (2, 5, 8) and the string value sorts LAST,
+      after all numerics — not a byte-lexical comparison of JSON
+      encodings (which would put a quoted string before ASCII digits),
+      but a typed total order that groups by type. Verified deterministic
+      across the exact row sequence 2, 5, 8, "nine".
+
+    - out-of-range-ordinal (`ORDER BY 99`, only 1 return column projected)
+      — LIMITATION-PIN. No error. status_class 00000, `"ordered":true`,
+      `"order_keys":["99"]` echoed back verbatim (the literal ordinal is
+      accepted without range validation against the projected column
+      count), flagged with flagger_finding `E:OrdinalSortKey` (the SAME
+      flag emitted for a genuinely in-range `ORDER BY 1`/`ORDER BY n.v` —
+      it marks "ordinal sort key was used", not "out of range"). The
+      returned rows fall back to the identical fixed internal scan order
+      observed in nonexistent-column (8,9,5,2,1), confirming an
+      out-of-range ordinal is treated the same way as a sort key that
+      resolves to nothing: accepted, not sorted, not rejected.
+
+  CRASH FINDING (documented, NOT encoded as a test step, per the bug
+  rule — crashes are reported, never baked into a passing assertion):
+  probing `ORDER BY 0` (and, by the same code path, any non-positive
+  ordinal) reliably crashes the server. Zig panic "integer does not fit
+  in destination type" at
+  src/execution/return_and_sorting.zig:203 — `getValueForKey` computes
+  `col_idx = @intCast(key.expr.Int - 1)` on an `Int` of 0, underflowing
+  to -1 before the cast to `usize`, which panics and aborts the serving
+  thread (observed to take the whole server process down — all
+  subsequent queries on the connection then time out). This spec
+  deliberately never issues `ORDER BY 0` or any non-positive ordinal
+  literal. Candidate GAP: `ORDER BY <n>` for `n <= 0` should be a
+  clean parse/plan-time rejection (e.g. 42000 "ordinal must be
+  positive"), not an integer-underflow panic. See p13-report.md for the
+  full repro and stack trace.
+
+  CANARY: REQ=REQ-ORDERBY-NEGATIVE-001; FEATURE="OrderBy"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/order_by_negative.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: setup-create-nodes
+  description: |
+    Prerequisite (positive) — seed 5 P13_N nodes with integer v values in
+    non-sorted insertion order (5, 2, 8, 1, 9), so a subsequent ORDER BY
+    has real sorting work to do.
+  query: "CREATE (:P13_N {v:5}), (:P13_N {v:2}), (:P13_N {v:8}), (:P13_N {v:1}), (:P13_N {v:9})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [order-by, setup, positive]
+
+- name: setup-valid-orderby-works
+  description: |
+    Prerequisite (positive) — a normal, valid ORDER BY n.v ASC over the
+    seeded ints must sort correctly (1, 2, 5, 8, 9), proving the baseline
+    ORDER BY path itself works before we probe its negative edges.
+  query: "MATCH (n:P13_N) RETURN n.v ORDER BY n.v ASC"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"ordered":true'
+    stdout_regex:
+    - '"v":1\D+"v":2\D+"v":5\D+"v":8\D+"v":9\D'
+  tags: [order-by, setup, positive]
+
+- name: nonexistent-column
+  description: |
+    LIMITATION-PIN — ORDER BY n.nosuch (a property that was never set on
+    any P13_N node) does NOT error on this build. Probed real behavior:
+    status_class 00000, `"ordered":true` and `"order_keys":["n.nosuch"]`
+    echoed back verbatim — the bogus property name is accepted without
+    existence validation. Every row is treated as an equal/null sort key,
+    so the result is NOT sorted by v; it falls back to a fixed internal
+    scan order (8, 9, 5, 2, 1) rather than the insertion order (5, 2, 8,
+    1, 9) or the ascending order (1, 2, 5, 8, 9) a correct sort on an
+    existing column would produce. Verified deterministic across two
+    consecutive identical probes. This is asserted as the real (accepted)
+    behavior, not claimed as a rejection.
+  query: "MATCH (n:P13_N) RETURN n.v ORDER BY n.nosuch"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"order_keys":["n.nosuch"]'
+    stdout_regex:
+    - '"v":8\D+"v":9\D+"v":5\D+"v":2\D+"v":1\D'
+  tags: [order-by, negative, nonexistent-column, limitation-pin, silent-accept]
+
+- name: invalid-direction
+  description: |
+    KEY NEGATIVE — ORDER BY n.v ASCENDING (ASCENDING is not a recognized
+    direction keyword; only ASC/DESC are valid) must be rejected as a
+    syntax error. Probed real behavior: status_class 42000, error "parse
+    error" — a genuine parse-time rejection, not a silent-accept.
+  query: "MATCH (n:P13_N) RETURN n.v ORDER BY n.v ASCENDING"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - parse error
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [order-by, negative, invalid-direction, key-assertion]
+
+- name: mixed-incomparable-types-seed
+  description: |
+    Prerequisite (positive) — seed P13_MIX with three ints (5, 2, 8) and
+    one string ('nine') on the same property v, so ORDER BY n.v must
+    compare across incompatible types.
+  query: "CREATE (:P13_MIX {v: 5}), (:P13_MIX {v: 2}), (:P13_MIX {v: 'nine'}), (:P13_MIX {v: 8})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [order-by, setup, positive, mixed-types]
+
+- name: mixed-incomparable-types
+  description: |
+    LIMITATION-PIN — ORDER BY n.v over a mix of ints and one string does
+    NOT error on this build. Probed real behavior: status_class 00000, a
+    documented total order where numeric values sort among themselves
+    ascending (2, 5, 8) and the string value sorts LAST, after all
+    numerics: exact sequence 2, 5, 8, "nine". This is NOT a byte-lexical
+    comparison of JSON encodings (which would place a quoted string
+    before ASCII digit characters) — it is a typed total order that
+    groups by value type. Verified deterministic across repeated probes.
+    Asserted as the real (accepted) behavior, not claimed as a rejection.
+  query: "MATCH (n:P13_MIX) RETURN n.v ORDER BY n.v"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"v":2\D+"v":5\D+"v":8\D+"v":"nine"'
+  tags: [order-by, negative, mixed-types, limitation-pin, silent-accept]
+
+- name: out-of-range-ordinal
+  description: |
+    LIMITATION-PIN — ORDER BY 99 (a positional ordinal far beyond the
+    single projected return column) does NOT error on this build. Probed
+    real behavior: status_class 00000, `"ordered":true` and
+    `"order_keys":["99"]` echoed back verbatim — the literal ordinal is
+    accepted with no range validation against the projected column count.
+    It carries the flagger_finding `E:OrdinalSortKey`, the SAME flag
+    emitted for a genuinely in-range ordinal (`ORDER BY 1`) — this flag
+    marks "an ordinal sort key was used", not "out of range". The
+    returned rows fall back to the identical fixed internal scan order
+    observed in nonexistent-column above (8, 9, 5, 2, 1), confirming an
+    out-of-range ordinal is treated the same way as a sort key that
+    resolves to nothing: accepted, not sorted, not rejected. NOTE:
+    `ORDER BY 0` (and other non-positive ordinals) is NOT probed here —
+    it reliably crashes the server (integer underflow panic in
+    getValueForKey, return_and_sorting.zig:203); see the CRASH FINDING in
+    this spec's description and p13-report.md for the full repro. This
+    test is asserted as the real (accepted) behavior for a positive
+    out-of-range ordinal, not claimed as a rejection.
+  query: "MATCH (n:P13_N) RETURN n.v ORDER BY 99"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"order_keys":["99"]'
+    - 'E:OrdinalSortKey'
+    stdout_regex:
+    - '"v":8\D+"v":9\D+"v":5\D+"v":2\D+"v":1\D'
+  tags: [order-by, negative, ordinal, limitation-pin, silent-accept]
+
+- name: cleanup-test-data
+  description: Clean up all P13 test data.
+  query: "MATCH (n) WHERE n:P13_N OR n:P13_MIX DETACH DELETE n"
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- order-by
+- negative-paths
+- nonexistent-column
+- invalid-direction
+- mixed-types
+- ordinal
+- silent-accept
+- limitation-pin
