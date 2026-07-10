@@ -412,6 +412,112 @@ tests:
     - cnt
   tags: [bm25, edge, empty-corpus]
 
+  # ---------------------------------------------------------------- GAP-0869 --
+  # Real positional phrase + proximity over a persisted FTS index.
+  # These exercise CALL geode.fts.phrase / geode.fts.proximity — the GAP-0869
+  # surface that runs adjacency/NEAR against the engine's per-(term,doc) token
+  # POSITIONS (not the bag-of-words =~ predicate above). A real fulltext index
+  # is built via `CREATE INDEX ... USING fulltext` over pre-existing nodes
+  # (nodes-first ordering indexes the existing rows deterministically). Each
+  # test is a MATCH-vs-NO-MATCH discriminator that a positional-postings
+  # implementation passes and a bag-of-words stub fails.
+- name: bm25-comp-adv-setup-nodes
+  description: GAP-0869 — seed 3 docs (nodes-first so the fulltext index picks them up)
+  args: [query, '-']
+  stdin: |
+    CREATE (:Bm25Adv869 {content: 'alpha beta gamma delta epsilon'}),
+           (:Bm25Adv869 {content: 'graph database index performance'}),
+           (:Bm25Adv869 {content: 'machine learning neural deep classification'})
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [bm25, gap0869, setup]
+
+- name: bm25-comp-adv-create-idx
+  description: GAP-0869 — build a REAL fulltext index (USING fulltext) over the seeded docs
+  args: [query, '-']
+  stdin: CREATE INDEX bm25adv869 ON Bm25Adv869 (content) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [bm25, gap0869, index]
+
+- name: bm25-comp-adv-phrase-adjacent-match
+  description: >
+    GAP-0869 — phrase 'beta gamma' (tokens adjacent in doc 1) MATCHES. The
+    node column is typed INTEGER (a real hit) and the BM25 score is present.
+  args: [query, '-']
+  stdin: CALL geode.fts.phrase('bm25adv869', 'beta gamma') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_regex:
+    - '"name":"node","type":"INTEGER"'
+  tags: [bm25, gap0869, phrase, match]
+
+- name: bm25-comp-adv-phrase-reversed-nomatch
+  description: >
+    GAP-0869 — phrase 'gamma beta' (reversed order) does NOT match: no doc has
+    those tokens ADJACENT in that order. Empty binding table (node type NULL,
+    rows []) — the discriminator proving true positional adjacency, not
+    bag-of-words. A stub that ignored positions would (wrongly) match here.
+  args: [query, '-']
+  stdin: CALL geode.fts.phrase('bm25adv869', 'gamma beta') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+    stdout_regex:
+    - '"name":"node","type":"NULL"'
+  tags: [bm25, gap0869, phrase, no-match]
+
+- name: bm25-comp-adv-proximity-within-match
+  description: >
+    GAP-0869 — proximity 'alpha delta' within distance 3 MATCHES (alpha@0,
+    delta@3 in doc 1; window = 3). Real token-window NEAR over persisted
+    positions.
+  args: [query, '-']
+  stdin: CALL geode.fts.proximity('bm25adv869', 'alpha delta', 3) YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_regex:
+    - '"name":"node","type":"INTEGER"'
+  tags: [bm25, gap0869, proximity, match]
+
+- name: bm25-comp-adv-proximity-outside-nomatch
+  description: >
+    GAP-0869 — proximity 'alpha delta' within distance 2 does NOT match: the
+    covering window (3) exceeds 2. Empty binding table — proves the distance
+    bound is enforced against real positions, not a constant.
+  args: [query, '-']
+  stdin: CALL geode.fts.proximity('bm25adv869', 'alpha delta', 2) YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+    stdout_regex:
+    - '"name":"node","type":"NULL"'
+  tags: [bm25, gap0869, proximity, no-match]
+
+- name: bm25-comp-adv-teardown
+  description: GAP-0869 — drop the advanced fulltext index and its nodes
+  args: [query, '-']
+  stdin: DROP INDEX bm25adv869
+  expect:
+    exit_code: 0
+  tags: [bm25, gap0869, cleanup]
+
+- name: bm25-comp-adv-teardown-nodes
+  description: GAP-0869 — remove the advanced FTS test nodes
+  args: [query, '-']
+  stdin: MATCH (n:Bm25Adv869) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [bm25, gap0869, cleanup]
+
   # ---------------------------------------------------------------- cleanup --
 - name: bm25-comp-teardown
   description: Remove all BM25 test nodes (CANARY idempotent teardown)
