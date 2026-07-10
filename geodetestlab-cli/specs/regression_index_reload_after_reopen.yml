@@ -1,0 +1,711 @@
+version: '1.0'
+name: Regression — index-served reads correct + prompt on FIRST post-reopen query (geode GAP-ENT-0048 / GAP-0064/0065)
+description: |
+  Pins the contract that after CREATE INDEX + a clean (graceful) shutdown +
+  reopen, index-served reads — WHERE equality, GROUP BY, DISTINCT, and
+  property-pattern point seek — return CORRECT results on the VERY FIRST
+  post-reopen query and do not wedge/hang. This targets the geode
+  GAP-ENT-0048 family and the GAP-0064/0065 reopen-reload behavior: an
+  index that has not yet finished rehydrating after reopen must either
+  serve a correct answer immediately or fall back correctly — it must
+  never silently serve a stale/empty/partial answer, and it must never
+  block indefinitely (a wedge must surface as a timeout, not a hang).
+
+  This is a CLEAN shutdown reopen (graceful restart_server: true, not a
+  crash) — the contract under test is reload-on-reopen correctness, which
+  a graceful checkpoint + reopen exercises directly.
+
+  Scenario:
+    1. Seed exactly 500 RG12_P nodes via 500 individual CREATE statements
+       (k: 'key<i>', grp: i mod 5 — UNWIND/FOREACH range-seeding is not a
+       supported clause on this build per prior probes for sibling specs,
+       so a script-generated CREATE batch is used instead). CREATE INDEX
+       on RG12_P.k using the FOR (n:Label) ON (n.prop) form.
+    2. Warm checks before restart: WHERE n.k='key42' RETURN n.grp is
+       correct (key42 -> grp 42 mod 5 = 2); RETURN DISTINCT n.grp yields
+       exactly 5 rows.
+    3. Restart the managed server against the SAME data dir (cleanup:
+       false + restart_server: true) — a graceful shutdown + reopen.
+    4. KEY: MATCH (n:RG12_P) WHERE n.k='key42' RETURN n.grp is the FIRST
+       query test that runs after the restart marker — no warm-up query
+       precedes it. Must return grp:2, within a 15s timeout (a wedge must
+       fail as a timeout, not hang forever).
+    5. GROUP BY over the index-backed label: RETURN n.grp AS g,
+       count(*) AS c GROUP BY g must return exactly 5 groups, each with
+       count 100, with the group value bound to its count in the
+       assertion (avoiding an unbound-substring pitfall where a lone
+       '"c":100' could match any group).
+    6. DISTINCT over the same label: RETURN DISTINCT n.grp must still
+       return exactly 5 rows.
+    7. Point seek via inline property pattern: MATCH (n:RG12_P
+       {k:'key7'}) RETURN count(n) must return exactly 1. (Probed output
+       column name for this pattern is "count", not "count(n)" — the
+       assertion below matches the actual observed column name.)
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4454
+  --data-dir /tmp/probe-r12, with GEODE_ADMIN_PASSWORD set on FIRST boot
+  so no ALTER USER password-reset dance is needed) before/after a manual
+  graceful SIGTERM + restart on the same data dir: CREATE INDEX ... FOR
+  (n:RG12_P) ON (n.k) succeeded; count(n) held at 500; the eq-seek for
+  key42 returned grp:2 as the literal first post-restart query; GROUP BY
+  returned all 5 groups at count 100 each; DISTINCT returned exactly 5
+  rows; the point-seek pattern returned count:1 with column name "count".
+  No live regression was observed on this build.
+
+  CANARY: REQ=REQ-INDEX-RELOAD-REOPEN-001; FEATURE="IndexReload"; ASPECT=FirstReadAfterReopen; STATUS=TESTED; TEST=geodetestlab/specs/regression_index_reload_after_reopen.yml; OWNER=qa; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed-rg12-p-500
+  description: |
+    Seed exactly 500 RG12_P nodes via 500 individual CREATE statements.
+    UNWIND/FOREACH range-seeding is not a supported clause on this build
+    (per prior probes for sibling reopen specs), so a script-generated
+    CREATE batch is used instead. k = 'key<i>', grp = i mod 5, giving
+    exactly 100 nodes per grp value (0..4) across the 500 nodes.
+  query: |
+    CREATE (:RG12_P {k: 'key0', grp: 0});
+    CREATE (:RG12_P {k: 'key1', grp: 1});
+    CREATE (:RG12_P {k: 'key2', grp: 2});
+    CREATE (:RG12_P {k: 'key3', grp: 3});
+    CREATE (:RG12_P {k: 'key4', grp: 4});
+    CREATE (:RG12_P {k: 'key5', grp: 0});
+    CREATE (:RG12_P {k: 'key6', grp: 1});
+    CREATE (:RG12_P {k: 'key7', grp: 2});
+    CREATE (:RG12_P {k: 'key8', grp: 3});
+    CREATE (:RG12_P {k: 'key9', grp: 4});
+    CREATE (:RG12_P {k: 'key10', grp: 0});
+    CREATE (:RG12_P {k: 'key11', grp: 1});
+    CREATE (:RG12_P {k: 'key12', grp: 2});
+    CREATE (:RG12_P {k: 'key13', grp: 3});
+    CREATE (:RG12_P {k: 'key14', grp: 4});
+    CREATE (:RG12_P {k: 'key15', grp: 0});
+    CREATE (:RG12_P {k: 'key16', grp: 1});
+    CREATE (:RG12_P {k: 'key17', grp: 2});
+    CREATE (:RG12_P {k: 'key18', grp: 3});
+    CREATE (:RG12_P {k: 'key19', grp: 4});
+    CREATE (:RG12_P {k: 'key20', grp: 0});
+    CREATE (:RG12_P {k: 'key21', grp: 1});
+    CREATE (:RG12_P {k: 'key22', grp: 2});
+    CREATE (:RG12_P {k: 'key23', grp: 3});
+    CREATE (:RG12_P {k: 'key24', grp: 4});
+    CREATE (:RG12_P {k: 'key25', grp: 0});
+    CREATE (:RG12_P {k: 'key26', grp: 1});
+    CREATE (:RG12_P {k: 'key27', grp: 2});
+    CREATE (:RG12_P {k: 'key28', grp: 3});
+    CREATE (:RG12_P {k: 'key29', grp: 4});
+    CREATE (:RG12_P {k: 'key30', grp: 0});
+    CREATE (:RG12_P {k: 'key31', grp: 1});
+    CREATE (:RG12_P {k: 'key32', grp: 2});
+    CREATE (:RG12_P {k: 'key33', grp: 3});
+    CREATE (:RG12_P {k: 'key34', grp: 4});
+    CREATE (:RG12_P {k: 'key35', grp: 0});
+    CREATE (:RG12_P {k: 'key36', grp: 1});
+    CREATE (:RG12_P {k: 'key37', grp: 2});
+    CREATE (:RG12_P {k: 'key38', grp: 3});
+    CREATE (:RG12_P {k: 'key39', grp: 4});
+    CREATE (:RG12_P {k: 'key40', grp: 0});
+    CREATE (:RG12_P {k: 'key41', grp: 1});
+    CREATE (:RG12_P {k: 'key42', grp: 2});
+    CREATE (:RG12_P {k: 'key43', grp: 3});
+    CREATE (:RG12_P {k: 'key44', grp: 4});
+    CREATE (:RG12_P {k: 'key45', grp: 0});
+    CREATE (:RG12_P {k: 'key46', grp: 1});
+    CREATE (:RG12_P {k: 'key47', grp: 2});
+    CREATE (:RG12_P {k: 'key48', grp: 3});
+    CREATE (:RG12_P {k: 'key49', grp: 4});
+    CREATE (:RG12_P {k: 'key50', grp: 0});
+    CREATE (:RG12_P {k: 'key51', grp: 1});
+    CREATE (:RG12_P {k: 'key52', grp: 2});
+    CREATE (:RG12_P {k: 'key53', grp: 3});
+    CREATE (:RG12_P {k: 'key54', grp: 4});
+    CREATE (:RG12_P {k: 'key55', grp: 0});
+    CREATE (:RG12_P {k: 'key56', grp: 1});
+    CREATE (:RG12_P {k: 'key57', grp: 2});
+    CREATE (:RG12_P {k: 'key58', grp: 3});
+    CREATE (:RG12_P {k: 'key59', grp: 4});
+    CREATE (:RG12_P {k: 'key60', grp: 0});
+    CREATE (:RG12_P {k: 'key61', grp: 1});
+    CREATE (:RG12_P {k: 'key62', grp: 2});
+    CREATE (:RG12_P {k: 'key63', grp: 3});
+    CREATE (:RG12_P {k: 'key64', grp: 4});
+    CREATE (:RG12_P {k: 'key65', grp: 0});
+    CREATE (:RG12_P {k: 'key66', grp: 1});
+    CREATE (:RG12_P {k: 'key67', grp: 2});
+    CREATE (:RG12_P {k: 'key68', grp: 3});
+    CREATE (:RG12_P {k: 'key69', grp: 4});
+    CREATE (:RG12_P {k: 'key70', grp: 0});
+    CREATE (:RG12_P {k: 'key71', grp: 1});
+    CREATE (:RG12_P {k: 'key72', grp: 2});
+    CREATE (:RG12_P {k: 'key73', grp: 3});
+    CREATE (:RG12_P {k: 'key74', grp: 4});
+    CREATE (:RG12_P {k: 'key75', grp: 0});
+    CREATE (:RG12_P {k: 'key76', grp: 1});
+    CREATE (:RG12_P {k: 'key77', grp: 2});
+    CREATE (:RG12_P {k: 'key78', grp: 3});
+    CREATE (:RG12_P {k: 'key79', grp: 4});
+    CREATE (:RG12_P {k: 'key80', grp: 0});
+    CREATE (:RG12_P {k: 'key81', grp: 1});
+    CREATE (:RG12_P {k: 'key82', grp: 2});
+    CREATE (:RG12_P {k: 'key83', grp: 3});
+    CREATE (:RG12_P {k: 'key84', grp: 4});
+    CREATE (:RG12_P {k: 'key85', grp: 0});
+    CREATE (:RG12_P {k: 'key86', grp: 1});
+    CREATE (:RG12_P {k: 'key87', grp: 2});
+    CREATE (:RG12_P {k: 'key88', grp: 3});
+    CREATE (:RG12_P {k: 'key89', grp: 4});
+    CREATE (:RG12_P {k: 'key90', grp: 0});
+    CREATE (:RG12_P {k: 'key91', grp: 1});
+    CREATE (:RG12_P {k: 'key92', grp: 2});
+    CREATE (:RG12_P {k: 'key93', grp: 3});
+    CREATE (:RG12_P {k: 'key94', grp: 4});
+    CREATE (:RG12_P {k: 'key95', grp: 0});
+    CREATE (:RG12_P {k: 'key96', grp: 1});
+    CREATE (:RG12_P {k: 'key97', grp: 2});
+    CREATE (:RG12_P {k: 'key98', grp: 3});
+    CREATE (:RG12_P {k: 'key99', grp: 4});
+    CREATE (:RG12_P {k: 'key100', grp: 0});
+    CREATE (:RG12_P {k: 'key101', grp: 1});
+    CREATE (:RG12_P {k: 'key102', grp: 2});
+    CREATE (:RG12_P {k: 'key103', grp: 3});
+    CREATE (:RG12_P {k: 'key104', grp: 4});
+    CREATE (:RG12_P {k: 'key105', grp: 0});
+    CREATE (:RG12_P {k: 'key106', grp: 1});
+    CREATE (:RG12_P {k: 'key107', grp: 2});
+    CREATE (:RG12_P {k: 'key108', grp: 3});
+    CREATE (:RG12_P {k: 'key109', grp: 4});
+    CREATE (:RG12_P {k: 'key110', grp: 0});
+    CREATE (:RG12_P {k: 'key111', grp: 1});
+    CREATE (:RG12_P {k: 'key112', grp: 2});
+    CREATE (:RG12_P {k: 'key113', grp: 3});
+    CREATE (:RG12_P {k: 'key114', grp: 4});
+    CREATE (:RG12_P {k: 'key115', grp: 0});
+    CREATE (:RG12_P {k: 'key116', grp: 1});
+    CREATE (:RG12_P {k: 'key117', grp: 2});
+    CREATE (:RG12_P {k: 'key118', grp: 3});
+    CREATE (:RG12_P {k: 'key119', grp: 4});
+    CREATE (:RG12_P {k: 'key120', grp: 0});
+    CREATE (:RG12_P {k: 'key121', grp: 1});
+    CREATE (:RG12_P {k: 'key122', grp: 2});
+    CREATE (:RG12_P {k: 'key123', grp: 3});
+    CREATE (:RG12_P {k: 'key124', grp: 4});
+    CREATE (:RG12_P {k: 'key125', grp: 0});
+    CREATE (:RG12_P {k: 'key126', grp: 1});
+    CREATE (:RG12_P {k: 'key127', grp: 2});
+    CREATE (:RG12_P {k: 'key128', grp: 3});
+    CREATE (:RG12_P {k: 'key129', grp: 4});
+    CREATE (:RG12_P {k: 'key130', grp: 0});
+    CREATE (:RG12_P {k: 'key131', grp: 1});
+    CREATE (:RG12_P {k: 'key132', grp: 2});
+    CREATE (:RG12_P {k: 'key133', grp: 3});
+    CREATE (:RG12_P {k: 'key134', grp: 4});
+    CREATE (:RG12_P {k: 'key135', grp: 0});
+    CREATE (:RG12_P {k: 'key136', grp: 1});
+    CREATE (:RG12_P {k: 'key137', grp: 2});
+    CREATE (:RG12_P {k: 'key138', grp: 3});
+    CREATE (:RG12_P {k: 'key139', grp: 4});
+    CREATE (:RG12_P {k: 'key140', grp: 0});
+    CREATE (:RG12_P {k: 'key141', grp: 1});
+    CREATE (:RG12_P {k: 'key142', grp: 2});
+    CREATE (:RG12_P {k: 'key143', grp: 3});
+    CREATE (:RG12_P {k: 'key144', grp: 4});
+    CREATE (:RG12_P {k: 'key145', grp: 0});
+    CREATE (:RG12_P {k: 'key146', grp: 1});
+    CREATE (:RG12_P {k: 'key147', grp: 2});
+    CREATE (:RG12_P {k: 'key148', grp: 3});
+    CREATE (:RG12_P {k: 'key149', grp: 4});
+    CREATE (:RG12_P {k: 'key150', grp: 0});
+    CREATE (:RG12_P {k: 'key151', grp: 1});
+    CREATE (:RG12_P {k: 'key152', grp: 2});
+    CREATE (:RG12_P {k: 'key153', grp: 3});
+    CREATE (:RG12_P {k: 'key154', grp: 4});
+    CREATE (:RG12_P {k: 'key155', grp: 0});
+    CREATE (:RG12_P {k: 'key156', grp: 1});
+    CREATE (:RG12_P {k: 'key157', grp: 2});
+    CREATE (:RG12_P {k: 'key158', grp: 3});
+    CREATE (:RG12_P {k: 'key159', grp: 4});
+    CREATE (:RG12_P {k: 'key160', grp: 0});
+    CREATE (:RG12_P {k: 'key161', grp: 1});
+    CREATE (:RG12_P {k: 'key162', grp: 2});
+    CREATE (:RG12_P {k: 'key163', grp: 3});
+    CREATE (:RG12_P {k: 'key164', grp: 4});
+    CREATE (:RG12_P {k: 'key165', grp: 0});
+    CREATE (:RG12_P {k: 'key166', grp: 1});
+    CREATE (:RG12_P {k: 'key167', grp: 2});
+    CREATE (:RG12_P {k: 'key168', grp: 3});
+    CREATE (:RG12_P {k: 'key169', grp: 4});
+    CREATE (:RG12_P {k: 'key170', grp: 0});
+    CREATE (:RG12_P {k: 'key171', grp: 1});
+    CREATE (:RG12_P {k: 'key172', grp: 2});
+    CREATE (:RG12_P {k: 'key173', grp: 3});
+    CREATE (:RG12_P {k: 'key174', grp: 4});
+    CREATE (:RG12_P {k: 'key175', grp: 0});
+    CREATE (:RG12_P {k: 'key176', grp: 1});
+    CREATE (:RG12_P {k: 'key177', grp: 2});
+    CREATE (:RG12_P {k: 'key178', grp: 3});
+    CREATE (:RG12_P {k: 'key179', grp: 4});
+    CREATE (:RG12_P {k: 'key180', grp: 0});
+    CREATE (:RG12_P {k: 'key181', grp: 1});
+    CREATE (:RG12_P {k: 'key182', grp: 2});
+    CREATE (:RG12_P {k: 'key183', grp: 3});
+    CREATE (:RG12_P {k: 'key184', grp: 4});
+    CREATE (:RG12_P {k: 'key185', grp: 0});
+    CREATE (:RG12_P {k: 'key186', grp: 1});
+    CREATE (:RG12_P {k: 'key187', grp: 2});
+    CREATE (:RG12_P {k: 'key188', grp: 3});
+    CREATE (:RG12_P {k: 'key189', grp: 4});
+    CREATE (:RG12_P {k: 'key190', grp: 0});
+    CREATE (:RG12_P {k: 'key191', grp: 1});
+    CREATE (:RG12_P {k: 'key192', grp: 2});
+    CREATE (:RG12_P {k: 'key193', grp: 3});
+    CREATE (:RG12_P {k: 'key194', grp: 4});
+    CREATE (:RG12_P {k: 'key195', grp: 0});
+    CREATE (:RG12_P {k: 'key196', grp: 1});
+    CREATE (:RG12_P {k: 'key197', grp: 2});
+    CREATE (:RG12_P {k: 'key198', grp: 3});
+    CREATE (:RG12_P {k: 'key199', grp: 4});
+    CREATE (:RG12_P {k: 'key200', grp: 0});
+    CREATE (:RG12_P {k: 'key201', grp: 1});
+    CREATE (:RG12_P {k: 'key202', grp: 2});
+    CREATE (:RG12_P {k: 'key203', grp: 3});
+    CREATE (:RG12_P {k: 'key204', grp: 4});
+    CREATE (:RG12_P {k: 'key205', grp: 0});
+    CREATE (:RG12_P {k: 'key206', grp: 1});
+    CREATE (:RG12_P {k: 'key207', grp: 2});
+    CREATE (:RG12_P {k: 'key208', grp: 3});
+    CREATE (:RG12_P {k: 'key209', grp: 4});
+    CREATE (:RG12_P {k: 'key210', grp: 0});
+    CREATE (:RG12_P {k: 'key211', grp: 1});
+    CREATE (:RG12_P {k: 'key212', grp: 2});
+    CREATE (:RG12_P {k: 'key213', grp: 3});
+    CREATE (:RG12_P {k: 'key214', grp: 4});
+    CREATE (:RG12_P {k: 'key215', grp: 0});
+    CREATE (:RG12_P {k: 'key216', grp: 1});
+    CREATE (:RG12_P {k: 'key217', grp: 2});
+    CREATE (:RG12_P {k: 'key218', grp: 3});
+    CREATE (:RG12_P {k: 'key219', grp: 4});
+    CREATE (:RG12_P {k: 'key220', grp: 0});
+    CREATE (:RG12_P {k: 'key221', grp: 1});
+    CREATE (:RG12_P {k: 'key222', grp: 2});
+    CREATE (:RG12_P {k: 'key223', grp: 3});
+    CREATE (:RG12_P {k: 'key224', grp: 4});
+    CREATE (:RG12_P {k: 'key225', grp: 0});
+    CREATE (:RG12_P {k: 'key226', grp: 1});
+    CREATE (:RG12_P {k: 'key227', grp: 2});
+    CREATE (:RG12_P {k: 'key228', grp: 3});
+    CREATE (:RG12_P {k: 'key229', grp: 4});
+    CREATE (:RG12_P {k: 'key230', grp: 0});
+    CREATE (:RG12_P {k: 'key231', grp: 1});
+    CREATE (:RG12_P {k: 'key232', grp: 2});
+    CREATE (:RG12_P {k: 'key233', grp: 3});
+    CREATE (:RG12_P {k: 'key234', grp: 4});
+    CREATE (:RG12_P {k: 'key235', grp: 0});
+    CREATE (:RG12_P {k: 'key236', grp: 1});
+    CREATE (:RG12_P {k: 'key237', grp: 2});
+    CREATE (:RG12_P {k: 'key238', grp: 3});
+    CREATE (:RG12_P {k: 'key239', grp: 4});
+    CREATE (:RG12_P {k: 'key240', grp: 0});
+    CREATE (:RG12_P {k: 'key241', grp: 1});
+    CREATE (:RG12_P {k: 'key242', grp: 2});
+    CREATE (:RG12_P {k: 'key243', grp: 3});
+    CREATE (:RG12_P {k: 'key244', grp: 4});
+    CREATE (:RG12_P {k: 'key245', grp: 0});
+    CREATE (:RG12_P {k: 'key246', grp: 1});
+    CREATE (:RG12_P {k: 'key247', grp: 2});
+    CREATE (:RG12_P {k: 'key248', grp: 3});
+    CREATE (:RG12_P {k: 'key249', grp: 4});
+    CREATE (:RG12_P {k: 'key250', grp: 0});
+    CREATE (:RG12_P {k: 'key251', grp: 1});
+    CREATE (:RG12_P {k: 'key252', grp: 2});
+    CREATE (:RG12_P {k: 'key253', grp: 3});
+    CREATE (:RG12_P {k: 'key254', grp: 4});
+    CREATE (:RG12_P {k: 'key255', grp: 0});
+    CREATE (:RG12_P {k: 'key256', grp: 1});
+    CREATE (:RG12_P {k: 'key257', grp: 2});
+    CREATE (:RG12_P {k: 'key258', grp: 3});
+    CREATE (:RG12_P {k: 'key259', grp: 4});
+    CREATE (:RG12_P {k: 'key260', grp: 0});
+    CREATE (:RG12_P {k: 'key261', grp: 1});
+    CREATE (:RG12_P {k: 'key262', grp: 2});
+    CREATE (:RG12_P {k: 'key263', grp: 3});
+    CREATE (:RG12_P {k: 'key264', grp: 4});
+    CREATE (:RG12_P {k: 'key265', grp: 0});
+    CREATE (:RG12_P {k: 'key266', grp: 1});
+    CREATE (:RG12_P {k: 'key267', grp: 2});
+    CREATE (:RG12_P {k: 'key268', grp: 3});
+    CREATE (:RG12_P {k: 'key269', grp: 4});
+    CREATE (:RG12_P {k: 'key270', grp: 0});
+    CREATE (:RG12_P {k: 'key271', grp: 1});
+    CREATE (:RG12_P {k: 'key272', grp: 2});
+    CREATE (:RG12_P {k: 'key273', grp: 3});
+    CREATE (:RG12_P {k: 'key274', grp: 4});
+    CREATE (:RG12_P {k: 'key275', grp: 0});
+    CREATE (:RG12_P {k: 'key276', grp: 1});
+    CREATE (:RG12_P {k: 'key277', grp: 2});
+    CREATE (:RG12_P {k: 'key278', grp: 3});
+    CREATE (:RG12_P {k: 'key279', grp: 4});
+    CREATE (:RG12_P {k: 'key280', grp: 0});
+    CREATE (:RG12_P {k: 'key281', grp: 1});
+    CREATE (:RG12_P {k: 'key282', grp: 2});
+    CREATE (:RG12_P {k: 'key283', grp: 3});
+    CREATE (:RG12_P {k: 'key284', grp: 4});
+    CREATE (:RG12_P {k: 'key285', grp: 0});
+    CREATE (:RG12_P {k: 'key286', grp: 1});
+    CREATE (:RG12_P {k: 'key287', grp: 2});
+    CREATE (:RG12_P {k: 'key288', grp: 3});
+    CREATE (:RG12_P {k: 'key289', grp: 4});
+    CREATE (:RG12_P {k: 'key290', grp: 0});
+    CREATE (:RG12_P {k: 'key291', grp: 1});
+    CREATE (:RG12_P {k: 'key292', grp: 2});
+    CREATE (:RG12_P {k: 'key293', grp: 3});
+    CREATE (:RG12_P {k: 'key294', grp: 4});
+    CREATE (:RG12_P {k: 'key295', grp: 0});
+    CREATE (:RG12_P {k: 'key296', grp: 1});
+    CREATE (:RG12_P {k: 'key297', grp: 2});
+    CREATE (:RG12_P {k: 'key298', grp: 3});
+    CREATE (:RG12_P {k: 'key299', grp: 4});
+    CREATE (:RG12_P {k: 'key300', grp: 0});
+    CREATE (:RG12_P {k: 'key301', grp: 1});
+    CREATE (:RG12_P {k: 'key302', grp: 2});
+    CREATE (:RG12_P {k: 'key303', grp: 3});
+    CREATE (:RG12_P {k: 'key304', grp: 4});
+    CREATE (:RG12_P {k: 'key305', grp: 0});
+    CREATE (:RG12_P {k: 'key306', grp: 1});
+    CREATE (:RG12_P {k: 'key307', grp: 2});
+    CREATE (:RG12_P {k: 'key308', grp: 3});
+    CREATE (:RG12_P {k: 'key309', grp: 4});
+    CREATE (:RG12_P {k: 'key310', grp: 0});
+    CREATE (:RG12_P {k: 'key311', grp: 1});
+    CREATE (:RG12_P {k: 'key312', grp: 2});
+    CREATE (:RG12_P {k: 'key313', grp: 3});
+    CREATE (:RG12_P {k: 'key314', grp: 4});
+    CREATE (:RG12_P {k: 'key315', grp: 0});
+    CREATE (:RG12_P {k: 'key316', grp: 1});
+    CREATE (:RG12_P {k: 'key317', grp: 2});
+    CREATE (:RG12_P {k: 'key318', grp: 3});
+    CREATE (:RG12_P {k: 'key319', grp: 4});
+    CREATE (:RG12_P {k: 'key320', grp: 0});
+    CREATE (:RG12_P {k: 'key321', grp: 1});
+    CREATE (:RG12_P {k: 'key322', grp: 2});
+    CREATE (:RG12_P {k: 'key323', grp: 3});
+    CREATE (:RG12_P {k: 'key324', grp: 4});
+    CREATE (:RG12_P {k: 'key325', grp: 0});
+    CREATE (:RG12_P {k: 'key326', grp: 1});
+    CREATE (:RG12_P {k: 'key327', grp: 2});
+    CREATE (:RG12_P {k: 'key328', grp: 3});
+    CREATE (:RG12_P {k: 'key329', grp: 4});
+    CREATE (:RG12_P {k: 'key330', grp: 0});
+    CREATE (:RG12_P {k: 'key331', grp: 1});
+    CREATE (:RG12_P {k: 'key332', grp: 2});
+    CREATE (:RG12_P {k: 'key333', grp: 3});
+    CREATE (:RG12_P {k: 'key334', grp: 4});
+    CREATE (:RG12_P {k: 'key335', grp: 0});
+    CREATE (:RG12_P {k: 'key336', grp: 1});
+    CREATE (:RG12_P {k: 'key337', grp: 2});
+    CREATE (:RG12_P {k: 'key338', grp: 3});
+    CREATE (:RG12_P {k: 'key339', grp: 4});
+    CREATE (:RG12_P {k: 'key340', grp: 0});
+    CREATE (:RG12_P {k: 'key341', grp: 1});
+    CREATE (:RG12_P {k: 'key342', grp: 2});
+    CREATE (:RG12_P {k: 'key343', grp: 3});
+    CREATE (:RG12_P {k: 'key344', grp: 4});
+    CREATE (:RG12_P {k: 'key345', grp: 0});
+    CREATE (:RG12_P {k: 'key346', grp: 1});
+    CREATE (:RG12_P {k: 'key347', grp: 2});
+    CREATE (:RG12_P {k: 'key348', grp: 3});
+    CREATE (:RG12_P {k: 'key349', grp: 4});
+    CREATE (:RG12_P {k: 'key350', grp: 0});
+    CREATE (:RG12_P {k: 'key351', grp: 1});
+    CREATE (:RG12_P {k: 'key352', grp: 2});
+    CREATE (:RG12_P {k: 'key353', grp: 3});
+    CREATE (:RG12_P {k: 'key354', grp: 4});
+    CREATE (:RG12_P {k: 'key355', grp: 0});
+    CREATE (:RG12_P {k: 'key356', grp: 1});
+    CREATE (:RG12_P {k: 'key357', grp: 2});
+    CREATE (:RG12_P {k: 'key358', grp: 3});
+    CREATE (:RG12_P {k: 'key359', grp: 4});
+    CREATE (:RG12_P {k: 'key360', grp: 0});
+    CREATE (:RG12_P {k: 'key361', grp: 1});
+    CREATE (:RG12_P {k: 'key362', grp: 2});
+    CREATE (:RG12_P {k: 'key363', grp: 3});
+    CREATE (:RG12_P {k: 'key364', grp: 4});
+    CREATE (:RG12_P {k: 'key365', grp: 0});
+    CREATE (:RG12_P {k: 'key366', grp: 1});
+    CREATE (:RG12_P {k: 'key367', grp: 2});
+    CREATE (:RG12_P {k: 'key368', grp: 3});
+    CREATE (:RG12_P {k: 'key369', grp: 4});
+    CREATE (:RG12_P {k: 'key370', grp: 0});
+    CREATE (:RG12_P {k: 'key371', grp: 1});
+    CREATE (:RG12_P {k: 'key372', grp: 2});
+    CREATE (:RG12_P {k: 'key373', grp: 3});
+    CREATE (:RG12_P {k: 'key374', grp: 4});
+    CREATE (:RG12_P {k: 'key375', grp: 0});
+    CREATE (:RG12_P {k: 'key376', grp: 1});
+    CREATE (:RG12_P {k: 'key377', grp: 2});
+    CREATE (:RG12_P {k: 'key378', grp: 3});
+    CREATE (:RG12_P {k: 'key379', grp: 4});
+    CREATE (:RG12_P {k: 'key380', grp: 0});
+    CREATE (:RG12_P {k: 'key381', grp: 1});
+    CREATE (:RG12_P {k: 'key382', grp: 2});
+    CREATE (:RG12_P {k: 'key383', grp: 3});
+    CREATE (:RG12_P {k: 'key384', grp: 4});
+    CREATE (:RG12_P {k: 'key385', grp: 0});
+    CREATE (:RG12_P {k: 'key386', grp: 1});
+    CREATE (:RG12_P {k: 'key387', grp: 2});
+    CREATE (:RG12_P {k: 'key388', grp: 3});
+    CREATE (:RG12_P {k: 'key389', grp: 4});
+    CREATE (:RG12_P {k: 'key390', grp: 0});
+    CREATE (:RG12_P {k: 'key391', grp: 1});
+    CREATE (:RG12_P {k: 'key392', grp: 2});
+    CREATE (:RG12_P {k: 'key393', grp: 3});
+    CREATE (:RG12_P {k: 'key394', grp: 4});
+    CREATE (:RG12_P {k: 'key395', grp: 0});
+    CREATE (:RG12_P {k: 'key396', grp: 1});
+    CREATE (:RG12_P {k: 'key397', grp: 2});
+    CREATE (:RG12_P {k: 'key398', grp: 3});
+    CREATE (:RG12_P {k: 'key399', grp: 4});
+    CREATE (:RG12_P {k: 'key400', grp: 0});
+    CREATE (:RG12_P {k: 'key401', grp: 1});
+    CREATE (:RG12_P {k: 'key402', grp: 2});
+    CREATE (:RG12_P {k: 'key403', grp: 3});
+    CREATE (:RG12_P {k: 'key404', grp: 4});
+    CREATE (:RG12_P {k: 'key405', grp: 0});
+    CREATE (:RG12_P {k: 'key406', grp: 1});
+    CREATE (:RG12_P {k: 'key407', grp: 2});
+    CREATE (:RG12_P {k: 'key408', grp: 3});
+    CREATE (:RG12_P {k: 'key409', grp: 4});
+    CREATE (:RG12_P {k: 'key410', grp: 0});
+    CREATE (:RG12_P {k: 'key411', grp: 1});
+    CREATE (:RG12_P {k: 'key412', grp: 2});
+    CREATE (:RG12_P {k: 'key413', grp: 3});
+    CREATE (:RG12_P {k: 'key414', grp: 4});
+    CREATE (:RG12_P {k: 'key415', grp: 0});
+    CREATE (:RG12_P {k: 'key416', grp: 1});
+    CREATE (:RG12_P {k: 'key417', grp: 2});
+    CREATE (:RG12_P {k: 'key418', grp: 3});
+    CREATE (:RG12_P {k: 'key419', grp: 4});
+    CREATE (:RG12_P {k: 'key420', grp: 0});
+    CREATE (:RG12_P {k: 'key421', grp: 1});
+    CREATE (:RG12_P {k: 'key422', grp: 2});
+    CREATE (:RG12_P {k: 'key423', grp: 3});
+    CREATE (:RG12_P {k: 'key424', grp: 4});
+    CREATE (:RG12_P {k: 'key425', grp: 0});
+    CREATE (:RG12_P {k: 'key426', grp: 1});
+    CREATE (:RG12_P {k: 'key427', grp: 2});
+    CREATE (:RG12_P {k: 'key428', grp: 3});
+    CREATE (:RG12_P {k: 'key429', grp: 4});
+    CREATE (:RG12_P {k: 'key430', grp: 0});
+    CREATE (:RG12_P {k: 'key431', grp: 1});
+    CREATE (:RG12_P {k: 'key432', grp: 2});
+    CREATE (:RG12_P {k: 'key433', grp: 3});
+    CREATE (:RG12_P {k: 'key434', grp: 4});
+    CREATE (:RG12_P {k: 'key435', grp: 0});
+    CREATE (:RG12_P {k: 'key436', grp: 1});
+    CREATE (:RG12_P {k: 'key437', grp: 2});
+    CREATE (:RG12_P {k: 'key438', grp: 3});
+    CREATE (:RG12_P {k: 'key439', grp: 4});
+    CREATE (:RG12_P {k: 'key440', grp: 0});
+    CREATE (:RG12_P {k: 'key441', grp: 1});
+    CREATE (:RG12_P {k: 'key442', grp: 2});
+    CREATE (:RG12_P {k: 'key443', grp: 3});
+    CREATE (:RG12_P {k: 'key444', grp: 4});
+    CREATE (:RG12_P {k: 'key445', grp: 0});
+    CREATE (:RG12_P {k: 'key446', grp: 1});
+    CREATE (:RG12_P {k: 'key447', grp: 2});
+    CREATE (:RG12_P {k: 'key448', grp: 3});
+    CREATE (:RG12_P {k: 'key449', grp: 4});
+    CREATE (:RG12_P {k: 'key450', grp: 0});
+    CREATE (:RG12_P {k: 'key451', grp: 1});
+    CREATE (:RG12_P {k: 'key452', grp: 2});
+    CREATE (:RG12_P {k: 'key453', grp: 3});
+    CREATE (:RG12_P {k: 'key454', grp: 4});
+    CREATE (:RG12_P {k: 'key455', grp: 0});
+    CREATE (:RG12_P {k: 'key456', grp: 1});
+    CREATE (:RG12_P {k: 'key457', grp: 2});
+    CREATE (:RG12_P {k: 'key458', grp: 3});
+    CREATE (:RG12_P {k: 'key459', grp: 4});
+    CREATE (:RG12_P {k: 'key460', grp: 0});
+    CREATE (:RG12_P {k: 'key461', grp: 1});
+    CREATE (:RG12_P {k: 'key462', grp: 2});
+    CREATE (:RG12_P {k: 'key463', grp: 3});
+    CREATE (:RG12_P {k: 'key464', grp: 4});
+    CREATE (:RG12_P {k: 'key465', grp: 0});
+    CREATE (:RG12_P {k: 'key466', grp: 1});
+    CREATE (:RG12_P {k: 'key467', grp: 2});
+    CREATE (:RG12_P {k: 'key468', grp: 3});
+    CREATE (:RG12_P {k: 'key469', grp: 4});
+    CREATE (:RG12_P {k: 'key470', grp: 0});
+    CREATE (:RG12_P {k: 'key471', grp: 1});
+    CREATE (:RG12_P {k: 'key472', grp: 2});
+    CREATE (:RG12_P {k: 'key473', grp: 3});
+    CREATE (:RG12_P {k: 'key474', grp: 4});
+    CREATE (:RG12_P {k: 'key475', grp: 0});
+    CREATE (:RG12_P {k: 'key476', grp: 1});
+    CREATE (:RG12_P {k: 'key477', grp: 2});
+    CREATE (:RG12_P {k: 'key478', grp: 3});
+    CREATE (:RG12_P {k: 'key479', grp: 4});
+    CREATE (:RG12_P {k: 'key480', grp: 0});
+    CREATE (:RG12_P {k: 'key481', grp: 1});
+    CREATE (:RG12_P {k: 'key482', grp: 2});
+    CREATE (:RG12_P {k: 'key483', grp: 3});
+    CREATE (:RG12_P {k: 'key484', grp: 4});
+    CREATE (:RG12_P {k: 'key485', grp: 0});
+    CREATE (:RG12_P {k: 'key486', grp: 1});
+    CREATE (:RG12_P {k: 'key487', grp: 2});
+    CREATE (:RG12_P {k: 'key488', grp: 3});
+    CREATE (:RG12_P {k: 'key489', grp: 4});
+    CREATE (:RG12_P {k: 'key490', grp: 0});
+    CREATE (:RG12_P {k: 'key491', grp: 1});
+    CREATE (:RG12_P {k: 'key492', grp: 2});
+    CREATE (:RG12_P {k: 'key493', grp: 3});
+    CREATE (:RG12_P {k: 'key494', grp: 4});
+    CREATE (:RG12_P {k: 'key495', grp: 0});
+    CREATE (:RG12_P {k: 'key496', grp: 1});
+    CREATE (:RG12_P {k: 'key497', grp: 2});
+    CREATE (:RG12_P {k: 'key498', grp: 3});
+    CREATE (:RG12_P {k: 'key499', grp: 4});
+  expected:
+    exit_code: 0
+  tags: [index-reload, reopen, setup]
+
+- name: seed-create-index-rg12-k
+  description: |
+    CREATE INDEX on RG12_P.k using the FOR (n:Label) ON (n.prop) form,
+    probed to succeed against a scratch server on this build.
+  query: "CREATE INDEX rg12_p_k_idx FOR (n:RG12_P) ON (n.k)"
+  expected:
+    exit_code: 0
+  tags: [index-reload, reopen, setup]
+
+- name: warm-eq-seek-before-restart
+  description: |
+    Warm check before restart — WHERE n.k='key42' RETURN n.grp must be
+    correct (key42 -> grp 42 mod 5 = 2).
+  query: "MATCH (n:RG12_P) WHERE n.k='key42' RETURN n.grp"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"grp":2'
+  tags: [index-reload, reopen, positive-baseline]
+
+- name: warm-distinct-before-restart
+  description: |
+    Warm check before restart — RETURN DISTINCT n.grp must yield exactly
+    5 rows (grp values 0..4).
+  query: "MATCH (n:RG12_P) RETURN DISTINCT n.grp"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"grp":0'
+    - '"grp":1'
+    - '"grp":2'
+    - '"grp":3'
+    - '"grp":4'
+  tags: [index-reload, reopen, positive-baseline]
+
+- name: restart-server-for-index-reload
+  description: |
+    Graceful (clean) shutdown + reopen of the managed server against the
+    SAME data dir (cleanup: false above). This is NOT a crash — it is
+    the clean-checkpoint + reopen path that the GAP-ENT-0048 /
+    GAP-0064/0065 contract targets: index-served reads must be correct
+    on the first query after reopen, and must not wedge/hang.
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RESTART
+  tags: [index-reload, reopen, restart]
+
+- name: first-read-eq-seek-after-reopen
+  description: |
+    KEY ASSERTION — this is the FIRST query test after the restart
+    marker above; no warm-up query precedes it. Under a live
+    GAP-ENT-0048/GAP-0064 regression this read could be served by a
+    not-yet-hydrated index and return a wrong/empty result, or wedge.
+    A 15s timeout enforces the prompt-response contract: a wedge must
+    fail as a timeout, not hang forever. Must return grp:2 (key42 ->
+    42 mod 5 = 2).
+  query: "MATCH (n:RG12_P) WHERE n.k='key42' RETURN n.grp"
+  timeout_ms: 15000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"grp":2'
+  tags: [index-reload, reopen, key-assertion]
+
+- name: groupby-post-reopen
+  description: |
+    KEY ASSERTION — GROUP BY over the indexed label must return exactly
+    5 groups, each with count 100. Each assertion binds the group value
+    to its count (e.g. '"g":0,"c":100') rather than asserting an
+    unbound '"c":100' substring, so a regression that shuffled counts
+    between groups (rather than losing them outright) would still be
+    caught.
+  query: "MATCH (n:RG12_P) RETURN n.grp AS g, count(*) AS c GROUP BY g"
+  timeout_ms: 15000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"g":0,"c":100'
+    - '"g":1,"c":100'
+    - '"g":2,"c":100'
+    - '"g":3,"c":100'
+    - '"g":4,"c":100'
+  tags: [index-reload, reopen, key-assertion]
+
+- name: distinct-post-reopen
+  description: |
+    KEY ASSERTION — RETURN DISTINCT n.grp must still return exactly 5
+    rows post-reopen.
+  query: "MATCH (n:RG12_P) RETURN DISTINCT n.grp"
+  timeout_ms: 15000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"grp":0'
+    - '"grp":1'
+    - '"grp":2'
+    - '"grp":3'
+    - '"grp":4'
+  tags: [index-reload, reopen, key-assertion]
+
+- name: point-seek-post-reopen
+  description: |
+    KEY ASSERTION — property-pattern point seek MATCH (n:RG12_P
+    {k:'key7'}) RETURN count(n) must return exactly 1 post-reopen.
+    Probed column name for this query shape is "count" (not
+    "count(n)") — the assertion matches the actual observed output.
+  query: "MATCH (n:RG12_P {k:'key7'}) RETURN count(n)"
+  timeout_ms: 15000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count":1'
+  tags: [index-reload, reopen, key-assertion]
+
+tags:
+- index-reload
+- reopen
+- first-read
+- regression
