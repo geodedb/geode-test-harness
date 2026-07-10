@@ -1,0 +1,317 @@
+version: '1.0'
+name: Fulltext Search Negative Paths (syntax/dropped/empty/non-text)
+description: >
+  Plan 2, Task 8 — negative-path coverage for the fulltext search query
+  surface. `fulltext_search_basic.yml` / `fulltext_bm25_comprehensive.yml`
+  are happy-path only. This spec adds the negative cases and folds in the
+  `fts_storage` dropped-index case per the task brief.
+
+
+  ## WORKING FTS SURFACE (2026-07-10, scratch server, ../geode/zig-out/bin/geode,
+  port 4475)
+
+
+  The `CREATE FULLTEXT INDEX ...` DDL (used elsewhere in this repo, e.g.
+  `fulltext_bm25_comprehensive.yml`) is UNPARSED — it silently falls back to
+  a bag-of-words `=~` scan with NO index actually built (Plan 1 Task 24
+  finding). The WORKING DDL is `CREATE INDEX <name> ON <Label> (<prop>)
+  USING fulltext`; it is genuinely built (confirmed: `SHOW INDEXES` reports
+  `"type":"fulltext"` for it, unlike the unparsed form). The real FTS query
+  surface is `CALL geode.fts.phrase(<index_name>, <search_string>) YIELD
+  node, score` (also `geode.fts.proximity(<index_name>, <search_string>,
+  <window>)`) — note both take the INDEX NAME, not the label, as the first
+  argument. This matches the GAP-0869 extension to
+  `fulltext_bm25_comprehensive.yml` (commit 4ced2f4).
+
+
+  ## PROBE FINDINGS
+
+
+  1. Malformed query syntax (unclosed string literal in the search-string
+     argument) is a genuine GQL parse error: `status_class":"42000"`,
+     `"error":"parse error"`. Real failure signal, asserted honestly.
+  2. `CALL geode.fts.phrase(<name>, ...)` against an index name that was
+     never created returns a clean error: `status_class":"0A000"`,
+     `"error":"Unsupported"` — no crash, no hang. Note the surface takes an
+     index name, not a label, so "no FTS index exists" is expressed as an
+     unknown index name.
+  3. Dropping the index (`DROP INDEX`) then calling
+     `geode.fts.phrase` with the now-stale index name returns the identical
+     clean error (`0A000`/`"Unsupported"`) — same signature as case 2, no
+     crash.
+  4. A freshly created fulltext index over a label with zero rows returns a
+     genuine empty result (`status_class":"00000"`, `"rows":[]`,
+     column types `NULL`) — correct boundary behavior, not an error.
+  5. SILENT-ACCEPT (limitation, not a crash/data-integrity bug): creating a
+     fulltext index on an INTEGER property (`CREATE INDEX ... ON
+     P8_NumDoc (score) USING fulltext`) is NOT rejected at DDL time —
+     `status_class":"00000"`, and the index shows up in `SHOW INDEXES`
+     identical to a valid text-property fulltext index. Inserting int-typed
+     rows under it is also accepted without error. Querying it via
+     `geode.fts.phrase` (with either the literal numeric value as a string,
+     or an arbitrary token) always returns an empty result set
+     (`"rows":[]`, no error) — the index is effectively permanently dead,
+     never matching anything, with no diagnostic signal to the caller.
+     Pinned honestly below, not hidden.
+
+
+  CANARY: REQ=REQ-FULLTEXT-SEARCH-NEGATIVE-001; FEATURE="FullText"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/fulltext_search_negative.yml; OWNER=qa; UPDATED=2026-07-10
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- fulltext
+- search
+- negative-paths
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: p8_teardown_canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:P8_Doc) DETACH DELETE n
+    MATCH (n:P8_EmptyDoc) DETACH DELETE n
+    MATCH (n:P8_NumDoc) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [fulltext, setup, canary]
+
+  # --------------------------------------------------------------- setup --
+- name: p8_setup_create_index
+  description: "Positive setup: create a REAL fulltext index (USING fulltext, not the unparsed CREATE FULLTEXT INDEX form) on P8_Doc.body"
+  args: [query, '-']
+  stdin: CREATE INDEX p8_fts_idx ON P8_Doc (body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, setup, positive, ddl]
+
+- name: p8_setup_show_index
+  description: SHOW INDEXES reports p8_fts_idx with type fulltext (proves it was genuinely built, unlike the unparsed DDL form)
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - p8_fts_idx
+    - '"type":"fulltext"'
+  tags: [fulltext, setup, positive, show]
+
+- name: p8_setup_seed_docs
+  description: "Positive setup: seed 3 documents under the indexed label"
+  args: [query, '-']
+  stdin: |
+    CREATE (:P8_Doc {id: 1, body: 'the quick brown fox jumps over the lazy dog'}),
+           (:P8_Doc {id: 2, body: 'graph databases enable fast traversal queries'}),
+           (:P8_Doc {id: 3, body: 'fulltext search indexes tokens for retrieval'})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, setup, positive, insert]
+
+- name: p8_setup_phrase_search_hits
+  description: "Positive: one phrase search hits via the real query surface (CALL geode.fts.phrase), proving setup end-to-end"
+  args: [query, '-']
+  stdin: CALL geode.fts.phrase('p8_fts_idx', 'quick brown') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"node","type":"INTEGER"'
+  tags: [fulltext, setup, positive, phrase]
+
+  # ------------------------------------------------------ malformed syntax --
+- name: p8_malformed_query_syntax
+  description: >
+    KEY negative — unclosed string literal (unbalanced quote) in the
+    geode.fts.phrase search-string argument. Verified real outcome: genuine
+    GQL parse error, status_class 42000, "parse error". The query CLI
+    subcommand always exits 0 regardless of GQL-level success/failure, so
+    the real failure signal is checked via stdout_contains/
+    stdout_not_contains on the JSON status_class/error fields, not
+    exit_code.
+  args: [query, '-']
+  stdin: |
+    CALL geode.fts.phrase('p8_fts_idx', 'quick brown) YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - error
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, negative, malformed-syntax]
+
+  # -------------------------------------------------- search-before-index --
+- name: p8_search_before_any_index
+  description: >
+    Negative — geode.fts.phrase against an index name that was never
+    created (the surface takes an index name, not a label, so "no FTS
+    index exists for this label" is expressed as an unknown index name).
+    Verified real outcome: clean error, status_class 0A000, "Unsupported"
+    — no crash, no hang.
+  args: [query, '-']
+  stdin: CALL geode.fts.phrase('p8_never_created_idx', 'quick brown') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, negative, no-index]
+
+  # ------------------------------------------------------ dropped index --
+- name: p8_search_dropped_index_drop
+  description: Drop the p8_fts_idx fulltext index before re-running a search against it (folds in the fts_storage dropped-index case)
+  args: [query, '-']
+  stdin: DROP INDEX p8_fts_idx
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, dropped-index]
+
+- name: p8_search_dropped_index_show_absent
+  description: p8_fts_idx no longer appears in SHOW INDEXES after DROP
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - p8_fts_idx
+  tags: [fulltext, dropped-index]
+
+- name: p8_search_dropped_index_call
+  description: >
+    Negative — geode.fts.phrase against the now-dropped index name.
+    Verified real outcome: identical clean error to the never-created case
+    (status_class 0A000, "Unsupported") — no crash, no stale-index hit, no
+    hang.
+  args: [query, '-']
+  stdin: CALL geode.fts.phrase('p8_fts_idx', 'quick brown') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, negative, dropped-index]
+
+  # -------------------------------------------------------- empty index --
+- name: p8_search_empty_index_create
+  description: "Positive-boundary: create a fresh fulltext index over a label with zero rows"
+  args: [query, '-']
+  stdin: CREATE INDEX p8_empty_idx ON P8_EmptyDoc (body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, positive, empty-index, ddl]
+
+- name: p8_search_empty_index_call
+  description: >
+    Positive-boundary — searching a genuinely empty fulltext index returns
+    0 rows with exit 0, no crash. Column types are NULL (no binding),
+    rows is an empty array.
+  args: [query, '-']
+  stdin: CALL geode.fts.phrase('p8_empty_idx', 'quick brown') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [fulltext, positive, empty-index]
+
+  # --------------------------------------------------- numeric property --
+- name: p8_index_numeric_property_create_limitation_pin
+  description: >
+    Negative — create a fulltext index on an INTEGER property
+    (P8_NumDoc.score). EXPECTED: rejected (fulltext indexes require a
+    text-typed property). ACTUAL (verified): silently ACCEPTED —
+    status_class 00000, exit 0, no validation of the property's type
+    occurs at DDL time. Pinned honestly, not hidden. If this behavior
+    changes to a genuine rejection, this test (and its
+    known_limitation/bug tags) must be updated to match.
+  args: [query, '-']
+  stdin: CREATE INDEX p8_num_idx ON P8_NumDoc (score) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, numeric-property, known_limitation, bug, ddl]
+
+- name: p8_index_numeric_property_show_evidence
+  description: Evidence — SHOW INDEXES confirms p8_num_idx was actually created, identical in shape to a valid text-property fulltext index.
+  args: [query, '-']
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - p8_num_idx
+    - '"type":"fulltext"'
+  tags: [fulltext, numeric-property, known_limitation, bug, evidence]
+
+- name: p8_index_numeric_property_insert_evidence
+  description: Evidence — inserting int-typed rows under the numeric-property fulltext index is also accepted without error.
+  args: [query, '-']
+  stdin: |
+    CREATE (:P8_NumDoc {id: 1, score: 42}), (:P8_NumDoc {id: 2, score: 99})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [fulltext, numeric-property, known_limitation, bug, evidence]
+
+- name: p8_index_numeric_property_search_limitation_pin
+  description: >
+    Negative-shaped case, verified real outcome — geode.fts.phrase against
+    the numeric-property index, searching for the literal value stored
+    (42), returns an empty result set rather than a match or a type error.
+    The index is effectively permanently dead: it never matches anything,
+    with no diagnostic signal to the caller that the property type is
+    unsupported. Pinned honestly as a limitation (silent no-op), not a
+    crash or data-integrity bug — no exception, no hang, no corrupted
+    data.
+  args: [query, '-']
+  stdin: CALL geode.fts.phrase('p8_num_idx', '42') YIELD node, score RETURN node, score
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [fulltext, numeric-property, known_limitation, bug]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: p8_teardown
+  description: Remove all P8 test nodes and indexes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:P8_Doc) DETACH DELETE n
+    MATCH (n:P8_EmptyDoc) DETACH DELETE n
+    MATCH (n:P8_NumDoc) DETACH DELETE n
+    DROP INDEX p8_empty_idx
+    DROP INDEX p8_num_idx
+  expect:
+    exit_code: 0
+  tags: [fulltext, cleanup, canary]
