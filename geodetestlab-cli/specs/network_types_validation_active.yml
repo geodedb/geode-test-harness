@@ -1,0 +1,202 @@
+version: '1.0'
+name: Network Types — Validation Negatives (re-homed from legacy)
+description: |
+  Re-homes the still-relevant negative-path assertions from deprecated
+  `specs/legacy/network_types_validation.yml` (a pre-harness-format spec
+  using `expect_output`/`expect_exit_code`/`expect_error`, which the
+  current geodetestlab parser does not read at all — none of its tests
+  actually run). `network_types_basic.yml` only covers the type surface
+  as plain STRING literals (`RETURN '192.168.1.1' AS ipv4_addr`); it
+  never constructs an actual IpAddr()/Subnet()/Mac() typed value, so it
+  has zero validation coverage. This spec fills that gap using the real
+  constructors documented in `../geode/docs/TYPES_AND_FUNCTIONS.md`
+  (`IpAddr(text)`, `Subnet(text)` for CIDR, `Mac(text)` for EUI-48).
+
+  `geode query` always exits 0 for GQL-level outcomes (confirmed by
+  direct probe below), so exit_code alone proves nothing; every negative
+  case is asserted via `stdout_contains` on the real status_class/error
+  text plus `stdout_not_contains '"status_class":"00000"'` to prove it
+  did NOT silently succeed.
+
+  Probed on a scratch server (`geode serve --listen 127.0.0.1:4490
+  --data-dir /tmp/probe-p23`), reproduced twice, all exit_code 0:
+
+    - valid-controls (positive) — one round-trip per type via helper
+      functions that give human-readable output (the raw typed value
+      itself serializes to an opaque base64 blob in JSON, e.g.
+      `{"type":"INET","value":"BMCoAWQ="}`, which is real but not a
+      useful assertion target): `ip_family(IpAddr('192.168.1.100'))` →
+      `"IPv4"`; `ip_family(IpAddr('2001:db8::1'))` → `"IPv6"`;
+      `mac_is_local(Mac('02:11:22:33:44:55'))` → `true`;
+      `ip_contains(Subnet('192.168.1.0/24'), IpAddr('192.168.1.100'))`
+      → `true`. All four constructors + their companion functions work
+      end to end. status_class 00000 throughout.
+
+    - invalid-ipv4 (`IpAddr('999.1.1.1')`, octet > 255) — legacy claimed
+      `expect_exit_code: 1, expect_error: "InvalidIPv4Format"` (using
+      `IpAddr('256.1.1.1')` as the example). That legacy assertion format
+      is not read by the current harness, and its exit_code:1 claim does
+      NOT hold on the current binary regardless (query always exits 0).
+      Probed real behavior: status_class `22P02` (SQLSTATE data
+      exception — invalid input), error text `"Invalid IP address
+      format"`. The malformed literal IS rejected — this is a genuine
+      negative, not a silent-accept. Salvaged as a real 22P02 assertion.
+
+    - malformed-ipv6 (`IpAddr('::gggg')`, non-hex characters) — legacy's
+      analogous case used `IpAddr('gggg::1')` and claimed
+      `expect_error: "InvalidIPv6Format"`. Probed real behavior:
+      status_class `22P02`, error text `"Invalid IP address format"`
+      (same generic message as the IPv4 case, not a distinct
+      "InvalidIPv6Format" string — the legacy exact-message claim does
+      NOT hold, but the underlying rejection behavior does). Genuine
+      negative.
+
+    - bad-mac (`Mac('zz:zz:zz:zz:zz:zz')`, non-hex nibbles) — legacy used
+      `Mac('GG:BB:CC:DD:EE:FF')` and claimed `expect_error:
+      "InvalidMacFormat"`. Probed real behavior: status_class `22P02`,
+      error text `"Invalid MAC address format"`. Genuine negative,
+      message text differs slightly in casing/wording from the legacy
+      claim but the substance (a distinct MAC-specific error) holds.
+
+    - invalid-cidr (`Subnet('10.0.0.0/33')`, prefix length > 32) — legacy
+      claimed `expect_exit_code: 1, expect_error: "InvalidPrefixLength"`.
+      Probed real behavior: status_class `58000` (NOT a 22xxx data
+      exception — this is the SQLSTATE "system error" class), error
+      text `"InvalidSubnet"`. Genuine negative — the oversized prefix IS
+      rejected — but via a different status_class family and a
+      different (more generic) error string than legacy claimed. Also
+      confirmed `Subnet('192.168.1.0')` (no `/prefix` at all, legacy's
+      separate `InvalidCIDRFormat` case) hits the same 58000/InvalidSubnet
+      path, so the two legacy CIDR-format cases collapse to one real
+      behavior here.
+
+  No silent-accepts were found for any of the four required negatives —
+  all four are genuine rejections. The legacy spec's specific error-code
+  *strings* (InvalidIPv4Format/InvalidIPv6Format/InvalidPrefixLength/
+  InvalidMacFormat) and its exit_code:1 claim do NOT match current
+  behavior (real: generic "Invalid IP/MAC address format" text or
+  "InvalidSubnet", status_class 22P02 or 58000, exit_code always 0), so
+  none of the legacy assertions are copied verbatim — every assertion
+  below reflects behavior re-verified directly against the current
+  binary.
+
+  CANARY: REQ=REQ-NETWORK-TYPES-VALIDATION-001; FEATURE="NetworkTypes"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/network_types_validation_active.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: p23_valid-controls
+  description: |
+    Positive control — one valid IPv4, IPv6, MAC, and CIDR literal each
+    round-trip through their real constructors (IpAddr/Mac/Subnet) and
+    companion functions, proving the type surface works before probing
+    its negative edges below. Uses helper functions (ip_family,
+    mac_is_local, ip_contains) for human-readable assertions since the
+    raw typed value serializes to an opaque base64 blob in JSON.
+  query: "RETURN ip_family(IpAddr('192.168.1.100')) AS ipv4_fam, ip_family(IpAddr('2001:db8::1')) AS ipv6_fam, mac_is_local(Mac('02:11:22:33:44:55')) AS mac_local, ip_contains(Subnet('192.168.1.0/24'), IpAddr('192.168.1.100')) AS cidr_contains"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"ipv4_fam":"IPv4"'
+    - '"ipv6_fam":"IPv6"'
+    - '"mac_local":true'
+    - '"cidr_contains":true'
+  tags: [network, positive, control, ipv4, ipv6, mac, cidr]
+
+- name: p23_invalid-ipv4
+  description: |
+    KEY NEGATIVE — IpAddr('999.1.1.1'), an IPv4 literal with an octet
+    over 255, must be rejected. Legacy claimed exit_code:1 +
+    "InvalidIPv4Format" (an assertion format the current harness never
+    even reads). Probed real behavior: status_class 22P02 (data
+    exception), error "Invalid IP address format", exit_code 0 (geode
+    query always exits 0). Genuine rejection, not a silent-accept —
+    salvaged as the real 22P02 assertion.
+  query: "RETURN IpAddr('999.1.1.1') AS addr"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22P02"'
+    - Invalid IP address format
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [network, negative, invalid-ipv4, key-negative]
+
+- name: p23_malformed-ipv6
+  description: |
+    NEGATIVE — IpAddr('::gggg'), an IPv6 literal with non-hex
+    characters, must be rejected. Legacy's analogous case used
+    IpAddr('gggg::1') and claimed "InvalidIPv6Format". Probed real
+    behavior: status_class 22P02, error "Invalid IP address format"
+    (same generic message as the IPv4 case, not a distinct
+    IPv6-specific string). Genuine rejection.
+  query: "RETURN IpAddr('::gggg') AS addr"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22P02"'
+    - Invalid IP address format
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [network, negative, malformed-ipv6]
+
+- name: p23_bad-mac
+  description: |
+    NEGATIVE — Mac('zz:zz:zz:zz:zz:zz'), non-hex nibbles in every
+    octet, must be rejected. Legacy used Mac('GG:BB:CC:DD:EE:FF') and
+    claimed "InvalidMacFormat". Probed real behavior: status_class
+    22P02, error "Invalid MAC address format". Genuine rejection.
+  query: "RETURN Mac('zz:zz:zz:zz:zz:zz') AS mac"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22P02"'
+    - Invalid MAC address format
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [network, negative, bad-mac]
+
+- name: p23_invalid-cidr
+  description: |
+    NEGATIVE — Subnet('10.0.0.0/33'), a CIDR prefix length beyond the
+    IPv4 maximum of 32, must be rejected. Legacy claimed exit_code:1 +
+    "InvalidPrefixLength". Probed real behavior: status_class 58000
+    (NOT a 22xxx data exception — the SQLSTATE "system error" class),
+    error "InvalidSubnet". Genuine rejection — the oversized prefix IS
+    caught — but via a different status_class family and a more
+    generic error string than legacy claimed; also confirmed
+    Subnet('192.168.1.0') (no /prefix at all, legacy's separate
+    "InvalidCIDRFormat" case) hits this same 58000/InvalidSubnet path.
+  query: "RETURN Subnet('10.0.0.0/33') AS subnet"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - InvalidSubnet
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [network, negative, invalid-cidr]
+
+tags:
+- network
+- network-types
+- validation
+- negative-paths
+- legacy-rehome
