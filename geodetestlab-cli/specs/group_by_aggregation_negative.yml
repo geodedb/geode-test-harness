@@ -1,0 +1,283 @@
+version: '1.0'
+name: GROUP BY / Aggregation — Negative Paths (non-grouped column / sum-of-strings / nested aggregate / HAVING)
+description: |
+  Covers GROUP BY / aggregation negative paths not exercised by
+  geode_edge_cases_errors.yml (which covers empty-result and NULL-in-input
+  aggregation only) or groupby_return_alias_correctness.yml (which covers
+  alias-resolution correctness). This spec probes what happens when the
+  aggregation *contract itself* is violated: a non-grouped, non-aggregated
+  column in the RETURN list; sum() applied to a string property; a nested
+  aggregate call; and HAVING referencing an identifier that is not a
+  RETURN alias, an aggregate, or a GROUP BY key. `geode query` always
+  exits 0 for GQL-level outcomes, so exit_code alone proves nothing;
+  every assertion below pins the REAL observed behavior (verified
+  deterministic across repeated probes on a scratch server, geode serve
+  --listen 127.0.0.1:4487 --data-dir /tmp/probe-p20).
+
+  Seeded data: 5 :P20_N nodes, g/v integers + s string, in insertion
+  order g=1,v=10,s='aa'; g=1,v=20,s='bb'; g=2,v=30,s='cc'; g=2,v=40,s='dd';
+  g=2,v=50,s='ee'. So GROUP BY n.g produces group 1 (2 rows) and group 2
+  (3 rows), and within each group the rows are NOT functionally dependent
+  on g for any other column (v/s vary freely within a group).
+
+  Probed real behavior (all four negatives are silent-accept/no-error;
+  none crashed the server):
+
+    1. non-grouped-column (KEY) — `RETURN n.g, n.v, count(*) GROUP BY n.g`
+       projects n.v, which is neither the GROUP BY key nor wrapped in an
+       aggregate. LIMITATION-PIN: no error (status_class 00000). Real
+       behavior is "implicit first-value" — for each group, the reported
+       n.v is the value from the FIRST row inserted into that group (g=1
+       -> v=10, the first g=1 row; g=2 -> v=30, the first g=2 row), NOT an
+       arbitrary/non-deterministic pick and NOT an error. Verified
+       deterministic across 3 consecutive identical probes. The ISO/IEC
+       39075:2024-style contract would require either a query-time error
+       ("n.v must appear in GROUP BY or be wrapped in an aggregate
+       function") or restriction to columns functionally dependent on the
+       group key; this build silently accepts and returns first-row
+       semantics instead.
+
+    2. sum-of-strings (negative) — `RETURN sum(n.s) AS total` where n.s is
+       a string property on every seeded row. LIMITATION-PIN: no type
+       error. status_class 00000, `"total":0` (type INTEGER) — sum()
+       silently treats every non-numeric value as contributing 0 rather
+       than raising a type error ("sum() requires numeric operand") or
+       returning NULL. Companion probe: avg(n.s) returns NULL (type
+       NULL) rather than 0 or an error — so sum() and avg() do NOT even
+       agree with each other on how to silently handle non-numeric input,
+       reinforcing that this is a real type-checking gap, not a
+       considered design choice.
+
+    3. nested-aggregate (negative) — `RETURN sum(avg(n.v)) AS nested`.
+       LIMITATION-PIN: no error, no crash. status_class 00000,
+       `"nested":null`. Per the ISO/IEC 39075:2024 contract, nesting one
+       set function inside another is a query-time error ("aggregate
+       function calls cannot be nested"); this build instead silently
+       resolves the inner avg(n.v) to nothing (NULL) and sums NULL,
+       producing NULL — not a crash, not an error, just silently wrong.
+       Server verified alive and answering queries immediately after this
+       probe.
+
+    4. having-unknown-alias (negative) — HAVING is supported (probed and
+       confirmed correct on a real alias: `HAVING c > 2` correctly
+       filters to only the group with c=3, excluding c=2). LIMITATION-PIN
+       for the unknown-identifier case: `HAVING nosuchalias > 2` where
+       nosuchalias is neither a RETURN alias, a GROUP BY key, nor an
+       aggregate — does NOT raise "unknown identifier in HAVING" as the
+       documented contract would require. Instead status_class 00000 and
+       the result set is silently filtered to ZERO rows. Companion probe
+       proves *why*: `HAVING nosuchalias IS NULL` returns BOTH groups,
+       confirming nosuchalias silently resolves to SQL NULL (not an
+       error) and `NULL > 2` is unknown/false, which is what filters out
+       every row in the `> 2` case. This is a real, deterministic,
+       documented silent-accept — not a crash, not a raised error.
+
+  CANARY: REQ=REQ-GROUPBY-AGG-NEGATIVE-001; FEATURE="Aggregation"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/group_by_aggregation_negative.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: p20-setup-seed
+  description: |
+    Prerequisite (positive) — seed 5 :P20_N nodes with integer g/v and a
+    string s, in insertion order such that GROUP BY n.g produces group 1
+    (2 rows, first row v=10) and group 2 (3 rows, first row v=30), with v
+    NOT functionally dependent on g within a group.
+  query: |
+    CREATE
+      (:P20_N {g:1, v:10, s:'aa'}),
+      (:P20_N {g:1, v:20, s:'bb'}),
+      (:P20_N {g:2, v:30, s:'cc'}),
+      (:P20_N {g:2, v:40, s:'dd'}),
+      (:P20_N {g:2, v:50, s:'ee'})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [aggregation, groupby, setup, positive]
+
+- name: p20-valid-control
+  description: |
+    Prerequisite (positive) — a normal grouped count over n.g must
+    correctly produce group 1 -> 2 rows and group 2 -> 3 rows, proving the
+    baseline GROUP BY/aggregation path works before probing its negative
+    edges.
+  query: "MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"grp":1,"c":2'
+    - '"grp":2,"c":3'
+  tags: [aggregation, groupby, setup, positive]
+
+- name: p20-non-grouped-column
+  description: |
+    KEY ASSERTION / LIMITATION-PIN — `RETURN n.g, n.v, count(*) GROUP BY
+    n.g` projects n.v, which is neither the GROUP BY key nor wrapped in
+    an aggregate, and v varies freely within each group (not functionally
+    dependent on g). Probed real behavior: no error (status_class
+    00000). The engine silently applies "implicit first-value" semantics
+    — for each group, n.v is reported as the value from the FIRST row
+    inserted into that group: g=1 -> v=10 (the first g=1 row, not v=20),
+    g=2 -> v=30 (the first g=2 row, not v=40 or v=50). Verified
+    deterministic across 3 consecutive identical probes. Per the
+    ISO/IEC 39075:2024-style contract this should be a query-time error
+    ("n.v must appear in GROUP BY or be wrapped in an aggregate
+    function"); this build instead silently accepts it. Do not weaken
+    this assertion to expect an error until the underlying validation
+    gap is fixed — flip it then.
+  query: "MATCH (n:P20_N) RETURN n.g, n.v, count(*) GROUP BY n.g"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"g":1,"v":10,"count":2'
+    - '"g":2,"v":30,"count":3'
+  tags: [aggregation, groupby, negative, key-assertion, limitation-pin, silent-accept]
+
+- name: p20-sum-of-strings
+  description: |
+    LIMITATION-PIN — `RETURN sum(n.s) AS total` where n.s is a string
+    property on every seeded row (never numeric). Probed real behavior:
+    no type error. status_class 00000, `"total":0` with column type
+    INTEGER — sum() silently treats every non-numeric value as
+    contributing 0 rather than raising a type error ("sum() requires
+    numeric operand") or returning NULL. This is asserted as the real
+    (accepted) behavior, not claimed as a rejection. Candidate GAP:
+    sum()/avg() should validate operand type and raise a query-time type
+    error for non-numeric input, matching the ISO/IEC 39075:2024
+    contract.
+  query: "MATCH (n:P20_N) RETURN sum(n.s) AS total"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":0'
+    - '"type":"INTEGER"'
+  tags: [aggregation, negative, sum, type-error, limitation-pin, silent-accept]
+
+- name: p20-avg-of-strings-differential
+  description: |
+    Differential companion to p20-sum-of-strings — `RETURN avg(n.s) AS
+    total` over the SAME all-string column. Probed real behavior: also
+    no type error (status_class 00000), but avg() resolves to NULL
+    (type NULL) rather than sum()'s silent 0. sum() and avg() do NOT
+    even agree with each other on how to silently handle non-numeric
+    input, reinforcing that this is a real type-checking gap rather than
+    a considered, consistent design choice.
+  query: "MATCH (n:P20_N) RETURN avg(n.s) AS total"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":null'
+    - '"type":"NULL"'
+  tags: [aggregation, negative, avg, type-error, limitation-pin, silent-accept, differential]
+
+- name: p20-nested-aggregate
+  description: |
+    LIMITATION-PIN — `RETURN sum(avg(n.v)) AS nested` nests one set
+    function inside another. Probed real behavior: no crash, no error.
+    status_class 00000, `"nested":null` (type NULL). Per the ISO/IEC
+    39075:2024 contract, nesting set functions is a query-time error
+    ("aggregate function calls cannot be nested"); this build instead
+    silently resolves the inner avg(n.v) to nothing and sums that,
+    producing NULL — silently wrong rather than rejected. Server
+    verified alive and answering queries immediately after this probe
+    (no crash observed against this input shape).
+  query: "MATCH (n:P20_N) RETURN sum(avg(n.v)) AS nested"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"nested":null'
+  tags: [aggregation, negative, nested-aggregate, limitation-pin, silent-accept]
+
+- name: p20-having-valid-control
+  description: |
+    Prerequisite (positive) — HAVING IS supported and, given a real
+    RETURN alias (`c`), correctly filters groups: `HAVING c > 2` must
+    keep ONLY the group with c=3 (g=2) and exclude the group with c=2
+    (g=1). Proves the baseline HAVING path works before probing its
+    unknown-identifier edge.
+  query: "MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING c > 2"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"grp":2,"c":3'
+    stdout_not_contains:
+    - '"grp":1,"c":2'
+  tags: [aggregation, having, setup, positive]
+
+- name: p20-having-unknown-alias
+  description: |
+    KEY ASSERTION / LIMITATION-PIN — `HAVING nosuchalias > 2` where
+    nosuchalias is neither a RETURN alias, a GROUP BY key, nor an
+    aggregate. Probed real behavior: no error (status_class 00000) —
+    the documented contract ("unknown identifier in HAVING") is NOT
+    enforced. Instead the result set is silently filtered to ZERO rows.
+    See p20-having-unknown-alias-is-null-differential below for the
+    root-cause proof (nosuchalias resolves to NULL, not an error). Do
+    not weaken this assertion to expect an error until the underlying
+    validation gap is fixed — flip it then.
+  query: "MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING nosuchalias > 2"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [aggregation, having, negative, key-assertion, limitation-pin, silent-accept]
+
+- name: p20-having-unknown-alias-is-null-differential
+  description: |
+    Root-cause differential for p20-having-unknown-alias — `HAVING
+    nosuchalias IS NULL` over the SAME unresolvable identifier returns
+    BOTH groups (grp=1,c=2 and grp=2,c=3), proving nosuchalias silently
+    resolves to SQL NULL rather than raising "unknown identifier".
+    `NULL > 2` is unknown/false, which is exactly what filters every row
+    out in the `> 2` case above — this is a consistent, deterministic,
+    silent NULL-resolution, not a crash or a raised error.
+  query: "MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING nosuchalias IS NULL"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"grp":1,"c":2'
+    - '"grp":2,"c":3'
+  tags: [aggregation, having, negative, limitation-pin, silent-accept, differential]
+
+- name: p20-cleanup
+  description: Clean up all P20 test data.
+  query: "MATCH (n:P20_N) DETACH DELETE n"
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- aggregation
+- groupby
+- negative-paths
+- non-grouped-column
+- sum-of-strings
+- nested-aggregate
+- having
+- silent-accept
+- limitation-pin
