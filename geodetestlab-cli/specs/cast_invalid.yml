@@ -1,0 +1,226 @@
+version: '1.0'
+name: CAST — Invalid/Negative Paths (bad string / unsupported target / overflow / null)
+description: |
+  Complements `cast_type_keywords.yml` (16 tests, all happy-path CAST
+  conversions between valid type keywords). This spec covers CAST's
+  negative/error surface: an unconvertible string into INTEGER, a
+  nonexistent/bogus target type keyword, a numeric literal that overflows
+  the target's range, and CAST(null) boundary behavior. `geode query`
+  always exits 0 for GQL-level outcomes, so exit_code alone proves
+  nothing here; every case that claims a real rejection is paired with
+  `stdout_not_contains '"status_class":"00000"'` to prove it did NOT
+  silently succeed where an error was observed.
+
+  Probed on a scratch server (geode serve --listen 127.0.0.1:4481
+  --data-dir /tmp/probe-p14):
+
+    - valid-cast-control (`CAST('42' AS INTEGER)`) — positive control.
+      status_class 00000, `"result":42`. Proves the baseline CAST path
+      works before probing its negative edges.
+
+    - string-to-int (`CAST('abc' AS INTEGER)`) — LIMITATION-PIN, not the
+      22018 "invalid cast" error one might expect. Probed real behavior:
+      status_class 00000 (success!), the result column comes back typed
+      `NULL` and the value is `null`. An unconvertible string is silently
+      swallowed into a null result instead of raising an error. This
+      pattern was checked broadly — the same silent-NULL behavior was
+      observed for CAST('12.34.56' AS DECIMAL(10,2)), CAST('notabool' AS
+      BOOLEAN), CAST('not-a-date' AS TIMESTAMP), CAST([1,2,3] AS INTEGER),
+      and CAST({a:1} AS INTEGER): every semantically-invalid value-level
+      CAST silently produces NULL rather than erroring. Asserted as the
+      real (accepted) behavior, not claimed as a rejection.
+
+    - unsupported-target (`CAST('42' AS BANANA)`) — LIMITATION-PIN, not
+      the 0A000/42000 one might expect for a bogus type keyword. Probed
+      real behavior: status_class 00000, result column typed `NULL`,
+      value `null`. The parser accepts ANY identifier (even a numeric
+      token, confirmed with `CAST('42' AS 123)`, same silent-NULL result)
+      as a CAST target type at the grammar level; there is no semantic
+      validation that the named type actually exists. Only a *missing*
+      type name entirely (e.g. `CAST('42' AS)`) is caught, and only as a
+      pure parse-time syntax error (see cast-missing-type-syntax-error
+      below) — once any token is present after AS, CAST proceeds and
+      silently resolves an unrecognized type to NULL. Asserted as the
+      real (accepted) behavior, not claimed as a rejection.
+
+    - numeric-overflow (`CAST('99999999999999999999999999999' AS
+      INTEGER)`, a decimal literal vastly beyond i64 range fed in as a
+      string) — LIMITATION-PIN. Probed real behavior: status_class
+      00000, result column typed `NULL`, value `null` — same silent-NULL
+      pattern as string-to-int, not a range/overflow error. Asserted as
+      the real (accepted) behavior, not claimed as a rejection.
+
+    - cast-null (`CAST(null AS INTEGER)`) — positive boundary. status_class
+      00000, result column typed `NULL`, value `null`, exit 0. This is
+      the one "returns null" case that is actually the CORRECT/documented
+      behavior (casting SQL/GQL null always yields null), included to
+      contrast with the LIMITATION-PIN cases above, which also return
+      null but for the wrong reason (an unconvertible/invalid input
+      silently swallowed instead of erroring).
+
+    - cast-missing-type-syntax-error (bonus contrast case, not one of the
+      5 required probes but included to prove the suite isn't blind to
+      real CAST errors) — `CAST('42' AS)` with the type name omitted
+      entirely IS a genuine parse-time rejection: status_class 42000,
+      error "expected type name in CAST". This shows the boundary
+      precisely: CAST syntax errors (malformed grammar) are caught;
+      CAST semantic errors (well-formed but unconvertible value, or a
+      well-formed but nonexistent target type) are not.
+
+  CRASH FINDING (documented, NOT encoded as a test step, per the bug
+  rule — crashes are reported, never baked into a passing assertion):
+  `CAST(1.0e308 AS INTEGER)` (a float literal whose magnitude vastly
+  exceeds the i64 range) reliably crashes the server. Zig panic
+  "integer part of floating point value out of bounds" in the
+  float-to-integer CAST conversion path, observed to take the whole
+  server process down (the querying client then hangs until its own
+  timeout, and the process is gone from `ps` afterward). Reproduced
+  twice on a fresh scratch server. This spec deliberately never issues a
+  float-to-INTEGER CAST whose literal magnitude could exceed i64 range;
+  the numeric-overflow case above uses a huge literal fed in as a
+  STRING instead, which is safely swallowed to NULL (see above) rather
+  than crashing. Candidate GAP: `CAST(<float> AS INTEGER)` for a float
+  magnitude beyond i64 range should be a clean runtime rejection (e.g.
+  22003 "numeric value out of range"), not an unchecked
+  float-to-int-cast panic. See p14-report.md for the full repro and
+  stack trace.
+
+  CANARY: REQ=REQ-CAST-INVALID-001; FEATURE="Cast"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/cast_invalid.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: valid-cast-control
+  description: |
+    Positive control — CAST('42' AS INTEGER) must succeed and produce the
+    integer 42. Establishes the baseline CAST path works before probing
+    its negative edges below.
+  query: "RETURN CAST('42' AS INTEGER) AS result"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"result":42'
+  tags: [cast, positive, control]
+
+- name: string-to-int
+  description: |
+    LIMITATION-PIN — CAST('abc' AS INTEGER), an unconvertible string,
+    does NOT error on this build (no 22018 "invalid cast"). Probed real
+    behavior: status_class 00000, result column typed NULL, value null.
+    The invalid string is silently swallowed into a null result rather
+    than raising an error. Asserted as the real (accepted) behavior, not
+    claimed as a rejection.
+  query: "RETURN CAST('abc' AS INTEGER) AS result"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"NULL"'
+    - '"result":null'
+  tags: [cast, negative, string-to-int, limitation-pin, silent-accept]
+
+- name: unsupported-target
+  description: |
+    LIMITATION-PIN — CAST('42' AS BANANA), a bogus/nonexistent target
+    type keyword, does NOT error on this build (no 0A000/42000
+    "unsupported type"). Probed real behavior: status_class 00000,
+    result column typed NULL, value null. The parser accepts any
+    identifier as a CAST target at the grammar level with no semantic
+    validation that the type actually exists; only an entirely-missing
+    type name is a syntax error (see cast-missing-type-syntax-error).
+    Asserted as the real (accepted) behavior, not claimed as a rejection.
+  query: "RETURN CAST('42' AS BANANA) AS result"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"NULL"'
+    - '"result":null'
+  tags: [cast, negative, unsupported-target, limitation-pin, silent-accept]
+
+- name: numeric-overflow
+  description: |
+    LIMITATION-PIN — CAST('99999999999999999999999999999' AS INTEGER), a
+    decimal literal (fed in as a string) vastly beyond the i64 range,
+    does NOT error on this build. Probed real behavior: status_class
+    00000, result column typed NULL, value null — the same silent-NULL
+    pattern as string-to-int, not a range/overflow error. NOTE: feeding
+    an oversized value in as a raw FLOAT literal instead of a string
+    (e.g. `CAST(1.0e308 AS INTEGER)`) reliably CRASHES the server (see
+    the CRASH FINDING in this spec's description and p14-report.md for
+    the full repro); this test deliberately uses the string-literal form,
+    which is safe. Asserted as the real (accepted) behavior, not claimed
+    as a rejection.
+  query: "RETURN CAST('99999999999999999999999999999' AS INTEGER) AS result"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"NULL"'
+    - '"result":null'
+  tags: [cast, negative, numeric-overflow, limitation-pin, silent-accept]
+
+- name: cast-null
+  description: |
+    Positive-boundary — CAST(null AS INTEGER) must return a null row
+    with exit 0. Unlike the LIMITATION-PIN cases above (which also
+    return null, but as an undocumented silent swallow of an invalid
+    input), this is the correct, expected behavior: casting null always
+    yields null. Probed real behavior: status_class 00000, result column
+    typed NULL, value null.
+  query: "RETURN CAST(null AS INTEGER) AS result"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"NULL"'
+    - '"result":null'
+  tags: [cast, positive-boundary, null]
+
+- name: cast-missing-type-syntax-error
+  description: |
+    Bonus contrast case (not one of the 5 required probes) — CAST('42'
+    AS), omitting the type name entirely, IS a genuine parse-time
+    rejection, proving this suite isn't blind to real CAST errors: it's
+    specifically value-level and unknown-target-type-level CAST errors
+    that are silently swallowed (see string-to-int/unsupported-target/
+    numeric-overflow above), while grammar-level syntax errors are
+    caught normally. Probed real behavior: status_class 42000, error
+    "expected type name in CAST" — a genuine rejection, not a
+    silent-accept.
+  query: "RETURN CAST('42' AS"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - expected type name in CAST
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [cast, negative, syntax-error, key-assertion]
+
+tags:
+- cast
+- negative-paths
+- string-to-int
+- unsupported-target
+- numeric-overflow
+- cast-null
+- silent-accept
+- limitation-pin
