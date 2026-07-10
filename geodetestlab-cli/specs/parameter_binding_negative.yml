@@ -1,0 +1,203 @@
+version: '1.0'
+name: Parameter Binding — Negative Paths (out-of-range / missing / extra / type-mismatch)
+description: |
+  Covers parameter-binding negative/edge paths not exercised by the existing
+  positive-only param specs (gql_parameter_binding.yml, positional_parameters.yml).
+  Those specs prove --param resolves $name and $1/$2/$3 references correctly;
+  this spec probes what happens when the binding is WRONG — a positional
+  reference beyond the supplied params, a named param never supplied, more
+  params supplied than referenced, and a string param fed into arithmetic.
+
+  `geode query` always exits 0 for GQL-level outcomes (confirmed here too —
+  every case below is exit_code 0), so exit_code alone proves nothing; every
+  claimed real rejection is paired with stdout_not_contains
+  '"status_class":"00000"'. No test in this spec persists graph data (all
+  are RETURN/arithmetic-only), so the P17_ node-label prefix convention used
+  by data-mutating specs does not apply here.
+
+  Probed on a scratch server (geode serve --listen 127.0.0.1:4484
+  --data-dir /tmp/probe-p17, GEODE_ADMIN_PASSWORD bootstrap):
+
+    - positional-out-of-range (KEY negative, `RETURN $1 AS a, $2 AS b` with
+      only --param 1 supplied) — LIMITATION-PIN, not a rejection.
+      status_class 00000; $2 (never bound) silently evaluates to NULL
+      rather than erroring "parameter $2 not supplied". Same null-on-unbound
+      semantics observed for unbound MATCH/WHERE variables elsewhere in the
+      suite (see merge_conflict_negative.yml, where_clause_negative.yml).
+
+    - missing-named-param (`RETURN $missing AS m`, $missing never supplied
+      via --param) — LIMITATION-PIN, not a rejection. status_class 00000,
+      $missing evaluates to NULL. No "parameter not found" / naming error
+      is raised — consistent with the positional case above.
+
+    - extra-params (--param 1/--param 2/--param 3 all supplied, query only
+      references $1) — LIMITATION-PIN: extra, unreferenced params are
+      silently accepted and ignored. status_class 00000, only $1's value
+      appears in the result; no warning or error about the unused params.
+
+    - type-mismatch-param (`RETURN $sval + 1 AS r` where $sval is bound to
+      the JSON string "not-a-number") — REAL ERROR, not a silent accept.
+      status_class 58000, error_code "TypeMismatch". This is the one
+      binding-negative that genuinely rejects — arithmetic on a string
+      param is caught, unlike the unbound/extra-param cases above. Note:
+      the task brief anticipated a 22xxx (data-exception) SQLSTATE class:
+      probed reality is 58000 ("TypeMismatch"), asserted honestly as
+      observed rather than the anticipated class.
+
+  CANARY: REQ=REQ-PARAM-BINDING-NEGATIVE-001; FEATURE="ParameterBinding"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/parameter_binding_negative.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: valid-binding-control
+  description: |
+    Positive control — a correctly supplied named param resolves and
+    returns the bound value, proving the --param surface itself works
+    before probing the negative paths below.
+  args:
+  - query
+  - --param
+  - name
+  - '"Alice"'
+  - RETURN $name AS name
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"Alice"'
+  tags: [parameter-binding, positive-control]
+
+- name: positional-out-of-range
+  description: |
+    KEY NEGATIVE — query references $1 AND $2, but only --param 1 is
+    supplied ($2 is never bound by any --param flag). Probed real
+    behavior: status_class 00000, NOT an error. $1 resolves to the
+    supplied value; $2 (out of range) silently evaluates to NULL rather
+    than raising "parameter $2 not supplied". Asserted as the real
+    (accepted) behavior — LIMITATION-PIN, not the naming error one
+    might expect.
+  args:
+  - query
+  - --param
+  - '1'
+  - '"only-one"'
+  - RETURN $1 AS a, $2 AS b
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"a":"only-one"'
+    - '"b":null'
+  tags: [parameter-binding, negative, positional-out-of-range, limitation-pin, silent-accept, key-assertion]
+
+- name: missing-named-param
+  description: |
+    KEY NEGATIVE — query references $missing, which is never supplied via
+    --param. Probed real behavior: status_class 00000, NOT an error naming
+    the missing parameter. $missing silently evaluates to NULL.
+    LIMITATION-PIN.
+  args:
+  - query
+  - RETURN $missing AS m
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"m":null'
+  tags: [parameter-binding, negative, missing-named-param, limitation-pin, silent-accept, key-assertion]
+
+- name: extra-params
+  description: |
+    Probe — three params supplied (--param 1/2/3) but the query only
+    references $1. Probed real behavior: status_class 00000, NOT an
+    error or warning about unused params — $2 and $3 are silently
+    accepted and ignored. LIMITATION-PIN (no "unused parameter"
+    diagnostic exists).
+  args:
+  - query
+  - --param
+  - '1'
+  - '"used"'
+  - --param
+  - '2'
+  - '"unused-a"'
+  - --param
+  - '3'
+  - '"unused-b"'
+  - RETURN $1 AS a
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"a":"used"'
+  tags: [parameter-binding, negative, extra-params, limitation-pin, silent-accept, key-assertion]
+
+- name: type-mismatch-param
+  description: |
+    KEY NEGATIVE — $sval is bound to the JSON string "not-a-number" and
+    used in arithmetic ($sval + 1). Probed real behavior: this DOES
+    reject — status_class 58000, error_code "TypeMismatch". Unlike the
+    silent-accept cases above, this is a genuine rejection, asserted via
+    stdout_not_contains '"status_class":"00000"' in addition to the
+    positive stdout_contains checks.
+  args:
+  - query
+  - --param
+  - sval
+  - '"not-a-number"'
+  - RETURN $sval + 1 AS r
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [parameter-binding, negative, type-mismatch, real-error, key-assertion]
+
+- name: type-mismatch-param-rerun-confirms
+  description: |
+    KEY ASSERTION — re-running the identical type-mismatch query with a
+    different operator (multiplication) confirms the rejection is
+    deterministic, not a one-off fluke of the addition operator.
+  args:
+  - query
+  - --param
+  - sval
+  - '"abc"'
+  - RETURN $sval * 2 AS r
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [parameter-binding, negative, type-mismatch, real-error, key-assertion]
+
+tags:
+- parameter-binding
+- negative-paths
+- positional-out-of-range
+- missing-named-param
+- extra-params
+- type-mismatch
+- silent-accept
+- limitation-pin
