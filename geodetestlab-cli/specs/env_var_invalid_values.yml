@@ -1,0 +1,555 @@
+version: '1.0'
+name: Env var / DSN invalid-value handling — port, numeric knob, unknown var, malformed DSN
+description: |
+  Task 27 (Plan 2, pos/neg coverage): negative + positive coverage for how
+  geode handles invalid environment-variable values and malformed DSN
+  connection strings. `environment_variables_basic.yml` is positive-only
+  (GQL string-substitution smoke tests, not real env-var validation).
+  This spec probes the REAL, observable behavior for four cases and pins
+  it honestly — most invalid numeric env values fall back to defaults
+  silently (established precedent: `config_buffer_pool_pages.yml` /
+  GEODE_BUFFER_POOL_PAGES=garbage boots-with-default), while malformed
+  client-facing input (a bad --server/--dsn address string) is rejected
+  cleanly and immediately.
+
+  ## PROBE FINDINGS (2026-07-10, scratch builds, ../geode/zig-out/bin/geode)
+
+  1. GEODE_PORT — grep across `../geode/src/` found ZERO references to a
+     `GEODE_PORT` environment variable anywhere in the server binary. The
+     server's listen address comes exclusively from the `--listen`
+     CLI flag (`geode serve --listen <addr:port>`); `GEODE_PORT` is purely
+     a shell-script convention used by THIS harness's own bash test blocks
+     (e.g. `rbac_drop_user_terminates_sessions.yml`,
+     `transaction_conflict_abort.yml`: `${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}`)
+     to remember which port a managed server bound. Live-probed: starting
+     a scratch server with `GEODE_PORT=banana` set in its environment
+     (while `--listen 127.0.0.1:65001` is passed explicitly) boots the
+     server completely normally — the env var is inert, not consumed.
+     The REAL negative surface for "invalid port" is therefore on the
+     CLIENT side: constructing a `--server`/`--dsn` address with a
+     non-numeric port. Live-probed: `geode query ... --server
+     127.0.0.1:banana` and `geode query ... --dsn quic://geode:pw@127.0.0.1:banana/g`
+     both fail immediately with `Error: Invalid port number in server
+     address` / `Error: query execution failed`, exit code 1 — a clean,
+     bounded rejection, not a hang. This spec's `invalid-port-env` test
+     documents BOTH halves of this honestly: the env var's inertness on
+     the server side, and the real client-side rejection.
+  2. GEODE_AUTH_RATE_LOCKOUT_SECS — genuinely consumed
+     (`../geode/src/server/auth_rate_limiter.zig:73`,
+     `AuthRateLimiter.initFromEnv`). `readEnvU64` (same file, ~line 83)
+     parses the raw env string with `std.fmt.parseInt`; a non-numeric
+     value simply fails to produce `Some(v)` and the `if (readEnvU64(...))
+     |secs|` guard never fires, silently leaving `lockout_ns` at its
+     `default_lockout_duration_ns` (60s) — same silent-catch-and-default
+     shape as `GEODE_BUFFER_POOL_PAGES`'s `envU64`. Live-probed:
+     `GEODE_AUTH_RATE_LOCKOUT_SECS=xyz` on a scratch server boots
+     normally (`[startup] server ready`), serves a query, and produces
+     no panic/segfault/crash marker in the log.
+  3. GEODE_TOTALLY_UNKNOWN=1 — no code path reads this name; a scratch
+     server started with it set boots identically to an unset baseline.
+  4. Malformed DSN — `geode query --dsn 'quic://:::bad'` (colliding with
+     the task brief's illustrative `geode://:::bad`, adapted to geode's
+     REAL supported schemes per `geode query --help`: `quic://` / `grpc://`)
+     fails immediately with `Error: Invalid port number in server address`
+     / `Error: query execution failed`, exit 1. A second malformed-DSN
+     shape was also probed for completeness: `--dsn ''` and `--dsn
+     'quic://'` (host-less) both fail with `Error: DSN missing host`,
+     exit 2 — a DIFFERENT, equally clean and bounded error path. Both are
+     asserted below (wrapped in `timeout`) to confirm neither hangs.
+
+  CANARY: REQ=REQ-ENV-DSN-INVALID-001; FEATURE="Config"; ASPECT=InvalidValueHandling; STATUS=TESTED; TEST=geodetestlab/specs/env_var_invalid_values.yml; OWNER=qa; UPDATED=2026-07-10
+
+single_node_only: true # scratch servers on a fixed local port + filesystem-local probe scripts
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# 1. invalid-port-env (KEY negative). GEODE_PORT is not consumed by the
+#    server (see probe finding #1) — asserts that inertness AND the real
+#    client-side rejection of a non-numeric port in --server/--dsn.
+# ---------------------------------------------------------------------------
+
+- name: p27_invalid-port-env
+  description: |
+    KEY negative. Part A: scratch server booted with GEODE_PORT=banana in
+    its environment (while --listen 127.0.0.1:65001 is passed explicitly)
+    — proves the env var is inert (not read by the server at all; grep
+    evidence in the spec description). Part B: the client-side negative
+    that actually exists — geode query with a malformed non-numeric port
+    in --server and in --dsn — asserts a clean, bounded (timeout-wrapped)
+    nonzero exit with a config-error message, never a hang.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    PORT=65001
+    PIDFILE=/tmp/p27_port_scratch.pid
+    DIRFILE=/tmp/p27_port_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    # Idempotent self-heal: kill any stale scratch server from a prior
+    # aborted run before claiming the port.
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT}\$" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/p27_port.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    # Port preflight: fail fast and loud if something else is squatting on
+    # the fixed port instead of a cryptic bind/connect error downstream.
+    # Port chosen above the ephemeral range (>60999) to avoid collisions.
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}\$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"\$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/p27_port.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+
+    # Verified-TLS parity (release-binary safe): present the CA-signed leaf
+    # certificate when the harness provisioned a CA; otherwise the client
+    # falls back to --insecure-tls-skip-verify against the server's
+    # auto-generated self-signed cert.
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    # Part A: GEODE_PORT=banana set in the environment; --listen is the
+    # REAL source of the bind address and is passed explicitly, so a
+    # garbage GEODE_PORT must have zero effect on server boot.
+    GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_PORT=banana \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level info --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 < /dev/null &
+    SPID=$!
+    echo "$SPID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      kill -9 "$SPID" 2>/dev/null || true
+      rm -f "$PIDFILE"
+      case "$WORKDIR" in /tmp/p27_port.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+      exit 1
+    fi
+    echo "GEODE_PORT_ENV_VAR_INERT_SERVER_BOOTED_ON_EXPLICIT_LISTEN"
+
+    # Part B: the real client-side negative. A non-numeric port in
+    # --server and in --dsn must be rejected cleanly and immediately
+    # (wrapped in timeout so a hang cannot wedge the suite).
+    set +e
+    timeout 8 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:banana" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >"$WORKDIR/client_server.out" 2>&1
+    CLIENT_SERVER_EXIT=$?
+    timeout 8 "$BIN" query "RETURN 1 AS x" --dsn "quic://geode:${PW}@127.0.0.1:banana/g" ${GEODE_CLIENT_TLS} >"$WORKDIR/client_dsn.out" 2>&1
+    CLIENT_DSN_EXIT=$?
+    set -e
+
+    echo "CLIENT_SERVER_EXIT=${CLIENT_SERVER_EXIT}"
+    cat "$WORKDIR/client_server.out"
+    echo "CLIENT_DSN_EXIT=${CLIENT_DSN_EXIT}"
+    cat "$WORKDIR/client_dsn.out"
+
+    if [ "$CLIENT_SERVER_EXIT" -ne 0 ] && [ "$CLIENT_SERVER_EXIT" -lt 124 ] && \
+       [ "$CLIENT_DSN_EXIT" -ne 0 ] && [ "$CLIENT_DSN_EXIT" -lt 124 ]; then
+      echo "INVALID_PORT_CLEANLY_REJECTED_BOUNDED"
+    else
+      echo "INVALID_PORT_HANDLING_UNEXPECTED"
+    fi
+
+    # Graceful shutdown of the scratch server (SIGTERM, then bounded wait).
+    kill -TERM "$SPID" 2>/dev/null || true
+    for i in $(seq 1 100); do
+      kill -0 "$SPID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$SPID" 2>/dev/null || true
+
+    if grep -qiE "panic|segmentation fault|segfault|SIGSEGV|SIGABRT|unhandled error|stack trace" "$WORKDIR/server.log"; then
+      echo "CRASH_SIGNATURE_DETECTED_IN_LOG"
+      cat "$WORKDIR/server.log"
+    else
+      echo "NO_CRASH_SIGNATURE"
+    fi
+
+    rm -f "$PIDFILE"
+    case "$WORKDIR" in /tmp/p27_port.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+
+    [ "$READY" -eq 1 ]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GEODE_PORT_ENV_VAR_INERT_SERVER_BOOTED_ON_EXPLICIT_LISTEN
+    - "CLIENT_SERVER_EXIT=1"
+    - "CLIENT_DSN_EXIT=1"
+    - Invalid port number in server address
+    - INVALID_PORT_CLEANLY_REJECTED_BOUNDED
+    - NO_CRASH_SIGNATURE
+    stdout_not_contains:
+    - SCRATCH_SERVER_TIMEOUT
+    - PORT_65001_OCCUPIED_BY_FOREIGN_PROCESS
+    - INVALID_PORT_HANDLING_UNEXPECTED
+    - CRASH_SIGNATURE_DETECTED_IN_LOG
+  tags: [env, dsn, negative, invalid-port, key-assertion]
+
+# ---------------------------------------------------------------------------
+# 2. invalid-numeric-env (negative). GEODE_AUTH_RATE_LOCKOUT_SECS=xyz on a
+#    scratch server. Probed: readEnvU64's parse failure silently leaves
+#    the guard un-taken, defaulting to 60s — same silent-fallback shape
+#    established by GEODE_BUFFER_POOL_PAGES=garbage in
+#    config_buffer_pool_pages.yml. Asserts boots + serves + no crash.
+# ---------------------------------------------------------------------------
+
+- name: p27_invalid-numeric-env
+  description: |
+    Negative -> documented fallback. Starts a scratch server with
+    GEODE_AUTH_RATE_LOCKOUT_SECS=xyz (non-numeric). Probed contract:
+    readEnvU64 (auth_rate_limiter.zig) returns null on parse failure, so
+    the `if (readEnvU64(...)) |secs|` guard never fires and the default
+    60s lockout window is used silently — no startup config-validation
+    gate rejects this value. Asserted here as SCRATCH_SERVER_READY plus a
+    successful query, with NO panic/segfault/crash marker in the captured
+    server log (the bug-rule tripwire).
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    PORT=65001
+    PIDFILE=/tmp/p27_numeric_scratch.pid
+    DIRFILE=/tmp/p27_numeric_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT}\$" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/p27_numeric.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}\$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"\$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/p27_numeric.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_AUTH_RATE_LOCKOUT_SECS=xyz \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level info --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 < /dev/null &
+    SPID=$!
+    echo "$SPID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      kill -9 "$SPID" 2>/dev/null || true
+      rm -f "$PIDFILE"
+      case "$WORKDIR" in /tmp/p27_numeric.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+      exit 1
+    fi
+    echo "SCRATCH_SERVER_READY"
+
+    QUERY_OK=1
+    timeout 10 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1 || QUERY_OK=0
+    if [ "$QUERY_OK" -eq 1 ]; then
+      echo "INVALID_NUMERIC_ENV_FALLBACK_SERVED_OK"
+    else
+      echo "INVALID_NUMERIC_ENV_QUERY_FAILED"
+    fi
+
+    kill -TERM "$SPID" 2>/dev/null || true
+    for i in $(seq 1 100); do
+      kill -0 "$SPID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$SPID" 2>/dev/null || true
+
+    if grep -qiE "panic|segmentation fault|segfault|SIGSEGV|SIGABRT|unhandled error|stack trace" "$WORKDIR/server.log"; then
+      echo "CRASH_SIGNATURE_DETECTED_IN_LOG"
+      cat "$WORKDIR/server.log"
+    else
+      echo "NO_CRASH_SIGNATURE"
+    fi
+
+    rm -f "$PIDFILE"
+    case "$WORKDIR" in /tmp/p27_numeric.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+
+    [ "$READY" -eq 1 ] && [ "$QUERY_OK" -eq 1 ]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+    - INVALID_NUMERIC_ENV_FALLBACK_SERVED_OK
+    - NO_CRASH_SIGNATURE
+    stdout_not_contains:
+    - SCRATCH_SERVER_TIMEOUT
+    - PORT_65001_OCCUPIED_BY_FOREIGN_PROCESS
+    - INVALID_NUMERIC_ENV_QUERY_FAILED
+    - CRASH_SIGNATURE_DETECTED_IN_LOG
+  tags: [env, negative, invalid-numeric, auth-rate-limiter]
+
+# ---------------------------------------------------------------------------
+# 3. unknown-env-ignored (positive). GEODE_TOTALLY_UNKNOWN=1 — no code
+#    path reads this name; server boots identically to an unset baseline.
+# ---------------------------------------------------------------------------
+
+- name: p27_unknown-env-ignored
+  description: |
+    Positive. Starts a scratch server with GEODE_TOTALLY_UNKNOWN=1 (a
+    name that appears nowhere in the geode source). Asserts the unknown
+    var is silently ignored: server boots and serves normally.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    PORT=65001
+    PIDFILE=/tmp/p27_unknown_scratch.pid
+    DIRFILE=/tmp/p27_unknown_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT}\$" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/p27_unknown.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}\$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"\$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/p27_unknown.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_TOTALLY_UNKNOWN=1 \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level info --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 < /dev/null &
+    SPID=$!
+    echo "$SPID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      kill -9 "$SPID" 2>/dev/null || true
+      rm -f "$PIDFILE"
+      case "$WORKDIR" in /tmp/p27_unknown.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+      exit 1
+    fi
+    echo "UNKNOWN_ENV_VAR_IGNORED_SERVER_BOOTED"
+
+    QUERY_OK=1
+    timeout 10 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1 || QUERY_OK=0
+    if [ "$QUERY_OK" -eq 1 ]; then
+      echo "UNKNOWN_ENV_SERVED_OK"
+    else
+      echo "UNKNOWN_ENV_QUERY_FAILED"
+    fi
+
+    kill -TERM "$SPID" 2>/dev/null || true
+    for i in $(seq 1 100); do
+      kill -0 "$SPID" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -9 "$SPID" 2>/dev/null || true
+
+    if grep -qiE "panic|segmentation fault|segfault|SIGSEGV|SIGABRT|unhandled error|stack trace" "$WORKDIR/server.log"; then
+      echo "CRASH_SIGNATURE_DETECTED_IN_LOG"
+      cat "$WORKDIR/server.log"
+    else
+      echo "NO_CRASH_SIGNATURE"
+    fi
+
+    rm -f "$PIDFILE"
+    case "$WORKDIR" in /tmp/p27_unknown.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+
+    [ "$READY" -eq 1 ] && [ "$QUERY_OK" -eq 1 ]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - UNKNOWN_ENV_VAR_IGNORED_SERVER_BOOTED
+    - UNKNOWN_ENV_SERVED_OK
+    - NO_CRASH_SIGNATURE
+    stdout_not_contains:
+    - SCRATCH_SERVER_TIMEOUT
+    - PORT_65001_OCCUPIED_BY_FOREIGN_PROCESS
+    - UNKNOWN_ENV_QUERY_FAILED
+    - CRASH_SIGNATURE_DETECTED_IN_LOG
+  tags: [env, positive, unknown-env]
+
+# ---------------------------------------------------------------------------
+# 4. malformed-dsn (negative). Client-only — no scratch server required
+#    since a malformed DSN is rejected before any connection attempt.
+#    Wrapped in timeout to catch a hang instead of hanging the suite.
+# ---------------------------------------------------------------------------
+
+- name: p27_malformed-dsn
+  description: |
+    Negative. `geode query --dsn 'quic://:::bad'` (geode's REAL supported
+    DSN schemes are quic:// and grpc://, confirmed via `geode query
+    --help`; adapted from the task brief's illustrative geode://
+    example). Probed: fails immediately with "Invalid port number in
+    server address" / "Error: query execution failed", exit 1. A second
+    malformed shape (host-less DSN) is also probed and asserted: both
+    `--dsn ''` and `--dsn 'quic://'` fail with "DSN missing host", exit
+    2 — a different but equally clean, bounded error path. Neither shape
+    hangs (each wrapped in `timeout 8`).
+  type: bash
+  timeout_ms: 30000
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+
+    set +e
+    OUT1=$(timeout 8 "$BIN" query "RETURN 1 AS x" --dsn "quic://:::bad" --insecure-tls-skip-verify 2>&1)
+    EXIT1=$?
+    OUT2=$(timeout 8 "$BIN" query "RETURN 1 AS x" --dsn "" --insecure-tls-skip-verify 2>&1)
+    EXIT2=$?
+    OUT3=$(timeout 8 "$BIN" query "RETURN 1 AS x" --dsn "quic://" --insecure-tls-skip-verify 2>&1)
+    EXIT3=$?
+    set -e
+
+    echo "MALFORMED_PORT_DSN_EXIT=${EXIT1}"
+    echo "$OUT1"
+    echo "EMPTY_DSN_EXIT=${EXIT2}"
+    echo "$OUT2"
+    echo "HOSTLESS_DSN_EXIT=${EXIT3}"
+    echo "$OUT3"
+
+    if [ "$EXIT1" -ne 0 ] && [ "$EXIT1" -lt 124 ] && \
+       [ "$EXIT2" -ne 0 ] && [ "$EXIT2" -lt 124 ] && \
+       [ "$EXIT3" -ne 0 ] && [ "$EXIT3" -lt 124 ]; then
+      echo "MALFORMED_DSN_CLEANLY_REJECTED_BOUNDED"
+    else
+      echo "MALFORMED_DSN_HANDLING_UNEXPECTED"
+    fi
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - "MALFORMED_PORT_DSN_EXIT=1"
+    - Invalid port number in server address
+    - "EMPTY_DSN_EXIT=2"
+    - "HOSTLESS_DSN_EXIT=2"
+    - DSN missing host
+    - MALFORMED_DSN_CLEANLY_REJECTED_BOUNDED
+    stdout_not_contains:
+    - MALFORMED_DSN_HANDLING_UNEXPECTED
+  tags: [dsn, negative, malformed-dsn, key-assertion]
+
+tags:
+- env
+- dsn
+- config
+- invalid-value
+- negative
