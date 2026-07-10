@@ -1,0 +1,443 @@
+version: '1.0'
+name: SIGTERM shutdown drain is bounded, no busy-spin (geode gap 0039)
+description: |
+  Pins geode commit 221a97f1 ("fix(server): gap 0039 — SIGTERM shutdown
+  busy-spun forever draining abandoned QUIC connections; bound the drain,
+  force-close stalled peers, watchdog the teardown"). Live signature:
+  SIGTERM lands, data flush completes, then the process sat >= 10 minutes
+  at ~1.75 cores with 2 threads spinning, the listener still answering
+  handshakes, and active_streams stuck with proto_idle_ms in the millions;
+  only SIGKILL ended it. Root cause was UNBOUNDED waits on connection
+  handlers that never finish for an abandoned peer (thread-pool
+  joinAllWorkers() and SharedConnState.waitForAllStreamsDrained were both
+  unbounded), so one stuck connection/acceptor task wedged the whole LIFO
+  defer unwind. The fix bounds the drain to
+  `GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS` (default 30000ms; `0` = immediate —
+  force-close whatever is open right away), force-closes whatever is left
+  at the deadline, and arms a detached teardown watchdog (budget
+  `max(drain_timeout_ms, 5000)`) that force-exits rc=0 if the remaining
+  pool join / store free / transport deinit still wedges — everything
+  durable is already flushed to disk by that point, so a watchdog exit
+  loses no data.
+
+  ## Why this spec drives its own scratch servers
+
+  SIGTERM must be sent to the process the harness's OWN test loop is
+  running against for its `server_running` invariant — but sending
+  SIGTERM to the harness-managed server would kill the very server every
+  other spec test in a parallel run depends on. This spec therefore keeps
+  a normal managed server (`cli.server.enabled: true`) solely to satisfy
+  the harness's `server_running` invariant (no test below queries it), and
+  drives every actual SIGTERM assertion via `type: bash` tests against
+  hand-rolled scratch servers on fixed ports, following the established
+  scratch-server hygiene pattern from
+  `specs/regression_gap0839_inmemory_graph_tenant_bind.yml` /
+  `specs/read_executor_budget_53200.yml` /
+  `specs/quic_stream_multiplexing_default.yml`: fresh mktemp working
+  directory, idempotent self-heal + port preflight before claiming the
+  port, and PID-file/trap-tracked teardown so a mid-script assertion
+  failure cannot leak the scratch server process.
+
+  ## Probe findings (this build, geode HEAD past 221a97f1 — fix present)
+
+  - Confirmed via `../geode/src/server/main.zig:3224`: the env var is
+    EXACTLY `GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS`
+    (`envUsize(gpa, "GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS", 30_000, 0,
+    86_400_000)`) — default 30000ms, min 0, max 86_400_000ms (24h). `0`
+    means immediate force-close, NOT "disabled"/"unbounded" — confirmed by
+    the shutdown log line
+    `[shutdown] force-closing N stalled connections after drain timeout
+    (0ms)` appearing immediately when `=0` is set.
+  - Live-probed a scratch server (port 4462) with one open connection
+    (a background `geode query` left running) at the moment SIGTERM was
+    sent, timing wall-clock from `kill -TERM $PID` to `kill -0 $PID`
+    first failing:
+      - `GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=2000`: 3 runs exited in 2.99s,
+        3.19s, 3.60s. Shutdown log showed
+        `[shutdown] connection drain complete (54-103ms)` — the drain
+        itself resolves almost instantly (the lone connection was idle,
+        not abandoned mid-frame), and the remaining ~3s is this
+        (debug-build) process's own teardown/deinit overhead, well inside
+        the `max(drain_timeout_ms, 5000)` = 5000ms watchdog budget — i.e.
+        this build exits via the normal teardown path, not the watchdog
+        force-exit.
+      - `GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=0`: 3 runs exited in 3.70s,
+        2.27s, 3.60s, with the log showing the immediate
+        `force-closing 1 stalled connections after drain timeout (0ms)`
+        line.
+  - ReleaseSafe worst-case headroom (the reason the ceilings below are
+    20s, not the ~4s a debug-only probe would suggest): the harness's
+    target binary is built `-Doptimize=ReleaseSafe` (geode/Makefile:322),
+    and `GEODE_QUIC_DETACHED_CONNECTION_ADMISSION` (main.zig:2490)
+    defaults ON in any non-Debug build (`builtin.mode != .Debug`) — so a
+    ReleaseSafe shutdown ADDITIONALLY calls
+    `g_connection_admission_gate.waitForZero(10 * std.time.ns_per_s)`
+    (main.zig:3209) BEFORE the drain phase even begins. That 10s is a
+    bounded TIMEOUT CEILING, not a fixed wait: it returns as soon as
+    in-flight admission threads reach zero, and only burns the full 10s
+    (then logs "Connection admission threads still active during
+    shutdown" and continues) if an admission thread is genuinely wedged —
+    which is precisely the abandoned-mid-admission peer gap-0039 hardens
+    against. Because these tests deliberately race a fresh client
+    connection against SIGTERM with zero settle time, the legitimate
+    ReleaseSafe worst case stacks: up to 10s admission-gate ceiling + the
+    drain window + the `max(drain_timeout_ms, 5000)` teardown-watchdog
+    floor. For `sigterm-immediate` (drain=0) that is up to ~10s + ~5s =
+    ~15s; for `sigterm-bounded` (drain=2000) up to ~10s + 2s + 5s = ~17s.
+  - ReleaseSafe RE-PROBE (actually built `-Doptimize=ReleaseSafe` to a
+    separate prefix so the shared `../geode/zig-out` was untouched; the
+    62MB stripped binary refuses `--insecure-tls-skip-verify` under
+    release hardening, so the probe client sets GEODE_ALLOW_INSECURE_TLS=1
+    — the harness spec below instead uses the CA-signed leaf via
+    GEODE_TEST_CA_CERT, same verified-TLS parity as the other scratch
+    specs). With the admission gate defaulting ON and 1-2 real
+    connections open at signal time, measured TYPICAL exits were
+    drain=2000 -> 1.35s / 1.46s and drain=0 -> 1.46s / 1.46s (shutdown log
+    confirmed "draining N connections" and, for drain=0, the immediate
+    "force-closing 1 stalled connections after drain timeout (0ms)"; NO
+    DebugAllocator leak reports, confirming a genuine release build). The
+    ReleaseSafe TYPICAL path is thus actually FASTER than the debug probe
+    because release-optimized teardown is quicker and the admission gate
+    returned promptly (connections completed cleanly); the ~15-17s figure
+    is the THEORETICAL ceiling reserved for a wedged admission thread, not
+    the observed norm. The 20s ceilings cover both with comfortable
+    margin.
+  - Given the ReleaseSafe ~15-17s theoretical worst case (and ~1.4s
+    typical) plus the fixing commit's own TDD numbers (~4.3s for a 2000ms
+    drain scenario, ~2.2s for a 0ms drain scenario), BOTH ceilings below
+    are set to a deliberately generous 20s to absorb a full admission-gate
+    timeout plus CI scheduling jitter without weakening the actual
+    regression teeth: this is a "bounded, not infinite" pin, not an
+    exact-timing assertion. A genuine gap-0039 regression (busy-spin)
+    would still fail hard — the pre-fix bug hung for 10+ MINUTES, so a 20s
+    ceiling comfortably separates "fixed" from "broken" (above the ~17s
+    legitimate worst case, well over an order of magnitude below the 600s+
+    hang) without flaking on normal variance.
+  - CRITICAL: every test below sends `kill -TERM` (or bare `kill`, which
+    defaults to SIGTERM), NEVER `kill -9`/`SIGKILL`, while polling for
+    exit — SIGKILL is uncatchable and would prove nothing about geode's
+    own graceful-teardown code path. SIGKILL is used ONLY as a
+    post-assertion cleanup fallback (after the pass/fail verdict is
+    already recorded) in case a genuine busy-spin regression is hit, so
+    the scratch server process cannot leak even on a FAIL.
+
+  CANARY: REQ=REQ-SERVER-SIGTERM-BOUNDED-SHUTDOWN-001; FEATURE="GracefulShutdown"; ASPECT=BoundedSigtermDrain; STATUS=TESTED; TEST=geodetestlab/specs/regression_sigterm_bounded_shutdown_0039.yml; OWNER=qa; UPDATED=2026-07-10
+
+single_node_only: true  # every assertion drives its own hand-rolled scratch server on a fixed port
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env: {}
+
+  client:
+    timeout_ms: 60000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Phase 1 (KEY): GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=2000 — bounded drain with
+# an open connection at signal time. Must exit well within a generous 20s
+# ceiling; a busy-spin regression would hang for 10+ minutes, so this
+# ceiling has enormous margin over the ReleaseSafe worst case (~17s: up to
+# 10s admission-gate wait + 2s drain + 5s teardown-watchdog floor) while
+# still failing hard on a genuine regression.
+# ---------------------------------------------------------------------------
+
+- name: sigterm-bounded
+  description: |
+    KEY — starts a scratch server on fixed port 4462 with
+    GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=2000, opens a background client query
+    to create an active connection at signal time, sends SIGTERM (NOT
+    SIGKILL), then polls `kill -0 $PID` up to a generous 20s ceiling
+    (sized for the ReleaseSafe admission-gate worst case ~17s, not the
+    ~3-4s debug exit). Asserts the process EXITED within the ceiling
+    (echo EXITED_WITHIN_BOUND) — if the process is STILL ALIVE at the
+    ceiling, that is the gap-0039 busy-spin regression and the test FAILS
+    (after a SIGKILL cleanup fallback so the process cannot leak past this
+    test). Idempotently self-heals against a stale scratch server from a
+    prior aborted run and preflights the port before claiming it.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # never let the scratch server see the managed server's data dir
+    PORT=4462
+    PIDFILE=/tmp/rg18_bounded_scratch.pid
+    DIRFILE=/tmp/rg18_bounded_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    CEILING_S=20
+
+    # Idempotent self-heal: kill any stale scratch server from a prior
+    # aborted run before claiming the port.
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/rg18_bounded.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    # Port preflight: fail fast and loud if something else is squatting on
+    # the fixed port instead of a cryptic bind/connect error downstream.
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/rg18_bounded.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+
+    # Verified-TLS parity (release-binary safe): present the CA-signed leaf
+    # certificate when the harness provisioned a CA; otherwise the client
+    # falls back to --insecure-tls-skip-verify against the server's
+    # auto-generated self-signed cert.
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=2000 \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level warn --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 &
+    SPID=$!
+    echo "$SPID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      rm -f "$PIDFILE"
+      case "$WORKDIR" in /tmp/rg18_bounded.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+      exit 1
+    fi
+    echo "SCRATCH_SERVER_READY"
+
+    # Open a background client query so there is an active connection at
+    # the moment SIGTERM lands (the pre-fix bug specifically busy-spun
+    # draining connections that were open/abandoned at signal time).
+    timeout 12 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+      > "$WORKDIR/bg_query.log" 2>&1 &
+    BGPID=$!
+
+    # CRITICAL: SIGTERM, not SIGKILL — the whole point is that geode's OWN
+    # bounded-drain teardown completes on its own, not that we forcibly
+    # kill it. `kill` with no signal name defaults to SIGTERM; spelled out
+    # explicitly here for clarity.
+    kill -TERM "$SPID" 2>/dev/null || true
+    echo "SIGTERM_SENT"
+
+    EXITED=0
+    for i in $(seq 1 $((CEILING_S * 10))); do
+      if ! kill -0 "$SPID" 2>/dev/null; then
+        EXITED=1
+        break
+      fi
+      sleep 0.1
+    done
+
+    wait "$BGPID" 2>/dev/null || true
+
+    if [ "$EXITED" -eq 1 ]; then
+      echo "EXITED_WITHIN_BOUND"
+    else
+      echo "BUSY_SPIN_STILL_ALIVE_AFTER_${CEILING_S}S"
+      # Cleanup fallback ONLY after the FAIL verdict above is already
+      # recorded in stdout — SIGKILL here proves nothing about the
+      # regression; it only prevents a process leak.
+      kill -9 "$SPID" 2>/dev/null || true
+    fi
+
+    rm -f "$PIDFILE"
+    case "$WORKDIR" in /tmp/rg18_bounded.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+
+    [ "$EXITED" -eq 1 ]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+    - SIGTERM_SENT
+    - EXITED_WITHIN_BOUND
+    stdout_not_contains:
+    - BUSY_SPIN_STILL_ALIVE
+    - SCRATCH_SERVER_TIMEOUT
+    - PORT_4462_OCCUPIED_BY_FOREIGN_PROCESS
+  tags: [sigterm, shutdown-drain, gap-0039, key-assertion, timing]
+
+# ---------------------------------------------------------------------------
+# Phase 2: GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=0 — immediate force-close, no
+# drain window at all. Uses the SAME generous 20s ceiling as Phase 1:
+# although drain=0 removes the drain wait, the ReleaseSafe admission gate
+# still waits up to 10s BEFORE drain (main.zig:3209) plus the 5s
+# teardown-watchdog floor (max(0, 5000)), so the ReleaseSafe worst case is
+# ~15s — a debug-tuned 10s ceiling would flake under load on the
+# ReleaseSafe target.
+# ---------------------------------------------------------------------------
+
+- name: sigterm-immediate
+  description: |
+    GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=0 means "0 = immediate" per the fixing
+    commit — the server force-closes any open connections right away
+    instead of waiting out a drain window. Same recipe as
+    `sigterm-bounded` (own scratch server, fixed port 4462, background
+    connection open at signal time, SIGTERM not SIGKILL) and the SAME
+    generous 20s ceiling: drain=0 removes the drain wait, but the
+    ReleaseSafe admission gate still contributes up to 10s before drain
+    plus the 5s teardown-watchdog floor (~15s worst case), so a tighter
+    ceiling would risk a ReleaseSafe CI flake.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    PORT=4462
+    PIDFILE=/tmp/rg18_immediate_scratch.pid
+    DIRFILE=/tmp/rg18_immediate_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    CEILING_S=20
+
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/rg18_immediate.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/rg18_immediate.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=0 \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level warn --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 &
+    SPID=$!
+    echo "$SPID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      rm -f "$PIDFILE"
+      case "$WORKDIR" in /tmp/rg18_immediate.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+      exit 1
+    fi
+    echo "SCRATCH_SERVER_READY"
+
+    timeout 12 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+      > "$WORKDIR/bg_query.log" 2>&1 &
+    BGPID=$!
+
+    # CRITICAL: SIGTERM, not SIGKILL.
+    kill -TERM "$SPID" 2>/dev/null || true
+    echo "SIGTERM_SENT"
+
+    EXITED=0
+    for i in $(seq 1 $((CEILING_S * 10))); do
+      if ! kill -0 "$SPID" 2>/dev/null; then
+        EXITED=1
+        break
+      fi
+      sleep 0.1
+    done
+
+    wait "$BGPID" 2>/dev/null || true
+
+    if [ "$EXITED" -eq 1 ]; then
+      echo "EXITED_WITHIN_BOUND"
+    else
+      echo "BUSY_SPIN_STILL_ALIVE_AFTER_${CEILING_S}S"
+      kill -9 "$SPID" 2>/dev/null || true
+    fi
+
+    rm -f "$PIDFILE"
+    case "$WORKDIR" in /tmp/rg18_immediate.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+
+    [ "$EXITED" -eq 1 ]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+    - SIGTERM_SENT
+    - EXITED_WITHIN_BOUND
+    stdout_not_contains:
+    - BUSY_SPIN_STILL_ALIVE
+    - SCRATCH_SERVER_TIMEOUT
+    - PORT_4462_OCCUPIED_BY_FOREIGN_PROCESS
+  tags: [sigterm, shutdown-drain, gap-0039, key-assertion, timing]
+
+tags:
+- sigterm
+- shutdown-drain
+- gap-0039
+- regression
+- graceful-shutdown
