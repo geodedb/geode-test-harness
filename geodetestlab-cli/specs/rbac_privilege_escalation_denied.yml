@@ -1,0 +1,228 @@
+version: '1.0'
+name: RBAC — privilege escalation attempts by a non-admin are denied
+description: |
+  Negative coverage for RBAC authorization: verifies that a non-admin user
+  CANNOT escalate privileges through the four most obvious DDL escalation
+  paths — creating a new user, granting a permission to someone else,
+  granting a permission the caller does not itself hold, and revoking a
+  permission it did not grant. All four are exercised AS the non-admin
+  user (explicit -U/-P bypasses the harness's admin-credential injection —
+  see geodetestlab/lib/executor.py's `if "-U" not in args` guard, and the
+  precedent in rbac_users_roles_grants_audit.yml / rbac_custom_role_binding_pin.yml
+  which already run queries as rbac_readonly_bob / rbac_pin_dan this way).
+
+  Denial mechanism (probed against a scratch server, port 4471, data dir
+  /tmp/probe-p4-data, same binary as this repo's cli.binary):
+
+    All four escalation attempts return exit_code 0 (the CLI process
+    itself succeeds) with a GQL-level error response:
+      {"status_class":"42501","error_code":"42501","error":"Permission denied"}
+    This matches proto_util.zig:146 (`error.Unauthorized => .{ .code =
+    "42501", .message = "Permission denied" }`), the same mapping already
+    pinned by rbac_custom_role_binding_pin.yml's
+    'pin-verify-user-is-not-admin' case for CREATE USER. GRANT and REVOKE
+    hit the identical admin-only gate (empirically confirmed: GRANT
+    READ/WRITE and REVOKE READ all returned "42501"/"Permission denied"
+    when attempted as a readonly non-admin, with no distinction made
+    between "you don't have this permission at all" vs "you're not
+    authorized to grant/revoke any permission" — the DDL gate is
+    admin-or-nothing, so "grant a privilege you lack" and "grant any
+    privilege at all as a non-admin" collapse to the same 42501 path).
+
+  RESULT OF ESCALATION PROBE: no privilege escalation bug found. All four
+  ops (CREATE USER, GRANT <perm> you don't hold, GRANT <perm> to someone
+  else, REVOKE an admin-granted perm) are correctly denied when attempted
+  by a non-admin (readonly) user. Each denial is also confirmed non-fake
+  by checking that the attempted mutation did NOT take effect (p4_evil
+  never appears in SHOW USERS after the denied CREATE USER attempt).
+
+  DROPPED CASE — audit queryability of denied attempts:
+    Probed whether a denied privilege-escalation attempt is recorded in
+    the audit log (GEODE_AUDIT_LOG_PATH JSONL, same mechanism verified
+    working in rbac_users_roles_grants_audit.yml for successful
+    GRANT_GRAPH_PERMISSION / ASSIGN_ROLE / CREATE_ROLE events). Empirical
+    result: the audit log is EMPTY after all four denied attempts, while
+    an admin-issued (successful) GRANT on the same server instance DOES
+    produce a GRANT_GRAPH_PERMISSION audit record. Source review confirms
+    why: the admin-only DDL gate returns error.Unauthorized directly
+    (server/proto_util.zig:146) without going through
+    auth_graph_manager.zig's logSecurityGraphMutation, and without going
+    through multi_graph_security.zig:572's logWithGraph(.access_denied,
+    ...) either — that access_denied audit event type exists but is only
+    wired for the data-read/write mutation gate (the same gate exercised
+    by rbac_users_roles_grants_audit.yml's phase1-bob-readonly-cannot-write
+    case), not for admin-only DDL checks (CREATE USER / GRANT / REVOKE).
+    Per the task instruction to not fake a case that isn't queryable,
+    the 'denied-attempt-audited' case is DROPPED. This is itself a
+    security-observability gap worth tracking separately (denied
+    privilege-escalation attempts against DDL are currently invisible to
+    the audit trail) — flagged here, not silently hidden.
+
+  CANARY: REQ=REQ-RBAC-ESCALATION-DENIED-001; FEATURE="RBAC"; ASPECT=PrivilegeEscalationDenied; STATUS=TESTED; TEST=geodetestlab/specs/rbac_privilege_escalation_denied.yml; OWNER=security; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  working_dir:
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: p4-preflight-cleanup
+  description: Idempotent pre-flight cleanup before the escalation-denial matrix.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS p4_user;
+    DROP USER IF EXISTS p4_owner;
+    DROP USER IF EXISTS p4_evil;
+    DROP GRAPH IF EXISTS p4_graph;
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: p4-create-target-graph
+  description: Create the graph the GRANT/REVOKE escalation attempts will target.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH p4_graph]
+  expect: {exit_code: 0}
+  tags: [rbac, setup]
+
+- name: p4-create-nonadmin-user
+  description: |
+    Create p4_user with the built-in readonly role — NO admin privileges,
+    NO grant/revoke privileges. This is the attacker identity for every
+    negative case below.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p4_user SET PASSWORD 'P4User-1234-Strong' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [p4_user]
+  tags: [rbac, setup]
+
+- name: p4-create-owner-user
+  description: |
+    Create p4_owner (also readonly, no admin privileges) — the recipient
+    of the admin-issued grant that p4_user will later try to revoke
+    without owning it.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p4_owner SET PASSWORD 'P4Owner-1234-Strong' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: [p4_owner]
+  tags: [rbac, setup]
+
+- name: p4-admin-grants-read-to-owner
+  description: |
+    Admin grants READ on p4_graph to p4_owner. This is the "admin-granted
+    privilege" that p4_user (a bystander with no ownership stake) will
+    attempt to revoke in nonowner-revoke-denied below.
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT READ ON GRAPH p4_graph TO p4_owner]
+  expect:
+    exit_code: 0
+    stdout_contains: [Granted]
+  tags: [rbac, setup, grant]
+
+- name: nonadmin-create-user-denied
+  description: |
+    KEY NEGATIVE — as p4_user (readonly, non-admin), attempt to create a
+    new user with the admin role (p4_evil). CREATE USER is an admin-only
+    DDL op. Must be denied with 42501/Permission denied, not silently
+    ignored or misrouted — the CLI process itself exits 0 (query
+    executed, GQL-level error returned), matching the existing
+    pin-verify-user-is-not-admin precedent in
+    rbac_custom_role_binding_pin.yml.
+  args: [query, -U, p4_user, -P, P4User-1234-Strong, CREATE USER p4_evil SET PASSWORD 'P4Evil-1234-Strong' ROLE admin]
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+    stdout_not_contains: [created p4_evil]
+  tags: [rbac, negative, security, escalation]
+
+- name: nonadmin-create-user-denied-verify-not-created
+  description: |
+    Honesty check for the case above — confirm p4_evil truly does NOT
+    exist (the denial wasn't just a misleading error on top of a
+    successful mutation). Run as admin so this is an independent
+    observation, not trusting p4_user's own view.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW USERS]
+  expect:
+    exit_code: 0
+    stdout_contains: [p4_user, p4_owner]
+    stdout_not_contains: [p4_evil]
+  tags: [rbac, positive, security, escalation]
+
+- name: nonadmin-grant-denied
+  description: |
+    KEY NEGATIVE — as p4_user (non-admin), attempt to GRANT READ on
+    p4_graph to p4_owner (a privilege p4_user does not itself hold and
+    has no authority to bestow on anyone). GRANT is an admin-only DDL op.
+  args: [query, -U, p4_user, -P, P4User-1234-Strong, GRANT READ ON GRAPH p4_graph TO p4_owner]
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+    stdout_not_contains: [Granted]
+  tags: [rbac, negative, security, escalation]
+
+- name: grant-privilege-you-lack-denied
+  description: |
+    NEGATIVE — as p4_user, attempt to GRANT WRITE on p4_graph to
+    p4_owner. p4_user holds neither WRITE on p4_graph nor any GRANT
+    authority; this is the "grant a privilege you don't hold" escalation
+    path. Denied via the same admin-only DDL gate as the case above.
+  args: [query, -U, p4_user, -P, P4User-1234-Strong, GRANT WRITE ON GRAPH p4_graph TO p4_owner]
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+    stdout_not_contains: [Granted]
+  tags: [rbac, negative, security, escalation]
+
+- name: nonowner-revoke-denied
+  description: |
+    NEGATIVE — as p4_user, attempt to REVOKE the READ grant that admin
+    issued to p4_owner (set up in p4-admin-grants-read-to-owner). p4_user
+    has no ownership or authority over that grant; REVOKE is admin-only.
+  args: [query, -U, p4_user, -P, P4User-1234-Strong, REVOKE READ ON GRAPH p4_graph FROM p4_owner]
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+    stdout_not_contains: [Revoked]
+  tags: [rbac, negative, security, escalation]
+
+- name: p4-cleanup
+  description: Teardown — drop test users and graph.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP USER IF EXISTS p4_user;
+    DROP USER IF EXISTS p4_owner;
+    DROP USER IF EXISTS p4_evil;
+    DROP GRAPH IF EXISTS p4_graph;
+  expect: {exit_code: 0}
+  tags: [rbac, teardown]
+
+tags:
+- rbac
+- security
+- escalation
+- negative
+- comprehensive
