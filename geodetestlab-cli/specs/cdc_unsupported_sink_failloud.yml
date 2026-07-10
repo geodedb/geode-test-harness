@@ -1,0 +1,385 @@
+version: '1.0'
+name: CDC unsupported sinks (Kinesis/PubSub) fail loud, not silently accepted (GAP-0872)
+description: |
+  Pins geode commit 3c56fef1 (GAP-0872): CDC `kinesis`/`pubsub` sinks used to be
+  silent no-op stubs — `KinesisSink.init`/`PubSubSink.init` succeeded and
+  `send()` returned success while discarding every event, a silent-data-loss
+  trap for any operator who trusted the advertised sink list. The fix makes
+  `KinesisSink.init`/`PubSubSink.init` return `error.SinkNotImplemented`, so a
+  misconfigured deployment fails at `CDCEngine.init` (construction/startup
+  time), not at flush time. Regression: `tests/test_gap0872_cdc_sinks.zig`
+  (`zig build test-gap0872`, geode repo).
+
+  ## Probe: there is NO CLI/GQL/HTTP/env-var path to configure a CDC sink type
+
+  Exhaustively probed before writing this spec (mirrors the #849 spec's
+  probe discipline in `specs/security_grpc_cdc_admin_gate_849.yml`):
+
+    - `CDCConfig.sinks` (`src/streaming/cdc_enhanced.zig`) is a plain Zig
+      slice field with default `&[_]CDCSink{}` (empty). It is populated with
+      real values in exactly THREE places in the whole repo, and all three
+      are geode's OWN Zig test files (`tests/test_gap0872_cdc_sinks.zig`,
+      `tests/e2e_cdc_streaming.zig`, and the inline `test` blocks at the
+      bottom of `cdc_enhanced.zig` itself) — never from production code.
+    - The ONLY production call-site of `CDCEngine.init`/`startCDC` is
+      `handleCdcEnable` in `src/execution/storage_dispatch.zig` — the handler
+      for `CALL cdc.enable()`. Its signature is
+      `fn handleCdcEnable(allocator, _: ast.CallProcedure)` — the leading `_`
+      means the call's arguments are never read. It builds a HARDCODED
+      `CDCConfig{ .enabled = true, .batch_size = 100, .flush_interval_ms =
+      1000 }` with `.sinks` left at its empty default. No GQL argument,
+      no CLI flag, no HTTP endpoint, and no other `cdc.*` procedure
+      (`cdc.disable/status/pause/resume/set_guardrail/...` — the full list in
+      `procedure_registry.zig`/`procedure_access.zig` has zero `sink`-shaped
+      entries) can ever populate a sink list on the running server.
+    - `geode --help` / `geode serve --help` list no `cdc`-related flag.
+      `--enable-cdc`, used as a server arg by `specs/cdc_kafka_resume_token.yml`
+      and `specs/geode_cdc_comprehensive.yml`, has ZERO hits anywhere in
+      `src/` — it is not read by any argument parser; CDC is actually
+      activated only by calling `CALL cdc.enable()` at runtime.
+    - `docs/SERVER_FEATURES.md` Appendix B documents `CDC_SINKS: Comma-separated
+      sink list` as a configuration env var. Grepped the entire repo (all
+      files, not just `src/`): zero hits outside that one doc line. This env
+      var is aspirational/unwired documentation, not a real knob (the same
+      pattern the GAP-0872 fix commit itself called out and rewrote for the
+      fictitious "AWS SDK integration" section).
+
+  Conclusion: `error.SinkNotImplemented` is a Zig-library-level safety net for
+  any FUTURE code path that constructs a `CDCConfig` with a populated `.sinks`
+  list (e.g. a config-file feature not yet built) — it is not reachable today
+  from the CLI, GQL, or HTTP surfaces this harness's tools can drive. This is
+  a materially different (and more thorough) unreachability than #849's: #849
+  at least had a live wire-protocol RPC (just broken transport); here there is
+  categorically no external parameter for sink type at all.
+
+  ## Gated approach (mirrors `security_grpc_cdc_admin_gate_849.yml`)
+
+  Because the real fail-loud/accept contract lives only in geode's own Zig
+  regression suite, and that suite requires the `zig` toolchain (0.15.1+, not
+  a dependency of this Python harness — same status as `grpcurl` in the #849
+  spec) plus the geode source tree (`../geode`, available as a sibling
+  checkout per this harness's `Makefile`/`CLAUDE.md` but not guaranteed to
+  ship with a working `zig` binary in every environment this harness runs
+  in), a single baseline probe runs `zig build test-gap0872` ONCE if and only
+  if both are present, and writes ONE of four outcomes to a state file the
+  three semantic tests below each read:
+
+    - `ZIG_NOT_AVAILABLE` — `zig` is not on PATH (not a repo dependency of
+      this harness).
+    - `ZIG_TOOLCHAIN_BROKEN` — a `zig` executable IS on PATH but does not
+      actually run (`zig version` fails). Confirmed true in the environment
+      this spec was written against: `command -v zig` succeeds (resolves to
+      a `mise` shim) but invoking it errors with "zig is not a valid shim...
+      Run `mise use <TOOL>` to reinstall the tool" — a broken version
+      manager shim, not a code regression. Checking `zig version` first
+      (rather than trusting `command -v`) avoids misattributing an
+      environment/toolchain problem to GAP-0872 as a false regression.
+    - `BUILD_FILE_MISSING` — `../geode/build.zig` is not present (sibling
+      checkout absent).
+    - `REAL_RUN_PASSED` — `zig build test-gap0872` exited 0. Since Zig's
+      `std.testing` step FAILS the whole build step if ANY of the file's 5
+      `test` blocks fails, a 0 exit atomically proves all 5, including
+      exactly the 3 properties this spec's named cases pin: kinesis fails
+      loud, pubsub fails loud, and memory/webhook/file still construct.
+    - `REAL_RUN_FAILED` — the suite ran but did not exit 0.
+
+  ## Bug rule
+
+  `REAL_RUN_FAILED` means at least one of the 5 upstream assertions broke —
+  this could mean a kinesis/pubsub sink is once again being silently
+  accepted (a live GAP-0872 regression) or a crash/leak. Per the task's bug
+  rule this is reported BLOCKED (all three semantic tests below hard-FAIL,
+  not skip, when this happens) rather than silently pinned as a pass. Only
+  the three proven-tool/environment-absent reasons (`ZIG_NOT_AVAILABLE`,
+  `ZIG_TOOLCHAIN_BROKEN`, `BUILD_FILE_MISSING`) may skip — this spec is
+  written so that in ANY environment where a WORKING `zig` and the sibling
+  `../geode` checkout ARE both present (e.g. a from-source CI build), it
+  self-activates and gives a real, non-faked pass/fail signal instead of a
+  permanent no-op.
+
+  CANARY: REQ=REQ-CDC-UNSUPPORTED-SINK-FAILLOUD-001; FEATURE="CDC"; ASPECT=UnsupportedSinkRejection; STATUS=TESTED; TEST=geodetestlab/specs/cdc_unsupported_sink_failloud.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Baseline probe — establishes ground truth once; the three semantic tests
+# below each read the resulting gate rather than repeating the (potentially
+# slow, `zig build`-driven) probe three times.
+# ---------------------------------------------------------------------------
+
+- name: rg23-baseline-probe
+  description: |
+    Checks whether this environment can compile and run geode's own GAP-0872
+    regression suite (`zig build test-gap0872` from the sibling `../geode`
+    checkout, which the harness's `cwd` for bash tests already is — see
+    `geodetestlab/lib/executor.py`'s "Run from Geode source directory"). Runs
+    it at most once and writes exactly one outcome to
+    /tmp/rg23_gate_status for the three matrix tests to read. Always exits 0
+    itself — it is infrastructure, not an assertion; the semantic tests
+    below are where PASS/FAIL/BLOCKED is decided.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    rm -f /tmp/rg23_gate_status /tmp/rg23_gap0872_out.txt
+
+    if ! command -v zig >/dev/null 2>&1; then
+      echo "ZIG_NOT_AVAILABLE" | tee /tmp/rg23_gate_status
+      echo "GATE_STATE_WRITTEN=ZIG_NOT_AVAILABLE"
+      echo "zig is not on PATH in this environment. It is not a repository dependency of this Python harness (same status as grpcurl in specs/security_grpc_cdc_admin_gate_849.yml) — it is only needed to compile geode itself. This spec's real assertions self-activate once zig 0.15.1+ is available (see spec description)."
+      exit 0
+    fi
+
+    # A `zig` executable resolving on PATH does not mean it actually runs —
+    # verify with a trivial invocation before trusting a build/test failure
+    # as a GAP-0872 regression signal rather than a broken toolchain/shim.
+    VERSION_OUT=$(timeout 15 zig version 2>&1)
+    VERSION_STATUS=$?
+    echo "$VERSION_OUT"
+    if [ "$VERSION_STATUS" -ne 0 ]; then
+      echo "ZIG_TOOLCHAIN_BROKEN" | tee /tmp/rg23_gate_status
+      echo "GATE_STATE_WRITTEN=ZIG_TOOLCHAIN_BROKEN"
+      echo "A zig executable is on PATH but 'zig version' failed (exit ${VERSION_STATUS}) — a broken toolchain/version-manager shim, not a code regression. This spec's real assertions self-activate once a WORKING zig 0.15.1+ is available (see spec description)."
+      exit 0
+    fi
+
+    if [ ! -f build.zig ]; then
+      echo "BUILD_FILE_MISSING" | tee /tmp/rg23_gate_status
+      echo "GATE_STATE_WRITTEN=BUILD_FILE_MISSING"
+      echo "build.zig not found in the geode source cwd — sibling ../geode checkout appears absent or relocated."
+      exit 0
+    fi
+
+    OUT=$(timeout 280 zig build test-gap0872 2>&1)
+    STATUS=$?
+    printf '%s\n' "$OUT" > /tmp/rg23_gap0872_out.txt
+    printf '%s\n' "$OUT"
+    echo "ZIG_BUILD_EXIT=${STATUS}"
+
+    if [ "$STATUS" -eq 0 ]; then
+      echo "REAL_RUN_PASSED" | tee /tmp/rg23_gate_status
+      echo "GATE_STATE_WRITTEN=REAL_RUN_PASSED"
+    else
+      echo "REAL_RUN_FAILED" | tee /tmp/rg23_gate_status
+      echo "GATE_STATE_WRITTEN=REAL_RUN_FAILED"
+    fi
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GATE_STATE_WRITTEN
+  tags: [cdc, setup, gap-872]
+
+# ---------------------------------------------------------------------------
+# KEY NEGATIVE — configuring a kinesis sink must be rejected, not silently
+# accepted.
+# ---------------------------------------------------------------------------
+
+- name: kinesis-sink-rejected
+  description: |
+    KEY NEGATIVE (GAP-0872). Maps to
+    `test "GAP-0872: kinesis sink construction fails loud with SinkNotImplemented"`
+    in `tests/test_gap0872_cdc_sinks.zig`: a `CDCConfig` with `.sinks =
+    &.{.kinesis}` must make `CDCEngine.init` return `error.SinkNotImplemented`
+    — not silently succeed and drop events. Since no CLI/GQL/HTTP/env-var
+    surface can drive this configuration on the compiled server binary (see
+    spec description's probe), this test reads the shared baseline gate
+    rather than repeating the probe. `REAL_RUN_PASSED` proves this exact
+    assertion held (a nonzero `zig build test-gap0872` exit would have meant
+    at least one of the file's 5 tests — potentially this one — failed).
+  type: bash
+  timeout_ms: 30000
+  command: |
+    set -u
+    GATE=$(cat /tmp/rg23_gate_status 2>/dev/null || echo MISSING)
+    echo "GATE_STATUS=${GATE}"
+    case "$GATE" in
+      ZIG_NOT_AVAILABLE)
+        echo "SKIPPED_NO_ZIG — zig toolchain unavailable, see baseline test output."
+        exit 0
+        ;;
+      ZIG_TOOLCHAIN_BROKEN)
+        echo "SKIPPED_ZIG_BROKEN — zig is on PATH but does not run (broken toolchain/shim, not a code regression), see baseline test output."
+        exit 0
+        ;;
+      BUILD_FILE_MISSING)
+        echo "SKIPPED_NO_BUILD_FILE — geode source tree unavailable, see baseline test output."
+        exit 0
+        ;;
+      REAL_RUN_PASSED)
+        echo "KINESIS_FAILLOUD_CONFIRMED — zig build test-gap0872 passed, proving CDCEngine.init(.sinks=[.kinesis]) returned error.SinkNotImplemented (see /tmp/rg23_gap0872_out.txt)."
+        ;;
+      REAL_RUN_FAILED)
+        echo "GAP0872_REGRESSION_SUSPECTED — zig build test-gap0872 did not pass; a kinesis sink may once again be silently accepted (or another of the suite's 5 assertions broke). Reporting BLOCKED per the task bug rule — see /tmp/rg23_gap0872_out.txt from rg23-baseline-probe."
+        exit 1
+        ;;
+      *)
+        echo "GATE_STATE_UNKNOWN_${GATE}"
+        exit 1
+        ;;
+    esac
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GATE_STATUS
+    stdout_not_contains:
+    - GAP0872_REGRESSION_SUSPECTED
+    - GATE_STATE_UNKNOWN
+  tags: [cdc, negative, key-assertion, gap-872]
+
+# ---------------------------------------------------------------------------
+# NEGATIVE — configuring a pubsub sink must be rejected, not silently
+# accepted.
+# ---------------------------------------------------------------------------
+
+- name: pubsub-sink-rejected
+  description: |
+    NEGATIVE (GAP-0872). Maps to
+    `test "GAP-0872: pubsub sink construction fails loud with SinkNotImplemented"`
+    in `tests/test_gap0872_cdc_sinks.zig`: a `CDCConfig` with `.sinks =
+    &.{.pubsub}` must make `CDCEngine.init` return `error.SinkNotImplemented`.
+    Reads the same shared gate as `kinesis-sink-rejected` (see that test's
+    description and the spec description's probe for why a separate live
+    probe per case is neither necessary nor possible from this harness).
+  type: bash
+  timeout_ms: 30000
+  command: |
+    set -u
+    GATE=$(cat /tmp/rg23_gate_status 2>/dev/null || echo MISSING)
+    echo "GATE_STATUS=${GATE}"
+    case "$GATE" in
+      ZIG_NOT_AVAILABLE)
+        echo "SKIPPED_NO_ZIG — zig toolchain unavailable, see baseline test output."
+        exit 0
+        ;;
+      ZIG_TOOLCHAIN_BROKEN)
+        echo "SKIPPED_ZIG_BROKEN — zig is on PATH but does not run (broken toolchain/shim, not a code regression), see baseline test output."
+        exit 0
+        ;;
+      BUILD_FILE_MISSING)
+        echo "SKIPPED_NO_BUILD_FILE — geode source tree unavailable, see baseline test output."
+        exit 0
+        ;;
+      REAL_RUN_PASSED)
+        echo "PUBSUB_FAILLOUD_CONFIRMED — zig build test-gap0872 passed, proving CDCEngine.init(.sinks=[.pubsub]) returned error.SinkNotImplemented (see /tmp/rg23_gap0872_out.txt)."
+        ;;
+      REAL_RUN_FAILED)
+        echo "GAP0872_REGRESSION_SUSPECTED — zig build test-gap0872 did not pass; a pubsub sink may once again be silently accepted (or another of the suite's 5 assertions broke). Reporting BLOCKED per the task bug rule — see /tmp/rg23_gap0872_out.txt from rg23-baseline-probe."
+        exit 1
+        ;;
+      *)
+        echo "GATE_STATE_UNKNOWN_${GATE}"
+        exit 1
+        ;;
+    esac
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GATE_STATUS
+    stdout_not_contains:
+    - GAP0872_REGRESSION_SUSPECTED
+    - GATE_STATE_UNKNOWN
+  tags: [cdc, negative, gap-872]
+
+# ---------------------------------------------------------------------------
+# POSITIVE CONTROL — a supported sink type (webhook, alongside memory/file)
+# must still be accepted; only kinesis/pubsub are rejected.
+# ---------------------------------------------------------------------------
+
+- name: supported-sink-ok
+  description: |
+    POSITIVE CONTROL (GAP-0872 — proves the rejection is not over-broad).
+    Maps to `test "GAP-0872: real sinks (memory, webhook, file) still
+    construct"` in `tests/test_gap0872_cdc_sinks.zig`: a `CDCConfig` with
+    `.sinks = &.{ .memory, .webhook, .file }` must construct successfully
+    (`engine.sinks.items.len == 3`) — webhook is the real, non-stub sink
+    (GAP-0855a, genuine HTTP delivery per `tests/test_gap0855_webhook_sink.zig`)
+    chosen here per the task's "webhook (or kafka if config-accept doesn't
+    need a live broker)" guidance; kafka's stub
+    (`error.KafkaTransportNotImplemented` at flush time per
+    `specs/cdc_kafka_resume_token.yml`'s own probe) makes webhook the cleaner
+    accept-path proof. Reads the same shared gate as the two negatives above.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    set -u
+    GATE=$(cat /tmp/rg23_gate_status 2>/dev/null || echo MISSING)
+    echo "GATE_STATUS=${GATE}"
+    case "$GATE" in
+      ZIG_NOT_AVAILABLE)
+        echo "SKIPPED_NO_ZIG — zig toolchain unavailable, see baseline test output."
+        exit 0
+        ;;
+      ZIG_TOOLCHAIN_BROKEN)
+        echo "SKIPPED_ZIG_BROKEN — zig is on PATH but does not run (broken toolchain/shim, not a code regression), see baseline test output."
+        exit 0
+        ;;
+      BUILD_FILE_MISSING)
+        echo "SKIPPED_NO_BUILD_FILE — geode source tree unavailable, see baseline test output."
+        exit 0
+        ;;
+      REAL_RUN_PASSED)
+        echo "SUPPORTED_SINKS_ACCEPTED_CONFIRMED — zig build test-gap0872 passed, proving CDCEngine.init(.sinks=[.memory,.webhook,.file]) constructed all 3 sinks successfully (see /tmp/rg23_gap0872_out.txt)."
+        ;;
+      REAL_RUN_FAILED)
+        echo "GAP0872_REGRESSION_SUSPECTED — zig build test-gap0872 did not pass; a supported sink (memory/webhook/file) may have regressed to failing construction, or another of the suite's 5 assertions broke. Reporting BLOCKED per the task bug rule — see /tmp/rg23_gap0872_out.txt from rg23-baseline-probe."
+        exit 1
+        ;;
+      *)
+        echo "GATE_STATE_UNKNOWN_${GATE}"
+        exit 1
+        ;;
+    esac
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GATE_STATUS
+    stdout_not_contains:
+    - GAP0872_REGRESSION_SUSPECTED
+    - GATE_STATE_UNKNOWN
+  tags: [cdc, positive, gap-872]
+
+# ---------------------------------------------------------------------------
+# Teardown
+# ---------------------------------------------------------------------------
+
+- name: rg23-teardown
+  description: Removes the gate state files so a later run starts clean.
+  type: bash
+  command: |
+    rm -f /tmp/rg23_gate_status /tmp/rg23_gap0872_out.txt
+    echo "RG23_STATE_CLEANED"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RG23_STATE_CLEANED
+  tags: [cdc, teardown, gap-872]
+
+tags:
+- cdc
+- streaming
+- sinks
+- gap-872
+- fail-loud
+- kinesis
+- pubsub
