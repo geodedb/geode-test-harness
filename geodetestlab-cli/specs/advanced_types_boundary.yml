@@ -1,0 +1,285 @@
+version: '1.0'
+name: Advanced Types — Boundary Negatives
+description: |
+  Salvages the still-relevant boundary/negative intent from deprecated
+  `specs/legacy/advanced_types_integration.yml` (a pre-harness-format spec
+  using `expect_output`/`expect_exit_code`/`expect_error`, which the current
+  geodetestlab parser does not read at all — none of its tests actually
+  run, and it covers Vector/Geographic/Signature types, not decimal/
+  interval/datetime boundaries at all). `advanced_types_basic.yml` is
+  positive-only for Vector/temporal/list/map types and never probes a
+  precision, range, or overflow boundary. This spec fills that gap for
+  Decimal128, Interval, and Date/Timestamp, using the real constructors
+  documented in `../geode/docs/TYPES_AND_FUNCTIONS.md` (`Decimal(text,
+  scale)`, `Interval("P...")`/`MakeInterval(months,days,micros)`,
+  `Date("YYYY-MM-DD")`, `Timestamp(...)`), and complements
+  `gql_interval_comparisons.yml` (which covers ordering/equality on
+  already-valid intervals, not construction-time or arithmetic overflow).
+
+  `geode query` always exits 0 for GQL-level outcomes, so exit_code alone
+  proves nothing; every negative case is asserted via `stdout_contains` on
+  the real status_class/error text plus `stdout_not_contains
+  '"status_class":"00000"'` to prove it did NOT silently succeed.
+
+  Probed on a scratch server (`geode serve --listen 127.0.0.1:65002
+  --data-dir /tmp/probe-p28`, `GEODE_ADMIN_PASSWORD` bootstrap), reproduced
+  twice per case, all exit_code 0:
+
+    - valid-controls (positive) — `Decimal('123.45', 2)`,
+      `Interval('P1Y2M3DT4H5M6S')`, `Date('2025-01-15')`,
+      `Timestamp('2025-06-15 12:00:00')` all round-trip cleanly,
+      status_class 00000. Also confirmed a 38-digit (the documented max)
+      Decimal coefficient constructs cleanly.
+
+    - decimal-precision-overflow (KEY negative) — `Decimal(text, scale)`
+      with a 39-digit coefficient (one over the documented 38-digit max)
+      is genuinely REJECTED at construction time: status_class 58000,
+      error "TypeMismatch". A 38-digit coefficient (the documented max)
+      constructs fine (see valid-controls), so this is a real boundary
+      enforcement, not a coincidence.
+
+    - decimal-arithmetic-overflow (bonus negative) — `decimal_mul` of two
+      operands whose product would exceed 38 digits is also genuinely
+      rejected: status_class 58000, error "DecimalOverflow". Arithmetic
+      overflow IS checked for multiplication.
+
+    - decimal-add-silent-overflow (bonus limitation-pin) — by contrast,
+      `decimal_add` of a 38-digit max value plus 1 silently produces a
+      39-digit result (`100000000000000000000000000000000000000`) with
+      status_class 00000 — NOT rejected. Multiplication enforces the
+      38-digit ceiling; addition does not. Documented honestly as a
+      silent-accept gap, not asserted as an error.
+
+    - decimal-scale-rounding (bonus, documented behavior) — `Decimal('123.456',
+      2)` (3 fractional digits against a declared scale of 2) does not
+      error; it rounds to `123.46` (half-even per docs) and constructs
+      cleanly, status_class 00000. Documented rounding, not a rejection —
+      this is the "OR documented rounding" branch of the KEY case's spec.
+
+    - interval-overflow (negative) — `Interval('P999999999Y')` (9-digit
+      year count, itself a valid i32) reliably **CRASHES the server**:
+      `thread panic: integer overflow` in
+      `src/types/datetime.zig:282` (`months += num * 12`, i32
+      multiplication overflow), full stack through
+      `quic_connection_handler.zig:handleClientMessage`. Reproduced twice;
+      the server process was gone from `ps` afterward both times (full
+      crash, not a hang). `MakeInterval(2147483648, 1, 1)` (one over
+      i32::max in the months argument) independently ALSO crashes the
+      server via an unchecked `@intCast` narrowing panic in
+      `src/eval/call_handlers.zig:1755` — a second, distinct
+      interval-overflow crash path. Per the bug rule (see P14's
+      CAST(1.0e308) precedent), NEITHER crashing form is shipped as a test
+      step. The safe substitute used here is `Interval('P9999999999Y')`
+      (10-digit year count — the numeric string itself exceeds i32::max
+      *before* the `* 12` multiply is ever reached), which hits
+      `std.fmt.parseInt`'s own overflow error, caught gracefully by the
+      surrounding `catch return Date.Error.ParseError` →
+      `EvalError.TimeParse`: status_class 58000, error "TimeParse", no
+      crash. This exercises the same "interval literal overflow" surface
+      via the code path that IS checked, while documenting (not
+      exercising) the two crash paths that are not. Candidate GAP: ISO-8601
+      duration parsing and `MakeInterval` narrowing should use checked/
+      saturating arithmetic for the months field instead of an unchecked
+      `i32` multiply/cast.
+
+    - datetime-out-of-range (negative) — `Date('2025-13-15')` (month 13)
+      is genuinely rejected: status_class 58000, error "TimeParse". Also
+      confirmed `Date('999999-01-15')` (6-digit year) and
+      `Timestamp('999999-06-15 12:00:00')` hit the identical
+      58000/TimeParse path. No crash for any of these — the Date/Timestamp
+      string parser validates calendar fields before construction, unlike
+      the Interval duration parser's unchecked arithmetic above.
+
+    - numeric-literal-overflow (negative) — a bare integer literal beyond
+      i64 range (`99999999999999999999999999999`, 29 digits) fed directly
+      as a GQL literal (not through a STRING-to-CAST path) is rejected at
+      PARSE time: status_class 42000, error "parse error". A literal at
+      exactly i64::max (`9223372036854775807`) parses and returns cleanly
+      (status_class 00000), confirming this is a genuine boundary, not a
+      blanket rejection. (Contrast: the equivalent-magnitude value written
+      with a trailing `.0` to force float parsing, e.g.
+      `999999999999999999999999999999.0`, is NOT rejected — it silently
+      becomes a FLOAT and stringifies the original digits back out. Not
+      asserted here since the required case is the plain-integer-literal
+      form, which IS a genuine parse-time rejection.)
+
+  No crashes are exercised by any test step below; the two confirmed
+  interval-overflow crashes are documented above and in the task report
+  only. All other negatives are genuine rejections re-verified directly
+  against the current binary; the one silent-accept found
+  (decimal-add-silent-overflow) is asserted as the real observed behavior,
+  not a claimed rejection.
+
+  CANARY: REQ=REQ-ADVANCED-TYPES-BOUNDARY-001; FEATURE="AdvancedTypes"; ASPECT=BoundaryNegatives; STATUS=TESTED; TEST=geodetestlab/specs/advanced_types_boundary.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: p28_valid-controls
+  description: |
+    Positive control — near-boundary valid Decimal, Interval, Date, and
+    Timestamp values all round-trip through their real constructors,
+    proving the type surface works before probing its boundary edges
+    below. Also includes a Decimal coefficient at exactly the documented
+    38-digit maximum precision to prove that boundary constructs cleanly
+    (contrast with decimal-precision-overflow, one digit past it).
+  query: "RETURN Decimal('123.45', 2) AS dec, Decimal('99999999999999999999999999999999999999', 0) AS dec_max38, Interval('P1Y2M3DT4H5M6S') AS iv, Date('2025-01-15') AS d, Timestamp('2025-06-15 12:00:00') AS ts"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"dec":"123.45"'
+    - '"dec_max38":"99999999999999999999999999999999999999"'
+    - INTERVAL
+    - DATE
+    - TIMESTAMP
+  tags: [advanced-types, positive, control, decimal, interval, datetime]
+
+- name: p28_decimal-precision-overflow
+  description: |
+    KEY NEGATIVE — Decimal(text, scale) with a 39-digit coefficient, one
+    digit past the documented 38-digit maximum precision, must be
+    rejected at construction time. Probed real behavior: status_class
+    58000, error "TypeMismatch". Contrast with valid-controls' 38-digit
+    max, which constructs cleanly — this is a genuine boundary
+    enforcement, not exit_code noise.
+  query: "RETURN Decimal('999999999999999999999999999999999999999', 0) AS d"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [advanced-types, negative, decimal, precision-overflow, key-negative]
+
+- name: p28_decimal-arithmetic-overflow
+  description: |
+    Bonus negative — decimal_mul() of two operands whose product exceeds
+    38 significant digits is genuinely rejected: status_class 58000,
+    error "DecimalOverflow". Shows arithmetic-level overflow IS checked
+    for multiplication (contrast with decimal-add-silent-overflow below,
+    where addition is NOT checked).
+  query: "RETURN decimal_mul(Decimal('99999999999999999999999999999999999999', 0), Decimal('2', 0)) AS d"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - DecimalOverflow
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [advanced-types, negative, decimal, arithmetic-overflow]
+
+- name: p28_decimal-add-silent-overflow
+  description: |
+    LIMITATION-PIN — decimal_add() of a 38-digit max-precision value plus
+    1 silently produces a 39-digit result rather than erroring like
+    decimal_mul does. Probed real behavior: status_class 00000, result
+    "100000000000000000000000000000000000000" (39 digits, one past the
+    documented 38-digit maximum). Asserted as the real observed
+    silent-accept, not a claimed rejection — genuine gap: decimal_add
+    lacks the overflow check that decimal_mul has.
+  query: "RETURN decimal_add(Decimal('99999999999999999999999999999999999999', 0), Decimal('1', 0)) AS d"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"d":"100000000000000000000000000000000000000"'
+  tags: [advanced-types, limitation, decimal, silent-accept]
+
+- name: p28_decimal-scale-rounding
+  description: |
+    Documented behavior — Decimal('123.456', 2) has 3 fractional digits
+    against a declared scale of 2. Probed real behavior: does NOT error;
+    rounds to 123.46 (half-even per docs) and constructs cleanly,
+    status_class 00000. This is the "OR documented rounding" branch
+    of the decimal-precision-overflow case's brief.
+  query: "RETURN Decimal('123.456', 2) AS d"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"d":"123.46"'
+  tags: [advanced-types, positive, decimal, scale, rounding]
+
+- name: p28_interval-overflow
+  description: |
+    NEGATIVE — interval literal overflow, using a SAFE substitute form.
+    Interval('P999999999Y') and MakeInterval(2147483648,1,1) both CRASH
+    the server (confirmed via direct probe, documented in the spec
+    description above and the task report — not exercised here per the
+    bug rule). Interval('P9999999999Y') (10-digit year count, the numeric
+    string itself exceeds i32::max before any multiply is attempted) hits
+    a different, checked code path: std.fmt.parseInt's own overflow error,
+    caught gracefully. Probed real behavior: status_class 58000, error
+    "TimeParse", no crash.
+  query: "RETURN Interval('P9999999999Y') AS iv"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TimeParse
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [advanced-types, negative, interval, overflow]
+
+- name: p28_datetime-out-of-range
+  description: |
+    NEGATIVE — Date('2025-13-15'), an out-of-range month (13), must be
+    rejected. Probed real behavior: status_class 58000, error "TimeParse".
+    Also confirmed Date('999999-01-15') (6-digit year) and
+    Timestamp('999999-06-15 12:00:00') hit the identical 58000/TimeParse
+    path — genuine calendar-field validation, no crash.
+  query: "RETURN Date('2025-13-15') AS d"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TimeParse
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [advanced-types, negative, datetime, out-of-range]
+
+- name: p28_numeric-literal-overflow
+  description: |
+    NEGATIVE — a bare integer literal beyond i64 range
+    (99999999999999999999999999999, 29 digits) fed directly as a GQL
+    literal must be rejected at parse time. Probed real behavior:
+    status_class 42000, error "parse error". Contrast: a literal at
+    exactly i64::max (9223372036854775807) parses and returns cleanly
+    (status_class 00000) — confirming this is a genuine boundary
+    rejection, not a blanket parser failure.
+  query: "RETURN 99999999999999999999999999999 AS n"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - parse error
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [advanced-types, negative, numeric, literal-overflow]
+
+tags:
+- advanced-types
+- boundary
+- negative-paths
+- decimal
+- interval
+- datetime
+- legacy-rehome
