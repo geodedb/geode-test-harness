@@ -1,0 +1,313 @@
+version: '1.0'
+name: Auto-Index — Edge/Boundary Cases (drop, reserved-name, unindexed, duplicates)
+description: |
+  Task 11 (Plan 2, positive/negative coverage) — edge/boundary cases around
+  the auto-created id btree index, NOT covered by the happy-path
+  auto_index_id.yml / auto_index_id_advanced.yml or the lifecycle-focused
+  auto_index_lifecycle.yml (GAP-0332).
+
+  KEY — drop-auto-index: probed real behavior on a scratch server
+  (geode serve --listen 127.0.0.1:4478 --data-dir /tmp/probe-p11) — DROP
+  INDEX on the auto-created index (e.g. auto_idx_P11_Foo_id) is ALLOWED
+  (status_class 00000), matching the documented eviction behavior already
+  asserted in auto_index_lifecycle.yml Phase 5: after DROP, SHOW INDEXES no
+  longer lists it, a query by id still returns correct results via a full
+  LabelScan (not IndexSeek — EXPLAIN confirms), and the very next CREATE on
+  that label transparently rebuilds the auto-index (visible again in SHOW
+  INDEXES, IndexSeek again in EXPLAIN). This spec asserts the full
+  drop -> scan-fallback -> rebuild cycle, once, on a dedicated label.
+
+  reserved-name-collision: probed real behavior — a manual
+  `CREATE INDEX auto_idx_<Label>_id ON <Label>(id)` with NO IF NOT EXISTS,
+  issued while the auto-index of that exact name already exists, is
+  REJECTED with status_class 42P07 "Duplicate index name" — the identical
+  negative-path behavior as the manual/manual collision already covered by
+  index_ddl_errors.yml's duplicate-name test. Per that spec's documented
+  crash finding (repeated identical duplicate CREATE INDEX attempts
+  segfault the server via a double-free in catalog.zig addIndex), this
+  collision is issued exactly ONCE and not repeated.
+
+  query-unindexed-label: an id-lookup on a label that has never had any
+  node written (so no auto-index was ever triggered for it) returns a
+  clean empty result set (status_class 00000, "rows":[]) with exit 0 — no
+  crash, no spurious auto-index creation from a read-only query (SHOW
+  INDEXES confirms the label never appears).
+
+  duplicate-id-values: the auto-index does not enforce uniqueness on the
+  id property — two nodes sharing the same label and the same id value are
+  both created successfully and both retrievable by an id-equality lookup
+  (ORDER BY makes the two-row result deterministic).
+
+  CANARY: REQ=REQ-AUTO-INDEX-EDGE-001; FEATURE="AutoIndex"; ASPECT=EdgeCases; STATUS=TESTED; TEST=geodetestlab/specs/auto_index_edge_cases.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# ------------------------------------------------------------------ setup --
+- name: setup-create-node-triggers-auto-index
+  description: |
+    Prerequisite — CREATE the first P11_Foo node so the auto-index
+    auto_idx_P11_Foo_id genuinely exists before we drop it below.
+  query: "CREATE (n:P11_Foo {id: 1, name: 'first'})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [auto-index, edge-case, setup, positive]
+
+- name: setup-auto-index-visible
+  description: auto_idx_P11_Foo_id must be visible in SHOW INDEXES immediately after creation.
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - auto_idx_P11_Foo_id
+  tags: [auto-index, edge-case, setup, positive]
+
+# ============================================================
+# Case 1 (KEY): drop-auto-index — DROP the auto-created id index
+# ============================================================
+- name: drop-auto-index
+  description: |
+    KEY — DROP INDEX directly targeting the auto-created index name.
+    Probed real behavior: ALLOWED (status_class 00000), not rejected.
+    This matches the documented eviction behavior in
+    auto_index_lifecycle.yml (auto-index removal is a normal, supported
+    DROP INDEX target, not a protected/reserved system object).
+  query: "DROP INDEX auto_idx_P11_Foo_id"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [auto-index, edge-case, drop, key-assertion]
+
+- name: drop-auto-index-absent-after-drop
+  description: auto_idx_P11_Foo_id must no longer appear in SHOW INDEXES after the DROP above.
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - auto_idx_P11_Foo_id
+  tags: [auto-index, edge-case, drop, show]
+
+- name: drop-auto-index-query-still-correct
+  description: |
+    Query by id after the drop must still return the correct node via a
+    full label scan (no auto-index required for correctness).
+  query: "MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n.name AS name"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - first
+  tags: [auto-index, edge-case, drop, scan-fallback]
+
+- name: drop-auto-index-explain-shows-scan-not-seek
+  description: |
+    EXPLAIN after the drop must show a (Label)Scan, not IndexSeek — proves
+    the query plan genuinely stopped using the dropped index rather than
+    silently reusing stale index metadata.
+  query: "EXPLAIN MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - Scan
+    stdout_not_contains:
+    - IndexSeek
+  tags: [auto-index, edge-case, drop, explain]
+
+- name: drop-auto-index-rebuild-on-next-write
+  description: |
+    A subsequent CREATE on the same label transparently rebuilds the
+    auto-index (documented rebuild-on-write behavior, not a silent gap).
+  query: "CREATE (n:P11_Foo {id: 2, name: 'second'})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [auto-index, edge-case, drop, rebuild]
+
+- name: drop-auto-index-rebuilt-visible
+  description: auto_idx_P11_Foo_id is visible again in SHOW INDEXES after the rebuild-triggering write.
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - auto_idx_P11_Foo_id
+  tags: [auto-index, edge-case, drop, rebuild, show]
+
+- name: drop-auto-index-rebuilt-explain-shows-seek
+  description: EXPLAIN shows IndexSeek again once the auto-index has been rebuilt.
+  query: "EXPLAIN MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - IndexSeek
+  tags: [auto-index, edge-case, drop, rebuild, explain]
+
+# ============================================================
+# Case 2 (negative): reserved-name-collision — manual CREATE INDEX
+# colliding with the live auto-index name, no IF NOT EXISTS
+# ============================================================
+- name: reserved-name-collision
+  description: |
+    KEY NEGATIVE — manual CREATE INDEX using the exact auto-index name
+    (auto_idx_P11_Foo_id, which exists again after the rebuild above), with
+    NO IF NOT EXISTS. Probed real behavior: REJECTED, status_class 42P07
+    "Duplicate index name" — same negative-path behavior as a manual/manual
+    name collision (index_ddl_errors.yml). Issued exactly ONCE per the
+    documented double-free-on-repeat crash finding in that spec — do not
+    repeat this identical statement against a live server.
+  query: "CREATE INDEX auto_idx_P11_Foo_id ON P11_Foo(id)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42P07"'
+    - Duplicate index name
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [auto-index, edge-case, negative, reserved-name, key-assertion]
+
+- name: reserved-name-collision-index-unchanged
+  description: |
+    Follow-up proof — the rejected collision attempt must not have altered
+    the existing auto-index entry; SHOW INDEXES still lists exactly the
+    one auto_idx_P11_Foo_id entry for P11_Foo.
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - auto_idx_P11_Foo_id
+  tags: [auto-index, edge-case, negative, reserved-name, show]
+
+# ============================================================
+# Case 3 (positive-boundary): query-unindexed-label — id-lookup on a
+# label that never received a write, so no auto-index was ever created
+# ============================================================
+- name: query-unindexed-label-no-index-exists
+  description: |
+    Baseline proof — P11_NeverWritten has never appeared in SHOW INDEXES
+    because no node with that label has ever been created.
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - P11_NeverWritten
+  tags: [auto-index, edge-case, positive-boundary, unindexed-label]
+
+- name: query-unindexed-label-zero-rows
+  description: |
+    An id-equality lookup on the never-written label must return a clean
+    empty result (status_class 00000, "rows":[]) with exit 0 — no crash,
+    no error, exactly zero rows.
+  query: "MATCH (n:P11_NeverWritten) WHERE n.id = 1 RETURN n.name AS name"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [auto-index, edge-case, positive-boundary, unindexed-label, key-assertion]
+
+- name: query-unindexed-label-read-does-not-create-index
+  description: |
+    Follow-up proof — the read-only query above must NOT have spuriously
+    triggered auto-index creation for P11_NeverWritten (auto-index is a
+    write-triggered side effect only, per auto_index_lifecycle.yml).
+  query: "SHOW INDEXES"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - P11_NeverWritten
+  tags: [auto-index, edge-case, positive-boundary, unindexed-label, show]
+
+# ============================================================
+# Case 4 (positive): duplicate-id-values — two nodes, same label, same
+# id property value; the auto-index does not enforce uniqueness
+# ============================================================
+- name: duplicate-id-values-create-first
+  description: Create the first P11_Dup node with id 5.
+  query: "CREATE (n:P11_Dup {id: 5, name: 'p11_dup_first'})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [auto-index, edge-case, positive, duplicate-id]
+
+- name: duplicate-id-values-create-second
+  description: |
+    Create a second P11_Dup node with the SAME id value (5) — must succeed;
+    the auto-index does not enforce uniqueness on id.
+  query: "CREATE (n:P11_Dup {id: 5, name: 'p11_dup_second'})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [auto-index, edge-case, positive, duplicate-id, key-assertion]
+
+- name: duplicate-id-values-both-retrievable
+  description: |
+    An id-equality lookup for id=5 must return BOTH nodes, proving the
+    auto-index correctly resolves to a multi-row bucket rather than
+    silently masking one of the two duplicates. ORDER BY makes the
+    two-row result deterministic.
+  query: "MATCH (n:P11_Dup) WHERE n.id = 5 RETURN n.name AS name ORDER BY n.name"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - p11_dup_first
+    - p11_dup_second
+  tags: [auto-index, edge-case, positive, duplicate-id, key-assertion]
+
+# ---------------------------------------------------------------- cleanup --
+- name: cleanup-drop-remaining-index
+  description: Drop the rebuilt P11_Foo auto-index to leave a clean catalog.
+  query: "DROP INDEX IF EXISTS auto_idx_P11_Foo_id"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [auto-index, edge-case, cleanup]
+
+- name: cleanup-test-data
+  description: Remove all P11 test nodes.
+  query: "MATCH (n) WHERE n.name IN ['first', 'second', 'p11_dup_first', 'p11_dup_second'] DETACH DELETE n"
+  expected:
+    exit_code: 0
+  tags: [auto-index, edge-case, cleanup]
+
+tags:
+- auto-index
+- edge-case
+- boundary
+- drop
+- reserved-name
+- unindexed-label
+- duplicate-id
