@@ -1,0 +1,251 @@
+version: '1.0'
+name: Recursion / CTE Limit Paths — cycle termination, depth cap, huge bound, missing base case
+description: |
+  recursive_and_cte.yml and nested_queries_advanced.yml are positive-only:
+  they exercise variable-length-path traversal (`[:REL*]`) and recursive CTE
+  syntax over ACYCLIC data (a tree / a chain) and never probe what happens
+  when recursion faces a REAL cycle, an explicit huge bound, or an
+  ill-formed self-reference. Only paren-nesting recursion has a limit test
+  (gql_parser_recursion_limit.yml, parser depth 128/129). This spec adds
+  the missing recursion/CTE limit + termination negatives: a genuine 4-node
+  cycle, an unbounded var-length traversal over it, an explicit
+  `[*1..100000]` bound over the same small cycle, the internal recursive-CTE
+  iteration cap, and a self-referential CTE missing its anchor/base case.
+
+  Source-verified mechanics (../geode/src, read before writing this spec):
+    - src/gql/match.zig:335 — an unbounded `*` var-length spec defaults to
+      `max_depth = 10` when no explicit bound is given.
+    - src/gql/match.zig:343-348 (needsCycleDetection) — any var-length edge
+      pattern (single edge with an explicit `max_hops`, i.e. any `*`/`*n..m`
+      pattern) gets cycle detection attached.
+    - src/execution/planned_read_runtime.zig:1386-1430 — cycle detection
+      tracks a per-path `visited` set keyed on traversal state, so a single
+      path can never revisit a node. On a 4-node simple cycle this bounds
+      total work to a small constant regardless of the requested max depth.
+    - src/execution/query_execution.zig:53-58 —
+      `RECURSIVE_CTE_MAX_ITERATIONS: u32 = 100` — the `WITH RECURSIVE` CTE
+      fixpoint evaluator (executeCTE) hard-caps at 100 recursive-term
+      iterations. tests/e2e_recursive_queries.zig test (c) proves a cyclic
+      `UNION ALL` recursion with NO natural termination (no WHERE, no
+      dedup) stops at exactly anchor(1) + 100 iterations = 101 rows rather
+      than hanging.
+    - tests/e2e_recursive_queries.zig — confirms the CLI/engine CTE syntax:
+      `WITH RECURSIVE <name> AS (<anchor> UNION [ALL] UNWIND <name> AS x
+      WHERE ... RETURN ...) RETURN <name>` — the CTE binds as a single
+      list value; `size(<name>)` gives its row count, `RETURN <name>`
+      dumps the raw list.
+
+  Probed LIVE on a scratch server (geode serve --listen 127.0.0.1:4485
+  --data-dir /tmp/probe-p18, GEODE_ADMIN_PASSWORD=GeodeTestPassword123!,
+  killable with -9) before shipping any query below — see
+  .superpowers/sdd/p18-report.md for the full per-case timing table. Every
+  case below TERMINATES in well under 2 seconds; none hang, none crash, none
+  are shipped without having been observed to complete first.
+
+  `geode query` always exits 0 for GQL-level outcomes — every case below
+  is exit_code 0. Real errors are asserted via
+  stdout_not_contains '"status_class":"00000"' plus the concrete error
+  text; documented caps (not errors) assert the exact capped count.
+
+  CANARY: REQ=REQ-RECURSIVE-CTE-LIMITS-001; FEATURE="Recursion"; ASPECT=LimitPaths; STATUS=TESTED; TEST=geodetestlab/specs/recursive_cte_limits.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+# Build a 4-node directed cycle P18_A -> P18_B -> P18_C -> P18_D -> P18_A
+# before any test runs. Proves the graph the recursion tests below run over
+# is a genuine cycle, not a tree/chain (which is all the existing positive
+# specs cover).
+setup:
+- args:
+  - query
+  - '-'
+  stdin: |
+    CREATE (a:P18_Node {id: 'A'})
+    CREATE (b:P18_Node {id: 'B'})
+    CREATE (c:P18_Node {id: 'C'})
+    CREATE (d:P18_Node {id: 'D'})
+  expect:
+    exit_code: 0
+- args:
+  - query
+  - "MATCH (a:P18_Node {id: 'A'}), (b:P18_Node {id: 'B'}) CREATE (a)-[:P18_NEXT]->(b)"
+  expect:
+    exit_code: 0
+- args:
+  - query
+  - "MATCH (b:P18_Node {id: 'B'}), (c:P18_Node {id: 'C'}) CREATE (b)-[:P18_NEXT]->(c)"
+  expect:
+    exit_code: 0
+- args:
+  - query
+  - "MATCH (c:P18_Node {id: 'C'}), (d:P18_Node {id: 'D'}) CREATE (c)-[:P18_NEXT]->(d)"
+  expect:
+    exit_code: 0
+- args:
+  - query
+  - "MATCH (d:P18_Node {id: 'D'}), (a:P18_Node {id: 'A'}) CREATE (d)-[:P18_NEXT]->(a)"
+  expect:
+    exit_code: 0
+
+tests:
+- name: setup-verify
+  description: |
+    Positive control — confirms the 4-node cycle built by the top-level
+    `setup:` block is actually present (4 distinct nodes reachable, not a
+    partially-applied setup) before the recursion probes below rely on it.
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:P18_Node) RETURN count(n) AS total"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":4'
+  tags: [recursion, cte, setup]
+
+- name: cycle-terminates
+  description: |
+    KEY — an unbounded variable-length traversal (`[:P18_NEXT*]`, no
+    explicit bound) over the REAL 4-node cycle. Probed live: this
+    TERMINATES in well under a second, NOT a hang. `[:P18_NEXT*]` defaults
+    to max_depth=10 (match.zig:335) AND gets per-path cycle detection
+    (planned_read_runtime.zig visited-set), so from node A exactly the 3
+    other nodes {B, C, D} are reachable and returned once each — the cycle
+    does not cause repeated revisits or unbounded output. If this had
+    hung, it would be a real bug (limitation-pin candidate); it does not.
+  timeout_ms: 30000
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:P18_Node {id: 'A'})-[:P18_NEXT*]->(x:P18_Node)
+    RETURN count(x) AS total
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":3'
+  tags: [recursion, cte, cycle, key]
+
+- name: depth-limit-exceeded
+  description: |
+    NEGATIVE / documented cap — a `WITH RECURSIVE` CTE whose recursive
+    term has NO natural termination condition (no WHERE, no dedup: an
+    anchor of 1, stepping via `3 - prev.n` toggles 1<->2 forever). Probed
+    live: this does NOT hang and does NOT error. It terminates at the
+    engine's internal RECURSIVE_CTE_MAX_ITERATIONS=100 hard cap
+    (query_execution.zig:58), producing exactly anchor(1) + 100 iterations
+    = 101 rows (size(c) == 101), matching tests/e2e_recursive_queries.zig
+    test (c) at the engine level. This is the "documented cap" outcome the
+    task allows in lieu of a clean error — asserted as the REAL observed
+    behavior (status_class 00000, size 101), not a wished-for rejection.
+  timeout_ms: 30000
+  args:
+  - query
+  - '-'
+  stdin: |
+    WITH RECURSIVE c AS (
+      RETURN 1 AS n
+      UNION ALL
+      UNWIND c AS prev RETURN 3 - prev.n AS n
+    )
+    RETURN size(c) AS total
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":101'
+  tags: [recursion, cte, depth-limit, cap]
+
+- name: huge-varlength-bound
+  description: |
+    BOUNDARY — `[*1..100000]` on the small 4-node cycle. Probed live: this
+    completes in well under 2 seconds, NOT a hang, despite the huge upper
+    bound. Per-path cycle detection (planned_read_runtime.zig visited-set)
+    bounds total work to the number of distinct reachable nodes regardless
+    of the requested max — the 100000 bound is never actually walked to.
+    Must NOT hang; it does not.
+  timeout_ms: 30000
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:P18_Node {id: 'A'})-[:P18_NEXT*1..100000]->(x:P18_Node)
+    RETURN count(x) AS total
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":3'
+  tags: [recursion, boundary, huge-bound]
+
+- name: cte-missing-base-case
+  description: |
+    NEGATIVE — a `WITH RECURSIVE` CTE that self-references itself with NO
+    anchor/base-case query before it (just `UNWIND c AS prev ...` with no
+    preceding `RETURN ... UNION`). Per parser.zig's CTE-body detection,
+    with no UNION token this is NOT recognized as the recursive form at
+    all — it parses as a plain (non-recursive) CTE whose body directly
+    self-references the not-yet-bound name `c`. Probed live: this is a
+    REAL clean error, status_class 58000, error_code "UnwindRequiresList"
+    (UNWIND is fed a non-list/unbound value) — fast, no hang, no crash.
+  timeout_ms: 30000
+  args:
+  - query
+  - '-'
+  stdin: |
+    WITH RECURSIVE c AS (
+      UNWIND c AS prev RETURN prev.n + 1 AS n
+    )
+    RETURN c
+  expected:
+    exit_code: 0
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    stdout_contains:
+    - '"status_class":"58000"'
+    - UnwindRequiresList
+  tags: [recursion, cte, negative, missing-base-case]
+
+- name: server-stable-after-recursion-probes
+  description: |
+    Recovery check — after the cycle traversal, the depth-capped CTE, the
+    huge-bound traversal, and the malformed-CTE error above, the server
+    must still answer a trivial query. Proves none of the preceding
+    recursion paths left the server in a degraded state.
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'p18-recover' AS probe
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - p18-recover
+  tags: [recursion, recovery, server-stability]
+
+tags:
+- gql
+- recursion
+- cte
+- variable-length-path
+- limits
+- regression
