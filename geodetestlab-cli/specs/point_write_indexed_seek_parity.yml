@@ -1,0 +1,359 @@
+version: '1.0'
+name: Point-write engine-direct indexed-seek parity + persistence (geode c8b67533)
+description: |
+  Pins the contract landed in geode commit c8b67533
+  ("perf(point-writes): GREEN — engine-direct point writes + legacy
+  write-executor working-set budget"): a single-node write of the shape
+  MATCH (n:L) WHERE n.<indexed>='<literal>' SET n.k=<literal> / REMOVE
+  n.k [RETURN ...] is now resolved via the SAME exact-index seek the
+  READ path uses (posting probe + candidate fetch + eval-parity
+  re-verify), rather than the legacy full-scan write loop. The result
+  rows and persisted state must be BYTE-PARITY with what the legacy
+  (non-indexed-predicate) path produces for the equivalent semantic
+  update, and the mutation must persist correctly across a clean
+  (graceful) restart/reopen.
+
+  Scenario:
+    1. Seed exactly 50 RG16_N nodes (k: 'pk<i>', other: <i>, val: 0) via
+       individual CREATE statements (UNWIND/FOREACH range-seeding is not
+       a supported clause on this build per prior sibling-spec probes).
+       CREATE INDEX on RG16_N.k using the FOR (n:Label) ON (n.prop) form
+       (probed working on this build, same DDL as
+       regression_index_reload_after_reopen.yml / RG12).
+    2. KEY (indexed-seek SET): MATCH (n:RG16_N) WHERE n.k='pk7' SET
+       n.val=42 — this predicate is an exact-literal equality on the
+       INDEXED property k, so it is eligible for the engine-direct
+       fast path. Must exit 0; a readback of pk7.val must show 42; and
+       a count of nodes with val=42 across the WHOLE label must be
+       EXACTLY 1 — this is the real teeth against an over-write bug:
+       if the indexed-seek fast path resolved the wrong slot->node
+       mapping or fell through into touching more than the single
+       matched node, this count would read 0, 2, or 50 instead of 1.
+    3. Legacy-path differential: MATCH (n:RG16_N) WHERE n.other=8 SET
+       n.val=43 — the predicate is on `other`, which has NO index, so
+       this is guaranteed to run the legacy full-scan write loop (the
+       route the engine-direct fast path was written to match
+       byte-for-byte). A readback of pk8.val must show 43 and a count
+       of val=43 must be EXACTLY 1 — same observable semantics as the
+       indexed-seek case in step 2, proving parity between the two
+       write paths for equivalent single-node point updates.
+    4. KEY (indexed-seek REMOVE): MATCH (n:RG16_N) WHERE n.k='pk7'
+       REMOVE n.val — same indexed-seek eligibility as step 2, this
+       time exercising REMOVE instead of SET. Probed rendering: a
+       removed property reads back as JSON null on this build (not an
+       absent key, not an error) — the assertion below matches the
+       actual observed behavior.
+    5. Restart the managed server against the SAME data dir (cleanup:
+       false + restart_server: true) — a graceful shutdown + reopen,
+       NOT a crash.
+    6. KEY: MATCH (n:RG16_N) WHERE n.k='pk8' RETURN n.val is the FIRST
+       query test that runs after the restart marker. Must still
+       return 43 — proving the legacy-path write from step 3 (which
+       the engine-direct path must match) durably persisted across a
+       clean reopen. (pk7 is also re-checked post-restart to confirm
+       the indexed-seek REMOVE from step 4 also persisted.)
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4460
+  --data-dir /tmp/probe-r16, with GEODE_ADMIN_PASSWORD set on FIRST
+  boot only) before/after a manual graceful SIGTERM + restart on the
+  same data dir: the indexed-seek SET on pk7 returned the mutated node
+  (val:42) and count(val=42) was exactly 1; the legacy-path SET on
+  other=8 (pk8) returned the mutated node (val:43) and count(val=43)
+  was exactly 1; the indexed-seek REMOVE on pk7 rendered n.val as JSON
+  null on readback; after a graceful SIGTERM + reopen the FIRST
+  post-restart query (pk8.val) still returned 43 and pk7.val still
+  read null; total RG16_N count held at 50 throughout. No live
+  regression was observed on this build.
+
+  CANARY: REQ=REQ-WRITE-POINT-INDEXED-SEEK-001; FEATURE="PointWrite"; ASPECT=IndexedSeekParityAndPersist; STATUS=TESTED; TEST=geodetestlab/specs/point_write_indexed_seek_parity.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed-rg16-n-50
+  description: |
+    Seed exactly 50 RG16_N nodes via 50 individual CREATE statements.
+    k = 'pk<i>', other = i, val = 0 for i in 0..49.
+  query: |
+    CREATE (:RG16_N {k: 'pk0', other: 0, val: 0});
+    CREATE (:RG16_N {k: 'pk1', other: 1, val: 0});
+    CREATE (:RG16_N {k: 'pk2', other: 2, val: 0});
+    CREATE (:RG16_N {k: 'pk3', other: 3, val: 0});
+    CREATE (:RG16_N {k: 'pk4', other: 4, val: 0});
+    CREATE (:RG16_N {k: 'pk5', other: 5, val: 0});
+    CREATE (:RG16_N {k: 'pk6', other: 6, val: 0});
+    CREATE (:RG16_N {k: 'pk7', other: 7, val: 0});
+    CREATE (:RG16_N {k: 'pk8', other: 8, val: 0});
+    CREATE (:RG16_N {k: 'pk9', other: 9, val: 0});
+    CREATE (:RG16_N {k: 'pk10', other: 10, val: 0});
+    CREATE (:RG16_N {k: 'pk11', other: 11, val: 0});
+    CREATE (:RG16_N {k: 'pk12', other: 12, val: 0});
+    CREATE (:RG16_N {k: 'pk13', other: 13, val: 0});
+    CREATE (:RG16_N {k: 'pk14', other: 14, val: 0});
+    CREATE (:RG16_N {k: 'pk15', other: 15, val: 0});
+    CREATE (:RG16_N {k: 'pk16', other: 16, val: 0});
+    CREATE (:RG16_N {k: 'pk17', other: 17, val: 0});
+    CREATE (:RG16_N {k: 'pk18', other: 18, val: 0});
+    CREATE (:RG16_N {k: 'pk19', other: 19, val: 0});
+    CREATE (:RG16_N {k: 'pk20', other: 20, val: 0});
+    CREATE (:RG16_N {k: 'pk21', other: 21, val: 0});
+    CREATE (:RG16_N {k: 'pk22', other: 22, val: 0});
+    CREATE (:RG16_N {k: 'pk23', other: 23, val: 0});
+    CREATE (:RG16_N {k: 'pk24', other: 24, val: 0});
+    CREATE (:RG16_N {k: 'pk25', other: 25, val: 0});
+    CREATE (:RG16_N {k: 'pk26', other: 26, val: 0});
+    CREATE (:RG16_N {k: 'pk27', other: 27, val: 0});
+    CREATE (:RG16_N {k: 'pk28', other: 28, val: 0});
+    CREATE (:RG16_N {k: 'pk29', other: 29, val: 0});
+    CREATE (:RG16_N {k: 'pk30', other: 30, val: 0});
+    CREATE (:RG16_N {k: 'pk31', other: 31, val: 0});
+    CREATE (:RG16_N {k: 'pk32', other: 32, val: 0});
+    CREATE (:RG16_N {k: 'pk33', other: 33, val: 0});
+    CREATE (:RG16_N {k: 'pk34', other: 34, val: 0});
+    CREATE (:RG16_N {k: 'pk35', other: 35, val: 0});
+    CREATE (:RG16_N {k: 'pk36', other: 36, val: 0});
+    CREATE (:RG16_N {k: 'pk37', other: 37, val: 0});
+    CREATE (:RG16_N {k: 'pk38', other: 38, val: 0});
+    CREATE (:RG16_N {k: 'pk39', other: 39, val: 0});
+    CREATE (:RG16_N {k: 'pk40', other: 40, val: 0});
+    CREATE (:RG16_N {k: 'pk41', other: 41, val: 0});
+    CREATE (:RG16_N {k: 'pk42', other: 42, val: 0});
+    CREATE (:RG16_N {k: 'pk43', other: 43, val: 0});
+    CREATE (:RG16_N {k: 'pk44', other: 44, val: 0});
+    CREATE (:RG16_N {k: 'pk45', other: 45, val: 0});
+    CREATE (:RG16_N {k: 'pk46', other: 46, val: 0});
+    CREATE (:RG16_N {k: 'pk47', other: 47, val: 0});
+    CREATE (:RG16_N {k: 'pk48', other: 48, val: 0});
+    CREATE (:RG16_N {k: 'pk49', other: 49, val: 0});
+  expected:
+    exit_code: 0
+  tags: [point-write, indexed-seek, setup]
+
+- name: seed-create-index-rg16-k
+  description: |
+    CREATE INDEX on RG16_N.k using the FOR (n:Label) ON (n.prop) form,
+    the same DDL probed working for the sibling
+    regression_index_reload_after_reopen.yml (RG12) spec. Only k is
+    indexed — other and val are NOT indexed, so any predicate on them
+    is guaranteed to route through the legacy write path.
+  query: "CREATE INDEX rg16_n_k_idx FOR (n:RG16_N) ON (n.k)"
+  expected:
+    exit_code: 0
+  tags: [point-write, indexed-seek, setup]
+
+- name: count-before-mutation
+  description: Confirm exactly 50 RG16_N nodes exist before any mutation.
+  query: "MATCH (n:RG16_N) RETURN count(n)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":50'
+  tags: [point-write, indexed-seek, positive-baseline]
+
+- name: indexed-seek-set
+  description: |
+    KEY — engine-direct indexed-seek SET. n.k is an exact-literal
+    equality predicate on the INDEXED property, so this is eligible
+    for the c8b67533 fast path: resolve via the same posting-probe +
+    candidate-fetch + eval-parity re-verify the READ path uses, then
+    apply via the same property_mutation helpers the legacy loop uses.
+  query: "MATCH (n:RG16_N) WHERE n.k='pk7' SET n.val=42"
+  expected:
+    exit_code: 0
+  tags: [point-write, indexed-seek, key-assertion]
+
+- name: indexed-seek-set-readback
+  description: Readback — pk7.val must now be 42.
+  query: "MATCH (n:RG16_N) WHERE n.k='pk7' RETURN n.val"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":42'
+  tags: [point-write, indexed-seek, key-assertion]
+
+- name: indexed-seek-set-touches-exactly-one
+  description: |
+    KEY ASSERTION — the real teeth against an over-write bug. A count
+    of nodes with val=42 across the WHOLE RG16_N label must be EXACTLY
+    1. If the indexed-seek fast path resolved the wrong slot->node
+    mapping, or fell through to touching more than the single matched
+    node (e.g. the whole posting list, or every node under the seeked
+    property), this count would read 0, 2, or 50 instead of 1.
+  query: "MATCH (n:RG16_N) WHERE n.val=42 RETURN count(n)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":1'
+  tags: [point-write, indexed-seek, key-assertion]
+
+- name: indexed-seek-set-siblings-unaffected
+  description: |
+    Negative control — the immediate neighbors of pk7 (pk6, pk8) in
+    the seed sequence must still read val=0, proving the indexed-seek
+    write did not spill onto adjacent slots/posting entries.
+  query: |
+    MATCH (n:RG16_N) WHERE n.k='pk6' RETURN n.val;
+    MATCH (n:RG16_N) WHERE n.k='pk8' RETURN n.val;
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":0'
+  tags: [point-write, indexed-seek, negative-control]
+
+- name: legacy-path-differential-set
+  description: |
+    KEY — differential probe against the LEGACY write path. The
+    predicate n.other=8 is on `other`, which has NO index, so this
+    query is guaranteed to route through the legacy full-scan write
+    loop (the exact route the c8b67533 engine-direct fast path was
+    built to match byte-for-byte). Targets the same node as pk8
+    (other=8 <-> k='pk8').
+  query: "MATCH (n:RG16_N) WHERE n.other=8 SET n.val=43"
+  expected:
+    exit_code: 0
+  tags: [point-write, legacy-path, key-assertion]
+
+- name: legacy-path-differential-readback
+  description: |
+    Readback via the indexed property — pk8.val must now be 43. Same
+    observable semantics as the indexed-seek-set case above, proving
+    parity between the two write paths for an equivalent point update.
+  query: "MATCH (n:RG16_N) WHERE n.k='pk8' RETURN n.val"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":43'
+  tags: [point-write, legacy-path, key-assertion]
+
+- name: legacy-path-differential-touches-exactly-one
+  description: |
+    KEY ASSERTION — count of nodes with val=43 across the WHOLE label
+    must be EXACTLY 1, mirroring the over-write teeth applied to the
+    indexed-seek path above. Confirms the legacy path is not itself
+    over-writing, so the parity comparison is meaningful.
+  query: "MATCH (n:RG16_N) WHERE n.val=43 RETURN count(n)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":1'
+  tags: [point-write, legacy-path, key-assertion]
+
+- name: indexed-seek-remove
+  description: |
+    KEY — engine-direct indexed-seek REMOVE. Same indexed-seek
+    eligibility as the SET case (exact-literal equality on the
+    INDEXED property k), this time exercising REMOVE n.<prop> instead
+    of SET n.<prop>=<lit>.
+  query: "MATCH (n:RG16_N) WHERE n.k='pk7' REMOVE n.val"
+  expected:
+    exit_code: 0
+  tags: [point-write, indexed-seek, key-assertion]
+
+- name: indexed-seek-remove-readback
+  description: |
+    KEY ASSERTION — probed rendering: a removed property reads back
+    as JSON null on this build (not an absent key, not an error). The
+    assertion below matches the actual observed behavior — pk7.val
+    must render as null, and must NOT still show the pre-remove 42.
+  query: "MATCH (n:RG16_N) WHERE n.k='pk7' RETURN n.val"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":null'
+    stdout_not_contains:
+    - '"val":42'
+  tags: [point-write, indexed-seek, key-assertion]
+
+- name: count-after-all-mutations
+  description: |
+    Negative control — total RG16_N count must still be exactly 50
+    after all SET/REMOVE mutations above (no accidental node creation
+    or loss from either write path).
+  query: "MATCH (n:RG16_N) RETURN count(n)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":50'
+  tags: [point-write, negative-control]
+
+- name: restart-server-for-persistence
+  description: |
+    Graceful (clean) shutdown + reopen of the managed server against
+    the SAME data dir (cleanup: false above). This is NOT a crash — it
+    is the clean-checkpoint + reopen path that the persistence half of
+    the c8b67533 contract targets: the indexed-seek SET/REMOVE and the
+    legacy-path SET above must have durably persisted, and must read
+    back correctly on the very first post-reopen query.
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RESTART
+  tags: [point-write, reopen, restart]
+
+- name: legacy-path-write-persists-after-reopen
+  description: |
+    KEY ASSERTION — this is the FIRST query test after the restart
+    marker above; no warm-up query precedes it. pk8.val must still
+    read 43 (the legacy-path SET from before the restart), proving the
+    write durably persisted across a clean reopen.
+  query: "MATCH (n:RG16_N) WHERE n.k='pk8' RETURN n.val"
+  timeout_ms: 15000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":43'
+  tags: [point-write, reopen, key-assertion]
+
+- name: indexed-seek-remove-persists-after-reopen
+  description: |
+    KEY ASSERTION — pk7.val must still render as null post-reopen,
+    proving the indexed-seek REMOVE from before the restart also
+    durably persisted (and did not resurrect the removed property on
+    reload).
+  query: "MATCH (n:RG16_N) WHERE n.k='pk7' RETURN n.val"
+  timeout_ms: 15000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"val":null'
+  tags: [point-write, reopen, key-assertion]
+
+- name: count-persists-after-reopen
+  description: |
+    KEY ASSERTION — total RG16_N count must still be exactly 50
+    post-reopen, confirming neither write path lost or duplicated a
+    node across the restart.
+  query: "MATCH (n:RG16_N) RETURN count(n)"
+  timeout_ms: 15000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":50'
+  tags: [point-write, reopen, key-assertion]
+
+tags:
+- point-write
+- indexed-seek
+- persistence
+- reopen
+- regression
