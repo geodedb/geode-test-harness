@@ -228,6 +228,62 @@ tests:
   - timeseries
   - storage
   - query
+# --- GAP-0865: durability — a written point survives a server restart ---
+# Pre-fix, geode's timeseries store silently degraded to memory-only on a
+# fresh data dir (the mkdir/FileNotFound fresh-dir trap) AND never started
+# the background WAL syncer, so accepted points were lost on restart. The
+# fix (fail-closed load + WAL-first write-through + background syncer) makes
+# an accepted write durable. This writes a distinctive point, restarts the
+# server against the SAME data dir, and asserts the point is still there — a
+# memory-only store would return an empty range here.
+- name: ts-durability-write-before-restart
+  description: GAP-0865 — write a distinctive point that must survive a restart
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.insert(42, 'durability.check', 424242, 8888)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"inserted":1'
+  tags:
+  - timeseries
+  - storage
+  - durability
+  - gap0865
+- name: ts-durability-restart-server
+  description: GAP-0865 — restart the server against the same data dir
+  type: bash
+  command: echo 'restart to exercise timeseries durability'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags:
+  - timeseries
+  - storage
+  - durability
+  - gap0865
+- name: ts-durability-point-survives-restart
+  description: >
+    GAP-0865 — after restart the (ts, value) point is still readable from
+    disk. rows:[] here would prove a non-durable (memory-only) store.
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.ts.range(42, 'durability.check', 0, 1000000)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"ts":424242'
+    - '"value":8888'
+  tags:
+  - timeseries
+  - storage
+  - durability
+  - gap0865
 tags:
 - timeseries
 - ts-storage
