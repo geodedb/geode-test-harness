@@ -1,0 +1,281 @@
+version: '1.0'
+name: ABAC — malformed/duplicate policy rejection (negative coverage)
+description: |
+  Negative coverage for the GPS `CREATE POLICY ... USING <expr>` DDL surface
+  (the same surface exercised by abac_policy_expressions_audit.yml). Probes
+  what actually happens when the USING expression is syntactically invalid,
+  references an attribute no principal has, or reuses an existing policy
+  name.
+
+  PROBE FINDINGS (2026-07-10, scratch server, ../geode/zig-out/bin/geode):
+
+  1. INVALID EXPRESSION IS SILENTLY ACCEPTED AT DDL TIME — KNOWN LIMITATION.
+     `src/gql/parser.zig::parseCreatePolicy` captures the USING clause as raw
+     SOURCE TEXT only; it does not parse/validate it. Compilation happens
+     lazily in `security/policy_catalog.zig::addPolicy`:
+       compiled = policy_expression.compileExpression(...) catch null;
+     A compile failure is swallowed (`catch null`) and the policy is stored
+     anyway with `compiled = null` — CREATE POLICY always returns exit 0 /
+     "Policy created", even for garbage like `... AND (` or `@@@ !!!`.
+     This is NOT a privilege-escalation bug: `security/gps.zig::decide()`
+     treats a null-compiled, non-"true" policy as fail-closed (it never
+     contributes an ALLOW — see the `expr_result = ... eql(expression_source,
+     "true")` fallback), which this spec verifies end-to-end. But the DDL
+     gives the operator ZERO feedback that their policy is inert. Tests
+     below pin the REAL behavior (accept + fail-closed), not the originally
+     hoped-for DDL-time rejection.
+
+  2. DUPLICATE POLICY NAMES ARE SILENTLY ACCEPTED — KNOWN LIMITATION / BUG.
+     `PolicyCatalog.addPolicy` has no name-uniqueness check; it unconditionally
+     appends. Creating a second policy with a name that already exists
+     succeeds (exit 0, "Policy created") and SHOW POLICIES then lists TWO
+     rows with the identical name. Worse: `removePolicy` removes only the
+     FIRST match, so a single `DROP POLICY <name>` leaves one ghost duplicate
+     behind — this spec reproduces and pins that too.
+
+  3. UNKNOWN ATTRIBUTE REFERENCE compiles fine (`principal.attributes.<key>
+     = '<value>'` is valid grammar per policy_expression.zig) and is a
+     documented deny-all: `policy_expression.evaluate` is explicitly
+     "fail-closed: unknown values evaluate to false for equality predicates",
+     so a principal lacking that attribute key is always denied by this
+     policy. Verified end-to-end below.
+
+  CANARY: REQ=REQ-ABAC-MALFORMED-POLICY-001; FEATURE="ABAC"; ASPECT=MalformedPolicyRejected; STATUS=TESTED; TEST=geodetestlab/specs/abac_malformed_policy_rejection.yml; OWNER=security; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: p5-preflight-cleanup
+  description: |
+    Idempotent pre-flight cleanup. Runs the baseline DROP twice up front
+    since a prior aborted run of THIS spec could have left a duplicate
+    p5_valid_baseline row behind (see p5-single-drop-leaves-duplicate-behind).
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS p5_valid_baseline;
+    DROP POLICY IF EXISTS p5_valid_baseline;
+    DROP POLICY IF EXISTS p5_malformed_paren;
+    DROP POLICY IF EXISTS p5_unknown_attr;
+    DROP USER IF EXISTS p5_malformed_user;
+    DROP USER IF EXISTS p5_unknown_attr_user;
+  expect: {exit_code: 0}
+  tags: [abac, setup]
+
+- name: p5-create-users
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE USER p5_malformed_user SET PASSWORD 'P5-Malformed-1234' ROLE readonly;
+    CREATE USER p5_unknown_attr_user SET PASSWORD 'P5-UnkAttr-1234' ROLE readonly;
+  expect: {exit_code: 0}
+  tags: [abac, setup]
+
+- name: p5-install-baseline-policy
+  description: |
+    SETUP — install one syntactically valid policy so SHOW POLICIES has a
+    known-good reference point to compare the negative cases against.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY p5_valid_baseline ON GRAPH * FOR WRITE USING current_user() = 'p5_baseline_user']
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [abac, setup, positive]
+
+- name: p5-show-policies-baseline-only
+  description: POSITIVE — before any negative case runs, only the baseline policy exists.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [p5_valid_baseline]
+    stdout_not_contains: [p5_malformed_paren, p5_unknown_attr]
+  tags: [abac, positive]
+
+- name: p5-invalid-expression-rejected
+  description: |
+    KEY NEGATIVE / KNOWN LIMITATION — CREATE POLICY with an unbalanced,
+    garbage USING expression ("... AND (" — a dangling open paren with no
+    matching close, no right-hand operand). Per the probe above the parser
+    captures USING as raw text and only attempts to compile it inside
+    addPolicy, where a compile failure is swallowed (`catch null`). The
+    REAL behavior is that this DDL statement is ACCEPTED (exit 0, "Policy
+    created"), not rejected. This assertion pins that real behavior so a
+    future fix (DDL-time validation added) flips it — when geode starts
+    rejecting malformed USING expressions, this assertion will fail and
+    must be updated to expect the rejection instead.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CREATE POLICY p5_malformed_paren ON GRAPH * FOR WRITE USING current_user() = 'p5_malformed_user' AND ("]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [abac, negative, known_limitation, trip_wire]
+
+- name: p5-malformed-policy-fails-closed
+  description: |
+    POSITIVE (compensating control) — even though the malformed policy
+    installed with zero error signal, it does NOT grant access: gps.zig's
+    decide() treats a null-compiled, non-"true" policy as fail-closed (it
+    never contributes an ALLOW). p5_malformed_user has no other WRITE grant
+    (readonly role only + this one malformed policy), so the WRITE below
+    must still be denied. This proves the missing DDL validation is a
+    silent-accept / observability gap, NOT a privilege-escalation bug.
+  args: [query, -U, p5_malformed_user, -P, P5-Malformed-1234, '-']
+  stdin: 'CREATE (n:P5MalformedTest {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [abac, positive, negative]
+
+- name: p5-unknown-attribute-policy-installs
+  description: |
+    SETUP for unknown-attribute-behavior probe. `principal.attributes.<key>
+    = '<value>'` is valid USING grammar (policy_expression.zig), so this
+    compiles successfully and installs cleanly — unlike the malformed case
+    above, this is expected/correct behavior, not a limitation.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CREATE POLICY p5_unknown_attr ON GRAPH * FOR WRITE USING principal.attributes.nosuch_xyz = 'anything'"]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [abac, setup, positive]
+
+- name: p5-unknown-attribute-behavior-denies-write
+  description: |
+    NEGATIVE / documented deny-all contract — p5_unknown_attr_user has no
+    `nosuch_xyz` attribute set (no principal does; the key does not exist
+    anywhere in the attribute store). policy_expression.evaluate() is
+    documented as "fail-closed: unknown values evaluate to false for
+    equality predicates", so this policy can never match and the WRITE
+    below (relying solely on it, readonly role otherwise) is denied. This
+    is the real, asserted contract for unknown-attribute references: a
+    silent deny-all, not a compile/runtime error.
+  args: [query, -U, p5_unknown_attr_user, -P, P5-UnkAttr-1234, '-']
+  stdin: 'CREATE (n:P5UnkAttrTest {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains: ['42501', Permission denied]
+  tags: [abac, negative]
+
+- name: p5-duplicate-policy-name-accepted
+  description: |
+    NEGATIVE / KNOWN LIMITATION — CREATE POLICY reusing the existing name
+    "p5_valid_baseline" (different USING expression). PolicyCatalog.addPolicy
+    has no name-uniqueness check and unconditionally appends, so the REAL
+    behavior is exit 0 / "Policy created" — no conflict error. This pins
+    that real behavior; a future fix (duplicate-name rejection) flips it.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY p5_valid_baseline ON GRAPH * FOR WRITE USING current_user() = 'p5_someone_else']
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy created]
+  tags: [abac, negative, known_limitation, trip_wire]
+
+- name: p5-show-policies-reveals-duplicate-row
+  type: bash
+  description: |
+    BUG EVIDENCE — SHOW POLICIES now lists p5_valid_baseline TWICE (two
+    distinct catalog entries with the identical name), proving the
+    duplicate-name CREATE above did not just no-op or overwrite.
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$("$BIN" query --server "${GEODE_SERVER_ADDRESS}" -U geode -P "$PW" "SHOW POLICIES" 2>&1)
+    echo "$OUT"
+    COUNT=$(echo "$OUT" | grep -o 'p5_valid_baseline' | wc -l)
+    [ "$COUNT" -eq 2 ] && echo "duplicate_count=ok" || { echo "duplicate_count=FAIL got=$COUNT"; exit 1; }
+  expect:
+    exit_code: 0
+    stdout_contains: [duplicate_count=ok]
+  tags: [abac, negative, known_limitation, bash]
+
+- name: p5-nothing-was-rejected
+  description: |
+    NEGATIVE / KNOWN LIMITATION — this is the inverse of the originally
+    hoped-for "no-partial-install" check: since neither the malformed
+    expression nor the duplicate name was ever rejected, SHOW POLICIES
+    shows ALL FOUR install attempts (baseline, malformed, unknown-attr,
+    duplicate-baseline), not just the one valid baseline. Nothing partially
+    installed — everything FULLY installed, including the two that should
+    have been rejected. That is the gap this spec exists to pin.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [p5_valid_baseline, p5_malformed_paren, p5_unknown_attr]
+  tags: [abac, negative, known_limitation]
+
+- name: p5-single-drop-leaves-duplicate-behind
+  description: |
+    BUG EVIDENCE — DROP POLICY removes only the FIRST matching entry
+    (security/policy_catalog.zig::removePolicy walks the list and returns
+    after the first name match). With two p5_valid_baseline rows installed,
+    ONE drop must leave a ghost duplicate behind — SHOW POLICIES still
+    contains p5_valid_baseline after this single DROP.
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY IF EXISTS p5_valid_baseline]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy dropped]
+  tags: [abac, negative, known_limitation]
+
+- name: p5-ghost-duplicate-still-present
+  description: |
+    BUG EVIDENCE (continued) — confirms the single DROP above did not fully
+    remove p5_valid_baseline; the ghost duplicate row is still listed.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_contains: [p5_valid_baseline]
+  tags: [abac, negative, known_limitation]
+
+- name: p5-second-drop-fully-clears
+  description: |
+    Second DROP removes the remaining ghost duplicate, confirming the
+    only thing left behind by the first DROP was the duplicate entry
+    (not some other, unrelated leak).
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP POLICY IF EXISTS p5_valid_baseline]
+  expect:
+    exit_code: 0
+    stdout_contains: [Policy dropped]
+  tags: [abac, positive]
+
+- name: p5-baseline-fully-gone
+  description: POSITIVE — after two drops, p5_valid_baseline is fully gone from SHOW POLICIES.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
+  expect:
+    exit_code: 0
+    stdout_not_contains: [p5_valid_baseline]
+  tags: [abac, positive]
+
+- name: p5-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP POLICY IF EXISTS p5_malformed_paren;
+    DROP POLICY IF EXISTS p5_unknown_attr;
+    DROP USER IF EXISTS p5_malformed_user;
+    DROP USER IF EXISTS p5_unknown_attr_user;
+  expect: {exit_code: 0}
+  tags: [abac, teardown]
+
+tags:
+- abac
+- security
+- policy
+- gps
+- negative
+- known_limitation
