@@ -1,0 +1,401 @@
+version: '1.0'
+name: Regression — CREATE INDEX on populated label returns promptly, no self-deadlock (geode 4a1efca4)
+description: |
+  Pins the contract that CREATE INDEX on a label that ALREADY HAS nodes
+  returns promptly — no hang, no wedge — the server stays alive, and
+  follow-up statements succeed. This targets geode commit 4a1efca4
+  ("fix(index): remove eager ordered-index build from CREATE INDEX
+  (self-deadlock)").
+
+  Root cause being regression-tested: the eager H3-P2/GAP-0064
+  `adapter.createOrderedIndex(...)` call inside the CREATE INDEX executor
+  ran under the per-graph EXCLUSIVE write lock already held for the
+  statement, then re-acquired the SAME rwlock SHARED on the same thread to
+  scan existing nodes of the label — an exclusive-then-shared
+  self-deadlock. It only reached the wedge with >=1 node of the label
+  already present to scan, which is why a populated-label CREATE INDEX
+  hung for ~30s and cascaded "Server died" to every subsequent test, while
+  a 0-node/empty-label CREATE INDEX (nothing to scan) passed. The fix
+  drops the eager ordered-tree build entirely; `orderedScanFastPath`
+  builds it lazily/in the background on first ORDER BY instead.
+
+  Scenario (order matters — nodes BEFORE index is the deadlock trigger):
+    1. Seed exactly 200 RG14_N nodes (k: 'k<i>') via a script-generated
+       CREATE batch — UNWIND/FOREACH range-seeding is not a supported
+       clause on this build per prior probes for sibling specs.
+    2. KEY: CREATE INDEX on RG14_N.k (label already populated) must return
+       exit 0 within a 20s timeout — the exact self-deadlock trigger
+       ordering from the bug report.
+    3. KEY: MATCH (n:RG14_N) RETURN count(n) immediately after must return
+       200 within a 20s timeout. This is the liveness proof: a wedged
+       server (live 4a1efca4 regression) would time out here, not just on
+       the CREATE INDEX statement itself.
+    4. A second DDL statement (CREATE CONSTRAINT, then a second CREATE
+       INDEX on a different property) must also succeed — confirms the
+       server is not merely alive but still able to take the write lock
+       for further DDL.
+    5. SHOW INDEXES must list the index; DROP INDEX must succeed; count
+       must still be 200 afterward.
+    6. Control: CREATE INDEX on a FRESH label (RG14_Empty, 0 nodes) must
+       also return exit 0 — confirms the non-triggering (empty-label)
+       path still works, isolating the trigger to "nodes present before
+       CREATE INDEX".
+
+  Probed against a scratch server (geode serve --listen 127.0.0.1:4456
+  --data-dir /tmp/probe-r14, GEODE_ADMIN_PASSWORD set on first boot)
+  running geode v0.8.0-16-g600b235e (built after 4a1efca4): seeded 200
+  RG14_N nodes (~0.5s), CREATE INDEX rg14_n_k_idx FOR (n:RG14_N) ON (n.k)
+  on the populated label returned in ~0.97s (no hang), the immediate
+  follow-up count(n) returned 200 in ~0.77s, CREATE CONSTRAINT ... REQUIRE
+  ... IS UNIQUE and a second CREATE INDEX both succeeded, SHOW INDEXES
+  listed both the created index and the label's auto id index, DROP INDEX
+  succeeded, count remained 200, and CREATE INDEX on a fresh 0-node label
+  also succeeded promptly. No live regression was observed on this build.
+
+  CANARY: REQ=REQ-INDEX-CREATE-POPULATED-NO-WEDGE-001; FEATURE="IndexDDL"; ASPECT=CreateIndexOnPopulatedLabel; STATUS=TESTED; TEST=geodetestlab/specs/regression_create_index_with_nodes_no_wedge.yml; OWNER=qa; UPDATED=2026-07-09
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed-first
+  description: |
+    Seed exactly 200 RG14_N nodes BEFORE the index is created — this
+    ordering (nodes present, THEN CREATE INDEX) is the exact self-deadlock
+    trigger from geode 4a1efca4. UNWIND/FOREACH range-seeding is not a
+    supported clause on this build (per prior probes for sibling regression
+    specs), so a script-generated CREATE batch is used instead.
+  query: |
+    CREATE (:RG14_N {k: 'k0'});
+    CREATE (:RG14_N {k: 'k1'});
+    CREATE (:RG14_N {k: 'k2'});
+    CREATE (:RG14_N {k: 'k3'});
+    CREATE (:RG14_N {k: 'k4'});
+    CREATE (:RG14_N {k: 'k5'});
+    CREATE (:RG14_N {k: 'k6'});
+    CREATE (:RG14_N {k: 'k7'});
+    CREATE (:RG14_N {k: 'k8'});
+    CREATE (:RG14_N {k: 'k9'});
+    CREATE (:RG14_N {k: 'k10'});
+    CREATE (:RG14_N {k: 'k11'});
+    CREATE (:RG14_N {k: 'k12'});
+    CREATE (:RG14_N {k: 'k13'});
+    CREATE (:RG14_N {k: 'k14'});
+    CREATE (:RG14_N {k: 'k15'});
+    CREATE (:RG14_N {k: 'k16'});
+    CREATE (:RG14_N {k: 'k17'});
+    CREATE (:RG14_N {k: 'k18'});
+    CREATE (:RG14_N {k: 'k19'});
+    CREATE (:RG14_N {k: 'k20'});
+    CREATE (:RG14_N {k: 'k21'});
+    CREATE (:RG14_N {k: 'k22'});
+    CREATE (:RG14_N {k: 'k23'});
+    CREATE (:RG14_N {k: 'k24'});
+    CREATE (:RG14_N {k: 'k25'});
+    CREATE (:RG14_N {k: 'k26'});
+    CREATE (:RG14_N {k: 'k27'});
+    CREATE (:RG14_N {k: 'k28'});
+    CREATE (:RG14_N {k: 'k29'});
+    CREATE (:RG14_N {k: 'k30'});
+    CREATE (:RG14_N {k: 'k31'});
+    CREATE (:RG14_N {k: 'k32'});
+    CREATE (:RG14_N {k: 'k33'});
+    CREATE (:RG14_N {k: 'k34'});
+    CREATE (:RG14_N {k: 'k35'});
+    CREATE (:RG14_N {k: 'k36'});
+    CREATE (:RG14_N {k: 'k37'});
+    CREATE (:RG14_N {k: 'k38'});
+    CREATE (:RG14_N {k: 'k39'});
+    CREATE (:RG14_N {k: 'k40'});
+    CREATE (:RG14_N {k: 'k41'});
+    CREATE (:RG14_N {k: 'k42'});
+    CREATE (:RG14_N {k: 'k43'});
+    CREATE (:RG14_N {k: 'k44'});
+    CREATE (:RG14_N {k: 'k45'});
+    CREATE (:RG14_N {k: 'k46'});
+    CREATE (:RG14_N {k: 'k47'});
+    CREATE (:RG14_N {k: 'k48'});
+    CREATE (:RG14_N {k: 'k49'});
+    CREATE (:RG14_N {k: 'k50'});
+    CREATE (:RG14_N {k: 'k51'});
+    CREATE (:RG14_N {k: 'k52'});
+    CREATE (:RG14_N {k: 'k53'});
+    CREATE (:RG14_N {k: 'k54'});
+    CREATE (:RG14_N {k: 'k55'});
+    CREATE (:RG14_N {k: 'k56'});
+    CREATE (:RG14_N {k: 'k57'});
+    CREATE (:RG14_N {k: 'k58'});
+    CREATE (:RG14_N {k: 'k59'});
+    CREATE (:RG14_N {k: 'k60'});
+    CREATE (:RG14_N {k: 'k61'});
+    CREATE (:RG14_N {k: 'k62'});
+    CREATE (:RG14_N {k: 'k63'});
+    CREATE (:RG14_N {k: 'k64'});
+    CREATE (:RG14_N {k: 'k65'});
+    CREATE (:RG14_N {k: 'k66'});
+    CREATE (:RG14_N {k: 'k67'});
+    CREATE (:RG14_N {k: 'k68'});
+    CREATE (:RG14_N {k: 'k69'});
+    CREATE (:RG14_N {k: 'k70'});
+    CREATE (:RG14_N {k: 'k71'});
+    CREATE (:RG14_N {k: 'k72'});
+    CREATE (:RG14_N {k: 'k73'});
+    CREATE (:RG14_N {k: 'k74'});
+    CREATE (:RG14_N {k: 'k75'});
+    CREATE (:RG14_N {k: 'k76'});
+    CREATE (:RG14_N {k: 'k77'});
+    CREATE (:RG14_N {k: 'k78'});
+    CREATE (:RG14_N {k: 'k79'});
+    CREATE (:RG14_N {k: 'k80'});
+    CREATE (:RG14_N {k: 'k81'});
+    CREATE (:RG14_N {k: 'k82'});
+    CREATE (:RG14_N {k: 'k83'});
+    CREATE (:RG14_N {k: 'k84'});
+    CREATE (:RG14_N {k: 'k85'});
+    CREATE (:RG14_N {k: 'k86'});
+    CREATE (:RG14_N {k: 'k87'});
+    CREATE (:RG14_N {k: 'k88'});
+    CREATE (:RG14_N {k: 'k89'});
+    CREATE (:RG14_N {k: 'k90'});
+    CREATE (:RG14_N {k: 'k91'});
+    CREATE (:RG14_N {k: 'k92'});
+    CREATE (:RG14_N {k: 'k93'});
+    CREATE (:RG14_N {k: 'k94'});
+    CREATE (:RG14_N {k: 'k95'});
+    CREATE (:RG14_N {k: 'k96'});
+    CREATE (:RG14_N {k: 'k97'});
+    CREATE (:RG14_N {k: 'k98'});
+    CREATE (:RG14_N {k: 'k99'});
+    CREATE (:RG14_N {k: 'k100'});
+    CREATE (:RG14_N {k: 'k101'});
+    CREATE (:RG14_N {k: 'k102'});
+    CREATE (:RG14_N {k: 'k103'});
+    CREATE (:RG14_N {k: 'k104'});
+    CREATE (:RG14_N {k: 'k105'});
+    CREATE (:RG14_N {k: 'k106'});
+    CREATE (:RG14_N {k: 'k107'});
+    CREATE (:RG14_N {k: 'k108'});
+    CREATE (:RG14_N {k: 'k109'});
+    CREATE (:RG14_N {k: 'k110'});
+    CREATE (:RG14_N {k: 'k111'});
+    CREATE (:RG14_N {k: 'k112'});
+    CREATE (:RG14_N {k: 'k113'});
+    CREATE (:RG14_N {k: 'k114'});
+    CREATE (:RG14_N {k: 'k115'});
+    CREATE (:RG14_N {k: 'k116'});
+    CREATE (:RG14_N {k: 'k117'});
+    CREATE (:RG14_N {k: 'k118'});
+    CREATE (:RG14_N {k: 'k119'});
+    CREATE (:RG14_N {k: 'k120'});
+    CREATE (:RG14_N {k: 'k121'});
+    CREATE (:RG14_N {k: 'k122'});
+    CREATE (:RG14_N {k: 'k123'});
+    CREATE (:RG14_N {k: 'k124'});
+    CREATE (:RG14_N {k: 'k125'});
+    CREATE (:RG14_N {k: 'k126'});
+    CREATE (:RG14_N {k: 'k127'});
+    CREATE (:RG14_N {k: 'k128'});
+    CREATE (:RG14_N {k: 'k129'});
+    CREATE (:RG14_N {k: 'k130'});
+    CREATE (:RG14_N {k: 'k131'});
+    CREATE (:RG14_N {k: 'k132'});
+    CREATE (:RG14_N {k: 'k133'});
+    CREATE (:RG14_N {k: 'k134'});
+    CREATE (:RG14_N {k: 'k135'});
+    CREATE (:RG14_N {k: 'k136'});
+    CREATE (:RG14_N {k: 'k137'});
+    CREATE (:RG14_N {k: 'k138'});
+    CREATE (:RG14_N {k: 'k139'});
+    CREATE (:RG14_N {k: 'k140'});
+    CREATE (:RG14_N {k: 'k141'});
+    CREATE (:RG14_N {k: 'k142'});
+    CREATE (:RG14_N {k: 'k143'});
+    CREATE (:RG14_N {k: 'k144'});
+    CREATE (:RG14_N {k: 'k145'});
+    CREATE (:RG14_N {k: 'k146'});
+    CREATE (:RG14_N {k: 'k147'});
+    CREATE (:RG14_N {k: 'k148'});
+    CREATE (:RG14_N {k: 'k149'});
+    CREATE (:RG14_N {k: 'k150'});
+    CREATE (:RG14_N {k: 'k151'});
+    CREATE (:RG14_N {k: 'k152'});
+    CREATE (:RG14_N {k: 'k153'});
+    CREATE (:RG14_N {k: 'k154'});
+    CREATE (:RG14_N {k: 'k155'});
+    CREATE (:RG14_N {k: 'k156'});
+    CREATE (:RG14_N {k: 'k157'});
+    CREATE (:RG14_N {k: 'k158'});
+    CREATE (:RG14_N {k: 'k159'});
+    CREATE (:RG14_N {k: 'k160'});
+    CREATE (:RG14_N {k: 'k161'});
+    CREATE (:RG14_N {k: 'k162'});
+    CREATE (:RG14_N {k: 'k163'});
+    CREATE (:RG14_N {k: 'k164'});
+    CREATE (:RG14_N {k: 'k165'});
+    CREATE (:RG14_N {k: 'k166'});
+    CREATE (:RG14_N {k: 'k167'});
+    CREATE (:RG14_N {k: 'k168'});
+    CREATE (:RG14_N {k: 'k169'});
+    CREATE (:RG14_N {k: 'k170'});
+    CREATE (:RG14_N {k: 'k171'});
+    CREATE (:RG14_N {k: 'k172'});
+    CREATE (:RG14_N {k: 'k173'});
+    CREATE (:RG14_N {k: 'k174'});
+    CREATE (:RG14_N {k: 'k175'});
+    CREATE (:RG14_N {k: 'k176'});
+    CREATE (:RG14_N {k: 'k177'});
+    CREATE (:RG14_N {k: 'k178'});
+    CREATE (:RG14_N {k: 'k179'});
+    CREATE (:RG14_N {k: 'k180'});
+    CREATE (:RG14_N {k: 'k181'});
+    CREATE (:RG14_N {k: 'k182'});
+    CREATE (:RG14_N {k: 'k183'});
+    CREATE (:RG14_N {k: 'k184'});
+    CREATE (:RG14_N {k: 'k185'});
+    CREATE (:RG14_N {k: 'k186'});
+    CREATE (:RG14_N {k: 'k187'});
+    CREATE (:RG14_N {k: 'k188'});
+    CREATE (:RG14_N {k: 'k189'});
+    CREATE (:RG14_N {k: 'k190'});
+    CREATE (:RG14_N {k: 'k191'});
+    CREATE (:RG14_N {k: 'k192'});
+    CREATE (:RG14_N {k: 'k193'});
+    CREATE (:RG14_N {k: 'k194'});
+    CREATE (:RG14_N {k: 'k195'});
+    CREATE (:RG14_N {k: 'k196'});
+    CREATE (:RG14_N {k: 'k197'});
+    CREATE (:RG14_N {k: 'k198'});
+    CREATE (:RG14_N {k: 'k199'});
+
+  expected:
+    exit_code: 0
+  tags: [regression, index, ddl, setup]
+
+- name: create-index-on-populated
+  description: |
+    KEY ASSERTION — CREATE INDEX on RG14_N.k, where RG14_N already has
+    200 nodes, must return exit 0 promptly. This is the exact ordering
+    (nodes present BEFORE CREATE INDEX) that self-deadlocked under geode
+    4a1efca4: the eager ordered-index build re-acquired the per-graph
+    rwlock SHARED while the statement already held it EXCLUSIVE, on the
+    same thread, only when there was >=1 node of the label to scan. A 20s
+    timeout enforces the prompt-response contract: a wedge must fail as a
+    timeout, not hang forever.
+  query: "CREATE INDEX rg14_n_k_idx FOR (n:RG14_N) ON (n.k)"
+  timeout_ms: 20000
+  expected:
+    exit_code: 0
+  tags: [regression, index, ddl, key-assertion]
+
+- name: server-alive-followup
+  description: |
+    KEY ASSERTION — the liveness proof. MATCH (n:RG14_N) RETURN
+    count(n) run IMMEDIATELY after CREATE INDEX on the populated label
+    must return 200 within a 20s timeout. Under a live 4a1efca4
+    self-deadlock, the CREATE INDEX statement itself hangs holding the
+    per-graph write lock, so this follow-up read would also wedge/time
+    out (or every subsequent test in the suite would cascade-fail with
+    "Server died") rather than the CREATE INDEX call failing outright.
+  query: "MATCH (n:RG14_N) RETURN count(n)"
+  timeout_ms: 20000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":200'
+  tags: [regression, index, key-assertion]
+
+- name: constraint-after-index
+  description: |
+    A second DDL statement (CREATE CONSTRAINT) after CREATE INDEX on the
+    populated label must also succeed — confirms the server is not just
+    alive for reads but still able to acquire the write lock for further
+    DDL (i.e. the write lock was released cleanly and is not left in a
+    partially-held state by the earlier CREATE INDEX).
+  query: "CREATE CONSTRAINT rg14_n_id_unique FOR (n:RG14_N) REQUIRE n.id IS UNIQUE"
+  timeout_ms: 20000
+  expected:
+    exit_code: 0
+  tags: [regression, index, ddl]
+
+- name: second-index-different-property
+  description: |
+    A second CREATE INDEX, on a different property of the SAME populated
+    label, must also succeed promptly — confirms the fix generalizes
+    beyond a single CREATE INDEX call on the label.
+  query: "CREATE INDEX rg14_n_k2_idx FOR (n:RG14_N) ON (n.k2)"
+  timeout_ms: 20000
+  expected:
+    exit_code: 0
+  tags: [regression, index, ddl]
+
+- name: show-index-lists-it
+  description: |
+    SHOW INDEXES must list the rg14_n_k_idx index created on the
+    populated label (probed exact form on this build: SHOW INDEXES,
+    plural — SHOW INDEX singular is a parse error on this build).
+  query: "SHOW INDEXES"
+  timeout_ms: 20000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - rg14_n_k_idx
+  tags: [regression, index]
+
+- name: drop-index-succeeds
+  description: |
+    DROP INDEX on the index created on the populated label must succeed.
+  query: "DROP INDEX rg14_n_k_idx"
+  timeout_ms: 20000
+  expected:
+    exit_code: 0
+  tags: [regression, index, ddl]
+
+- name: count-still-200-after-drop
+  description: |
+    Node count must still be 200 after DROP INDEX — confirms DROP INDEX
+    only removed the index metadata, not the underlying data.
+  query: "MATCH (n:RG14_N) RETURN count(n)"
+  timeout_ms: 20000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"count(n)":200'
+  tags: [regression, index]
+
+- name: create-index-empty-label
+  description: |
+    CONTROL — CREATE INDEX on a FRESH label (RG14_Empty) with 0 nodes
+    must also return exit 0 promptly. This is the non-triggering path per
+    the 4a1efca4 root-cause analysis: the eager ordered-index build only
+    reached the self-deadlock when there was >=1 node of the label to
+    scan, so a 0-node CREATE INDEX passed even under the live regression.
+    Included so this spec exercises BOTH sides of the trigger condition,
+    not just the populated-label path.
+  query: "CREATE INDEX rg14_empty_idx FOR (n:RG14_Empty) ON (n.k)"
+  timeout_ms: 20000
+  expected:
+    exit_code: 0
+  tags: [regression, index, ddl, control]
+
+tags:
+- regression
+- index
+- ddl
+- self-deadlock
+- geode-4a1efca4
