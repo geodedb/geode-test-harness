@@ -1,0 +1,417 @@
+version: '1.0'
+name: Read-executor memory budget aborts oversized reads with 53200 (geode de9a769d, GAP-ENT-0044/0045)
+description: |
+  Pins a fix (geode commit de9a769d, "GAP-ENT-0044/0045 (T5) — read-executor
+  memory budget + cancel-on-disconnect") for a live OOM incident: two
+  abandoned `GROUP BY ... count(*)` reads (client timed out) kept running
+  server-side ~50 min, materialized unboundedly, RSS grew 27G -> 93.6G, and
+  the kernel OOM killer took the whole server. The fix installs a
+  thread-local budget `Scope` around the READ dispatch of any MATCH-carrying
+  non-write query: every allocation routed through a pass-through
+  `MeteredAllocator` is charged net-live, and once live bytes exceed
+  `GEODE_READ_EXECUTOR_BUDGET_MB` (default 8192 MB; 0 disables) the scope
+  trips — the query aborts cleanly with `error.ReadQueryBudgetExceeded`,
+  mapped to SQLSTATE 53200. The OOM killer is never the arbiter, and the
+  server must survive to answer the next query.
+
+  ## Probe findings (this build, geode HEAD 78173943, well past the
+  ## de9a769d fix — 55 commits downstream — feature verified present)
+
+  - Confirmed via `src/read_budget.zig`: the env var is EXACTLY
+    `GEODE_READ_EXECUTOR_BUDGET_MB` (default 8192, `0` disables — parses
+    once, cached). `src/server/proto_util.zig` maps
+    `error.ReadQueryBudgetExceeded` to SQLSTATE `"53200"` with message
+    prefix `"ReadQueryBudgetExceeded: this read query's working set
+    exceeded GEODE_READ_EXECUTOR_BUDGET_MB (default 8192; 0 disables) and
+    was aborted before exhausting server memory. No data was modified.
+    Narrow the query (indexed GROUP BY/DISTINCT/count shapes are served
+    O(distinct) from the index), add a LIMIT, or raise the budget"`.
+  - Probed against a scratch server (`geode serve --listen 127.0.0.1:4457`)
+    with `GEODE_READ_EXECUTOR_BUDGET_MB=1` (1 MiB):
+      - `MATCH (n:RG15_Big) RETURN n.k, n.pad, count(*) GROUP BY n.k, n.pad`
+        (the shape the task brief suggested) did **NOT** trip the budget at
+        2000 rows x 2000-byte pad (~4 MiB of pad data) — it returned
+        `status_class":"00000"` successfully. This matches the error
+        message's own hint: indexed GROUP BY/DISTINCT/count shapes are
+        served O(distinct) from the index on this build, so they don't
+        materialize the full working set the same way a row-by-row sort
+        does.
+      - `MATCH (n:RG15_Big) RETURN n.k, n.pad ORDER BY n.pad` (requires
+        materializing every row to sort them) reliably tripped the budget:
+        500 rows x 1000-byte pad (~500 KiB) did NOT trip; 2000 rows x
+        2000-byte pad (~4 MiB) DID trip; 1000 rows x 2000-byte pad
+        (~2 MiB, 2x the 1 MiB budget) reliably trips with margin and is
+        the size this spec seeds. ORDER BY (not GROUP BY) is therefore the
+        query used for the KEY negative test.
+      - The CLI's `geode query` always exits 0 for a SQLSTATE error (the
+        error is reported as structured JSON on stdout, not a nonzero
+        process exit) — matching the convention already used by
+        `syntax-error-handling` in specs/geode_gql_compliance.yml. The
+        real assertion is the JSON body, not the exit code.
+      - After the trip, the server answered `RETURN 1 AS x` and
+        `MATCH (n:RG15_Big) RETURN count(n)` successfully — the abort left
+        the system usable. (During interactive probing this was the same
+        server process, same PID; the harness spec below does NOT assert
+        process identity — see the honesty note on `server-alive-after`.)
+      - `GEODE_READ_EXECUTOR_BUDGET_MB=0` on a second scratch server
+        (127.0.0.1:4459), with the identical 1000 x 2000-byte-pad dataset
+        and the identical `ORDER BY n.pad` query, returned
+        `status_class":"00000"` (succeeded) — confirming `0` truly
+        disables the budget rather than merely raising it.
+
+  A second `GEODE_READ_EXECUTOR_BUDGET_MB` value cannot be exercised in the
+  same spec run against the harness-managed server (one `cli.server.env`
+  block per spec), so the `=0` disables-the-guard control drives its own
+  hand-rolled scratch server on a fixed port (4459), following the
+  established scratch-server hygiene pattern (fresh mktemp workdir,
+  idempotent self-heal + port preflight, PID-file-tracked teardown) from
+  `specs/regression_gap0839_inmemory_graph_tenant_bind.yml`.
+
+  CANARY: REQ=REQ-READ-EXECUTOR-BUDGET-001; FEATURE="ReadExecutorBudget"; ASPECT=OversizedReadAbort53200; STATUS=TESTED; TEST=geodetestlab/specs/read_executor_budget_53200.yml; OWNER=qa; UPDATED=2026-07-10
+
+single_node_only: true  # the budget-disabled control drives its own hand-rolled scratch server on a fixed port
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_READ_EXECUTOR_BUDGET_MB: '1'
+
+  client:
+    timeout_ms: 60000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# Phase 1: seed a working set that exceeds a 1 MiB budget on the managed
+# (budget=1) server
+# ---------------------------------------------------------------------------
+
+- name: seed-large
+  description: |
+    Seed 1000 RG15_Big nodes, each carrying a 2000-byte `pad` string
+    (~2 MiB total), against the managed server (GEODE_READ_EXECUTOR_BUDGET_MB
+    set to 1 MiB via cli.server.env above). Uses `geode query -f <file>`
+    against a script-generated seed file rather than a `query:` field —
+    a single positional CLI argument this large exceeds the kernel's
+    per-argument length limit (probed: ~128 KiB) and fails with "argument
+    list too long" before it ever reaches the server. Idempotently clears
+    any RG15_Big residue from a prior aborted run first.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    SERVER="${GEODE_SERVER_ADDRESS}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+
+    geode query "MATCH (n:RG15_Big) DETACH DELETE n" --server "${SERVER}" ${GEODE_CLIENT_TLS} \
+      -U geode -P "${PW}" >/dev/null 2>&1 || true
+
+    SEEDFILE=$(mktemp /tmp/rg15_seed.XXXXXX.gql)
+    python3 - "$SEEDFILE" <<'PYEOF'
+    import sys
+    pad = 'x' * 2000
+    lines = [f"CREATE (:RG15_Big {{k: {i}, pad: '{pad}'}});" for i in range(1, 1001)]
+    with open(sys.argv[1], "w") as f:
+        f.write("\n".join(lines))
+    PYEOF
+
+    OUT=$(geode query -f "$SEEDFILE" --server "${SERVER}" ${GEODE_CLIENT_TLS} -U geode -P "${PW}" 2>&1)
+    EC=$?
+    rm -f "$SEEDFILE"
+    echo "$OUT" | tail -5
+    echo "SEED_EXIT=$EC"
+    [ "$EC" -eq 0 ] && echo "SEED_DONE" || exit 1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SEED_DONE
+    - 'Statements executed: 1000'
+  tags: [read-executor-budget, setup]
+
+- name: verify-seed-count
+  description: Confirm exactly 1000 RG15_Big nodes were seeded before exercising the budget.
+  query: MATCH (n:RG15_Big) RETURN count(n) AS cnt
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1000'
+    - '"status_class":"00000"'
+  tags: [read-executor-budget, setup]
+
+# ---------------------------------------------------------------------------
+# Phase 2: KEY NEGATIVE — the oversized read aborts with 53200, server
+# survives
+# ---------------------------------------------------------------------------
+
+- name: oversized-read-budget-error
+  description: |
+    KEY NEGATIVE — MATCH ... ORDER BY n.pad forces full materialization of
+    all 1000 rows (~2 MiB of pad data) to sort them, which exceeds the
+    1 MiB GEODE_READ_EXECUTOR_BUDGET_MB configured for this server. Probed:
+    the equivalent GROUP BY shape suggested by the task brief did NOT trip
+    the budget on this build (served O(distinct) from the index per the
+    error message's own hint), so ORDER BY is the query that actually
+    exercises the regression tooth. The CLI always exits 0 for a SQLSTATE
+    error (probed) — the real assertion is the structured JSON body
+    carrying status_class 53200 and the ReadQueryBudgetExceeded error name.
+  query: MATCH (n:RG15_Big) RETURN n.k, n.pad ORDER BY n.pad
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"53200"'
+    - ReadQueryBudgetExceeded
+    - GEODE_READ_EXECUTOR_BUDGET_MB
+    - No data was modified
+  tags: [read-executor-budget, negative, key-assertion]
+
+- name: server-alive-after
+  description: |
+    POSITIVE — the server (or its auto-restarted replacement) must still
+    answer a trivial query immediately after the budget trip, i.e. the
+    abort did not leave the system unusable. HONESTY NOTE: this test does
+    NOT by itself prove the SAME process survived without a crash — the
+    harness has silent crash-auto-restart (runner.py) that would
+    transparently replace a genuinely OOM-killed server before the next
+    test, and this test asserts no PID / process-identity, so it would
+    pass against a fresh process too. The REAL regression teeth are in
+    `oversized-read-budget-error` above: a genuine OOM-kill would surface
+    there as a crash/timeout/dropped-connection instead of the clean
+    53200 body, failing that test's own assertions. This test complements
+    it by confirming the post-abort system remains responsive.
+  query: RETURN 1 AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"x":1'
+    - '"status_class":"00000"'
+  tags: [read-executor-budget, positive, key-assertion]
+
+- name: small-read-ok
+  description: |
+    POSITIVE — a cheap read against the SAME oversized dataset (count is
+    served without materializing per-row pad data) must still succeed
+    under the same 1 MiB budget, proving the budget only rejects reads that
+    actually need to materialize an oversized working set, not every read
+    against a label with a large aggregate footprint.
+  query: MATCH (n:RG15_Big) RETURN count(n) AS cnt
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1000'
+    - '"status_class":"00000"'
+  tags: [read-executor-budget, positive]
+
+- name: cleanup-managed-server-data
+  description: Remove RG15_Big nodes from the managed server so this spec leaves no residue.
+  query: MATCH (n:RG15_Big) DETACH DELETE n RETURN count(n) AS deleted
+  expected:
+    exit_code: 0
+  tags: [read-executor-budget, cleanup]
+
+# ---------------------------------------------------------------------------
+# Phase 3: budget-disabled control (GEODE_READ_EXECUTOR_BUDGET_MB=0) — own
+# scratch server, since the managed server above is fixed at budget=1 for
+# the whole spec run. Follows the scratch-server hygiene pattern from
+# specs/regression_gap0839_inmemory_graph_tenant_bind.yml: fresh mktemp
+# workdir, idempotent self-heal + port preflight, PID-file teardown.
+# ---------------------------------------------------------------------------
+
+- name: budget-disabled-start-and-seed
+  description: |
+    Start a second, hand-rolled scratch server on fixed port 4459 with
+    GEODE_READ_EXECUTOR_BUDGET_MB=0 (disabled), from a fresh mktemp
+    working directory. Idempotently kills any stale scratch server left by
+    a prior aborted run before claiming the port, then seeds the IDENTICAL
+    1000 x 2000-byte-pad dataset used against the managed (budget=1)
+    server above (label RG15_BigCtrl to avoid any cross-server confusion).
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # never let the scratch server see the managed server's data dir
+    PORT=4459
+    PIDFILE=/tmp/rg15_budget_disabled_scratch.pid
+    DIRFILE=/tmp/rg15_budget_disabled_scratch.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    # Idempotent self-heal: kill any stale scratch server from a prior
+    # aborted run before claiming the port.
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve --data-dir .*--listen 127.0.0.1:${PORT}" 2>/dev/null || true
+    pkill -f "geode serve.*127.0.0.1:${PORT}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/rg15_budget_disabled.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    # Port preflight: fail fast and loud if something else is squatting on
+    # the fixed port instead of a cryptic bind/connect error downstream.
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"
+      ss -tulpn 2>/dev/null | awk -v p=":${PORT}" '$5 ~ p"$"' || true
+      exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/rg15_budget_disabled.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+
+    # Verified-TLS parity (release-binary safe): present the CA-signed leaf
+    # certificate when the harness provisioned a CA; otherwise the client
+    # falls back to --insecure-tls-skip-verify against the server's
+    # auto-generated self-signed cert.
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
+    GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_READ_EXECUTOR_BUDGET_MB=0 \
+      nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level warn --listen "127.0.0.1:${PORT}" \
+      ${SERVER_TLS_ARGS} \
+      > "$WORKDIR/server.log" 2>&1 &
+    echo $! > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 100); do
+      if "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+        READY=1
+        break
+      fi
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SCRATCH_SERVER_TIMEOUT"
+      cat "$WORKDIR/server.log"
+      exit 1
+    fi
+    echo "SCRATCH_SERVER_READY"
+
+    SEEDFILE="$WORKDIR/seed.gql"
+    python3 - "$SEEDFILE" <<'PYEOF'
+    import sys
+    pad = 'x' * 2000
+    lines = [f"CREATE (:RG15_BigCtrl {{k: {i}, pad: '{pad}'}});" for i in range(1, 1001)]
+    with open(sys.argv[1], "w") as f:
+        f.write("\n".join(lines))
+    PYEOF
+
+    SEEDOUT=$("$BIN" query -f "$SEEDFILE" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    SEEDEC=$?
+    echo "$SEEDOUT" | tail -3
+    echo "SEED_EXIT=$SEEDEC"
+    [ "$SEEDEC" -eq 0 ] && echo "SCRATCH_SEED_DONE" || exit 1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+    - SCRATCH_SEED_DONE
+    - 'Statements executed: 1000'
+  tags: [read-executor-budget, disabled-control, setup]
+
+- name: budget-disabled-oversized-read-succeeds
+  description: |
+    KEY — with GEODE_READ_EXECUTOR_BUDGET_MB=0 on the scratch server, the
+    IDENTICAL oversized ORDER BY read that trips 53200 on the budget=1
+    managed server above must instead succeed (status_class 00000),
+    proving 0 truly disables the guard rather than merely raising it.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    PORT=4459
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    OUT=$("$BIN" query "MATCH (n:RG15_BigCtrl) RETURN n.k, n.pad ORDER BY n.pad" \
+          --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "${OUT:0:300}"
+    echo "$OUT" | grep -q '"status_class":"00000"' && echo "BUDGET_DISABLED_READ_SUCCEEDED" || echo "BUDGET_DISABLED_READ_FAILED"
+    echo "$OUT" | grep -q '"status_class":"00000"'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - BUDGET_DISABLED_READ_SUCCEEDED
+    stdout_not_contains:
+    - '"status_class":"53200"'
+  tags: [read-executor-budget, disabled-control, key-assertion]
+
+- name: budget-disabled-teardown
+  description: |
+    Teardown — stop the scratch server and remove its scratch state. The
+    harness always reaches this test regardless of earlier failures
+    (runner.py's test loop only stops on interactive interrupt), so a
+    mid-spec failure cannot leak the scratch server process. The startup
+    test's idempotent self-heal covers the remaining case of an
+    interactive SIGINT mid-spec.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    set -u
+    PORT=4459
+    PIDFILE=/tmp/rg15_budget_disabled_scratch.pid
+    DIRFILE=/tmp/rg15_budget_disabled_scratch.dir
+
+    if [ -f "$PIDFILE" ]; then
+      PID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        kill "$PID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$PID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    # NOTE: keep the port a variable substitution here, not a hardcoded
+    # digit string, and never restate the fully-expanded pattern in a
+    # comment on this line either — pkill -f regex-matches against the
+    # full cmdline of every process, INCLUDING this very bash -c
+    # invocation's own source text, so writing the expanded pattern out
+    # verbatim anywhere in this script (even in a comment) makes it
+    # self-match and SIGTERM this script mid-run (probed and confirmed:
+    # an earlier draft of this exact line self-killed via its own
+    # docstring restating the pattern).
+    pkill -f "geode serve.*127.0.0.1:${PORT}" 2>/dev/null || true
+
+    if [ -f "$DIRFILE" ]; then
+      WORKDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$WORKDIR" in /tmp/rg15_budget_disabled.*) rm -rf "$WORKDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    echo "SCRATCH_SERVER_STOPPED"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags: [read-executor-budget, disabled-control, teardown]
+
+tags:
+- read-executor-budget
+- gap-ent-0044
+- gap-ent-0045
+- regression
+- memory-safety
