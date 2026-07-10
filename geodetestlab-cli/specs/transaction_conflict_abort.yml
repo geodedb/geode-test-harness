@@ -1,0 +1,366 @@
+version: '1.0'
+name: 'Transaction Conflict / State Negatives (REQ-TXN-CONFLICT-ABORT-001)'
+description: |
+  CANARY: REQ=REQ-TXN-CONFLICT-ABORT-001; FEATURE="Transactions"; ASPECT=StateAndConflict; STATUS=TESTED; TEST=geodetestlab/specs/transaction_conflict_abort.yml; OWNER=qa; UPDATED=2026-07-10
+
+  `transactions_mvcc_isolation.yml` proves the positive no-write-skew /
+  rollback-atomicity surface but has no explicit serialization-failure abort
+  or invalid-transaction-state error coverage. This spec adds those
+  negatives and documents (rather than fakes) what the current build
+  actually does.
+
+  Probing method: a Geode `query -` invocation processes every statement
+  piped via stdin sequentially on ONE connection, but only the LAST
+  statement's JSON result is printed to stdout. This is how BEGIN...COMMIT
+  is held open across statements (single invocation, multi-statement stdin
+  blob) — there is no cross-process session-resume path via the CLI, so
+  genuinely concurrent transactions require two separate OS processes
+  raced via bash backgrounding (see the last test below).
+
+  PROBED FINDINGS (scratch server, port 4489, 2026-07-10):
+
+  1. commit-without-txn / rollback-without-txn: a bare COMMIT or ROLLBACK
+     issued with no active transaction does NOT return an error. It
+     returns exit_code 0, status_class 00000, and a single result row
+     `{"status":"no transaction active"}`. This is a documented no-op,
+     not a 25000-class invalid-transaction-state error. (Note: an EARLIER
+     spec, gql_transaction_management_comprehensive.yml, asserted
+     `geode_query: {status_class: 0A000}` for this same case — that
+     assertion is DEAD CODE: `GeodeQueryAssert` in assertions.py has no
+     `status_class` field, assertions.py is itself marked "not used by
+     the test runner" (checks.py is authoritative), so that check always
+     silently passed regardless of actual output. This spec instead
+     asserts the real stdout text via stdout_contains.)
+
+  2. statement-after-abort: inside an explicit BEGIN, a runtime error
+     (e.g. `'abc' + 5` -> TypeMismatch/58000 when run standalone) does
+     NOT put the transaction into an aborted/rejected state. The error's
+     own result is silently swallowed (not printed — only the final
+     statement's JSON is ever shown), and every CREATE before AND after
+     the failing statement is committed once COMMIT runs. There is no
+     ISO-style "current transaction is aborted, commands ignored until
+     end of transaction block" enforcement observable via this CLI.
+     No data corruption occurs (both rows land with exactly the values
+     specified) — this is a spec-compliance gap, not a correctness bug.
+
+  3. concurrent-writes-conflict: two independent OS processes (bash
+     background + wait, mirroring rbac_concurrent_alter_user.yml's race
+     pattern) each running BEGIN; MATCH+SET on the SAME node property;
+     COMMIT, launched concurrently against the same scratch server, were
+     raced 20 times. Every single race: both processes returned exit 0
+     and status_class 00000 — no 40001/serialization-failure was ever
+     observed, and the GQL engine does not expose a SET TRANSACTION
+     ISOLATION LEVEL / SERIALIZABLE selector (confirmed by
+     transactions_mvcc_isolation.yml's GAP-0337 skip:true tests). The
+     final row state was always coherent (exactly one committed value,
+     never null/duplicated) — i.e. last-write-wins with no visible
+     conflict, not corruption. This spec documents the observable
+     invariant (both writers succeed, final state is coherent, no crash)
+     rather than fabricating a 40001 the engine does not produce.
+
+  Seed: none (deterministic labels, P22_ prefixed). Runtime: Python 3.11 /
+  geode binary (debug build, self-signed TLS via tls_verify: false).
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+
+# ---------------------------------------------------------------------------
+# 1. setup (positive) — a normal BEGIN...COMMIT transaction works
+# ---------------------------------------------------------------------------
+- name: p22-setup-begin-commit-works
+  description: |
+    Baseline positive: BEGIN; CREATE; COMMIT persists the row. Proves the
+    transaction surface this spec's negatives are probing actually works.
+  args:
+  - query
+  - '-'
+  stdin: "BEGIN\nCREATE (n:P22_Setup {canary: 'p22-setup', id: 1})\nCOMMIT\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - transaction
+  - setup
+  - positive
+
+- name: p22-setup-commit-persisted
+  description: A follow-up standalone query must see the committed row.
+  args:
+  - query
+  - 'MATCH (n:P22_Setup {id: 1}) RETURN count(n) AS cnt'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  tags:
+  - transaction
+  - setup
+  - positive
+
+# ---------------------------------------------------------------------------
+# 2. commit-without-txn (KEY negative — probed: silent no-op, not 25000)
+# ---------------------------------------------------------------------------
+- name: p22-commit-without-txn-is-silent-noop
+  description: |
+    KEY negative, probed real behavior: a bare COMMIT with no active
+    transaction does NOT error. It returns exit_code 0, status_class
+    00000, and a `{"status":"no transaction active"}` row. This is a
+    documented no-op, NOT a 25000-class invalid-transaction-state error.
+    LIMITATION-PIN: ISO/IEC 39075 implies COMMIT with no active
+    transaction should raise an invalid-transaction-state condition;
+    this build accepts it silently instead. Asserted here as the real,
+    reproducible behavior (not the earlier spec's dead geode_query.
+    status_class assertion, which never actually executed).
+  args:
+  - query
+  - COMMIT
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - 'no transaction active'
+  tags:
+  - transaction
+  - error
+  - commit
+  - limitation
+  - probed
+
+# ---------------------------------------------------------------------------
+# 3. rollback-without-txn (negative — probed: same silent no-op)
+# ---------------------------------------------------------------------------
+- name: p22-rollback-without-txn-is-silent-noop
+  description: |
+    Negative, probed real behavior: a bare ROLLBACK with no active
+    transaction returns the identical documented no-op as bare COMMIT
+    above (exit_code 0, status_class 00000, "no transaction active").
+    LIMITATION-PIN: same gap as commit-without-txn — no
+    invalid-transaction-state enforcement observable via this CLI.
+  args:
+  - query
+  - ROLLBACK
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - 'no transaction active'
+  tags:
+  - transaction
+  - error
+  - rollback
+  - limitation
+  - probed
+
+# ---------------------------------------------------------------------------
+# 4. statement-after-abort (negative — probed: not rejected, silently
+#    continues; documented gap, no data corruption)
+# ---------------------------------------------------------------------------
+- name: p22-statement-after-runtime-error-not-rejected
+  description: |
+    Negative, probed real behavior: inside one held-open transaction
+    (single CLI invocation, multi-statement stdin — the only way to hold
+    a txn open across statements via this CLI), a runtime type error
+    ('abc' + 5, which returns TypeMismatch/58000 when run standalone) is
+    issued between two CREATE statements. If the engine enforced
+    ISO-style "transaction aborted, commands ignored until ROLLBACK"
+    semantics, the second CREATE and the COMMIT would be rejected.
+    PROBED: they are not. The final (COMMIT's) result is a plain success;
+    the error statement's own result is silently swallowed rather than
+    surfaced. This is checked in the next step.
+  args:
+  - query
+  - '-'
+  stdin: "BEGIN\nCREATE (n:P22_AbortSeq {canary: 'p22-abort-pre', id: 1})\nRETURN\
+    \ ('abc' + 5) AS bad\nCREATE (n:P22_AbortSeq {canary: 'p22-abort-post', id: 2})\n\
+    COMMIT\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - transaction
+  - error
+  - abort
+  - limitation
+  - probed
+
+- name: p22-statement-after-runtime-error-both-rows-committed
+  description: |
+    LIMITATION-PIN: both the pre-error AND post-error CREATE from the
+    previous test are committed — proving the engine does not reject
+    statements issued after a runtime error inside a transaction. No data
+    corruption results (both rows land with exactly their specified
+    values), but this is a real spec-compliance gap relative to
+    ISO/IEC 39075 invalid-transaction-state semantics.
+  args:
+  - query
+  - 'MATCH (n:P22_AbortSeq) RETURN count(n) AS cnt'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":2'
+  tags:
+  - transaction
+  - error
+  - abort
+  - limitation
+  - probed
+
+# ---------------------------------------------------------------------------
+# 5. concurrent-writes-conflict (KEY — probed: no 40001, documented
+#    last-write-wins with no observable conflict abort)
+# ---------------------------------------------------------------------------
+- name: p22-concurrent-seed-node
+  description: Seed the node both concurrent sessions will race to write.
+  args:
+  - query
+  - "CREATE (n:P22_ConflictWrite {canary: 'p22-conflict', id: 1, val: 'init'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - transaction
+  - conflict
+  - setup
+
+- name: p22-concurrent-writes-race-no-serialization-abort
+  description: |
+    KEY negative, probed via two independent OS processes (bash
+    backgrounding + wait — mirroring rbac_concurrent_alter_user.yml's
+    race pattern, since the CLI has no way to hold two transactions open
+    within one invocation). Both sessions BEGIN, MATCH the SAME node,
+    SET the same property to different values, then COMMIT — raced
+    concurrently 5 times in this step (probed up to 20x manually before
+    writing this spec; see spec description header). PROBED: every race
+    round, BOTH sessions return exit 0 and status_class 00000 — no
+    40001/serialization-failure is ever produced. LIMITATION-PIN: the
+    GQL surface exposed by this CLI has no SET TRANSACTION ISOLATION
+    LEVEL selector and (per transactions_mvcc_isolation.yml GAP-0337)
+    SERIALIZABLE write-skew detection is not reachable from the client
+    — so this asserts the real, observable contract instead: both
+    concurrent writers succeed and the server does not crash or hang.
+    The next step verifies the resulting state is coherent (no
+    corruption), not which writer "won".
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    FAIL=0
+    for i in 1 2 3 4 5; do
+      "$BIN" query - --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+        <<< $'BEGIN\nMATCH (n:P22_ConflictWrite {id: 1}) SET n.val = \'sessionA\'\nCOMMIT' \
+        > "/tmp/p22_conflict_a_${i}.log" 2>&1 &
+      PIDA=$!
+      "$BIN" query - --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+        <<< $'BEGIN\nMATCH (n:P22_ConflictWrite {id: 1}) SET n.val = \'sessionB\'\nCOMMIT' \
+        > "/tmp/p22_conflict_b_${i}.log" 2>&1 &
+      PIDB=$!
+      wait $PIDA; RCA=$?
+      wait $PIDB; RCB=$?
+      echo "round=$i RCA=$RCA RCB=$RCB"
+      cat "/tmp/p22_conflict_a_${i}.log"
+      cat "/tmp/p22_conflict_b_${i}.log"
+      if [ $RCA -ne 0 ] || [ $RCB -ne 0 ]; then
+        FAIL=1
+      fi
+      if grep -q '"status_class":"40001"' "/tmp/p22_conflict_a_${i}.log" "/tmp/p22_conflict_b_${i}.log"; then
+        echo "NOTE: a real 40001 serialization-failure WAS observed in round $i -- engine behavior changed, update this spec's limitation-pin"
+      fi
+    done
+    rm -f /tmp/p22_conflict_a_*.log /tmp/p22_conflict_b_*.log
+    exit $FAIL
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - conflict
+  - concurrent
+  - limitation
+  - probed
+
+- name: p22-concurrent-writes-final-state-coherent
+  description: |
+    POSITIVE invariant after the race — the row must still exist exactly
+    once (no duplication) and its value must be one of the two written
+    values (no null/corrupted state), proving the race resolved to a
+    well-defined last-write-wins outcome rather than data corruption.
+  args:
+  - query
+  - "MATCH (n:P22_ConflictWrite {id: 1}) RETURN count(n) AS cnt"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"cnt":1'
+  tags:
+  - transaction
+  - conflict
+  - positive
+
+- name: p22-concurrent-writes-final-value-is-one-of-the-writers
+  description: |
+    Bash-level check that the final value is exactly 'sessionA' or
+    'sessionB' — never null, empty, or some corrupted mix.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$("$BIN" query "MATCH (n:P22_ConflictWrite {id: 1}) RETURN n.val AS val" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT"
+    if echo "$OUT" | grep -q '"val":"sessionA"' || echo "$OUT" | grep -q '"val":"sessionB"'; then
+      echo "PASS: final value is a coherent writer value"
+      exit 0
+    fi
+    echo "FAIL: final value was neither sessionA nor sessionB"
+    exit 1
+  expect:
+    exit_code: 0
+  tags:
+  - transaction
+  - conflict
+  - positive
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+- name: p22-cleanup
+  description: Remove all P22_-labeled test data.
+  args:
+  - query
+  - MATCH (n) WHERE n:P22_Setup OR n:P22_AbortSeq OR n:P22_ConflictWrite DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags:
+  - cleanup
+  - transaction
+
+tags:
+- transaction
+- conflict
+- state
+- error-handling
+- gql-compliance
