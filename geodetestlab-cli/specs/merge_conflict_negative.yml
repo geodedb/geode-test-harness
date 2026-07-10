@@ -1,0 +1,292 @@
+version: '1.0'
+name: MERGE — Conflict / Negative Paths (unbound-var / null-key / contradictory ON CREATE-ON MATCH)
+description: |
+  Covers MERGE negative/conflict paths not exercised by the existing
+  positive-only MERGE specs (gql_merge_properties.yml, gql_merge_edge.yml,
+  gql_merge_bare_set.yml, merge_oncreate_unit_tests.yml,
+  regression_match_merge_without_return.yml, regression_merge_dedup_after_reopen.yml).
+  `geode query` always exits 0 for GQL-level outcomes, so exit_code alone
+  proves nothing here; every case that claims a real rejection would be
+  paired with stdout_not_contains '"status_class":"00000"' — but per the
+  probe below, NONE of the MERGE negatives tested here actually reject;
+  all are silent-accepts, documented honestly as limitation-pins.
+
+  Probed on a scratch server (geode serve --listen 127.0.0.1:4483
+  --data-dir /tmp/probe-p16):
+
+    - merge-undefined-var-pattern (KEY negative, `MERGE (n:P16_Unbound
+      {k: m.v})` where `m` is never bound by any MATCH pattern) —
+      LIMITATION-PIN, not a rejection. status_class 00000, the property
+      access `m.v` evaluates to NULL (same null-semantics observed for
+      unbound variables in WHERE clauses, see where_clause_negative.yml),
+      and MERGE silently CREATES a node with k=null rather than erroring
+      for referencing an undeclared variable. Re-running the identical
+      MERGE a second time matches the same null-keyed node (count stays
+      at 1, not 2) — the dedup lookup treats two NULL key values as equal
+      for MERGE-matching purposes, so this is a deterministic silent
+      accept, not a crash or duplicate-creation bug.
+
+    - merge-null-key (probe, `MERGE (n:P16_NullKey {k: null})`, an
+      explicit literal null used as the merge key) — LIMITATION-PIN.
+      status_class 00000, creates a node with k=null on first execution.
+      Re-running the identical MERGE matches the existing null-keyed node
+      (count stays at 1) — confirms MERGE dedup is stable for null keys,
+      consistent with the unbound-var finding above (both silently accept
+      and both dedup correctly on rerun).
+
+    - contradictory-oncreate-onmatch (`MERGE (n:P16_Contra {k: 'ck'}) ON
+      CREATE SET n.status = 'created_val' ON MATCH SET n.status =
+      'matched_val'`, executed twice) — runs cleanly, only one arm fires
+      per execution as documented GQL MERGE semantics require. First
+      execution (node does not exist): status = 'created_val' (CREATE arm
+      fired, MATCH arm did not). Second execution (node now exists):
+      status = 'matched_val' (MATCH arm fired, CREATE arm did not — the
+      value is NOT 'created_val' left over from the first run). Node
+      count stays at 1 across both executions — no duplicate created.
+
+    - merge-without-return (positive control, bare `MERGE (n:P16_NoReturn
+      {k: 'nr'})` with no RETURN clause) — exit_code 0, status_class
+      00000, empty columns/rows (no result set requested), node
+      persisted (count 1). Complements
+      regression_match_merge_without_return.yml's MATCH+MATCH+MERGE
+      case by covering a standalone bare MERGE with no preceding MATCH.
+
+  CANARY: REQ=REQ-MERGE-CONFLICT-NEGATIVE-001; FEATURE="Merge"; ASPECT=NegativePaths; STATUS=TESTED; TEST=geodetestlab/specs/merge_conflict_negative.yml; OWNER=qa; UPDATED=2026-07-10
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port: null
+    data_dir: null
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: setup-merge-creates-node
+  description: |
+    Prerequisite (positive) — a valid MERGE on a never-before-seen key
+    must CREATE a new node and return its property.
+  query: "MERGE (n:P16_Setup {k: 'sv'}) RETURN n.k AS k"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":"sv"'
+  tags: [merge, setup, positive]
+
+- name: setup-merge-matches-existing
+  description: |
+    Prerequisite (positive) — re-running the identical MERGE must MATCH
+    the existing node (not create a duplicate); the returned value is
+    unchanged.
+  query: "MERGE (n:P16_Setup {k: 'sv'}) RETURN n.k AS k"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":"sv"'
+  tags: [merge, setup, positive]
+
+- name: setup-count-stable
+  description: |
+    KEY ASSERTION — count(n) must be exactly 1 after two identical
+    MERGE executions, proving MERGE works (creates once, matches on
+    repeat) before probing the negative/conflict paths below.
+  query: MATCH (n:P16_Setup) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags: [merge, setup, positive, key-assertion]
+
+- name: merge-undefined-var-pattern
+  description: |
+    KEY NEGATIVE — MERGE (n:P16_Unbound {k: m.v}) references `m`, a
+    variable never bound by any MATCH pattern in this query. Per GAP-0858
+    lineage (unbound vars silently no-op elsewhere in GQL), probed real
+    behavior: status_class 00000, NOT an error. The property access
+    `m.v` evaluates to NULL and MERGE silently CREATES a node with
+    k=null. Asserted as the real (accepted) behavior — LIMITATION-PIN,
+    not the naming error one might expect.
+  query: "MERGE (n:P16_Unbound {k: m.v}) RETURN n.k AS k"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":null'
+  tags: [merge, negative, unbound-var, limitation-pin, silent-accept, key-assertion]
+
+- name: merge-undefined-var-pattern-rerun-dedups
+  description: |
+    KEY ASSERTION — re-running the identical unbound-var MERGE must MATCH
+    the already-created null-keyed node, not create a second one. Proves
+    the silent-accept dedups deterministically on NULL keys rather than
+    spawning a duplicate node on every execution.
+  query: "MERGE (n:P16_Unbound {k: m.v}) RETURN n.k AS k"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":null'
+  tags: [merge, negative, unbound-var, limitation-pin, key-assertion]
+
+- name: merge-undefined-var-pattern-count
+  description: |
+    KEY ASSERTION — count(n) must be exactly 1 after two executions of
+    the unbound-var MERGE. A bug would show count 2 (duplicate node
+    created because the null-keyed MERGE failed to dedup).
+  query: MATCH (n:P16_Unbound) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags: [merge, negative, unbound-var, key-assertion]
+
+- name: merge-null-key
+  description: |
+    Probe — MERGE (n:P16_NullKey {k: null}) uses an explicit literal null
+    as the merge key. Probed real behavior: status_class 00000, NOT an
+    error. Creates a node with k=null on first execution. Asserted as the
+    real (accepted) behavior — LIMITATION-PIN (no rejection of null as a
+    merge-key value).
+  query: "MERGE (n:P16_NullKey {k: null}) RETURN n.k AS k"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":null'
+  tags: [merge, negative, null-key, limitation-pin, silent-accept, key-assertion]
+
+- name: merge-null-key-rerun-dedups
+  description: |
+    KEY ASSERTION — re-running the identical null-key MERGE must MATCH
+    the existing null-keyed node, not create a second one.
+  query: "MERGE (n:P16_NullKey {k: null}) RETURN n.k AS k"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":null'
+  tags: [merge, negative, null-key, limitation-pin, key-assertion]
+
+- name: merge-null-key-count
+  description: |
+    KEY ASSERTION — count(n) must be exactly 1 after two executions of
+    the null-key MERGE. A bug would show count 2 (duplicate node created
+    because dedup on a null key value failed).
+  query: MATCH (n:P16_NullKey) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags: [merge, negative, null-key, key-assertion]
+
+- name: contradictory-oncreate-onmatch-first-execution-fires-create-arm
+  description: |
+    KEY ASSERTION — first execution of a MERGE whose ON CREATE SET and
+    ON MATCH SET write CONTRADICTORY values to the same property (n.status)
+    must fire ONLY the ON CREATE arm (node does not yet exist). Probed
+    real behavior: status = 'created_val', proving the ON MATCH arm did
+    NOT also fire on the create path.
+  query: "MERGE (n:P16_Contra {k: 'ck'}) ON CREATE SET n.status = 'created_val' ON MATCH SET n.status = 'matched_val' RETURN n.status AS status"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"status":"created_val"'
+    stdout_not_contains:
+    - '"status":"matched_val"'
+  tags: [merge, negative, contradictory-arms, key-assertion]
+
+- name: contradictory-oncreate-onmatch-second-execution-fires-match-arm
+  description: |
+    KEY ASSERTION — second execution of the identical MERGE (node now
+    exists from the first run) must fire ONLY the ON MATCH arm. Probed
+    real behavior: status = 'matched_val', overwriting the 'created_val'
+    left by the first run — proving the ON CREATE arm did NOT re-fire on
+    the match path.
+  query: "MERGE (n:P16_Contra {k: 'ck'}) ON CREATE SET n.status = 'created_val' ON MATCH SET n.status = 'matched_val' RETURN n.status AS status"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"status":"matched_val"'
+    stdout_not_contains:
+    - '"status":"created_val"'
+  tags: [merge, negative, contradictory-arms, key-assertion]
+
+- name: contradictory-oncreate-onmatch-count-stable
+  description: |
+    KEY ASSERTION — count(n) must be exactly 1 after both executions,
+    proving the contradictory-arm MERGE never created a duplicate node
+    (bug rule: wrong-arm firing or duplicate creation would be a bug).
+  query: MATCH (n:P16_Contra) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags: [merge, negative, contradictory-arms, key-assertion]
+
+- name: merge-without-return
+  description: |
+    Positive control — a bare MERGE with no RETURN clause and no
+    preceding MATCH must exit 0 with status 00000 and an empty result
+    set. Complements regression_match_merge_without_return.yml, which
+    covers MATCH+MATCH+MERGE without RETURN; this covers a standalone
+    bare MERGE.
+  query: "MERGE (n:P16_NoReturn {k: 'nr'})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"columns":[]'
+    - '"rows":[]'
+  tags: [merge, positive-control, no-return]
+
+- name: merge-without-return-persists
+  description: |
+    KEY ASSERTION — the bare MERGE without RETURN must still persist the
+    node (count 1), proving the missing RETURN clause does not silently
+    skip execution.
+  query: MATCH (n:P16_NoReturn) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags: [merge, positive-control, no-return, key-assertion]
+
+- name: cleanup-test-data
+  description: Clean up all P16_-labeled test data created by this spec.
+  query: |
+    MATCH (n:P16_Setup) DETACH DELETE n;
+    MATCH (n:P16_Unbound) DETACH DELETE n;
+    MATCH (n:P16_NullKey) DETACH DELETE n;
+    MATCH (n:P16_Contra) DETACH DELETE n;
+    MATCH (n:P16_NoReturn) DETACH DELETE n;
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- merge
+- negative-paths
+- unbound-var
+- null-key
+- contradictory-arms
+- silent-accept
+- limitation-pin
