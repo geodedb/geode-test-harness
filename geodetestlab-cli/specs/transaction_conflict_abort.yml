@@ -206,22 +206,26 @@ tests:
   - abort
   - post-error-rejection
 
-- name: p22-statement-after-runtime-error-both-rows-committed
+- name: p22-statement-after-runtime-error-full-abort-rolls-back
   description: |
-    GAP-0917 fix: the POST-error CREATE is now REJECTED (not committed),
-    so exactly one row — the pre-error CREATE — remains, giving cnt:1
-    (previously both committed → cnt:2). NOTE: full ISO abort would roll
-    the pre-error write back too (cnt:0); geode's transaction model
-    commits the pre-error statement, so cnt:1 is the current behavior —
-    the key spec-compliance fix is that statements after the error no
-    longer execute.
+    GAP-0917 (+ its ReleaseSafe follow-up): the aborted transaction is now
+    FULLY atomic — cnt:0. The POST-error CREATE is rejected (never executes),
+    AND the PRE-error CREATE is rolled back when COMMIT-after-error drives the
+    implicit rollback. Previously geode replayed the undo log only for an
+    .Active transaction, so a .Failed transaction's implicit rollback skipped
+    the replay and leaked the pre-error write (cnt:1); the fix replays on
+    .Failed too (safe once the process-global undo log is reset per store
+    teardown — the change that also fixed the ReleaseSafe UAF crash in
+    test_gap0917_txn_post_error). This matches ISO/IEC 39075 abort atomicity:
+    nothing from an aborted transaction is visible (cnt:0, previously cnt:1,
+    originally cnt:2 before any GAP-0917 work).
   args:
   - query
   - 'MATCH (n:P22_AbortSeq) RETURN count(n) AS cnt'
   expect:
     exit_code: 0
     stdout_contains:
-    - '"cnt":1'
+    - '"cnt":0'
   tags:
   - transaction
   - error
