@@ -46,46 +46,31 @@ description: |
       disconnected case above — the phantom row is a property of
       `shortestPath()` itself, not of disconnectedness specifically.
 
-    - cycle-detect-on-dag: **REAL BUG (independent, match-time), evidence
-      below.** The existing positive spec's own `detect-cycles` technique
-      — reusing the same pattern variable at both ends of a relationship
-      pattern (`(n)-[*]->(n)`) to mean "back to the same node" — does NOT
-      enforce that constraint at all, and this is PROVEN at match time
-      with a NON-aggregated projection (so it is NOT merely a downstream
-      symptom of the aggregate defect described next). Over the
-      verified-acyclic {F,G,H} DAG,
+    - cycle-detect-on-dag: **FIXED by GAP-0912 (endpoint unification).**
+      The `detect-cycles` technique — reusing the same pattern variable at
+      both ends of a relationship pattern (`(n)-[*]->(n)`) to mean "back to
+      the same node" — now correctly enforces that constraint at MATCH time.
+      Over the verified-acyclic {F,G,H} DAG,
       `MATCH p = (n:P19_Node {id:'F'})-[:P19_DAG*]->(n)
-      RETURN [x IN nodes(p) | x.id]` returns 3 rows whose start node (F)
-      differs from the end node: `["F","G"]`, `["F","H"]`, `["F","G","H"]`
-      — real acyclic paths ending at G or H, never back at F. No aggregate
-      appears in that query, so the endpoint-unification constraint is
-      genuinely dropped during path matching. The aggregate form
-      (`RETURN count(p)` -> 3, matching the UNFILTERED
-      `(n)-[*]->(m)` count) is a consistent second witness, not the
-      primary evidence. Confirmed further: the exact existing-spec idiom
-      shape `(n)-[:P19_DAG*]-(n) WHERE length(p) > 0 RETURN p` over this
-      acyclic DAG returns many start != end rows where a correct engine
-      would return zero — so the idiom really is broken as shipped. A
-      DIFFERENT technique — explicit `id(n) = id(m)` in a WHERE clause,
-      checked on a non-aggregated projection — correctly returns 0 rows
-      for the same DAG, proving no cycle exists and giving a working
-      cycle-check idiom.
+      RETURN [x IN nodes(p) | x.id]` returns 0 rows (it previously WRONGLY
+      returned `["F","G"]`, `["F","H"]`, `["F","G","H"]` — acyclic paths
+      ending at G or H, never back at F). The aggregate form
+      (`RETURN count(p)` -> 0, was 3) agrees. `(n)...(n)` is now a correct
+      cycle detector. The explicit `id(n) = id(m)` WHERE-clause technique
+      (checked on a non-aggregated projection) also correctly returns 0 rows
+      for the same DAG and remains a valid alternative idiom.
 
-    - unsatisfiable-filter: **REAL BUG, evidence below.** A variable-length
-      path with an impossible property filter
+    - unsatisfiable-filter: **FIXED by GAP-0913 (aggregate honors WHERE).**
+      A variable-length path with an impossible property filter
       (`WHERE all(x IN r WHERE x.weight > 999)` when every real edge has
       weight 2) correctly returns 0 rows when the result is projected
-      directly (`RETURN p` -> `"rows":[]`). But `RETURN count(p) AS total`
-      over the IDENTICAL MATCH + WHERE returns 2 — the full unfiltered
-      path count — as if the WHERE clause were never applied. This
-      reproduces for both the cycle-check query above and this filter
-      query, so it is a general defect: **aggregate functions (count) over
-      a variable-length relationship pattern silently ignore the WHERE
-      clause**, while non-aggregated projections correctly respect it.
-      This is invisible in geode_graph_algorithms.yml's own
-      `variable-length-with-filter` test because that test only asserts
-      `stdout_contains: [length]`, never a row/aggregate count. Documented
-      here as a real, reproducible wrong-result bug, not a hang or crash.
+      directly (`RETURN p` -> `"rows":[]`). Previously `RETURN count(p) AS
+      total` over the IDENTICAL MATCH + WHERE WRONGLY returned 2 — the full
+      unfiltered path count — as if the WHERE clause were never applied.
+      GAP-0913 makes aggregate functions over a variable-length relationship
+      pattern HONOR the WHERE clause, so `count(p)` now returns 0, agreeing
+      with the non-aggregated projection. The same fix repairs the aggregate
+      form of the cycle-check query above.
 
   CANARY: REQ=REQ-GRAPH-ALGO-EDGE-001; FEATURE="GraphAlgorithms"; ASPECT=EdgeCases; STATUS=TESTED; TEST=geodetestlab/specs/graph_algorithm_edge_cases.yml; OWNER=qa; UPDATED=2026-07-10
 
@@ -242,25 +227,19 @@ tests:
 
 - name: cycle-detect-on-dag-samevar-nonaggregated-bug
   description: |
-    KEY BUG EVIDENCE (match-time, NON-aggregated) — this is the airtight
-    proof that the repeated-pattern-variable endpoint constraint is
-    dropped at MATCH TIME, independent of any aggregate. The existing
-    positive spec's `detect-cycles` idiom reuses the same variable at both
-    ends, `(n)...(n)`, to mean "path that returns to the same node".
-    Applied here to the verified-acyclic {F,G,H} DAG with a NON-aggregated
-    projection — `MATCH p = (n:P19_Node {id:'F'})-[:P19_DAG*]->(n)
-    RETURN [x IN nodes(p) | x.id] AS path_ids` — the engine returns 3
-    rows whose start node (F) does NOT equal the end node:
-    `["F","G"]`, `["F","H"]`, and `["F","G","H"]`. Every one of these is a
-    real acyclic path from F ending at G or H, never back at F. Because
-    there is NO aggregate function anywhere in this query, this rules out
-    the "count() drops the WHERE/constraint" defect
-    (unsatisfiable-filter-aggregate-bug below) as the explanation: the
-    endpoint-unification constraint is genuinely not enforced during path
-    matching. Asserted with teeth via the exact wrong path lists that a
-    correct engine (enforcing start=end) could never return. This is what
-    makes `(n)...(n)` broken as a cycle detector — a distinct, independent
-    bug from the aggregate defect.
+    POSITIVE ASSERTION (was KEY BUG EVIDENCE; fixed by GAP-0912) — reusing
+    the same pattern variable at both ends, `(n)...(n)`, correctly means "a
+    path that returns to the same node". Applied to the verified-acyclic
+    {F,G,H} DAG with a NON-aggregated projection —
+    `MATCH p = (n:P19_Node {id:'F'})-[:P19_DAG*]->(n)
+    RETURN [x IN nodes(p) | x.id] AS path_ids` — GAP-0912 makes the engine
+    UNIFY the repeated endpoint at MATCH TIME, so an acyclic DAG yields NO
+    same-endpoint rows. Expected real behavior: status_class 00000 with zero
+    rows (`"rows":[]`). The previously-returned non-cyclic paths
+    (`["F","G"]`, `["F","H"]`, `["F","G","H"]` — real acyclic paths from F
+    ending at G or H, never back at F) no longer appear, proving the
+    endpoint-unification constraint is now enforced during path matching.
+    `(n)...(n)` is now a correct cycle detector.
   args:
   - query
   - '-'
@@ -269,6 +248,8 @@ tests:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
+    - '"rows":[]'
+    stdout_not_contains:
     - '"path_ids":["F","G"]'
     - '"path_ids":["F","H"]'
     - '"path_ids":["F","G","H"]'
@@ -276,18 +257,18 @@ tests:
 
 - name: cycle-detect-on-dag-samevar-technique-bug
   description: |
-    BUG WITH EVIDENCE (aggregate form) — the aggregate companion to the
-    non-aggregated match-time proof above. Reusing the same pattern
-    variable at both ends, `(n)-[*]->(n)`, over the verified-acyclic
-    {F,G,H} DAG: `MATCH p = (n:P19_Node {id:'F'})-[:P19_DAG*]->(n)
-    RETURN count(p)` returns 3 — identical to the UNFILTERED total path
-    count from F (confirmed by the baseline query below). Combined with
-    cycle-detect-on-dag-samevar-nonaggregated-bug (which shows the SAME 3
-    non-cyclic paths with a non-aggregated projection), this establishes
-    the count of 3 is the dropped MATCH-time endpoint constraint, NOT the
-    separate aggregate-drops-WHERE defect. Asserted as the REAL (wrong)
-    count, honestly, as bug evidence — NOT as a correct "cycle found"
-    result.
+    POSITIVE ASSERTION (was BUG WITH EVIDENCE; fixed by GAP-0912) — the
+    aggregate companion to the non-aggregated match-time proof above.
+    Reusing the same pattern variable at both ends, `(n)-[*]->(n)`, over the
+    verified-acyclic {F,G,H} DAG:
+    `MATCH p = (n:P19_Node {id:'F'})-[:P19_DAG*]->(n) RETURN count(p)`.
+    GAP-0912 now UNIFIES the repeated endpoint at MATCH time, so an acyclic
+    DAG has zero same-endpoint paths. Expected real behavior: status_class
+    00000, `count(p)` = 0 — correctly reporting no cycle, versus the
+    previously-wrong 3 (which equalled the UNFILTERED total path count from
+    the baseline query below, because the endpoint constraint was dropped).
+    Combined with cycle-detect-on-dag-samevar-nonaggregated-bug (now 0 rows),
+    the same-variable-reuse idiom is a correct cycle detector.
   args:
   - query
   - '-'
@@ -296,16 +277,17 @@ tests:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - '"total":3'
+    - '"total":0'
   tags: [graph-algorithms, boundary, cycle-detection, dag, bug, wrong-result]
 
 - name: cycle-detect-on-dag-samevar-technique-bug-baseline
   description: |
-    Evidence companion — the UNFILTERED total path count from F (no
-    endpoint constraint at all) is also 3, proving the two tests above
-    applied zero additional filtering from the repeated-variable endpoint
-    constraint versus a fully unconstrained `(n)-[*]->(m)`. Concrete
-    evidence the `(n)...(n)` constraint was silently dropped.
+    Contrast companion — the UNFILTERED total path count from F (no endpoint
+    constraint at all, `(n)-[*]->(m)` with a distinct end variable) is 3
+    (F->G, F->H, F->G->H). After GAP-0912 this CONTRASTS with the
+    same-variable `(n)...(n)` form above (0 paths over this acyclic DAG),
+    demonstrating the endpoint-unification constraint is now applied:
+    constrained = 0, unconstrained = 3.
   args:
   - query
   - '-'
@@ -320,12 +302,11 @@ tests:
 - name: cycle-detect-on-dag-correct-technique
   description: |
     REQUIRED BOUNDARY, correctly answered — using explicit `id(n) = id(m)`
-    comparison in a WHERE clause, checked on a NON-aggregated projection
-    (`RETURN p`, not `count(p)` — see unsatisfiable-filter-aggregate-bug
-    below for why aggregates over variable-length patterns can't be
-    trusted with a WHERE clause), correctly reports the {F,G,H} DAG has
-    NO cycle: 0 rows. This is the technique that should be used instead of
-    the broken same-variable-reuse idiom above.
+    comparison in a WHERE clause on a NON-aggregated projection (`RETURN p`)
+    correctly reports the {F,G,H} DAG has NO cycle: 0 rows. This remains a
+    valid cycle-check idiom; after GAP-0912 the same-variable-reuse idiom
+    (`(n)...(n)`) above is also correct, and after GAP-0913 aggregates over
+    variable-length patterns honor their WHERE clause too.
   args:
   - query
   - '-'
@@ -420,19 +401,17 @@ tests:
 
 - name: unsatisfiable-filter-aggregate-bug
   description: |
-    BUG WITH EVIDENCE — `RETURN count(p) AS total` over the IDENTICAL
-    MATCH + WHERE from unsatisfiable-filter above (impossible weight > 999
-    filter) returns 2, not 0 — the full UNFILTERED path count (confirmed
-    by unsatisfiable-filter-satisfiable-control finding exactly 2 real
-    paths). The WHERE clause is silently ignored when its result feeds an
-    aggregate over a variable-length relationship pattern, while the
-    non-aggregated projection in unsatisfiable-filter correctly respects
-    it. This reproduces the identical shape of bug seen in
-    cycle-detect-on-dag-samevar-technique-bug above (aggregate + WHERE +
-    variable-length = WHERE ignored) and is invisible in
-    geode_graph_algorithms.yml's own `variable-length-with-filter` test,
-    which never asserts a row or aggregate count. Asserted as the REAL
-    (wrong) count, honestly, as bug evidence.
+    POSITIVE ASSERTION (was BUG WITH EVIDENCE; fixed by GAP-0913) —
+    `RETURN count(p) AS total` over the IDENTICAL MATCH + WHERE from
+    unsatisfiable-filter above (impossible weight > 999 filter). This used
+    to return 2 — the full UNFILTERED path count — because the WHERE clause
+    was silently dropped when its result fed an aggregate over a
+    variable-length relationship pattern. GAP-0913 makes aggregates HONOR
+    the WHERE clause. Expected real behavior: status_class 00000,
+    `count(p)` = 0 — matching the non-aggregated projection in
+    unsatisfiable-filter (which correctly returns 0 rows). The aggregate and
+    non-aggregated paths now agree, and the same fix repairs the
+    aggregate + WHERE + variable-length shape generally.
   args:
   - query
   - '-'
@@ -441,7 +420,7 @@ tests:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - '"total":2'
+    - '"total":0'
   tags: [graph-algorithms, boundary, variable-length, filter, bug, wrong-result]
 
 - name: server-stable-after-algo-probes

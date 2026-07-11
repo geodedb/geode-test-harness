@@ -316,29 +316,33 @@ tests:
   # ============================================================================
 - name: p26-policy-ddl-unauthorized-limitation-pin
   description: |
-    LIMITATION-PIN, SECURITY-RELEVANT — a non-admin readonly user with
-    NO schema grant is currently able to CREATE POLICY. Probed live
-    (binary v0.8.0-19-gddc852c2): status_class 00000, "Policy created",
-    and the policy is confirmed persisted via a follow-up admin SHOW
-    POLICIES in the probe session. This pins the CURRENT (permissive)
-    behavior so a future fix that closes the dispatch-layer gap (see
-    description) flips this test — at which point it should be updated
-    to assert denial instead of documenting the gap.
+    NEGATIVE (flipped from LIMITATION-PIN) — a non-admin readonly user with
+    NO schema grant attempts CREATE POLICY and is now DENIED. GAP-0911 made
+    policy DDL admin-only: the .CreatePolicy dispatch arm calls
+    requirePolicyDdlAdmin() first, which returns error.Unauthorized for a
+    non-Admin role, mapping to SQLSTATE 42501 / "Permission denied". This
+    test formerly pinned the old permissive behavior (status_class 00000,
+    "Policy created", policy persisted); it now asserts the verified-correct
+    denial. The paired -confirmed-persisted test below verifies the policy
+    was NOT written to the catalog.
   args: [query, -U, p26_ro, -P, 'P26RoAuthzPass!234', CREATE POLICY p26_probe_unauthorized_policy ON GRAPH * FOR WRITE USING true]
   expect:
     exit_code: 0
-    stdout_contains: ['"status_class":"00000"', 'Policy created']
+    stdout_contains: ['42501', 'Permission denied']
+    stdout_not_contains: ['"status_class":"00000"', 'Policy created']
   tags: [p26, negative, policy-ddl, limitation, security-gap]
 
 - name: p26-policy-ddl-unauthorized-confirmed-persisted
   description: |
-    Confirms (as admin) that the policy created by the unauthorized
-    p26_ro session above actually persisted in the catalog — proving
-    the prior test observed a real write, not a client-side echo.
+    FIX EVIDENCE (flipped from LIMITATION-PIN) — confirms (as admin) that
+    the CREATE POLICY denied for the unauthorized p26_ro session above was
+    NOT written to the catalog (GAP-0911). SHOW POLICIES no longer contains
+    p26_probe_unauthorized_policy. Formerly this pinned the unauthorized
+    policy persisting.
   args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
   expect:
     exit_code: 0
-    stdout_contains: [p26_probe_unauthorized_policy]
+    stdout_not_contains: [p26_probe_unauthorized_policy]
   tags: [p26, negative, policy-ddl, limitation, security-gap]
 
   # ============================================================================

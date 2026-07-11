@@ -178,16 +178,15 @@ tests:
 # ---------------------------------------------------------------------------
 - name: p22-statement-after-runtime-error-not-rejected
   description: |
-    Negative, probed real behavior: inside one held-open transaction
-    (single CLI invocation, multi-statement stdin — the only way to hold
-    a txn open across statements via this CLI), a runtime type error
-    ('abc' + 5, which returns TypeMismatch/58000 when run standalone) is
-    issued between two CREATE statements. If the engine enforced
-    ISO-style "transaction aborted, commands ignored until ROLLBACK"
-    semantics, the second CREATE and the COMMIT would be rejected.
-    PROBED: they are not. The final (COMMIT's) result is a plain success;
-    the error statement's own result is silently swallowed rather than
-    surfaced. This is checked in the next step.
+    Inside one held-open transaction (single CLI invocation,
+    multi-statement stdin), a runtime type error ('abc' + 5 →
+    TypeMismatch/58000) is issued between two CREATE statements. GAP-0917
+    fix: the engine now enforces ISO-style "transaction aborted, commands
+    ignored until ROLLBACK" semantics — the error fails the transaction,
+    the post-error CREATE is rejected, COMMIT performs an implicit abort,
+    and the batch surfaces the original error (58000/TypeMismatch) instead
+    of silently swallowing it and returning a plain success. The
+    limitation-pin flipped once the fix landed.
   args:
   - query
   - '-'
@@ -197,35 +196,37 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
   tags:
   - transaction
   - error
   - abort
-  - limitation
-  - probed
+  - post-error-rejection
 
 - name: p22-statement-after-runtime-error-both-rows-committed
   description: |
-    LIMITATION-PIN: both the pre-error AND post-error CREATE from the
-    previous test are committed — proving the engine does not reject
-    statements issued after a runtime error inside a transaction. No data
-    corruption results (both rows land with exactly their specified
-    values), but this is a real spec-compliance gap relative to
-    ISO/IEC 39075 invalid-transaction-state semantics.
+    GAP-0917 fix: the POST-error CREATE is now REJECTED (not committed),
+    so exactly one row — the pre-error CREATE — remains, giving cnt:1
+    (previously both committed → cnt:2). NOTE: full ISO abort would roll
+    the pre-error write back too (cnt:0); geode's transaction model
+    commits the pre-error statement, so cnt:1 is the current behavior —
+    the key spec-compliance fix is that statements after the error no
+    longer execute.
   args:
   - query
   - 'MATCH (n:P22_AbortSeq) RETURN count(n) AS cnt'
   expect:
     exit_code: 0
     stdout_contains:
-    - '"cnt":2'
+    - '"cnt":1'
   tags:
   - transaction
   - error
   - abort
-  - limitation
-  - probed
+  - post-error-rejection
 
 # ---------------------------------------------------------------------------
 # 5. concurrent-writes-conflict (KEY — probed: no 40001, documented

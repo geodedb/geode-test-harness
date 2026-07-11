@@ -85,11 +85,18 @@ tests:
 - name: 'P21-SAT-001: saturate a --max-connections 2 server with two continuously-busy holders'
   description: |
     Seed a small graph and launch two background `geode query` processes
-    each running a 4-way cross join expensive enough to keep them
+    each running a 5-way cross join expensive enough to keep them
     genuinely busy (continuously sending/receiving, never idle) for
-    roughly 20-30s. With --max-connections 2 these two holders occupy
+    roughly 15-25s. With --max-connections 2 these two holders occupy
     every slot the server has. PIDs are persisted to files so later,
     independently-executed test steps can check on and drain them.
+    NOTE: the cross join is 5-way (18^5 = 1,889,568 combinations), not
+    4-way — a 4-way join (18^4 = 104,976) completed in <1s on fast
+    multi-core hosts, so holder1 routinely finished before the 1s
+    liveness probe below and the test flaked ("holder1_alive=no"). The
+    5-way join reliably keeps each holder busy well past the 1s SAT check
+    AND the ~8s over-cap probe window in P21-OVERCAP-001, while still
+    draining gracefully inside P21-RECOVER-001's poll deadline.
   type: bash
   command: |
     SERVER="${GEODE_SERVER_ADDRESS}"
@@ -111,7 +118,7 @@ tests:
               (n13:P21Load {i:13}),(n14:P21Load {i:14}),(n15:P21Load {i:15}),(n16:P21Load {i:16}),
               (n17:P21Load {i:17}),(n18:P21Load {i:18})" >/dev/null 2>&1
 
-    HOLDER_QUERY="MATCH (a:P21Load),(b:P21Load),(c:P21Load),(d:P21Load) RETURN count(*) AS c"
+    HOLDER_QUERY="MATCH (a:P21Load),(b:P21Load),(c:P21Load),(d:P21Load),(e:P21Load) RETURN count(*) AS c"
 
     ( geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
         -U geode -P "${PW}" --timeout 60 "${HOLDER_QUERY}" \

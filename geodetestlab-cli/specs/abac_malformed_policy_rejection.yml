@@ -176,30 +176,34 @@ tests:
 
 - name: p5-duplicate-policy-name-accepted
   description: |
-    NEGATIVE / KNOWN LIMITATION — CREATE POLICY reusing the existing name
-    "p5_valid_baseline" (different USING expression). PolicyCatalog.addPolicy
-    has no name-uniqueness check and unconditionally appends, so the REAL
-    behavior is exit 0 / "Policy created" — no conflict error. This pins
-    that real behavior; a future fix (duplicate-name rejection) flips it.
+    POSITIVE (flipped from LIMITATION-PIN) — CREATE POLICY reusing the
+    existing name "p5_valid_baseline" (different USING expression) is now
+    REJECTED. GAP-0923(b) added a name-uniqueness check to
+    PolicyCatalog.addPolicy (returns error.PolicyAlreadyExists), which maps
+    to SQLSTATE 42710 / "Duplicate policy name". This test formerly pinned
+    the old buggy behavior (exit 0 / "Policy created", duplicate silently
+    appended); it now asserts the verified-correct rejection.
   args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY p5_valid_baseline ON GRAPH * FOR WRITE USING current_user() = 'p5_someone_else']
   expect:
     exit_code: 0
-    stdout_contains: [Policy created]
+    stdout_contains: ['42710', Duplicate policy name]
+    stdout_not_contains: ['"status_class":"00000"', Policy created]
   tags: [abac, negative, known_limitation, trip_wire]
 
 - name: p5-show-policies-reveals-duplicate-row
   type: bash
   description: |
-    BUG EVIDENCE — SHOW POLICIES now lists p5_valid_baseline TWICE (two
-    distinct catalog entries with the identical name), proving the
-    duplicate-name CREATE above did not just no-op or overwrite.
+    FIX EVIDENCE (flipped from LIMITATION-PIN) — after GAP-0923(b) rejects
+    the duplicate-name CREATE above, SHOW POLICIES lists p5_valid_baseline
+    exactly ONCE (a single catalog entry), proving the duplicate was
+    refused rather than silently appended. Formerly this asserted TWO rows.
   command: |
     BIN="${GEODE_BINARY:-geode}"
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
     OUT=$("$BIN" query --server "${GEODE_SERVER_ADDRESS}" -U geode -P "$PW" "SHOW POLICIES" 2>&1)
     echo "$OUT"
     COUNT=$(echo "$OUT" | grep -o 'p5_valid_baseline' | wc -l)
-    [ "$COUNT" -eq 2 ] && echo "duplicate_count=ok" || { echo "duplicate_count=FAIL got=$COUNT"; exit 1; }
+    [ "$COUNT" -eq 1 ] && echo "duplicate_count=ok" || { echo "duplicate_count=FAIL got=$COUNT"; exit 1; }
   expect:
     exit_code: 0
     stdout_contains: [duplicate_count=ok]
@@ -235,12 +239,16 @@ tests:
 
 - name: p5-ghost-duplicate-still-present
   description: |
-    BUG EVIDENCE (continued) — confirms the single DROP above did not fully
-    remove p5_valid_baseline; the ghost duplicate row is still listed.
+    FIX EVIDENCE (flipped from LIMITATION-PIN) — the ghost-duplicate bug is
+    fixed (GAP-0923b). Because duplicate names are now rejected, only ONE
+    p5_valid_baseline ever existed, so the single DROP above fully removed
+    it — no ghost survives. SHOW POLICIES no longer contains
+    p5_valid_baseline (only p5_malformed_paren and p5_unknown_attr remain).
+    Formerly this pinned a ghost duplicate row surviving one DROP.
   args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
   expect:
     exit_code: 0
-    stdout_contains: [p5_valid_baseline]
+    stdout_not_contains: [p5_valid_baseline]
   tags: [abac, negative, known_limitation]
 
 - name: p5-second-drop-fully-clears

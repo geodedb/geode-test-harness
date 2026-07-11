@@ -317,27 +317,41 @@ tests:
     tail -30 "$WORKDIR/server_boot2.log" 2>/dev/null || true
     echo "--- end log ---"
 
+    # GAP-0908 fix: an unwritable audit sink at startup is now a GRACEFUL,
+    # FAIL-CLOSED REFUSAL to start -- the server logs a clear
+    # "cannot open audit log sink; refusing to start" and exits non-zero with
+    # error.AuditSinkUnavailable, instead of the previous unhandled AccessDenied
+    # crash. For a fail-closed audit policy this is the CORRECT contract: the
+    # server must NOT serve with a broken audit sink, and it must NOT crash
+    # uncontrolled -- it refuses cleanly. This test asserts that new contract
+    # (the pinned crash bug is fixed).
     if [ "$ALIVE" -eq 1 ]; then
+      # Server stayed alive with an unwritable sink -- that is FAIL-OPEN, which
+      # violates the fail-closed policy this spec name asserts.
       if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
-        echo "P6_HARD_FAILURE_POLICY=GRACEFUL (server started and answered queries despite an unwritable sink -- the crash bug pinned by this spec appears FIXED; update this test to assert the new graceful contract instead)"
+        echo "P6_HARD_FAILURE_POLICY=FAIL_OPEN (server started and served queries despite an unwritable audit sink -- violates the fail-closed policy)"
       else
-        echo "P6_HARD_FAILURE_POLICY=HUNG (process alive but never became ready -- a different/new bug, not the one this spec pins)"
+        echo "P6_HARD_FAILURE_POLICY=HUNG (process alive but never became ready)"
       fi
       kill -9 "$SPID2" 2>/dev/null || true
       rm -f "$PIDFILE"
       exit 1
     fi
-    if grep -qi "AccessDenied" "$WORKDIR/server_boot2.log" 2>/dev/null && grep -q "audit.zig" "$WORKDIR/server_boot2.log" 2>/dev/null; then
-      echo "P6_HARD_FAILURE_POLICY=CRASH_ON_STARTUP exit=$RESTART_EXIT (AccessDenied opening audit.jsonl -- unhandled crash, not a graceful rejection)"
+    if grep -qi "AuditSinkUnavailable" "$WORKDIR/server_boot2.log" 2>/dev/null || grep -qi "cannot open audit log sink" "$WORKDIR/server_boot2.log" 2>/dev/null; then
+      echo "P6_HARD_FAILURE_POLICY=FAILCLOSED_REFUSAL exit=$RESTART_EXIT (graceful fail-closed: refused to start with a clear AuditSinkUnavailable error, no unhandled crash)"
       rm -f "$PIDFILE"
+    elif grep -qi "AccessDenied" "$WORKDIR/server_boot2.log" 2>/dev/null && grep -q "audit.zig" "$WORKDIR/server_boot2.log" 2>/dev/null; then
+      echo "P6_HARD_FAILURE_POLICY=CRASH_ON_STARTUP exit=$RESTART_EXIT (OLD BUG: AccessDenied opening audit.jsonl -- unhandled crash, not a graceful rejection)"
+      rm -f "$PIDFILE"
+      exit 1
     else
-      echo "P6_HARD_FAILURE_POLICY=CRASH_ON_STARTUP_UNKNOWN_CAUSE exit=$RESTART_EXIT (crashed, but NOT the AccessDenied/audit.zig signature this spec pins -- investigate as a separate issue)"
+      echo "P6_HARD_FAILURE_POLICY=CRASH_ON_STARTUP_UNKNOWN_CAUSE exit=$RESTART_EXIT (exited, but NOT the fail-closed AuditSinkUnavailable signature -- investigate)"
       rm -f "$PIDFILE"
       exit 1
     fi
   expect:
     exit_code: 0
-    stdout_contains: [P6_SINK_CHMOD_000_OK, 'P6_HARD_FAILURE_POLICY=CRASH_ON_STARTUP exit']
+    stdout_contains: [P6_SINK_CHMOD_000_OK, 'P6_HARD_FAILURE_POLICY=FAILCLOSED_REFUSAL']
   tags: [audit, sink, p6, key, known_limitation, bug, fail-closed-via-crash]
 
 - name: p6_hard_failure_restore_and_chain_verify

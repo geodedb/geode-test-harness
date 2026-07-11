@@ -138,23 +138,26 @@ tests:
 
 - name: groupby-unknown-alias-limitation-pin
   description: |
-    BUG-RULE LIMITATION PIN (geode ce8bd8f0) — GROUP BY on `nosuch`, an
+    NEGATIVE (flipped from LIMITATION-PIN) — GROUP BY on `nosuch`, an
     identifier that is neither a RETURN alias nor a resolvable property
-    path, SHOULD raise a query-time error per the documented contract
-    ("unknown identifier in GROUP BY"). Probed against the current binary,
-    it instead succeeds (exit 0) and silently collapses all 9 rows into a
-    single group, reporting c=9 (the full unfiltered row count) alongside
-    an arbitrary/non-deterministic value for s. This test pins TODAY'S
-    actual behavior — do not weaken it to assert an error until the
-    underlying resolution bug is fixed; when it is, flip this test to
-    assert a nonzero exit_code / stderr error instead.
+    path, now raises a query-time error per the ISO/IEC 39075:2024 contract.
+    GAP-0914 made an unresolvable GROUP BY key return error.UnknownGroupKey,
+    mapping to SQLSTATE 42703 / "GROUP BY key does not resolve to any RETURN
+    alias, variable, or binding". This test formerly pinned the old buggy
+    behavior (exit 0, all 9 rows silently collapsed into one group reporting
+    c=9); it now asserts the verified-correct rejection. exit_code stays 0
+    (geode query returns 0 on a completed round-trip; the error lives in the
+    JSON status_class).
   args:
   - query
   - MATCH (n:RG1_Item) RETURN n.category AS s, count(*) AS c GROUP BY nosuch
   expected:
     exit_code: 0
     stdout_contains:
-    - '"c":9'
+    - '42703'
+    - GROUP BY key does not resolve
+    stdout_not_contains:
+    - '"status_class":"00000"'
   tags: [groupby, alias, negative, limitation-pin]
 
 - name: filtered-count-parity

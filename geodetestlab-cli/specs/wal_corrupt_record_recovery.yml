@@ -40,15 +40,16 @@ description: |
 
   THE ORACLE (honest): the "committed data survives" assertions use a
   LABEL-LESS oracle — `MATCH (n) RETURN count(n)` and property lookups
-  `MATCH (n) WHERE n.p3id = '...'` — NOT a label-filtered count. This is
-  deliberate: probing showed that after an UNCLEAN (SIGKILL) crash+reopen,
-  the raw node/property data reliably survives (label-less count and value
-  lookups return the full committed set, 4/4 across repeated runs), but a
-  LABEL-FILTERED query (`MATCH (n:P3_A) RETURN count(n)`) returns 0 — the
-  label→node index is not reconstructed on the hard-crash recovery path.
-  So the WAL itself keeps the committed prefix (the contract this spec
-  pins); it is only the label index that is not rebuilt after a hard crash.
-  See the `*-limitation-pin` test below.
+  `MATCH (n) WHERE n.p3id = '...'` — as an index-agnostic check. This is
+  deliberate: it verifies the raw node/property data survives (label-less
+  count and value lookups return the full committed set, 4/4 across repeated
+  runs) independently of any secondary index. A LABEL-FILTERED query
+  (`MATCH (n:P3_A) RETURN count(n)`) now ALSO returns the full count after a
+  hard crash: GAP-0915 fixed hard-crash label-index reconstruction, so the
+  label→node index is rebuilt on the unclean-crash recovery path. The WAL
+  keeps the committed prefix AND the label index is reconstructed. See the
+  (now-positive) `*-limitation-pin` test below — originally it pinned the
+  label-filtered count returning 0; geode's fix flipped it to == 4.
 
   WHAT THIS SPEC PINS:
     (a) POSITIVE — WAL tail-corruption / torn-write tolerance + committed-
@@ -56,18 +57,18 @@ description: |
         (count + first/last value lookups) after TWO independent
         crash+corrupt+reopen rounds (append-garbage, then a second
         incomplete-record torn-write shape).
-    (b) LIMITATION-PIN — a live label-index-reconstruction bug on the
-        UNCLEAN-crash recovery path: `MATCH (n:P3_A) RETURN count(n)` returns
-        0 (not the seeded count) after the hard crash, even though the nodes
-        demonstrably survive under a label-less scan. The EXPECTED contract
-        is that it equals the seeded count, exactly as it does after a
-        GRACEFUL restart (a graceful-restart control passed 4/4 in probing;
+    (b) POSITIVE (converted from a limitation-pin) — label-index
+        reconstruction on the UNCLEAN-crash recovery path now works:
+        `MATCH (n:P3_A) RETURN count(n)` returns the seeded count (4) after
+        the hard crash, matching the label-less oracle and the pre-crash
+        baseline. GAP-0915 fixed hard-crash label-index reconstruction (the
+        EXPECTED contract: equal to the seeded count, exactly as after a
+        GRACEFUL restart — a graceful-restart control passed 4/4 in probing;
         cf. geode 9a255a83 / regression_label_count_after_reopen.yml, which
         fixes the FIRST-read-after-GRACEFUL-restart race — a DIFFERENT path).
-        This pin asserts today's BUGGY behavior (== 0) so it self-activates
-        (flips to a failure) the moment geode fixes hard-crash label-index
-        recovery, at which point it should be converted to a positive.
-        This spec does NOT claim label-filtered survival works.
+        The pin self-activated when geode landed the fix and has been
+        converted to this positive assertion (== 4). Label-filtered survival
+        after a hard crash now works.
 
   Probed against a scratch server (geode serve --listen 127.0.0.1:4470..4474
   --data-dir /tmp/probe-p3* with --persist-interval 600000, admin seeded via
@@ -79,9 +80,11 @@ description: |
   likely a torn write, CRC/AEAD failure, or non-monotonic LSN` — the server
   reached `server ready` with no panic, the WAL was physically truncated
   back to valid_end, and a label-less scan returned the full committed set.
-  The label-filtered count returned 0 on the hard-crash path (the pinned
-  limitation) while a graceful restart returned the full count. The
-  label-less oracle used here passed 8/8 across 3 repeated harness runs.
+  The label-filtered count now also returns the full count on the hard-crash
+  path after GAP-0915 (it previously returned 0 — the original pinned
+  limitation, now converted to a positive), matching the graceful-restart
+  control. The label-less oracle used here passed 8/8 across 3 repeated
+  harness runs.
 
   CANARY: REQ=REQ-WAL-CORRUPT-RECOVERY-001; FEATURE="WalRecovery"; ASPECT=TailCorruptionTolerated; STATUS=TESTED; TEST=geodetestlab/specs/wal_corrupt_record_recovery.yml; OWNER=qa; UPDATED=2026-07-10
 
@@ -219,33 +222,54 @@ tests:
 
 - name: label-index-after-crash-limitation-pin
   description: |
-    LIMITATION-PIN (honest, negative) — pins a LIVE bug: after the UNCLEAN
-    (SIGKILL) crash + reopen, the label-filtered count returns 0 instead of
-    the seeded 4, even though the nodes demonstrably survived (the label-less
-    assertions above all passed). The label→node index is not reconstructed
-    on the hard-crash recovery path.
-    EXPECTED contract: this should return 4, exactly as it does BEFORE the
-    crash (see confirm-label-before-crash) and after a GRACEFUL restart (a
+    POSITIVE (converted from a limitation-pin) — after the UNCLEAN (SIGKILL)
+    crash + reopen, the label-filtered count now correctly returns the seeded
+    4. GAP-0915 fixed hard-crash label-index reconstruction: the label→node
+    index is rebuilt on the unclean-crash recovery path, so a label-filtered
+    query matches the label-less oracle above and the pre-crash baseline.
+    EXPECTED contract: this returns 4, exactly as it does BEFORE the crash
+    (see confirm-label-before-crash) and after a GRACEFUL restart (a
     graceful-restart control returned the full count 4/4 in probing; cf.
     geode 9a255a83 / regression_label_count_after_reopen.yml, which fixes the
     first-read-after-GRACEFUL-restart race — a distinct path).
-    This test asserts today's BUGGY value (0) so it SELF-ACTIVATES: when
-    geode fixes hard-crash label-index recovery this will flip to a failure,
-    signalling that it should be converted into a positive assertion (== 4).
-    This spec does NOT claim label-filtered survival works.
+    This test previously asserted the then-BUGGY value (0) as a
+    self-activating pin; geode's GAP-0915 fix flipped it, and it has been
+    converted into this positive assertion (== 4). The label-less oracle
+    above is retained as an independent, index-agnostic survival check.
   query: MATCH (n:P3_A) RETURN count(n) AS total
   expected:
     exit_code: 0
     stdout_contains:
-    - '"total":0'
-  tags: [wal, recovery, corruption, limitation-pin, known-bug, negative]
+    - '"total":4'
+  tags: [wal, recovery, corruption, positive, key-assertion]
+
+- name: torn-write-reseed-wal-before-round2
+  description: |
+    ROUND 2 precondition. After ROUND 1's UNCLEAN crash, geode recovered by
+    replaying graph.wal and then CHECKPOINTED the recovered state into the
+    durable snapshot, correctly TRUNCATING graph.wal back to 0 bytes (durable
+    state lives in the snapshot, not an ever-growing WAL — confirmed by the
+    label-less survival counts above). Every step since ROUND 1 has been
+    read-only, so there is no fresh WAL tail for ROUND 2 to torn-corrupt and
+    its `find … -size +0c` would match nothing. Issue one committed write that
+    does NOT change the node/label counts — an idempotent property SET on an
+    existing seed node — purely to append a fresh committed record to graph.wal
+    so ROUND 2 has a real tail to corrupt. total/P3_A counts stay 4.
+  query: MATCH (n:P3_A {p3id:'p3-1'}) SET n.round2_marker = true RETURN count(n) AS touched
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"touched":1'
+  tags: [wal, recovery, corruption, torn-write, reseed]
 
 - name: torn-write-crash-and-corrupt
   description: |
     ROUND 2 (torn-write-tolerated) — a second independent UNCLEAN crash +
     tail corruption, this time appending a short incomplete-record garbage
     chunk (13 bytes) to simulate a process that died having written only the
-    first few bytes of a new WAL record (a torn mid-record write). Again
+    first few bytes of a new WAL record (a torn mid-record write). The
+    torn-write-reseed-wal-before-round2 step above repopulated graph.wal with a
+    fresh committed record so there is a non-empty tail to corrupt. Again
     asserts ≥1 file corrupted; restart_server reopens the twice-corrupted
     data dir.
   type: bash

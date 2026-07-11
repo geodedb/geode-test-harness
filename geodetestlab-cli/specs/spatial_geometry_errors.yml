@@ -11,6 +11,22 @@ description: >
   ## PROBE FINDINGS (2026-07-10, scratch server, ../geode/zig-out/bin/geode, port 4477)
 
 
+  UPDATE (GAP-0924 + arg-eval follow-up): the silent-NULL limitations
+  pinned in findings 2, 4b, and 4c below are now CLOSED for bad geometry.
+  Malformed WKT (`POINT(banana)`), degenerate rings (`POLYGON((0 0, 10
+  10))`), and self-intersecting "bowtie" rings are now REJECTED with
+  `status_class":"58000"`/`TypeMismatch` BOTH at the bare
+  `GeometryFromText(...)` call AND when nested as a function argument (e.g.
+  inside `ST_AsText`/`ST_Contains`, or as a CREATE property value -- which
+  now fails the write and stores nothing). The pre-fix findings-2/4 prose
+  below is retained as the dated observation; the converted tests further
+  down assert the new, correct 58000 behavior. STILL-VALID EXCEPTION: the
+  genuinely NONEXISTENT function `ST_GeomFromText` with WELL-FORMED WKT
+  remains a NULL-collapse of an unrecognized expression (a different
+  mechanism, unchanged by GAP-0924) -- so the ST_GeomFromText evidence
+  tests below still assert 00000/null bare and 58000 only when composed.
+
+
   1. FUNCTION NAME + THE CORE PATTERN: the task brief's `ST_GeomFromText`
      does NOT exist on this binary. Neither `ST_GeomFromText(...)` nor
      `GeometryFromText(...)` ever raises a parse/type error directly, no
@@ -207,44 +223,61 @@ tests:
 - name: p10_malformed_wkt_limitation_pin
   description: >
     KEY negative (per task brief) -- GeometryFromText('POINT(banana)').
-    EXPECTED: parse/data-exception error. ACTUAL (verified): silently
-    ACCEPTED -- status_class 00000, exit 0, result is NULL, no parse
-    error, no warning. Pinned honestly, not hidden. If this changes to a
-    genuine rejection, update this test and its known_limitation/bug tags.
+    FIXED (GAP-0924): malformed WKT now raises a genuine data-exception at
+    the bare call instead of silently resolving to NULL -- status_class
+    58000, error TypeMismatch. Previously this was silently ACCEPTED as a
+    stored NULL (status_class 00000); that silent-NULL limitation is now
+    closed. Converted from a limitation pin to assert the correct
+    rejection.
   args: [query, '-']
   stdin: RETURN GeometryFromText('POINT(banana)') AS g
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"g":null'
-  tags: [spatial, wkt, known_limitation, bug]
+  tags: [spatial, wkt, negative]
 
 - name: p10_malformed_wkt_stored_value_evidence
   description: >
-    Evidence for the pin above in a storage context: CREATE-ing a node
-    with the same malformed WKT as a property value silently stores NULL
-    rather than failing the write, and the stored NULL persists on
-    read-back.
+    Evidence for the fix above in a storage context (GAP-0924): CREATE-ing
+    a node with the same malformed WKT as a property value now FAILS the
+    write -- status_class 58000, error TypeMismatch -- because the bad
+    geometry is rejected during argument evaluation. The node is NOT
+    created (confirmed by the read-back evidence below). Previously this
+    silently stored NULL (status_class 00000).
   args: [query, '-']
   stdin: |
     CREATE (n1:P10Geo {id: 1, g: GeometryFromText('POINT(banana)')})
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-  tags: [spatial, wkt, known_limitation, bug, evidence]
+  tags: [spatial, wkt, negative, evidence]
 
 - name: p10_malformed_wkt_readback_evidence
-  description: Confirms the property stored for n1 is genuinely NULL on read-back.
+  description: >
+    Cascade of the fix above (GAP-0924): because the bad-geometry write is
+    now rejected, node n1 was never created -- so this read-back returns an
+    empty result set (no rows) with NO stored NULL. Confirms nothing was
+    persisted for the malformed-WKT CREATE. Previously this returned a
+    genuine stored NULL (g:null).
   args: [query, '-']
   stdin: >-
     MATCH (n:P10Geo {id: 1}) RETURN n.g AS g
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+    stdout_not_contains:
     - '"g":null'
-  tags: [spatial, wkt, known_limitation, bug, evidence]
+  tags: [spatial, wkt, negative, evidence]
 
 - name: p10_malformed_wkt_composed_function_evidence
   description: >
@@ -359,27 +392,31 @@ tests:
   description: >
     Negative-shaped case -- a self-intersecting ("bowtie") ring
     (POLYGON((0 0, 10 10, 10 0, 0 10, 0 0))) is not a valid OGC Simple
-    Feature polygon. EXPECTED: rejected (invalid/non-simple geometry
-    error). ACTUAL (verified): silently ACCEPTED -- status_class 00000,
-    no self-intersection validation performed at parse time. Pinned
-    honestly, not a crash/hang (bug rule not triggered as a hard bug, but
-    documented as a missing-validation limitation).
+    Feature polygon. FIXED (GAP-0924): the bowtie is now REJECTED at
+    construction -- GeometryFromText raises status_class 58000, error
+    TypeMismatch, and the error propagates through the ST_AsText wrapper.
+    Previously it was silently ACCEPTED (status_class 00000) with no
+    self-intersection validation; that missing-validation limitation is
+    now closed. Converted to assert the correct rejection.
   args: [query, '-']
   stdin: RETURN ST_AsText(GeometryFromText('POLYGON((0 0, 10 10, 10 0, 0 10, 0 0))')) AS g
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - POLYGON
-  tags: [spatial, polygon, self-intersecting, known_limitation, bug]
+  tags: [spatial, polygon, self-intersecting, negative]
 
 - name: p10_self_intersecting_polygon_predicate_evidence
   description: >
-    Evidence for the pin above -- the accepted bowtie ring is usable in
-    ST_Contains without crashing, but produces geometrically ambiguous
-    (fill-rule-dependent) results for its two triangular lobes: point
-    (9,9) reports true, symmetric point (1,1) reports false. No crash, no
-    hang -- deterministic but ungoverned by any simple-polygon check.
+    Evidence for the fix above (GAP-0924): the bowtie ring is now rejected
+    at construction, so feeding it into ST_Contains as a predicate argument
+    raises status_class 58000, error TypeMismatch -- the error propagates
+    rather than returning geometrically ambiguous true/false results.
+    Previously this silently returned lobe_a=true / lobe_b=false from an
+    accepted non-simple polygon; that limitation is now closed.
   args: [query, '-']
   stdin: >-
     RETURN
@@ -388,28 +425,30 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"lobe_a":true'
-    - '"lobe_b":false'
-  tags: [spatial, polygon, self-intersecting, known_limitation, bug, evidence]
+  tags: [spatial, polygon, self-intersecting, negative, evidence]
 
 - name: p10_degenerate_polygon_null_at_construction_limitation_pin
   description: >
     Negative-shaped case -- a degenerate ring with only 2 distinct points
-    (POLYGON((0 0, 10 10))), not enough points to form a ring. EXPECTED:
-    rejected at construction. ACTUAL (verified): follows the SAME
-    NULL-swallow pattern as the malformed-WKT case above (finding 1/2) --
-    the bare call silently resolves to NULL, status_class 00000, no
-    parse error. Pinned honestly as the same known limitation, not a
-    separate structural check.
+    (POLYGON((0 0, 10 10))), not enough points to form a ring. FIXED
+    (GAP-0924): the bare call now raises a genuine data-exception at
+    construction -- status_class 58000, error TypeMismatch -- rather than
+    silently resolving to NULL (status_class 00000). That NULL-swallow
+    limitation is now closed. Converted to assert the correct rejection.
   args: [query, '-']
   stdin: RETURN GeometryFromText('POLYGON((0 0, 10 10))') AS g
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"g":null'
-  tags: [spatial, polygon, degenerate, known_limitation, bug]
+  tags: [spatial, polygon, degenerate, negative]
 
 - name: p10_degenerate_polygon_predicate_rejected
   description: >

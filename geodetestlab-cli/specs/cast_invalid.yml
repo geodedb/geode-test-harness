@@ -121,61 +121,55 @@ tests:
 
 - name: string-to-int
   description: |
-    LIMITATION-PIN — CAST('abc' AS INTEGER), an unconvertible string,
-    does NOT error on this build (no 22018 "invalid cast"). Probed real
-    behavior: status_class 00000, result column typed NULL, value null.
-    The invalid string is silently swallowed into a null result rather
-    than raising an error. Asserted as the real (accepted) behavior, not
-    claimed as a rejection.
+    CAST('abc' AS INTEGER), an unconvertible string, is REJECTED with
+    SQLSTATE 22018 "Invalid character value for cast" (GAP-0921 fix).
+    Previously this silently resolved to NULL; the limitation-pin flipped
+    once the fix landed and is now a positive assertion of the rejection.
   query: "RETURN CAST('abc' AS INTEGER) AS result"
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"22018"'
+    - 'Invalid character value for cast'
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"type":"NULL"'
-    - '"result":null'
-  tags: [cast, negative, string-to-int, limitation-pin, silent-accept]
+  tags: [cast, negative, string-to-int, semantic-validation]
 
 - name: unsupported-target
   description: |
-    LIMITATION-PIN — CAST('42' AS BANANA), a bogus/nonexistent target
-    type keyword, does NOT error on this build (no 0A000/42000
-    "unsupported type"). Probed real behavior: status_class 00000,
-    result column typed NULL, value null. The parser accepts any
-    identifier as a CAST target at the grammar level with no semantic
-    validation that the type actually exists; only an entirely-missing
-    type name is a syntax error (see cast-missing-type-syntax-error).
-    Asserted as the real (accepted) behavior, not claimed as a rejection.
+    CAST('42' AS BANANA), a bogus/nonexistent target type keyword, is
+    REJECTED with SQLSTATE 0A000 "Unsupported CAST target type"
+    (GAP-0921 fix). Previously the parser accepted any identifier and the
+    evaluator silently returned NULL; the limitation-pin flipped once the
+    fix landed. (An entirely-missing type name remains a 42000 syntax
+    error — see cast-missing-type-syntax-error.)
   query: "RETURN CAST('42' AS BANANA) AS result"
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"0A000"'
+    - 'Unsupported CAST target type'
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"type":"NULL"'
-    - '"result":null'
-  tags: [cast, negative, unsupported-target, limitation-pin, silent-accept]
+  tags: [cast, negative, unsupported-target, semantic-validation]
 
 - name: numeric-overflow
   description: |
-    LIMITATION-PIN — CAST('99999999999999999999999999999' AS INTEGER), a
-    decimal literal (fed in as a string) vastly beyond the i64 range,
-    does NOT error on this build. Probed real behavior: status_class
-    00000, result column typed NULL, value null — the same silent-NULL
-    pattern as string-to-int, not a range/overflow error. NOTE: feeding
-    an oversized value in as a raw FLOAT literal instead of a string
-    (e.g. `CAST(1.0e308 AS INTEGER)`) reliably CRASHES the server (see
-    the CRASH FINDING in this spec's description and p14-report.md for
-    the full repro); this test deliberately uses the string-literal form,
-    which is safe. Asserted as the real (accepted) behavior, not claimed
-    as a rejection.
+    CAST('99999999999999999999999999999' AS INTEGER), a decimal literal
+    (fed in as a string) vastly beyond the i64 range, is REJECTED with
+    SQLSTATE 22003 "Integer value out of range" (GAP-0921 fix).
+    Previously this silently resolved to NULL. NOTE: the oversized FLOAT
+    literal form (e.g. `CAST(1.0e308 AS INTEGER)`) that formerly CRASHED
+    the server is also fixed (GAP-0905) — it now raises a clean error too.
   query: "RETURN CAST('99999999999999999999999999999' AS INTEGER) AS result"
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"22003"'
+    - 'Integer value out of range'
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"type":"NULL"'
-    - '"result":null'
-  tags: [cast, negative, numeric-overflow, limitation-pin, silent-accept]
+  tags: [cast, negative, numeric-overflow, semantic-validation]
 
 - name: cast-null
   description: |

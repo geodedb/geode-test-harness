@@ -43,12 +43,12 @@ description: |
       rejected: status_class 58000, error "DecimalOverflow". Arithmetic
       overflow IS checked for multiplication.
 
-    - decimal-add-silent-overflow (bonus limitation-pin) — by contrast,
-      `decimal_add` of a 38-digit max value plus 1 silently produces a
-      39-digit result (`100000000000000000000000000000000000000`) with
-      status_class 00000 — NOT rejected. Multiplication enforces the
-      38-digit ceiling; addition does not. Documented honestly as a
-      silent-accept gap, not asserted as an error.
+    - decimal-add-overflow (was silent-accept; fixed by GAP-0925) —
+      `decimal_add` of a 38-digit max value plus 1 would produce a 39-digit
+      result. This used to be silently accepted (status_class 00000);
+      GAP-0925 made the 38-digit precision ceiling consistent, so addition
+      now enforces it just like multiplication. Real behavior: status_class
+      58000, error "DecimalOverflow" — REJECTED, matching `decimal_mul`.
 
     - decimal-scale-rounding (bonus, documented behavior) — `Decimal('123.456',
       2)` (3 fractional digits against a declared scale of 2) does not
@@ -188,19 +188,23 @@ tests:
 
 - name: p28_decimal-add-silent-overflow
   description: |
-    LIMITATION-PIN — decimal_add() of a 38-digit max-precision value plus
-    1 silently produces a 39-digit result rather than erroring like
-    decimal_mul does. Probed real behavior: status_class 00000, result
-    "100000000000000000000000000000000000000" (39 digits, one past the
-    documented 38-digit maximum). Asserted as the real observed
-    silent-accept, not a claimed rejection — genuine gap: decimal_add
-    lacks the overflow check that decimal_mul has.
+    POSITIVE ASSERTION (was LIMITATION-PIN; fixed by GAP-0925) — decimal_add()
+    of a 38-digit max-precision value plus 1 would produce a 39-digit result,
+    one past the documented 38-digit maximum. This used to be silently
+    accepted (status_class 00000, 39-digit result) while decimal_mul already
+    rejected the equivalent overflow. GAP-0925 made the 38-digit decimal
+    precision ceiling consistent across operations: decimal_add now REJECTS
+    the overflow exactly as decimal_mul does. Expected real behavior:
+    status_class 58000, error "DecimalOverflow" — the addition overflow check
+    now matches multiplication.
   query: "RETURN decimal_add(Decimal('99999999999999999999999999999999999999', 0), Decimal('1', 0)) AS d"
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - DecimalOverflow
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"d":"100000000000000000000000000000000000000"'
   tags: [advanced-types, limitation, decimal, silent-accept]
 
 - name: p28_decimal-scale-rounding

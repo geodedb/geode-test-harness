@@ -20,7 +20,8 @@ description: |
   (3 rows), and within each group the rows are NOT functionally dependent
   on g for any other column (v/s vary freely within a group).
 
-  Probed real behavior (all four negatives are silent-accept/no-error;
+  Probed real behavior (items 1 and 4 remain silent-accept/no-error; items
+  2 and 3 now correctly raise a query-time error after GAP-0916 / GAP-0926;
   none crashed the server):
 
     1. non-grouped-column (KEY) — `RETURN n.g, n.v, count(*) GROUP BY n.g`
@@ -37,26 +38,22 @@ description: |
        group key; this build silently accepts and returns first-row
        semantics instead.
 
-    2. sum-of-strings (negative) — `RETURN sum(n.s) AS total` where n.s is
-       a string property on every seeded row. LIMITATION-PIN: no type
-       error. status_class 00000, `"total":0` (type INTEGER) — sum()
-       silently treats every non-numeric value as contributing 0 rather
-       than raising a type error ("sum() requires numeric operand") or
-       returning NULL. Companion probe: avg(n.s) returns NULL (type
-       NULL) rather than 0 or an error — so sum() and avg() do NOT even
-       agree with each other on how to silently handle non-numeric input,
-       reinforcing that this is a real type-checking gap, not a
-       considered design choice.
+    2. sum-of-strings / avg-of-strings (FIXED by GAP-0916) —
+       `RETURN sum(n.s) AS total` (and `avg(n.s)`) where n.s is a string
+       property on every seeded row. This used to be silently accepted:
+       sum() returned 0 (type INTEGER) and avg() returned NULL (type NULL)
+       — the two set functions not even agreeing on non-numeric input.
+       GAP-0916 makes sum() AND avg() validate operand type and raise a
+       query-time type error. Real behavior: status_class 58000, error
+       "TypeMismatch" for both.
 
-    3. nested-aggregate (negative) — `RETURN sum(avg(n.v)) AS nested`.
-       LIMITATION-PIN: no error, no crash. status_class 00000,
-       `"nested":null`. Per the ISO/IEC 39075:2024 contract, nesting one
-       set function inside another is a query-time error ("aggregate
-       function calls cannot be nested"); this build instead silently
-       resolves the inner avg(n.v) to nothing (NULL) and sums NULL,
-       producing NULL — not a crash, not an error, just silently wrong.
-       Server verified alive and answering queries immediately after this
-       probe.
+    3. nested-aggregate (FIXED by GAP-0926) — `RETURN sum(avg(n.v)) AS
+       nested`. This used to be silently accepted (status_class 00000,
+       `"nested":null`), resolving the inner avg(n.v) to nothing and
+       summing NULL. Per the ISO/IEC 39075:2024 contract, nesting one set
+       function inside another is a query-time error. GAP-0926 makes geode
+       reject it. Real behavior: status_class 42803, error "Aggregate
+       functions cannot be nested".
 
     4. having-unknown-alias (negative) — HAVING is supported (probed and
        confirmed correct on a real alias: `HAVING c > 2` correctly
@@ -154,60 +151,62 @@ tests:
 
 - name: p20-sum-of-strings
   description: |
-    LIMITATION-PIN — `RETURN sum(n.s) AS total` where n.s is a string
-    property on every seeded row (never numeric). Probed real behavior:
-    no type error. status_class 00000, `"total":0` with column type
-    INTEGER — sum() silently treats every non-numeric value as
-    contributing 0 rather than raising a type error ("sum() requires
-    numeric operand") or returning NULL. This is asserted as the real
-    (accepted) behavior, not claimed as a rejection. Candidate GAP:
-    sum()/avg() should validate operand type and raise a query-time type
-    error for non-numeric input, matching the ISO/IEC 39075:2024
-    contract.
+    POSITIVE ASSERTION (was LIMITATION-PIN; fixed by GAP-0916) —
+    `RETURN sum(n.s) AS total` where n.s is a string property on every
+    seeded row (never numeric). This used to be silently accepted
+    (status_class 00000, `"total":0`, column type INTEGER), treating each
+    non-numeric value as contributing 0. GAP-0916 makes sum() validate its
+    operand type and raise a query-time type error for non-numeric input,
+    matching the ISO/IEC 39075:2024 contract. Expected real behavior:
+    status_class 58000, error "TypeMismatch" — no longer a silent 0.
   query: "MATCH (n:P20_N) RETURN sum(n.s) AS total"
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"total":0'
-    - '"type":"INTEGER"'
   tags: [aggregation, negative, sum, type-error, limitation-pin, silent-accept]
 
 - name: p20-avg-of-strings-differential
   description: |
-    Differential companion to p20-sum-of-strings — `RETURN avg(n.s) AS
-    total` over the SAME all-string column. Probed real behavior: also
-    no type error (status_class 00000), but avg() resolves to NULL
-    (type NULL) rather than sum()'s silent 0. sum() and avg() do NOT
-    even agree with each other on how to silently handle non-numeric
-    input, reinforcing that this is a real type-checking gap rather than
-    a considered, consistent design choice.
+    POSITIVE ASSERTION (was LIMITATION-PIN; fixed by GAP-0916) —
+    `RETURN avg(n.s) AS total` over the SAME all-string column. Previously
+    avg() silently resolved to NULL (status_class 00000, type NULL) while
+    sum() silently returned 0 — the two set functions did not even agree
+    with each other on non-numeric input. GAP-0916 makes sum() AND avg()
+    consistent: both now raise a query-time type error for non-numeric
+    operands. Expected real behavior: status_class 58000, error
+    "TypeMismatch" — the same rejection sum() now gives.
   query: "MATCH (n:P20_N) RETURN avg(n.s) AS total"
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"total":null'
-    - '"type":"NULL"'
   tags: [aggregation, negative, avg, type-error, limitation-pin, silent-accept, differential]
 
 - name: p20-nested-aggregate
   description: |
-    LIMITATION-PIN — `RETURN sum(avg(n.v)) AS nested` nests one set
-    function inside another. Probed real behavior: no crash, no error.
-    status_class 00000, `"nested":null` (type NULL). Per the ISO/IEC
-    39075:2024 contract, nesting set functions is a query-time error
-    ("aggregate function calls cannot be nested"); this build instead
-    silently resolves the inner avg(n.v) to nothing and sums that,
-    producing NULL — silently wrong rather than rejected. Server
-    verified alive and answering queries immediately after this probe
-    (no crash observed against this input shape).
+    POSITIVE ASSERTION (was LIMITATION-PIN; fixed by GAP-0926) —
+    `RETURN sum(avg(n.v)) AS nested` nests one set function inside another.
+    This used to be silently accepted (status_class 00000, `"nested":null`),
+    resolving the inner avg(n.v) to nothing and summing that. Per the
+    ISO/IEC 39075:2024 contract, nesting set functions is a query-time
+    error. GAP-0926 makes geode reject it. Expected real behavior:
+    status_class 42803, error "Aggregate functions cannot be nested" — a
+    proper query-time rejection rather than a silently-wrong NULL.
   query: "MATCH (n:P20_N) RETURN sum(avg(n.v)) AS nested"
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"42803"'
+    - Aggregate functions cannot be nested
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"nested":null'
   tags: [aggregation, negative, nested-aggregate, limitation-pin, silent-accept]
 
 - name: p20-having-valid-control

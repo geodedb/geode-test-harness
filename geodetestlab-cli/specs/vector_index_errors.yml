@@ -15,23 +15,25 @@ description: >
   ## PROBE FINDINGS (2026-07-10, scratch server, ../geode/zig-out/bin/geode, port 4474)
 
 
-  1. WRONG-DIMENSION INSERT IS SILENTLY ACCEPTED — BUG. Inserting a
-     3-component vectorf32 value into a property (`emb`) that already
-     holds 4-component vectors under an HNSW index returns
-     `status_class":"00000"` (success), not a rejection. The mismatched
-     vector is stored as-is (verified: a same-vector-space cosine
-     comparison against it returns NULL rather than a number, proving the
-     stored value genuinely has a different dimension, not a coerced/
-     padded one). This is a data-integrity risk per the bug rule and is
-     pinned honestly below (`p7_wrong_dimension_insert_limitation_pin`),
-     not asserted as intended behavior.
+  1. WRONG-DIMENSION INSERT — probed as silently ACCEPTED (status_class
+     00000); FIXED by GAP-0918. Inserting a 3-component vectorf32 value into
+     a property (`emb`) that already holds 4-component vectors under an HNSW
+     index now returns `status_class":"22000"` with "Vector dimension does
+     not match the indexed property's established dimension" — a clean
+     rejection. The bad-dimension vector never reaches the store, closing
+     the mixed-dimension data-integrity risk. Asserted as the verified
+     rejection below (`p7_wrong_dimension_insert_limitation_pin`, converted
+     from its original silent-accept limitation-pin to a positive).
 
-  2. INVALID METRIC NAME IS SILENTLY ACCEPTED — BUG. `CREATE INDEX ...
-     USING HNSW WITH (metric = 'banana', ...)` returns success and the
-     index shows up in `SHOW INDEXES` with `type: vector` — identical to
-     a valid-metric index. No validation of the `metric` value occurs at
-     DDL time. Pinned honestly below
-     (`p7_invalid_metric_create_limitation_pin`).
+  2. INVALID METRIC NAME — probed as silently ACCEPTED (index created with
+     a bogus metric); FIXED by GAP-0918. `CREATE INDEX ... USING HNSW WITH
+     (metric = 'banana', ...)` now returns `status_class":"42704"` with
+     "Unknown vector distance metric (supported: l2, euclidean, cosine,
+     dot_product, inner_product)". The metric is validated at DDL time and
+     the bad index is never registered, so it does NOT appear in
+     `SHOW INDEXES`. Asserted as the verified rejection below
+     (`p7_invalid_metric_create_limitation_pin`, converted from its original
+     silent-accept limitation-pin to a positive).
 
   3. KNN AFTER DROPPING THE INDEX STILL WORKS — DOCUMENTED FALLBACK, NOT A
      BUG. The KNN query pattern used throughout this codebase
@@ -42,14 +44,15 @@ description: >
      KNN query still returns exit 0 with correct results (full scan
      fallback). This is asserted as genuine, working behavior.
 
-  4. MALFORMED VECTOR LITERAL (non-numeric component) IS SILENTLY SWALLOWED
-     TO NULL — BUG. `vectorf32("[1.0, 'x', 2.0]")` (and `CREATE (n {emb:
-     vectorf32(...)})` with the same malformed literal) both return
-     `status_class":"00000"` (success) with the value/property set to
-     NULL. There is no parse error, no warning, no diagnostic anywhere —
-     the malformed input is silently discarded. This is a worse outcome
-     than a clean rejection (silent data loss) and is pinned honestly
-     below (`p7_malformed_vector_literal_limitation_pin`).
+  4. MALFORMED VECTOR LITERAL (non-numeric component) — probed as silently
+     swallowed to NULL (status_class 00000); FIXED by GAP-0918.
+     `vectorf32("[1.0, 'x', 2.0]")` (and `CREATE (n {emb: vectorf32(...)})`
+     with the same malformed literal) now both return `status_class":"58000"`
+     with "TypeMismatch" — a clean error instead of silent data loss. The
+     malformed RETURN raises the error; the malformed CREATE fails the write
+     (the node is never created). Asserted as the verified rejection below
+     (`p7_malformed_vector_literal_limitation_pin`, converted from its
+     original silent-NULL limitation-pin to a positive).
 
   5. `LIMIT 0` (k=0) is genuine, correct behavior: an empty result set,
      `status_class":"00000"`. `LIMIT -1` (k=-1) is a genuine GQL syntax
@@ -167,29 +170,47 @@ tests:
 - name: p7_wrong_dimension_insert_limitation_pin
   description: >
     KEY negative (per task brief) — insert a dim=3 vector into the dim=4,
-    HNSW-indexed `emb` property. EXPECTED: rejected (dimension mismatch
-    error). ACTUAL (verified): silently ACCEPTED — status_class 00000,
-    exit 0, no error, no warning. This is a data-integrity bug: the store
-    now holds mixed-dimension vectors under one index/property with no
-    signal to the caller. Pinned honestly, not hidden. If this behavior
-    changes to a genuine rejection, this test (and its
-    known_limitation/bug tags) must be updated to match.
+    HNSW-indexed `emb` property. Geode now REJECTS this with a dimension-
+    mismatch error (status_class 22000, "Vector dimension does not match
+    the indexed property's established dimension"): the store refuses to
+    hold mixed-dimension vectors under one index/property and surfaces the
+    data-integrity violation to the caller instead of silently accepting it
+    (GAP-0918). Converted from a limitation-pin that asserted the old
+    silent-accept (00000) behavior to a positive assertion of the verified
+    rejection.
   args: [query, '-']
   stdin: >-
     CREATE (n4:P7Vec {id: 4, emb: vectorf32('[1.0, 2.0, 3.0]')})
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"22000"'
+    - Vector dimension does not match
+    stdout_not_contains:
     - '"status_class":"00000"'
-  tags: [vector, dimension, known_limitation, bug]
+  tags: [vector, dimension, positive]
 
 - name: p7_wrong_dimension_stored_value_evidence
   description: >
-    Evidence for the pin above: the stored dim=3 vector is NOT silently
-    coerced/padded to dim=4 — a same-space cosine comparison against it
-    returns NULL (geode's documented behavior for dimension-mismatched
-    vector ops, see docs/API_REFERENCE_GENERATED.md), proving the bad
-    dimension really made it into the store.
+    Evidence for the rejection above (GAP-0918): the dim=3 vector was
+    REJECTED at HNSW index-insert time, so the mismatched vector did NOT
+    make it into the store — a same-space cosine comparison against n.emb
+    returns NULL (dist:null), proving n.emb holds no dim=3 vector. This is
+    the exact contract GAP-0918 established: refuse to hold a
+    mixed-dimension vector under the index, surface the 22000 error, and
+    store no bad vector. NOTE (scoped honesty): GAP-0918 rejects the
+    VECTOR, not the whole node — the `CREATE` errors (22000) yet the node
+    id=4 row is still committed with `emb` left unset (null). Full
+    statement-level rollback of the node on an index-constraint violation
+    is a SEPARATE, deeper atomicity concern: geode's node create touches
+    both an in-memory map and the durable engine, and the per-statement
+    engine-txn abort only unwinds the engine layer, so the in-memory row
+    survives. That two-layer rollback gap is distinct from GAP-0930 (which
+    made a bad property *expression* — e.g. malformed WKT — abort the
+    CREATE with no node at all, since expression eval now runs before any
+    write). This evidence test therefore asserts the real, verified
+    behavior: the readback succeeds (00000), the row exists, and n.emb is
+    null (dist:null) — i.e. the bad vector was not stored.
   args: [query, '-']
   stdin: >-
     MATCH (n:P7Vec {id: 4})
@@ -197,18 +218,23 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"00000"'
     - '"dist":null'
-  tags: [vector, dimension, known_limitation, bug, evidence]
+    stdout_not_contains:
+    - '"dist":0'
+    - '"dist":1'
+  tags: [vector, dimension, positive, evidence]
 
   # ----------------------------------------------------------- invalid metric --
 - name: p7_invalid_metric_create_limitation_pin
   description: >
     Negative — CREATE INDEX with an invalid distance metric name
-    ('banana'). EXPECTED: rejected (unknown metric error). ACTUAL
-    (verified): silently ACCEPTED — status_class 00000, exit 0, no
-    validation of the metric value occurs at DDL time. Pinned honestly.
-    If this behavior changes to a genuine rejection, update this test and
-    its known_limitation/bug tags to match.
+    ('banana'). Geode now REJECTS this at DDL time with
+    status_class 42704, "Unknown vector distance metric (supported: l2,
+    euclidean, cosine, dot_product, inner_product)" — the metric value is
+    validated and the bad index is never registered (GAP-0918). Converted
+    from a limitation-pin that asserted the old silent-accept (00000)
+    behavior to a positive assertion of the verified rejection.
   args: [query, '-']
   stdin: >-
     CREATE INDEX IF NOT EXISTS p7_bad_metric_idx
@@ -218,18 +244,25 @@ tests:
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"42704"'
+    - Unknown vector distance metric
+    stdout_not_contains:
     - '"status_class":"00000"'
-  tags: [vector, metric, known_limitation, bug, ddl]
+  tags: [vector, metric, positive, ddl]
 
 - name: p7_invalid_metric_show_index_evidence
-  description: Evidence -- SHOW INDEXES confirms p7_bad_metric_idx was actually created despite the invalid metric.
+  description: >
+    Evidence -- SHOW INDEXES confirms p7_bad_metric_idx was NOT registered
+    (the invalid-metric CREATE was rejected, GAP-0918); the report shows only
+    the valid p7_vec_idx and its auto id index (auto_idx_P7Vec_id) remain.
+    Converted from a limitation-pin that asserted the bogus index appeared.
   args: [query, '-']
   stdin: SHOW INDEXES
   expect:
     exit_code: 0
-    stdout_contains:
+    stdout_not_contains:
     - p7_bad_metric_idx
-  tags: [vector, metric, known_limitation, bug, evidence]
+  tags: [vector, metric, positive, evidence]
 
   # ------------------------------------------------------- knn-on-dropped-index --
 - name: p7_knn_dropped_index_drop
@@ -278,46 +311,59 @@ tests:
 - name: p7_malformed_vector_literal_limitation_pin
   description: >
     Negative -- vectorf32 literal with a non-numeric component
-    ([1.0, 'x', 2.0]). EXPECTED: parse/type error. ACTUAL (verified):
-    silently returns NULL -- status_class 00000, exit 0, no parse error,
-    no diagnostic anywhere. Worse than a clean rejection because the bad
-    input is silently discarded rather than surfaced. Pinned honestly. If
-    this behavior changes to a genuine rejection, update this test and
-    its known_limitation/bug tags to match.
+    ([1.0, 'x', 2.0]). Geode now raises a clean error -- status_class 58000,
+    "TypeMismatch" -- instead of silently swallowing the malformed input to
+    NULL (GAP-0918). Converted from a limitation-pin that asserted the old
+    silent-NULL behavior (00000 / "v":null) to a positive assertion of the
+    verified error.
   args: [query, '-']
   stdin: |
     RETURN vectorf32("[1.0, 'x', 2.0]") AS v
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"v":null'
-  tags: [vector, malformed-literal, known_limitation, bug]
+  tags: [vector, malformed-literal, positive]
 
 - name: p7_malformed_vector_literal_create_evidence
   description: >
-    Evidence for the pin above in a storage context: CREATE-ing a node
-    with the same malformed vector literal as a property value silently
-    stores NULL rather than failing the write.
+    Evidence in a storage context: CREATE-ing a node with the same
+    malformed vector literal as a property value now FAILS the write with
+    status_class 58000, "TypeMismatch" (GAP-0918) -- the node is not
+    created, rather than silently storing NULL. Converted from a
+    limitation-pin that asserted the old silent-accept (00000) behavior to
+    a positive assertion of the verified error.
   args: [query, '-']
   stdin: |
     CREATE (n5:P7Vec {id: 5, emb: vectorf32("[1.0, 'x', 2.0]")})
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"58000"'
+    - TypeMismatch
+    stdout_not_contains:
     - '"status_class":"00000"'
-  tags: [vector, malformed-literal, known_limitation, bug, evidence]
+  tags: [vector, malformed-literal, positive, evidence]
 
 - name: p7_malformed_vector_literal_stored_value_evidence
-  description: Confirms the property stored for n5 is genuinely NULL, not a partially-parsed vector.
+  description: >
+    Confirms n5 was never created (the malformed-literal CREATE was
+    rejected, GAP-0918) -- a lookup by id=5 returns an empty result set
+    rather than a node with a silently-NULL emb. Cascade of
+    p7_malformed_vector_literal_create_evidence: the CREATE now returns
+    error status_class 58000, so no node id=5 is committed.
   args: [query, '-']
   stdin: >-
     MATCH (n:P7Vec {id: 5}) RETURN n.emb AS emb
   expect:
     exit_code: 0
     stdout_contains:
-    - '"emb":null'
-  tags: [vector, malformed-literal, known_limitation, bug, evidence]
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags: [vector, malformed-literal, positive, evidence]
 
   # ------------------------------------------------------------------ k=0/k=-1 --
 - name: p7_knn_k_zero
