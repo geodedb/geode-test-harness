@@ -18,6 +18,7 @@ import os
 import shlex
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -277,6 +278,31 @@ def _start_initial_server(
     return None
 
 
+def _setup_item_payload(setup_item: Any, index: int, description: str) -> dict[str, Any] | None:
+    """Normalize one ``setup:`` entry into a :class:`TestCase` payload.
+
+    A setup entry may be written either as a mapping (``query``/``command``
+    plus optional per-item keys) or as a bare string of GQL — the YAML
+    block-scalar form (``- |``) that most specs in this repo use.
+
+    The string form used to be skipped silently, so every spec written that
+    way ran its whole test list against an *empty* graph. That is how
+    ``geode_c01_c05_regression.yml`` came to assert ``count(DISTINCT n.type)
+    == 0`` as a "known regression": the Entity fixture was never created, so
+    0 was simply the count of an empty set.
+
+    Returns ``None`` for entries with nothing to execute.
+    """
+    if isinstance(setup_item, dict):
+        return {"name": f"setup-{index}", "description": description, **setup_item}
+    if isinstance(setup_item, str):
+        text = setup_item.strip()
+        if not text:
+            return None
+        return {"name": f"setup-{index}", "description": description, "query": text}
+    return None
+
+
 def _run_setup_queries(
     setup: list[Any] | None,
     dry_run: bool,
@@ -292,30 +318,28 @@ def _run_setup_queries(
     if verbose:
         print(f"Running {len(setup)} setup queries...")
     for i, setup_item in enumerate(setup):
-        if isinstance(setup_item, dict):
-            setup_case = TestCase.from_dict(
-                {
-                    "name": f"setup-{i}",
-                    "description": "Setup query",
-                    **setup_item,
-                }
-            )
-            if verbose:
-                print(f"  Executing setup-{i}...")
-            result = run_cli_test(
-                test_case=setup_case,
-                binary=binary,
-                env=env,
-                secrets=secrets,
-                timeout_ms=timeout_ms,
-                data_dir=data_dir,
-                verbose=verbose,
-            )
-            if verbose:
-                status = "OK" if result.passed else "FAILED"
-                print(f"  Setup-{i}: {status}")
-            if not result.passed and verbose:
-                print(f"    Error: {result.error}")
+        payload = _setup_item_payload(setup_item, i, "Setup query")
+        if payload is None:
+            continue
+        setup_case = TestCase.from_dict(payload)
+        if verbose:
+            print(f"  Executing setup-{i}...")
+        result = run_cli_test(
+            test_case=setup_case,
+            binary=binary,
+            env=env,
+            secrets=secrets,
+            timeout_ms=timeout_ms,
+            data_dir=data_dir,
+            verbose=verbose,
+        )
+        if verbose:
+            status = "OK" if result.passed else "FAILED"
+            print(f"  Setup-{i}: {status}")
+        # A failed fixture makes every downstream assertion meaningless, so
+        # report it even when not running verbosely.
+        if not result.passed:
+            print(f"  WARNING: setup-{i} failed: {result.error}", file=sys.stderr)
 
 
 def _replay_setup(
@@ -333,23 +357,19 @@ def _replay_setup(
     if verbose:
         print(f"  Re-running {len(setup)} setup queries after restart...")
     for i, setup_item in enumerate(setup):
-        if isinstance(setup_item, dict):
-            setup_case = TestCase.from_dict(
-                {
-                    "name": f"setup-{i}",
-                    "description": "Setup query (replay)",
-                    **setup_item,
-                }
-            )
-            run_cli_test(
-                test_case=setup_case,
-                binary=binary,
-                env=env,
-                secrets=secrets,
-                timeout_ms=timeout_ms,
-                data_dir=data_dir,
-                verbose=verbose,
-            )
+        payload = _setup_item_payload(setup_item, i, "Setup query (replay)")
+        if payload is None:
+            continue
+        setup_case = TestCase.from_dict(payload)
+        run_cli_test(
+            test_case=setup_case,
+            binary=binary,
+            env=env,
+            secrets=secrets,
+            timeout_ms=timeout_ms,
+            data_dir=data_dir,
+            verbose=verbose,
+        )
 
 
 def _check_and_restart_crashed_server(
