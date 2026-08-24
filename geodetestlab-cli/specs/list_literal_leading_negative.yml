@@ -1,0 +1,219 @@
+version: '1.0'
+name: List Literal — Leading Negative Element (ENG-3904 parse rejection)
+description: |
+  Regression spec for ENG-3904: a list literal whose FIRST element is negative
+  is rejected as a syntax error.
+
+    RETURN [-0.0483, 1.0]
+    -> 42000 "expected token 'l_paren', got 'minus' at line 1 col 9"
+
+  Root cause (verified on v0.8.5 / 4264ccba): the pattern-comprehension
+  heuristic at src/gql/parser.zig:3951 treats `[` followed by `.minus` (or
+  `.arrow_l`) as the start of a graph pattern and routes into
+  parseGraphPattern(), which cannot parse a numeric expression. The same
+  rejection hits every embedded vector literal that starts with a negative
+  component — the common case for real embeddings:
+
+    CREATE (t:VecTest {embedding: vectorf32([-0.0483, 1.0, 2.0])})
+    -> 42000 "expected token 'l_paren', got 'minus' at line 1 col 47"
+
+  Probed on a scratch server (geode serve --listen 127.0.0.1:4499):
+
+    - RETURN [-0.0483, 1.0]           -> 42000 parse error            (THE BUG)
+    - RETURN [-1, 2, 3]               -> 42000 parse error            (THE BUG)
+    - vectorf32([-0.0483, 1.0, 2.0])  -> 42000 parse error            (THE BUG)
+    - RETURN [1.0, -0.0483]           -> 00000, LIST ["1.0","-0.0483"]  (CONTROL)
+    - RETURN -1                       -> 00000, INTEGER -1              (CONTROL)
+    - vectorf32([1.0, -0.0483, 2.0])  -> 00000, stored + read back as
+                                         {"type":"VECTOR", ...}         (CONTROL)
+    - pattern comprehension           -> 00000                          (CONTROL)
+
+  Expectations below encode POST-FIX behavior: the leading-negative cases must
+  return 00000, so they FAIL on v0.8.5. The controls (trailing negative, bare
+  negative, pattern/list comprehension) are green today and guard the fix from
+  simply deleting the heuristic that routes real patterns.
+
+  Node labels are prefixed L3904_ so this spec cannot collide with any other
+  spec's data.
+
+  CANARY: REQ=REQ-ENG-3904-LIST-LEADING-NEGATIVE; FEATURE="ListValueConstructor"; ASPECT=LeadingNegativeElement; STATUS=TESTED; TEST=geodetestlab/specs/list_literal_leading_negative.yml; OWNER=parser; UPDATED=2026-08-24
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: control-trailing-negative-list
+  description: |
+    CONTROL (green on v0.8.5) — a negative element anywhere BUT first parses
+    fine. Proves the negative numeric literal itself is not the problem.
+  query: RETURN [1.0, -0.0483] AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '-0.0483'
+    row_count: 1
+  tags: [parser, eng-3904, control, positive]
+
+- name: control-bare-negative
+  description: CONTROL (green on v0.8.5) — a bare negative literal parses.
+  query: RETURN -1 AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"v":-1'
+    row_count: 1
+  tags: [parser, eng-3904, control, positive]
+
+- name: leading-negative-float-list
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the reported reproduction. A list literal
+    whose first element is negative must parse and return the list. Probed real
+    behavior: 42000 "expected token 'l_paren', got 'minus' at line 1 col 9".
+  query: RETURN [-0.0483, 1.0] AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '-0.0483'
+    stdout_not_contains:
+    - '"status_class":"42000"'
+    - got 'minus'
+    row_count: 1
+  tags: [parser, eng-3904, regression, key-assertion]
+
+- name: leading-negative-integer-list
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the same defect for an integer list.
+  query: RETURN [-1, 2, 3] AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42000"'
+    row_count: 1
+  tags: [parser, eng-3904, regression, key-assertion]
+
+- name: leading-negative-single-element-list
+  description: |
+    Boundary (FAILS on v0.8.5) — a one-element list whose only element is
+    negative.
+  query: RETURN [-1.5] AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '-1.5'
+    stdout_not_contains:
+    - '"status_class":"42000"'
+    row_count: 1
+  tags: [parser, eng-3904, regression, boundary]
+
+- name: control-vectorf32-trailing-negative-create
+  description: |
+    CONTROL (green on v0.8.5) — a vector literal whose negative component is
+    NOT first stores successfully.
+  query: 'CREATE (t:L3904_V {id: 2, embedding: vectorf32([1.0, -0.0483, 2.0])})'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [parser, eng-3904, vector, control, positive]
+
+- name: control-vectorf32-trailing-negative-readback
+  description: |
+    CONTROL (green on v0.8.5) — the stored value reads back as a VECTOR.
+  query: 'MATCH (t:L3904_V {id: 2}) RETURN t.embedding AS v'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"VECTOR"'
+    row_count: 1
+  tags: [parser, eng-3904, vector, control, positive]
+
+- name: vectorf32-leading-negative-create
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the real-world shape: an embedding whose
+    first component is negative. Probed real behavior: 42000 "expected token
+    'l_paren', got 'minus' at line 1 col 47" — the node is never created.
+  query: 'CREATE (t:L3904_V {id: 1, embedding: vectorf32([-0.0483, 1.0, 2.0])})'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42000"'
+    - got 'minus'
+  tags: [parser, eng-3904, vector, regression, key-assertion]
+
+- name: vectorf32-leading-negative-readback
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the leading-negative embedding must round
+    trip and read back typed as VECTOR (v0.8.5 returns zero rows because the
+    CREATE above was rejected).
+  query: 'MATCH (t:L3904_V {id: 1}) RETURN t.embedding AS v'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"VECTOR"'
+    row_count: 1
+  tags: [parser, eng-3904, vector, regression, key-assertion]
+
+- name: control-pattern-comprehension-still-parses
+  description: |
+    CONTROL (green on v0.8.5) — the `[`-prefixed pattern comprehension the
+    heuristic at parser.zig:3951 exists to route. The ENG-3904 fix must relax
+    the heuristic WITHOUT breaking this form.
+  query: MATCH (a:L3904_V) RETURN [(a)-[:L3904_R]->(b) | b.id] AS xs
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [parser, eng-3904, control, pattern-comprehension]
+
+- name: control-list-comprehension-still-parses
+  description: |
+    CONTROL (green on v0.8.5) — the other `[`-prefixed form (list
+    comprehension) must keep parsing.
+  query: RETURN [x IN [1, 2, 3] WHERE x > 1 | x] AS xs
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    row_count: 1
+  tags: [parser, eng-3904, control, list-comprehension]
+
+- name: cleanup-test-data
+  description: Clean up all L3904 test data.
+  query: MATCH (n:L3904_V) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- parser
+- eng-3904
+- list-literal
+- negative-numbers
+- vector
+- regression

@@ -1,0 +1,286 @@
+version: '1.0'
+name: MERGE — Chained / Comma-Separated Patterns (ENG-3903 silent data loss)
+description: |
+  Regression spec for ENG-3903: a chained MERGE sequence reports SQLSTATE
+  00000 while silently dropping the relationship write.
+
+    MERGE (a:MT {name:'a'}) MERGE (b:MT {name:'b'}) MERGE (a)-[:REL {type:'x'}]->(b)
+
+  creates the two nodes and ZERO relationships — success status, missing data.
+  Two layers, both verified on v0.8.5 (4264ccba):
+
+    (a) parseMergeStatement (src/gql/parser.zig:4676-4741) parses exactly ONE
+        MERGE clause, so the 2nd/3rd MERGE become separate statements and the
+        variables a/b are not in scope for the relationship MERGE;
+    (b) the executeMerge edge branch (src/execution/crud_operations.zig:
+        3201-3333) resolves endpoints only from context.bindings or from inline
+        labels/props — bare (a)/(b) resolve to null, the guard at :3285 skips
+        edge creation, and :3334-3341 still commits and returns success;
+    (c) executeMerge reads only chains[0], so the comma form
+        `MERGE (a:MX {name:'a'}), (b:MX {name:'b'})` creates only node 'a'.
+
+  Probed on a scratch server (geode serve --listen 127.0.0.1:4499):
+
+    - chained MERGE            -> 00000, count(n)=2, count(r)=0   (THE BUG)
+    - chained MERGE re-run     -> 00000, count(n)=2               (nodes idempotent)
+    - comma-form MERGE         -> 00000, count(n)=1 (expected 2)  (THE BUG)
+    - MATCH (a),(b) MERGE (a)-[:REL]->(b) -> 00000, count(r)=1,
+      still 1 after a re-run (WORKING CONTROL, must stay green)
+
+  Expectations below encode POST-FIX behavior, so the two key-assertion tests
+  FAIL on v0.8.5 (count(r)=0 / count(n)=1) and pass once the fix lands.
+  `geode query` always exits 0 for GQL-level outcomes, so exit_code proves
+  nothing on its own; every key assertion pins the row value itself.
+
+  Node labels are prefixed M3903_ so this spec cannot collide with any other
+  spec's data.
+
+  CANARY: REQ=REQ-ENG-3903-CHAINED-MERGE; FEATURE="MergeRelationship"; ASPECT=ChainedPatterns; STATUS=TESTED; TEST=geodetestlab/specs/merge_chained_relationship.yml; OWNER=execution; UPDATED=2026-08-24
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: control-seed-nodes
+  description: |
+    Positive control (setup) — seed the two endpoint nodes for the WORKING
+    MATCH + MERGE form with plain CREATEs.
+  query: "CREATE (:M3903_C {name: 'a'})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [merge, eng-3903, setup, positive]
+
+- name: control-seed-nodes-b
+  description: Positive control (setup) — second endpoint node.
+  query: "CREATE (:M3903_C {name: 'b'})"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [merge, eng-3903, setup, positive]
+
+- name: control-match-merge-creates-relationship
+  description: |
+    WORKING CONTROL (green on v0.8.5) — with both endpoints bound by a
+    preceding MATCH, MERGE creates the relationship. This is the shape users
+    are told to fall back to; it must stay green after the ENG-3903 fix.
+  query: MATCH (a:M3903_C {name:'a'}), (b:M3903_C {name:'b'}) MERGE (a)-[:M3903_CTL {type:'x'}]->(b)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [merge, eng-3903, control, positive]
+
+- name: control-match-merge-relationship-count
+  description: WORKING CONTROL — exactly one :M3903_CTL relationship exists.
+  query: MATCH (:M3903_C)-[r:M3903_CTL]->(:M3903_C) RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+    row_count: 1
+  tags: [merge, eng-3903, control, positive]
+
+- name: control-match-merge-idempotent
+  description: |
+    WORKING CONTROL — re-running the identical MATCH + MERGE must not create a
+    second relationship (MERGE is idempotent). Verified green on v0.8.5.
+  query: MATCH (a:M3903_C {name:'a'}), (b:M3903_C {name:'b'}) MERGE (a)-[:M3903_CTL {type:'x'}]->(b)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [merge, eng-3903, control, idempotency]
+
+- name: control-match-merge-relationship-count-after-rerun
+  description: WORKING CONTROL — still exactly one relationship after the re-run.
+  query: MATCH (:M3903_C)-[r:M3903_CTL]->(:M3903_C) RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+    row_count: 1
+  tags: [merge, eng-3903, control, idempotency]
+
+- name: chained-merge-runs
+  description: |
+    The reported ENG-3903 reproduction. It already returns 00000 today — that
+    is precisely the problem, since the relationship is never written. Asserted
+    here so the follow-up count tests attribute their failure to missing data
+    rather than to a rejected query.
+  query: MERGE (a:M3903_N {name:'a'}) MERGE (b:M3903_N {name:'b'}) MERGE (a)-[:M3903_REL {type:'x'}]->(b)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [merge, eng-3903, regression]
+
+- name: chained-merge-creates-both-nodes
+  description: |
+    Both MERGE'd nodes exist (green on v0.8.5 — the node writes are not the
+    lost ones). Pins that the fix must not regress the node half.
+  query: MATCH (n:M3903_N) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+    row_count: 1
+  tags: [merge, eng-3903, regression]
+
+- name: chained-merge-creates-relationship
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the chained MERGE must create exactly one
+    :M3903_REL relationship between the two MERGE'd nodes. Probed real
+    behavior on v0.8.5: count(r) = 0 with the write silently dropped. Post-fix:
+    count(r) = 1.
+  query: MATCH (:M3903_N)-[r:M3903_REL]->(:M3903_N) RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+    stdout_not_contains:
+    - '"c":0'
+    row_count: 1
+  tags: [merge, eng-3903, regression, key-assertion, silent-data-loss]
+
+- name: chained-merge-rerun-is-idempotent
+  description: |
+    Re-running the identical chained MERGE must not duplicate anything
+    (MERGE semantics). Returns 00000 today as well.
+  query: MERGE (a:M3903_N {name:'a'}) MERGE (b:M3903_N {name:'b'}) MERGE (a)-[:M3903_REL {type:'x'}]->(b)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [merge, eng-3903, idempotency]
+
+- name: chained-merge-node-count-after-rerun
+  description: Still exactly two nodes after the re-run (no duplicates).
+  query: MATCH (n:M3903_N) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+    row_count: 1
+  tags: [merge, eng-3903, idempotency]
+
+- name: chained-merge-relationship-count-after-rerun
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — still exactly ONE relationship after the
+    re-run: the fix must create the edge once and then match it, not create a
+    duplicate. v0.8.5 reports 0 here (never created at all).
+  query: MATCH (:M3903_N)-[r:M3903_REL]->(:M3903_N) RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+    stdout_not_contains:
+    - '"c":0'
+    - '"c":2'
+    row_count: 1
+  tags: [merge, eng-3903, idempotency, key-assertion]
+
+- name: comma-form-merge-runs
+  description: |
+    Comma-separated MERGE chains — returns 00000 today while creating only the
+    first chain (executeMerge reads chains[0] only).
+  query: MERGE (a:M3903_X {name:'a'}), (b:M3903_X {name:'b'})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [merge, eng-3903, regression]
+
+- name: comma-form-merge-creates-both-nodes
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — a comma-separated MERGE pattern must
+    create EVERY chain. Probed real behavior: count(n) = 1 (only node 'a').
+    Post-fix: count(n) = 2.
+  query: MATCH (n:M3903_X) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+    stdout_not_contains:
+    - '"c":1'
+    row_count: 1
+  tags: [merge, eng-3903, regression, key-assertion, silent-data-loss]
+
+- name: comma-form-merge-rerun-is-idempotent
+  description: Re-running the comma form must not duplicate the nodes.
+  query: MERGE (a:M3903_X {name:'a'}), (b:M3903_X {name:'b'})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [merge, eng-3903, idempotency]
+
+- name: comma-form-merge-node-count-after-rerun
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — exactly two nodes after the re-run.
+  query: MATCH (n:M3903_X) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+    stdout_not_contains:
+    - '"c":1'
+    - '"c":3'
+    - '"c":4'
+    row_count: 1
+  tags: [merge, eng-3903, idempotency, key-assertion]
+
+- name: cleanup-chained-nodes
+  description: Clean up the chained-MERGE data.
+  query: MATCH (n:M3903_N) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-comma-nodes
+  description: Clean up the comma-form data.
+  query: MATCH (n:M3903_X) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-control-nodes
+  description: Clean up the control data.
+  query: MATCH (n:M3903_C) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- merge
+- eng-3903
+- relationships
+- idempotency
+- silent-data-loss
+- regression

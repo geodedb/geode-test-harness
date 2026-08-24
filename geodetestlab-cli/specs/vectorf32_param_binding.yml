@@ -1,0 +1,218 @@
+version: '1.0'
+name: vectorf32() — Parameter Binding (ENG-3905 parse rejection of $param)
+description: |
+  Regression spec for ENG-3905: vectorf32($param) is rejected at PARSE time,
+  so a client can never bind an embedding as a query parameter.
+
+    geode query --param vec '[1.0,2.0,3.0]' "RETURN vectorf32($vec)"
+    -> 42000 "invalid builtin function call"
+
+  Root cause (verified on v0.8.5 / 4264ccba): the parse-time
+  validateBuiltinCall gate (src/gql/parser.zig:4237/4240, raised at :3619)
+  accepts only an ArrayLit or a string-like argument for VectorF32/VectorI32;
+  an `ast.Param` node is not accepted. The RUNTIME constructor already handles
+  a List argument (constructVectorF32, src/eval_extended.zig:625-658) — the
+  WITH-variable control below proves it — so the rejection is purely the
+  parse-time gate.
+
+  Probed on a scratch server (geode serve --listen 127.0.0.1:4499):
+
+    - --param vec '[1.0,2.0,3.0]'  RETURN vectorf32($vec) -> 42000  (THE BUG)
+    - --param vec '[1,2,3]'        RETURN vectorf32($vec) -> 42000  (THE BUG)
+    - --param bad '42'             RETURN vectorf32($bad) -> 42000  (already
+      rejected — must STAY rejected after the fix, at evaluation time)
+    - --param vec '[1.0,2.0,3.0]'  RETURN $vec  -> 00000, LIST       (CONTROL)
+    - WITH [1.0,2.0,3.0] AS xs RETURN vectorf32(xs)
+                                   -> 00000, {"type":"VECTOR", ...}  (CONTROL)
+
+  Expectations below encode POST-FIX behavior: the bound-parameter cases must
+  return 00000 with a VECTOR-typed value, so they FAIL on v0.8.5. The negative
+  case is a guard — a non-list scalar parameter must NOT start returning 00000
+  once the parse gate is relaxed (the engine-side regression test pins the
+  exact error: error.TypeMismatch).
+
+  Node labels are prefixed V3905_ so this spec cannot collide with any other
+  spec's data.
+
+  CANARY: REQ=REQ-ENG-3905-VECTORF32-PARAM; FEATURE="VectorF32"; ASPECT=ParameterBinding; STATUS=TESTED; TEST=geodetestlab/specs/vectorf32_param_binding.yml; OWNER=parser; UPDATED=2026-08-24
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: control-plain-list-param
+  description: |
+    CONTROL (green on v0.8.5) — the --param surface itself delivers a JSON list
+    to the query as a LIST value. Proves the binding path works before probing
+    vectorf32().
+  args:
+  - query
+  - --param
+  - vec
+  - '[1.0,2.0,3.0]'
+  - RETURN $vec AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"LIST"'
+    row_count: 1
+  tags: [parameter-binding, eng-3905, control, positive]
+
+- name: control-with-variable-vectorf32
+  description: |
+    CONTROL (green on v0.8.5) — the runtime constructor already accepts a List
+    argument when it reaches evaluation (here via a WITH variable), returning a
+    VECTOR. This is what the $param path must match.
+  query: WITH [1.0, 2.0, 3.0] AS xs RETURN vectorf32(xs) AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"VECTOR"'
+    row_count: 1
+  tags: [parameter-binding, eng-3905, control, positive]
+
+- name: vectorf32-float-list-param
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the reported reproduction. Probed real
+    behavior: 42000 "invalid builtin function call". Post-fix: 00000 with a
+    VECTOR-typed value.
+  args:
+  - query
+  - --param
+  - vec
+  - '[1.0,2.0,3.0]'
+  - RETURN vectorf32($vec) AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"VECTOR"'
+    stdout_not_contains:
+    - '"status_class":"42000"'
+    - invalid builtin function call
+    row_count: 1
+  tags: [parameter-binding, eng-3905, vector, regression, key-assertion]
+
+- name: vectorf32-integer-list-param
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the same binding with an integer JSON
+    list (`--param vec '[1,2,3]'`), which arrives as a list of INTs rather than
+    DOUBLEs. Both element shapes must construct a VECTOR.
+  args:
+  - query
+  - --param
+  - vec
+  - '[1,2,3]'
+  - RETURN vectorf32($vec) AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"VECTOR"'
+    stdout_not_contains:
+    - '"status_class":"42000"'
+    - invalid builtin function call
+    row_count: 1
+  tags: [parameter-binding, eng-3905, vector, regression, key-assertion]
+
+- name: vectorf32-param-stores-node-property
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the real client use case: bind the
+    embedding as a parameter on a CREATE. v0.8.5 rejects the statement at parse
+    time, so the node is never written.
+  args:
+  - query
+  - --param
+  - vec
+  - '[1.0,2.0,3.0]'
+  - 'CREATE (t:V3905_N {id: 1, embedding: vectorf32($vec)})'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42000"'
+    - invalid builtin function call
+  tags: [parameter-binding, eng-3905, vector, regression, key-assertion]
+
+- name: vectorf32-param-readback-is-vector
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the parameter-bound embedding must read
+    back typed as VECTOR (v0.8.5 returns zero rows: the CREATE above was
+    rejected).
+  query: 'MATCH (t:V3905_N {id: 1}) RETURN t.embedding AS v'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"type":"VECTOR"'
+    row_count: 1
+  tags: [parameter-binding, eng-3905, vector, regression, key-assertion]
+
+- name: negative-non-list-param-must-not-succeed
+  description: |
+    GUARD (green today, must STAY green) — relaxing the parse gate must not
+    open a silent-accept hole: a scalar (non-list) parameter is NOT a valid
+    vectorf32() argument and must not start returning 00000 / a coerced
+    one-element vector. On v0.8.5 it is rejected at parse time (42000); after
+    the fix it must be rejected at evaluation time (the engine test
+    tests/test_eng3904_3905_vector_literals.zig pins error.TypeMismatch).
+  args:
+  - query
+  - --param
+  - bad
+  - '42'
+  - RETURN vectorf32($bad) AS v
+  expected:
+    exit_code: 0
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [parameter-binding, eng-3905, negative, key-assertion, silent-accept]
+
+- name: negative-non-vector-string-param-must-not-succeed
+  description: |
+    GUARD (green today, must STAY green) — a string parameter that is not a
+    vector literal must not be silently accepted either.
+  args:
+  - query
+  - --param
+  - bad
+  - '"not-a-vector"'
+  - RETURN vectorf32($bad) AS v
+  expected:
+    exit_code: 0
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [parameter-binding, eng-3905, negative, silent-accept]
+
+- name: cleanup-test-data
+  description: Clean up all V3905 test data.
+  query: MATCH (n:V3905_N) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- parameter-binding
+- eng-3905
+- vector
+- vectorf32
+- regression
