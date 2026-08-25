@@ -1,0 +1,372 @@
+version: '1.0'
+name: A write statement that fails part-way through must leave nothing behind (property-write atomicity)
+description: |
+  Wire-level spec for statement-level atomicity of property writes.
+
+  THE DEFECT. Under autocommit geode has no statement rollback. The
+  per-statement engine transaction is an fsync-BATCHING device: it is pinned to
+  a single round-robin shard, its abort only discards WAL records, and the
+  ~15/16 of a statement's sub-ops that route to a different shard open and
+  COMMIT their own transaction; the in-memory GraphStore mirror is mutated
+  unconditionally on top of that. So a property refused half-way through a
+  statement left the half that had already landed:
+
+    * a CREATE refused on a later property persisted the node with the
+      EARLIER properties and the refused one absent — an orphan the caller was
+      told did not happen ({"status_class":"22000"} + a row in the graph);
+    * a multi-assignment `SET a = .., b = ..` refused on `b` COMMITTED `a`.
+
+  Both were reproduced against a scratch server before the fix (see the exact
+  transcript in the geode commit); both are asserted green below.
+
+  WHICH FAILURE THIS SPEC USES, AND WHY. The trigger has to be a refusal that
+  fires AFTER a statement's first store mutation and is reachable from the CLI.
+  Two candidates exist:
+
+    1. an oversized property VALUE. NOT USABLE HERE. Since graph-storage v0.4.0
+       a value that does not fit a property page spills to a VarStore overflow
+       chain and SUCCEEDS; the only value-size refusal left is
+       GraphConfig.max_property_value_bytes (default 1 MiB). A >1 MiB literal
+       cannot be driven through this CLI at all — probed and documented in
+       specs/property_value_size_limit.yml: the `--param` route dies on the OS
+       ARG_MAX before geode is exec'd, and the `--file` route takes the >16 KB
+       chunked path and dies in transport with ConnectionTimeout, returning no
+       SQLSTATE. Asserting on either would be a DIFFERENT failure wearing the
+       right-looking label.
+
+    2. a VECTOR<f32> whose dimension disagrees with the HNSW index covering the
+       property (GAP-0918) -> SQLSTATE 22000. USED HERE. It is honestly
+       CLI-triggerable, it fires exactly where the size refusal used to (the
+       property-write chokepoint, i.e. after the node exists), and the atomicity
+       contract is failure-source agnostic — the same shapes fall out of any
+       mid-statement refusal.
+
+  NOT COVERED HERE (deliberately, not faked):
+
+    * the >1 MiB size class and the relationship-CREATE / MERGE-ON-CREATE-SET /
+      bulk-fast-path shapes, which need a >1 MiB value. They are pinned in
+      geode's tests/test_property_write_atomicity.zig
+      (`zig build test-property-write-atomicity`), which builds the value in Zig
+      and drives the real executor + engine-backed store with a true restart.
+    * the exact-index/value divergence on a failed property put (RC-4: the old
+      value's index posting was dropped BEFORE the fallible write, so a failed
+      write left the row holding its old value but invisible to
+      `MATCH (n:L {k: <old>})`, durably and across restart). PROBED: it is not
+      CLI-triggerable post-v0.4.0. It requires the failure to occur INSIDE
+      StorageAdapter.setNodeProperty, and the vector-dimension refusal used here
+      fires one layer earlier (in property_mutation, before the adapter is
+      called), so it never reaches the divergence. The >1 MiB failure that would
+      is unreachable from the CLI per (1). It is pinned at the adapter in the
+      Zig suite instead.
+
+  CONTRACT encoded below:
+
+    1. A CREATE refused for a mid-statement reason returns its error AND leaves
+       no node — not a partial one carrying the properties written before the
+       refused one.
+    2. A multi-assignment SET is all-or-nothing: a refusal on a later
+       assignment leaves every earlier assignment unapplied.
+    3. Valid writes of the same shapes are unaffected — including a 2048-dim
+       vector, which only stores because of the v0.4.0 overflow path, so the
+       fix is proven not to be an over-eager refusal.
+
+  Node labels are prefixed PWA_ so this spec cannot collide with any other
+  spec's data.
+
+  Engine-side sibling: geode tests/test_property_write_atomicity.zig
+  (`zig build test-property-write-atomicity`, 12 tests) covers the same contract
+  for the shapes this CLI cannot reach.
+
+  CANARY: REQ=REQ-PROPERTY-WRITE-ATOMICITY; FEATURE="PropertyStorage"; ASPECT=StatementAtomicity; STATUS=TESTED; TEST=geodetestlab/specs/property_write_atomicity.yml; OWNER=engine; UPDATED=2026-08-25
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# Fixture — an HNSW index whose dimension is established at 4 by the first
+# valid insert. From here a 3-dim vector on the same (label, property) is
+# refused at the property-write chokepoint.
+# ---------------------------------------------------------------------------
+- name: setup-create-vector-index
+  description: |
+    Create the HNSW index that makes PWA_Doc.emb dimension-validated. The
+    dimension itself is not declared in DDL — it is established by the first
+    vector actually written (see geode GAP-0918).
+  query: CREATE INDEX pwa_emb_idx ON PWA_Doc (emb) USING HNSW WITH (metric = 'l2')
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, setup]
+
+- name: setup-establish-index-dimension-at-4
+  description: |
+    A valid 4-dim insert. Establishes the index dimension AND is the control
+    that the ordinary path is unaffected.
+  query: >-
+    CREATE (:PWA_Doc {id: 1, tag: 'good', emb: vectorf32('[1.0, 0.0, 0.0, 0.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, setup, control, positive]
+
+# ---------------------------------------------------------------------------
+# (1) A refused CREATE must leave NO node.
+# ---------------------------------------------------------------------------
+- name: refused-create-reports-the-dimension-error
+  description: |
+    A 3-dim vector against the 4-dim index is refused with SQLSTATE 22000.
+    `id` and `tag` are written BEFORE `emb`, so this is precisely the shape that
+    used to commit a partial node behind an error response.
+  query: >-
+    CREATE (:PWA_Doc {id: 2, tag: 'partial', emb: vectorf32('[1.0, 2.0, 3.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+    - Vector dimension
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, negative, vector]
+
+- name: refused-create-leaves-no-partial-node
+  description: |
+    KEY ASSERTION. The refused CREATE must not have persisted the node it had
+    already created before hitting the refused property.
+
+    RED before the fix (verified on a scratch server): this returned one row,
+    {"t":"partial","embnull":true} — the node existed, carried the `tag`
+    written before the refusal, and was missing the property the statement was
+    actually about. GREEN after: no rows.
+  query: >-
+    MATCH (n:PWA_Doc {id: 2}) RETURN n.tag AS t, n.emb IS NULL AS embnull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"t":"partial"'
+    row_count: 0
+  tags: [atomicity, negative, key-assertion, vector]
+
+- name: refused-create-does-not-change-the-node-count
+  description: |
+    The same assertion from the other side: only the one valid fixture node
+    exists. Catches a partial node that somehow lost its `id` too.
+  query: MATCH (n:PWA_Doc) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+    row_count: 1
+  tags: [atomicity, negative, key-assertion]
+
+# ---------------------------------------------------------------------------
+# (2) A multi-assignment SET is all-or-nothing.
+# ---------------------------------------------------------------------------
+- name: setup-set-fixture-node
+  description: A node whose `tag` must survive a later failed SET untouched.
+  query: >-
+    CREATE (:PWA_Row {id: 1, tag: 'keep'})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, setup]
+
+- name: setup-set-fixture-index
+  description: Dimension-validated index over PWA_Row.emb.
+  query: CREATE INDEX pwa_row_emb_idx ON PWA_Row (emb) USING HNSW WITH (metric = 'l2')
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, setup]
+
+- name: setup-set-fixture-establish-dimension
+  description: Establishes the PWA_Row index dimension at 4 via a valid SET.
+  query: >-
+    MATCH (n:PWA_Row {id: 1}) SET n.emb = vectorf32('[1.0, 0.0, 0.0, 0.0]')
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, setup, control, positive]
+
+- name: refused-multi-assignment-set-reports-the-dimension-error
+  description: |
+    `SET n.tag = 'changed', n.emb = <2-dim>`: the FIRST assignment is perfectly
+    storable, the SECOND is refused. The statement must fail.
+  query: >-
+    MATCH (n:PWA_Row {id: 1}) SET n.tag = 'changed', n.emb = vectorf32('[9.0, 9.0]')
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+    - Vector dimension
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, negative, set, vector]
+
+- name: refused-set-leaves-the-earlier-assignment-unapplied
+  description: |
+    KEY ASSERTION. `n.tag` must still be 'keep'.
+
+    RED before the fix (verified on a scratch server): this returned
+    {"t":"changed"} — the first assignment of a clause list the caller was told
+    had FAILED was committed. GREEN after: 'keep'.
+  query: >-
+    MATCH (n:PWA_Row {id: 1}) RETURN n.tag AS t
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"keep"'
+    stdout_not_contains:
+    - '"t":"changed"'
+    row_count: 1
+  tags: [atomicity, negative, key-assertion, set]
+
+- name: refused-set-leaves-the-established-vector-intact
+  description: |
+    The property the failed SET targeted still holds its previous value: the
+    refusal must not have blanked it either.
+  query: >-
+    MATCH (n:PWA_Row {id: 1}) RETURN n.emb IS NULL AS embnull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"embnull":false'
+    row_count: 1
+  tags: [atomicity, negative, key-assertion, set]
+
+# ---------------------------------------------------------------------------
+# (3) Controls — the fix must not turn into an over-eager refusal.
+# ---------------------------------------------------------------------------
+- name: control-valid-create-still-succeeds-after-a-refusal
+  description: |
+    A dimension-correct insert on the SAME label still stores after the refused
+    one. Proves the pre-pass rejects the entry, not the path.
+  query: >-
+    CREATE (:PWA_Doc {id: 3, tag: 'good3', emb: vectorf32('[0.0, 1.0, 0.0, 0.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, control, positive, vector]
+
+- name: control-valid-create-reads-back
+  description: The recovered insert is genuinely persisted, vector included.
+  query: >-
+    MATCH (n:PWA_Doc {id: 3}) RETURN n.tag AS t, n.emb IS NULL AS embnull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"good3"'
+    - '"embnull":false'
+    row_count: 1
+  tags: [atomicity, control, positive, readback, vector]
+
+- name: control-valid-multi-assignment-set-still-applies-both
+  description: |
+    The all-or-nothing rule is ALL when everything is storable: both
+    assignments land.
+  query: >-
+    MATCH (n:PWA_Row {id: 1}) SET n.tag = 'updated', n.note = 'ok'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [atomicity, control, positive, set]
+
+- name: control-valid-multi-assignment-set-reads-back
+  description: Both assignments of the successful SET are visible.
+  query: >-
+    MATCH (n:PWA_Row {id: 1}) RETURN n.tag AS t, n.note AS note
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"updated"'
+    - '"note":"ok"'
+    row_count: 1
+  tags: [atomicity, control, positive, readback, set]
+
+- name: control-2048-dim-vector-on-an-unindexed-label-still-stores
+  description: |
+    GUARD against an over-eager pre-pass. A 2048-dim VECTOR<f32> is ~8 KB
+    encoded — past the ~8142-byte inline per-entry budget — so it only stores
+    because of the graph-storage v0.4.0 overflow chain. The atomicity pre-pass
+    measures the value against max_property_value_bytes (1 MiB), NOT against the
+    page budget, so this must still be accepted.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    V=$(python3 -c "print('['+','.join(['0.5']*2048)+']')")
+    ./zig-out/bin/geode query "CREATE (:PWA_Big {tag: 'v2048', emb: vectorf32(\$v)})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyValueTooLarge
+    - PropertyKeyTooLong
+  tags: [atomicity, control, positive, overflow, vector]
+
+- name: control-2048-dim-vector-reads-back
+  description: The 2048-dim vector is genuinely persisted, not silently dropped.
+  query: MATCH (n:PWA_Big) RETURN n.tag AS t, n.emb IS NULL AS embnull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"v2048"'
+    - '"embnull":false'
+    row_count: 1
+  tags: [atomicity, control, positive, readback, overflow, vector]
+
+# ---------------------------------------------------------------------------
+- name: cleanup-doc-nodes
+  description: Clean up the vector-index fixture nodes.
+  query: MATCH (n:PWA_Doc) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-row-nodes
+  description: Clean up the SET fixture node.
+  query: MATCH (n:PWA_Row) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-big-nodes
+  description: Clean up the overflow-vector control node.
+  query: MATCH (n:PWA_Big) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
