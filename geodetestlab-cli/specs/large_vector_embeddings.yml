@@ -1,0 +1,496 @@
+version: '1.0'
+name: Large VECTOR<f32> embeddings store, overwrite and survive restart (graph-storage v0.4.0 overflow)
+description: |
+  Wire-level spec for the embedding sizes real models actually emit.
+
+  Until graph-storage v0.4.0 a property VALUE had to fit the ~8142-byte inline
+  per-entry budget (8192-byte page minus header; an entry is
+  2 + key.len + encoded value), which capped a VECTOR<f32> at 2030 dimensions —
+  below every mainstream embedding width. v0.4.0 spills an over-budget encoded
+  value into a VarStore overflow chain and leaves a fixed 13-byte stub in the
+  entry, so the practical ceiling becomes the sanity cap
+  `GraphConfig.max_property_value_bytes` (default 1 MiB ≈ 262,144 f32 dims).
+
+  This spec covers the sizes that were previously IMPOSSIBLE and are now the
+  point of the feature:
+
+    2560 dims (10 KB encoded)  — e.g. mid-size instruct embedders
+    3072 dims (12 KB encoded)  — e.g. text-embedding-3-large
+    4096 dims (16 KB encoded)  — e.g. large LLM hidden-state embeddings
+
+  Each is CREATEd with a bound $param (which works since the ENG-3905 fix,
+  spec vectorf32_param_binding.yml) and then read back.
+
+  HOW READBACK IS VERIFIED — `distance(stored, written) = 0`, not `size()`.
+  `size()` on a VECTOR returns 0 on this build (a pre-existing surface gap: it
+  reads 0 for a 2030-dim INLINE vector too, so it is unrelated to overflow) and
+  would silently assert nothing. `distance()` is strictly stronger:
+
+    * a dimension difference raises TypeMismatch (probed: comparing the stored
+      2048-dim vector against a 2030-dim one returns
+      {"status_class":"58000","error":"TypeMismatch"}), so a spill truncated at
+      a page boundary CANNOT pass; and
+    * the result is exactly 0.000000 only if every element round-tripped.
+
+  Element values are deliberately VARIED ((i % 97) * 0.25 + 0.125, all exactly
+  representable in f32) rather than a constant, so a chain that reassembled its
+  pages in the wrong order would not cancel out.
+
+  Coverage beyond plain store+read:
+
+    * OVERWRITE CYCLE (4096 -> 2560 -> 4096, with a fresh value pattern on the
+      way back). This is the path that frees an old overflow chain and writes a
+      new one, and it shrinks across the inline/overflow boundary in both
+      directions. A leaked or double-freed chain, or a stale chain still being
+      read, shows up as a nonzero distance or a TypeMismatch.
+    * RESTART SURVIVAL. The managed server is restarted against the SAME data
+      dir (cleanup: false + restart_server: true, the pattern used by
+      regression_label_count_after_reopen.yml) and every vector is re-read at
+      full fidelity afterwards — proving the overflow chains are durable and
+      recovered, not just resident in the page cache.
+
+  NOT COVERED HERE — the >1 MiB over-cap refusal (`PropertyValueTooLarge` /
+  SQLSTATE 54000). It cannot be driven honestly through this CLI; the two routes
+  and their real (unrelated) failures are documented in
+  specs/property_value_size_limit.yml, and the cap is pinned upstream in the
+  graph-storage v0.4.0 suite and by
+  geode/tests/test_eng3911_property_value_size_error.zig.
+
+  Node labels are prefixed LVE_ so this spec cannot collide with any other
+  spec's data.
+
+  Sibling specs: property_value_size_limit.yml (the size contract and the
+  oversized-KEY guard), vectorf32_param_binding.yml (ENG-3905 $param binding).
+
+  CANARY: REQ=REQ-ENG-3911-PROPERTY-VALUE-SIZE-ERROR; FEATURE="PropertyStorage"; ASPECT=LargeVectorOverflowStorage; STATUS=TESTED; TEST=geodetestlab/specs/large_vector_embeddings.yml; OWNER=transport; UPDATED=2026-08-25
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# CREATE — three embedding widths that were impossible before v0.4.0.
+# ---------------------------------------------------------------------------
+- name: create-2560-dim-embedding
+  description: |
+    A 2560-dimension VECTOR<f32> (10,240 bytes encoded) bound through
+    vectorf32($v). Over the ~8142-byte inline budget, so it takes the overflow
+    chain. Before v0.4.0 this was 58000 "PropertyKeyTooLong".
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(2560))+']')")
+    ./zig-out/bin/geode query "CREATE (:LVE_2560 {tag: 'e2560', emb: vectorf32(\$v)})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - PropertyValueTooLarge
+  tags: [vector, embeddings, overflow, graph-storage-040, positive]
+
+- name: readback-2560-dim-embedding
+  description: |
+    The 2560-dim vector round-trips exactly: present, and distance to the vector
+    that was written is 0.000000 (which also proves the dimension survived — a
+    mismatch would raise TypeMismatch instead).
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(2560))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_2560) RETURN n.tag AS t, n.emb IS NULL AS embnull, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"e2560"'
+    - '"embnull":false'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, readback]
+
+- name: create-3072-dim-embedding
+  description: |
+    A 3072-dimension VECTOR<f32> (12,288 bytes encoded) — the
+    text-embedding-3-large width.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(3072))+']')")
+    ./zig-out/bin/geode query "CREATE (:LVE_3072 {tag: 'e3072', emb: vectorf32(\$v)})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - PropertyValueTooLarge
+  tags: [vector, embeddings, overflow, graph-storage-040, positive]
+
+- name: readback-3072-dim-embedding
+  description: The 3072-dim vector round-trips exactly.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(3072))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_3072) RETURN n.tag AS t, n.emb IS NULL AS embnull, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"e3072"'
+    - '"embnull":false'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, readback]
+
+- name: create-4096-dim-embedding
+  description: |
+    A 4096-dimension VECTOR<f32> (16,384 bytes encoded) — twice the page size,
+    so its overflow chain is genuinely multi-page.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(4096))+']')")
+    ./zig-out/bin/geode query "CREATE (:LVE_4096 {tag: 'e4096', emb: vectorf32(\$v)})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - PropertyValueTooLarge
+  tags: [vector, embeddings, overflow, graph-storage-040, positive]
+
+- name: readback-4096-dim-embedding
+  description: The 4096-dim vector round-trips exactly across its multi-page chain.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(4096))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_4096) RETURN n.tag AS t, n.emb IS NULL AS embnull, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"e4096"'
+    - '"embnull":false'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, readback]
+
+# ---------------------------------------------------------------------------
+# OVERWRITE CYCLE — 4096 -> 2560 -> 4096. Exercises freeing an overflow chain
+# and writing a new one, shrinking and growing across the boundary.
+# ---------------------------------------------------------------------------
+- name: seed-overwrite-node-at-4096
+  description: |
+    Seed a dedicated node at 4096 dims. Kept separate from LVE_4096 so the
+    plain-store assertions above stay independent of the overwrite path.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(4096))+']')")
+    ./zig-out/bin/geode query "CREATE (:LVE_CYCLE {tag: 'cycle', emb: vectorf32(\$v)})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - PropertyValueTooLarge
+  tags: [vector, embeddings, overflow, graph-storage-040, overwrite]
+
+- name: overwrite-4096-to-2560
+  description: |
+    SET the same property to a SMALLER 2560-dim vector. The old 4096-dim chain
+    must be released and the new one written; the read that follows must see the
+    new value only.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(2560))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_CYCLE) SET n.emb = vectorf32(\$v)" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - PropertyValueTooLarge
+  tags: [vector, embeddings, overflow, graph-storage-040, overwrite]
+
+- name: readback-after-shrink-to-2560
+  description: |
+    The shrunken value reads back exactly at 2560 dims. If the old 4096-dim
+    chain were still being read, this would raise TypeMismatch instead.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(2560))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_CYCLE) RETURN n.tag AS t, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"cycle"'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, overwrite, readback]
+
+- name: overwrite-2560-back-to-4096
+  description: |
+    Grow back to 4096 dims with a DIFFERENT value pattern
+    ((i % 89) * 0.5 + 0.25), so the readback cannot pass by accidentally
+    matching the original 4096-dim seed.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 89) * 0.5 + 0.25) for i in range(4096))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_CYCLE) SET n.emb = vectorf32(\$v)" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - PropertyValueTooLarge
+  tags: [vector, embeddings, overflow, graph-storage-040, overwrite]
+
+- name: readback-after-regrow-to-4096
+  description: The re-grown 4096-dim value reads back exactly, with the new pattern.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 89) * 0.5 + 0.25) for i in range(4096))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_CYCLE) RETURN n.tag AS t, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"cycle"'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, overwrite, readback]
+
+- name: guard-old-4096-pattern-is-gone
+  description: |
+    GUARD for the overwrite path — comparing against the ORIGINAL 4096-dim
+    pattern must NOT return 0. Same dimension, so this is not a TypeMismatch: it
+    is a real content comparison, and it proves the readback above is reading
+    the NEW chain rather than a stale one that merely happens to be the right
+    size.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(4096))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_CYCLE) RETURN n.tag AS t, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"cycle"'
+    stdout_not_contains:
+    - '"d":"0.000000"'
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, overwrite, guard]
+
+# ---------------------------------------------------------------------------
+# RESTART SURVIVAL — overflow chains must be durable, not page-cache resident.
+# cleanup: false above keeps the data dir across the restart.
+# ---------------------------------------------------------------------------
+- name: restart-server-for-durability-check
+  description: |
+    Restart the managed server against the SAME data dir. Everything below this
+    point re-reads vectors written before the restart, so it exercises recovery
+    of the overflow chains rather than a warm page cache.
+  type: bash
+  command: echo RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+  tags: [vector, embeddings, overflow, graph-storage-040, restart]
+
+- name: readback-2560-dim-after-restart
+  description: The 2560-dim vector survives restart at full fidelity.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(2560))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_2560) RETURN n.tag AS t, n.emb IS NULL AS embnull, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"e2560"'
+    - '"embnull":false'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, restart, readback]
+
+- name: readback-3072-dim-after-restart
+  description: The 3072-dim vector survives restart at full fidelity.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(3072))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_3072) RETURN n.tag AS t, n.emb IS NULL AS embnull, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"e3072"'
+    - '"embnull":false'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, restart, readback]
+
+- name: readback-4096-dim-after-restart
+  description: The 4096-dim vector survives restart at full fidelity.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 97) * 0.25 + 0.125) for i in range(4096))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_4096) RETURN n.tag AS t, n.emb IS NULL AS embnull, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"e4096"'
+    - '"embnull":false'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, restart, readback]
+
+- name: readback-overwritten-node-after-restart
+  description: |
+    The overwrite cycle's FINAL value (4096 dims, second pattern) is what
+    survives the restart — not the seed and not the intermediate 2560-dim value.
+    This is the assertion that would catch a chain freed at overwrite time but
+    still referenced by the persisted entry.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    V=$(python3 -c "print('['+','.join('%.4f' % ((i % 89) * 0.5 + 0.25) for i in range(4096))+']')")
+    ./zig-out/bin/geode query "MATCH (n:LVE_CYCLE) RETURN n.tag AS t, n.emb IS NULL AS embnull, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"cycle"'
+    - '"embnull":false'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [vector, embeddings, overflow, graph-storage-040, restart, overwrite, readback]
+
+# ---------------------------------------------------------------------------
+- name: cleanup-2560-nodes
+  description: Clean up the 2560-dim fixture node.
+  query: MATCH (n:LVE_2560) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-3072-nodes
+  description: Clean up the 3072-dim fixture node.
+  query: MATCH (n:LVE_3072) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-4096-nodes
+  description: Clean up the 4096-dim fixture node.
+  query: MATCH (n:LVE_4096) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-cycle-nodes
+  description: Clean up the overwrite-cycle fixture node.
+  query: MATCH (n:LVE_CYCLE) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- vector
+- embeddings
+- property-size
+- storage
+- overflow
+- graph-storage-040
+- regression

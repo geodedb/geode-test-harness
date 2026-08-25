@@ -1,54 +1,84 @@
 version: '1.0'
-name: Oversized property VALUE reports PropertyKeyTooLong / 58000 (ENG-3911)
+name: Large property VALUES store via overflow; over-cap values report PropertyValueTooLarge / 54000 (ENG-3911)
 description: |
-  Regression spec for ENG-3911: when a property VALUE crosses the per-entry
-  storage budget, the client is told `PropertyKeyTooLong` with SQLSTATE 58000 —
-  the wrong noun, and a system-error class for what is really a documented
-  resource limit.
+  Wire-level spec for the property-VALUE size contract.
 
-  The budget is 8142 bytes per property entry (8192-byte page minus header; an
-  entry is 2 + key.len + encoded value). Crossing it raises
-  `error.PropertyKeyTooLong` inside the graph_storage dependency — a misnomer
-  the dependency's own comment admits — and src/server/proto_util.zig:244 has no
-  arm for it, so the `else` fallback emits `@errorName(err)` under 58000.
+  HISTORY (ENG-3911, fixed). A property VALUE that crossed the per-entry storage
+  budget was refused, and refused DISHONESTLY: the client got
+  `PropertyKeyTooLong` under SQLSTATE 58000 — the wrong noun, and the
+  system-error class for what was really a documented resource limit. The
+  storage dependency raised `error.PropertyKeyTooLong` for two structurally
+  different refusals and src/server/proto_util.zig had no arm for either, so the
+  `else` fallback emitted `@errorName(err)` under 58000.
 
-  Probed on a scratch server started the way this harness starts one
-  (geode serve --data-dir <tmp> --listen 127.0.0.1:4581, v0.8.5 / 5c37d58a).
-  Every line is real observed output; the property key in each case is `emb`,
-  `s` or `l` — three characters or fewer, nowhere near any key limit:
+  WHAT CHANGED (graph-storage v0.4.0, pinned in geode 2026-08-25). The
+  ~8142-byte inline per-entry budget (8192-byte page minus header; an entry is
+  2 + key.len + encoded value) is NO LONGER A CEILING. A value whose entry does
+  not fit inline spills into a VarStore overflow chain and leaves a fixed
+  13-byte stub in the entry, so it stores and reads back in full. The ceiling
+  that remains is the storage sanity cap `GraphConfig.max_property_value_bytes`
+  (default 1 MiB), which bounds WAL record volume and per-op memory for a spill;
+  a value above it is refused BEFORE anything is written, and the storage layer
+  raises `error.PropertyValueTooLarge` itself. `error.PropertyKeyTooLong` is now
+  reserved for a genuinely oversized KEY.
 
-    vectorf32, 2030 dims      -> 00000                              (CONTROL, fits)
-    vectorf32, 2048 dims      -> 58000 "PropertyKeyTooLong"         (THE BUG)
-    string, 8132 chars        -> 00000                              (CONTROL, fits)
-    string, 8200 chars        -> 58000 "PropertyKeyTooLong"         (THE BUG)
-    list parameter, 700 elems -> 58000 "PropertyKeyTooLong"         (THE BUG)
-    property KEY of 65600+ chars -> 42000 "property key"            (CONTROL —
+  So the three cases this spec used to pin as FAILURES now SUCCEED. They are
+  inverted below — asserted green WITH READBACK, because "returns 00000" without
+  reading the value back would not distinguish a real store from a silent drop:
+
+    vectorf32, 2030 dims      -> 00000 + readback   (CONTROL, fits inline)
+    vectorf32, 2048 dims      -> 00000 + readback   (WAS 58000; now overflows)
+    string, 8132 chars        -> 00000 + readback   (CONTROL, fits inline)
+    string, 8200 chars        -> 00000 + readback   (WAS 58000; now overflows)
+    list parameter, 700 elems -> 00000 + readback   (WAS 58000; now overflows)
+    property KEY of 65600+ chars -> 42000 "property key"   (GUARD, unchanged —
                                      a genuine key overflow is rejected by the
                                      parser and never reaches storage)
 
-  Two independent defects in one response: the message blames the KEY when the
-  VALUE overflowed, sending every operator who reads it down the wrong path; and
-  58000 tells clients and monitoring "the server broke", when the request was
-  refused for a documented limit and the server is perfectly healthy.
+  OBSOLETE — the two "limitation-pin" partial-node tests. They pinned the fact
+  that a FAILING oversized-value CREATE still persisted the node carrying its
+  small `tag` while the oversized property was absent (`n.emb IS NULL` -> true):
+  silent partial data behind an error response. Those writes no longer fail, so
+  there is no partial node left to pin; the tests are replaced in place by
+  full-success readback assertions on the SAME labels (P3911_V48, P3911_S8200),
+  which assert the property is present and correct rather than absent. If a
+  future change reintroduces a partial write on this path, those assertions go
+  red. NOTE: statement-level atomicity for a property write that fails for some
+  OTHER reason is still not pinned anywhere — it was never in ENG-3911's scope,
+  and the case that used to exercise it no longer exists at this size.
 
-  LIMITATION-PIN (partial write, observed, separate ticket): the failing CREATE
-  is NOT atomic. After the 2048-dim and the 8200-char failures the node WAS
-  persisted, carrying its small `tag` property, with the oversized property
-  absent (IS NULL true). Probed:
+  NOT COVERED HERE — the >1 MiB negative case that would fire the surviving
+  `PropertyValueTooLarge` / 54000 arm. It cannot be driven honestly through this
+  CLI. Both routes were PROBED against a scratch server (geode serve --data-dir
+  <tmp> --listen 127.0.0.1:4591) with a 262145-dim vectorf32, whose encoded form
+  is 1048584 bytes — 8 bytes over the 1 MiB cap:
 
-    MATCH (n) RETURN n.tag, n.emb IS NULL  ->  {"t":"b","e":true}
+    --param route: the 1048581-byte argv never reaches geode at all —
+      "argument list too long: ./zig-out/bin/geode" (the OS ARG_MAX, hit before
+      the CLI's own 1 MiB PARAM_MAX_SIZE at src/cli/main.zig:1768).
+    --file literal route: the CLI takes the >16 KB chunked-execution path and
+      the request dies in transport —
+      "ConnectionTimeout / Error executing chunk: error.ConnectionFailed".
+      No SQLSTATE is returned at all.
 
-  That is silent partial data — the caller saw an error and still got a row.
-  It is pinned below as current reality, NOT as desired behaviour, and is out of
-  scope for this fix (which only makes the refusal honest). Raising the
-  8142-byte cap itself is also out of scope: that is a storage-format change.
+  Neither is the storage cap refusing the value; asserting on either would be a
+  DIFFERENT failure wearing the right-looking label. So the cap is pinned where
+  it can be exercised truthfully, and NOT faked here: in the graph-storage
+  v0.4.0 suite (which drives the store directly, above the CLI's reach), and at
+  the geode mapping layer by tests/test_eng3911_property_value_size_error.zig,
+  which asserts `PropertyValueTooLarge` -> SQLSTATE 54000 with a message naming
+  the VALUE and the 1048576-byte cap. If the CLI ever grows a file-backed
+  `--param` (or the chunked path stops timing out at this size), add the
+  negative case here.
 
-  POST-FIX CONTRACT encoded below:
+  CONTRACT encoded below:
 
-    1. The oversized-VALUE refusal carries SQLSTATE 54000
-       (program_limit_exceeded) and a message naming `PropertyValueTooLarge`.
-    2. It must NOT say `PropertyKeyTooLong` and must NOT be 58000.
-    3. Payloads that fit still store and read back unchanged (controls).
+    1. Values that used to overflow the inline budget now STORE and read back
+       byte-for-byte / element-for-element (vector dims, string length, list
+       length and content).
+    2. Neither `PropertyKeyTooLong` nor `PropertyValueTooLarge` appears on any
+       of those writes.
+    3. Payloads that always fit still store and read back unchanged (controls).
     4. A genuine property-KEY overflow keeps its own key-specific rejection and
        is not relabelled as a value overflow (guard).
 
@@ -60,8 +90,10 @@ description: |
 
   Engine-side sibling: tests/test_eng3911_property_value_size_error.zig
   (`zig build test-eng3911`) pins the proto_util.mapError contract directly.
+  Larger embeddings (2560/3072/4096 dims), an overwrite cycle and restart
+  survival are covered by specs/large_vector_embeddings.yml.
 
-  CANARY: REQ=REQ-ENG-3911-PROPERTY-VALUE-SIZE-ERROR; FEATURE="PropertyStorage"; ASPECT=OversizedValueErrorMapping; STATUS=TESTED; TEST=geodetestlab/specs/property_value_size_limit.yml; OWNER=transport; UPDATED=2026-08-24
+  CANARY: REQ=REQ-ENG-3911-PROPERTY-VALUE-SIZE-ERROR; FEATURE="PropertyStorage"; ASPECT=OversizedValueErrorMapping; STATUS=TESTED; TEST=geodetestlab/specs/property_value_size_limit.yml; OWNER=transport; UPDATED=2026-08-25
 
 cli:
   binary: ./zig-out/bin/geode
@@ -84,13 +116,15 @@ invariants:
 
 tests:
 # ---------------------------------------------------------------------------
-# Controls — payloads that fit the 8142-byte per-entry budget.
+# Controls — payloads that fit the ~8142-byte inline per-entry budget and never
+# take the overflow path. Unchanged by graph-storage v0.4.0.
 # ---------------------------------------------------------------------------
 - name: control-2030-dim-vector-stores
   description: |
-    CONTROL (green on v0.8.5) — the largest VECTOR<f32> that fits the per-entry
-    budget: 2030 dimensions. Bound as a parameter through vectorf32($v), which
-    works since the ENG-3905 fix. Must stay green.
+    CONTROL — the largest VECTOR<f32> that fits the INLINE per-entry budget:
+    2030 dimensions. Bound as a parameter through vectorf32($v), which works
+    since the ENG-3905 fix. Never took the overflow path before or after
+    v0.4.0; kept so a regression in the inline path is still caught.
   type: bash
   timeout_ms: 60000
   command: |
@@ -110,9 +144,9 @@ tests:
 
 - name: control-2030-dim-vector-reads-back
   description: |
-    CONTROL (green on v0.8.5) — the 2030-dim vector is genuinely persisted: the
-    node is there AND the vector property is not null. Proves the control above
-    stored data rather than merely returning 00000.
+    CONTROL — the 2030-dim vector is genuinely persisted: the node is there AND
+    the vector property is not null. Proves the control above stored data rather
+    than merely returning 00000.
   query: MATCH (n:P3911_V30) RETURN n.tag AS t, n.emb IS NULL AS embnull
   expected:
     exit_code: 0
@@ -125,8 +159,8 @@ tests:
 
 - name: control-8132-char-string-stores
   description: |
-    CONTROL (green on v0.8.5) — the largest STRING that fits the per-entry
-    budget: 8132 characters. Must stay green.
+    CONTROL — the largest STRING that fits the INLINE per-entry budget: 8132
+    characters. Never took the overflow path; must stay green.
   type: bash
   timeout_ms: 60000
   command: |
@@ -146,8 +180,7 @@ tests:
 
 - name: control-8132-char-string-reads-back
   description: |
-    CONTROL (green on v0.8.5) — the 8132-character string round-trips at full
-    length.
+    CONTROL — the 8132-character string round-trips at full length.
   query: MATCH (n:P3911_S8132) RETURN n.tag AS t, size(n.s) AS len
   expected:
     exit_code: 0
@@ -159,19 +192,22 @@ tests:
   tags: [property-size, eng-3911, control, positive, string]
 
 # ---------------------------------------------------------------------------
-# Key assertions — oversized VALUES. FAIL on v0.8.5.
+# Key assertions — values that OVERFLOW the inline budget. These three used to
+# be refused with 58000 "PropertyKeyTooLong"; since graph-storage v0.4.0 they
+# spill to a VarStore overflow chain and store.
 # ---------------------------------------------------------------------------
-- name: oversized-vector-value-reports-truthful-error
+- name: overflowing-vector-value-stores
   description: |
-    KEY ASSERTION (FAILS on v0.8.5) — a 2048-dimension VECTOR<f32> exceeds the
-    8142-byte per-entry budget and must be refused with a TRUTHFUL error naming
-    the VALUE, under SQLSTATE 54000 (program_limit_exceeded). Probed real
-    behaviour on v0.8.5:
+    KEY ASSERTION (INVERTED at graph-storage v0.4.0) — a 2048-dimension
+    VECTOR<f32> exceeds the ~8142-byte inline per-entry budget. It used to be
+    refused with
 
       {"status_class":"58000","error_code":"58000","error":"PropertyKeyTooLong"}
 
-    The property key is `emb` — three characters. Post-fix: 54000 with
-    PropertyValueTooLarge, and PropertyKeyTooLong must not appear at all.
+    (property key `emb`, three characters). It now spills to an overflow chain
+    and succeeds. Neither the old misnomer nor the surviving over-cap error may
+    appear: 2048*4 = 8192 bytes is three orders of magnitude below the 1 MiB
+    `max_property_value_bytes` cap.
   type: bash
   timeout_ms: 60000
   command: |
@@ -183,19 +219,52 @@ tests:
   expected:
     exit_code: 0
     stdout_contains:
-    - PropertyValueTooLarge
-    - '"status_class":"54000"'
+    - '"status_class":"00000"'
     stdout_not_contains:
     - PropertyKeyTooLong
+    - PropertyValueTooLarge
     - '"status_class":"58000"'
-    - '"status_class":"00000"'
-  tags: [property-size, eng-3911, regression, key-assertion, wrong-error, vector]
+    - '"status_class":"54000"'
+  tags: [property-size, eng-3911, regression, key-assertion, overflow, vector]
 
-- name: oversized-string-value-reports-truthful-error
+- name: overflowing-vector-value-reads-back
   description: |
-    KEY ASSERTION (FAILS on v0.8.5) — an 8200-character STRING crosses the same
-    budget and must produce the same truthful refusal. Probed: 58000
-    "PropertyKeyTooLong" (property key is `s`, one character).
+    READBACK for the 2048-dim vector — REPLACES the obsolete
+    `limitation-pin-oversized-value-leaves-a-partial-node` test, which pinned
+    `n.emb IS NULL -> true` (a node persisted WITHOUT the property, behind an
+    error response). The write now succeeds, so the property must be PRESENT and
+    identical to what was written.
+
+    Verified with distance(), NOT size(): `size()` on a VECTOR returns 0 on this
+    build (a separate, pre-existing surface gap — it reads 0 for the 2030-dim
+    inline control too, so it is unrelated to overflow) and would silently
+    assert nothing. `distance(stored, written)` is the stronger check anyway: it
+    raises TypeMismatch on any dimension difference — so a truncated spill CAN
+    NOT pass — and returns exactly 0 only if every element round-tripped.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    V=$(python3 -c "print('['+','.join(['0.5']*2048)+']')")
+    ./zig-out/bin/geode query "MATCH (n:P3911_V48) RETURN n.tag AS t, n.emb IS NULL AS embnull, distance(n.emb, vectorf32(\$v)) AS d" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"v2048"'
+    - '"embnull":false'
+    - '"d":"0.000000"'
+    stdout_not_contains:
+    - TypeMismatch
+  tags: [property-size, eng-3911, regression, key-assertion, overflow, readback, vector]
+
+- name: overflowing-string-value-stores
+  description: |
+    KEY ASSERTION (INVERTED at graph-storage v0.4.0) — an 8200-character STRING
+    crosses the same inline budget (property key `s`, one character). Used to be
+    58000 "PropertyKeyTooLong"; now spills and stores.
   type: bash
   timeout_ms: 60000
   command: |
@@ -207,21 +276,38 @@ tests:
   expected:
     exit_code: 0
     stdout_contains:
-    - PropertyValueTooLarge
-    - '"status_class":"54000"'
+    - '"status_class":"00000"'
     stdout_not_contains:
     - PropertyKeyTooLong
+    - PropertyValueTooLarge
     - '"status_class":"58000"'
-    - '"status_class":"00000"'
-  tags: [property-size, eng-3911, regression, key-assertion, wrong-error, string]
+    - '"status_class":"54000"'
+  tags: [property-size, eng-3911, regression, key-assertion, overflow, string]
 
-- name: oversized-list-value-reports-truthful-error
+- name: overflowing-string-value-reads-back
   description: |
-    KEY ASSERTION (FAILS on v0.8.5) — a 700-element LIST parameter crosses the
-    budget as well (the documented ceiling is 624 elements). Probed: 58000
-    "PropertyKeyTooLong". Included because it is a third, structurally different
-    value type reaching the same mis-attributed error, which is what makes this
-    a mapping defect rather than a vector-specific one.
+    READBACK for the 8200-character string — REPLACES the obsolete
+    `limitation-pin-oversized-string-leaves-a-partial-node` test, which pinned
+    `n.s IS NULL -> true`. The string must now come back at its FULL length:
+    8200, not 8142, not truncated at a page boundary.
+  query: MATCH (n:P3911_S8200) RETURN n.tag AS t, n.s IS NULL AS snull, size(n.s) AS len
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"s8200"'
+    - '"snull":false'
+    - '"len":8200'
+    row_count: 1
+  tags: [property-size, eng-3911, regression, key-assertion, overflow, readback, string]
+
+- name: overflowing-list-value-stores
+  description: |
+    KEY ASSERTION (INVERTED at graph-storage v0.4.0) — a 700-element LIST
+    parameter crosses the inline budget too (the old documented ceiling was 624
+    elements). Kept as a third, structurally different value type: what used to
+    prove the mis-attribution was not vector-specific now proves the overflow
+    path is not vector-specific either.
   type: bash
   timeout_ms: 60000
   command: |
@@ -233,27 +319,44 @@ tests:
   expected:
     exit_code: 0
     stdout_contains:
-    - PropertyValueTooLarge
-    - '"status_class":"54000"'
+    - '"status_class":"00000"'
     stdout_not_contains:
     - PropertyKeyTooLong
+    - PropertyValueTooLarge
     - '"status_class":"58000"'
+    - '"status_class":"54000"'
+  tags: [property-size, eng-3911, regression, key-assertion, overflow, list]
+
+- name: overflowing-list-value-reads-back
+  description: |
+    READBACK for the 700-element list: present, and all 700 elements survive the
+    overflow round-trip.
+  query: MATCH (n:P3911_L700) RETURN n.tag AS t, n.l IS NULL AS lnull, size(n.l) AS len
+  expected:
+    exit_code: 0
+    stdout_contains:
     - '"status_class":"00000"'
-  tags: [property-size, eng-3911, regression, key-assertion, wrong-error, list]
+    - '"t":"l700"'
+    - '"lnull":false'
+    - '"len":700'
+    row_count: 1
+  tags: [property-size, eng-3911, regression, key-assertion, overflow, readback, list]
 
 # ---------------------------------------------------------------------------
 # Guard — a genuine KEY overflow must keep its own key-specific rejection.
+# UNCHANGED by graph-storage v0.4.0.
 # ---------------------------------------------------------------------------
 - name: guard-oversized-property-key-still-a-key-error
   description: |
-    GUARD (green on v0.8.5) — a genuinely oversized property KEY (65600
-    characters) is rejected with a key-specific diagnostic. Probed:
+    GUARD (unchanged) — a genuinely oversized property KEY (65600 characters) is
+    rejected with a key-specific diagnostic:
 
       {"status_class":"42000","error_code":"42000","error":"property key"}
 
     i.e. the parser refuses it before storage is reached, so it never takes the
-    value path at all. Pinned so the ENG-3911 remap stays a targeted fix for the
-    mis-attributed VALUE case and does not relabel key overflows.
+    value path at all. Pinned so raising the value ceiling never turns a key
+    overflow into a value diagnostic — the two remain distinct refusals, in the
+    storage layer (v0.4.0 splits them at the source) and on the wire.
   type: bash
   timeout_ms: 60000
   command: |
@@ -272,79 +375,36 @@ tests:
   tags: [property-size, eng-3911, guard, negative, key]
 
 # ---------------------------------------------------------------------------
-# LIMITATION-PIN — the failing CREATE is not atomic. Current reality, not a
-# desired outcome; out of scope for the ENG-3911 error-mapping fix.
-# ---------------------------------------------------------------------------
-- name: limitation-pin-oversized-value-leaves-a-partial-node
-  description: |
-    LIMITATION-PIN (green on v0.8.5, and expected to stay green through the
-    ENG-3911 fix, which only changes the error text and SQLSTATE).
-
-    The CREATE that failed with the oversized 2048-dim vector still PERSISTED
-    the node: `tag` is stored, `emb` is absent. Probed on v0.8.5:
-
-      MATCH (n:P3911_V48) RETURN n.tag, n.emb IS NULL -> {"t":"v2048","e":true}
-
-    So a caller who received an error nonetheless has a row in the graph that is
-    missing the property they asked for. That is silent partial data and it
-    deserves its own ticket (statement-level atomicity for property writes);
-    pinning it here means the behaviour cannot change unnoticed in either
-    direction.
-  query: MATCH (n:P3911_V48) RETURN n.tag AS t, n.emb IS NULL AS embnull
-  expected:
-    exit_code: 0
-    stdout_contains:
-    - '"status_class":"00000"'
-    - '"t":"v2048"'
-    - '"embnull":true'
-    row_count: 1
-  tags: [property-size, eng-3911, limitation-pin, partial-write]
-
-- name: limitation-pin-oversized-string-leaves-a-partial-node
-  description: |
-    LIMITATION-PIN (green on v0.8.5) — the same partial write for the
-    8200-character string: the node exists with `tag` set and `s` absent.
-  query: MATCH (n:P3911_S8200) RETURN n.tag AS t, n.s IS NULL AS snull
-  expected:
-    exit_code: 0
-    stdout_contains:
-    - '"status_class":"00000"'
-    - '"t":"s8200"'
-    - '"snull":true'
-    row_count: 1
-  tags: [property-size, eng-3911, limitation-pin, partial-write]
-
-# ---------------------------------------------------------------------------
 - name: cleanup-vector-nodes
-  description: Clean up the vector fixture nodes.
+  description: Clean up the inline-vector fixture node.
   query: MATCH (n:P3911_V30) DETACH DELETE n
   expected:
     exit_code: 0
   tags: [cleanup]
 
-- name: cleanup-partial-vector-nodes
-  description: Clean up the partially-written vector node.
+- name: cleanup-overflow-vector-nodes
+  description: Clean up the overflow-vector fixture node.
   query: MATCH (n:P3911_V48) DETACH DELETE n
   expected:
     exit_code: 0
   tags: [cleanup]
 
 - name: cleanup-string-nodes
-  description: Clean up the string fixture node.
+  description: Clean up the inline-string fixture node.
   query: MATCH (n:P3911_S8132) DETACH DELETE n
   expected:
     exit_code: 0
   tags: [cleanup]
 
-- name: cleanup-partial-string-nodes
-  description: Clean up the partially-written string node.
+- name: cleanup-overflow-string-nodes
+  description: Clean up the overflow-string fixture node.
   query: MATCH (n:P3911_S8200) DETACH DELETE n
   expected:
     exit_code: 0
   tags: [cleanup]
 
 - name: cleanup-list-nodes
-  description: Clean up the partially-written list node.
+  description: Clean up the overflow-list fixture node.
   query: MATCH (n:P3911_L700) DETACH DELETE n
   expected:
     exit_code: 0
@@ -355,5 +415,5 @@ tags:
 - eng-3911
 - storage
 - error-mapping
-- limitation-pin
+- overflow
 - regression
