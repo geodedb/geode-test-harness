@@ -1,0 +1,359 @@
+version: '1.0'
+name: Oversized property VALUE reports PropertyKeyTooLong / 58000 (ENG-3911)
+description: |
+  Regression spec for ENG-3911: when a property VALUE crosses the per-entry
+  storage budget, the client is told `PropertyKeyTooLong` with SQLSTATE 58000 —
+  the wrong noun, and a system-error class for what is really a documented
+  resource limit.
+
+  The budget is 8142 bytes per property entry (8192-byte page minus header; an
+  entry is 2 + key.len + encoded value). Crossing it raises
+  `error.PropertyKeyTooLong` inside the graph_storage dependency — a misnomer
+  the dependency's own comment admits — and src/server/proto_util.zig:244 has no
+  arm for it, so the `else` fallback emits `@errorName(err)` under 58000.
+
+  Probed on a scratch server started the way this harness starts one
+  (geode serve --data-dir <tmp> --listen 127.0.0.1:4581, v0.8.5 / 5c37d58a).
+  Every line is real observed output; the property key in each case is `emb`,
+  `s` or `l` — three characters or fewer, nowhere near any key limit:
+
+    vectorf32, 2030 dims      -> 00000                              (CONTROL, fits)
+    vectorf32, 2048 dims      -> 58000 "PropertyKeyTooLong"         (THE BUG)
+    string, 8132 chars        -> 00000                              (CONTROL, fits)
+    string, 8200 chars        -> 58000 "PropertyKeyTooLong"         (THE BUG)
+    list parameter, 700 elems -> 58000 "PropertyKeyTooLong"         (THE BUG)
+    property KEY of 65600+ chars -> 42000 "property key"            (CONTROL —
+                                     a genuine key overflow is rejected by the
+                                     parser and never reaches storage)
+
+  Two independent defects in one response: the message blames the KEY when the
+  VALUE overflowed, sending every operator who reads it down the wrong path; and
+  58000 tells clients and monitoring "the server broke", when the request was
+  refused for a documented limit and the server is perfectly healthy.
+
+  LIMITATION-PIN (partial write, observed, separate ticket): the failing CREATE
+  is NOT atomic. After the 2048-dim and the 8200-char failures the node WAS
+  persisted, carrying its small `tag` property, with the oversized property
+  absent (IS NULL true). Probed:
+
+    MATCH (n) RETURN n.tag, n.emb IS NULL  ->  {"t":"b","e":true}
+
+  That is silent partial data — the caller saw an error and still got a row.
+  It is pinned below as current reality, NOT as desired behaviour, and is out of
+  scope for this fix (which only makes the refusal honest). Raising the
+  8142-byte cap itself is also out of scope: that is a storage-format change.
+
+  POST-FIX CONTRACT encoded below:
+
+    1. The oversized-VALUE refusal carries SQLSTATE 54000
+       (program_limit_exceeded) and a message naming `PropertyValueTooLarge`.
+    2. It must NOT say `PropertyKeyTooLong` and must NOT be 58000.
+    3. Payloads that fit still store and read back unchanged (controls).
+    4. A genuine property-KEY overflow keeps its own key-specific rejection and
+       is not relabelled as a value overflow (guard).
+
+  Big payloads are generated in-test with python3 rather than pasted as
+  literals, so the spec file stays readable.
+
+  Node labels are prefixed P3911_ so this spec cannot collide with any other
+  spec's data.
+
+  Engine-side sibling: tests/test_eng3911_property_value_size_error.zig
+  (`zig build test-eng3911`) pins the proto_util.mapError contract directly.
+
+  CANARY: REQ=REQ-ENG-3911-PROPERTY-VALUE-SIZE-ERROR; FEATURE="PropertyStorage"; ASPECT=OversizedValueErrorMapping; STATUS=TESTED; TEST=geodetestlab/specs/property_value_size_limit.yml; OWNER=transport; UPDATED=2026-08-24
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# Controls — payloads that fit the 8142-byte per-entry budget.
+# ---------------------------------------------------------------------------
+- name: control-2030-dim-vector-stores
+  description: |
+    CONTROL (green on v0.8.5) — the largest VECTOR<f32> that fits the per-entry
+    budget: 2030 dimensions. Bound as a parameter through vectorf32($v), which
+    works since the ENG-3905 fix. Must stay green.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    V=$(python3 -c "print('['+','.join(['0.5']*2030)+']')")
+    ./zig-out/bin/geode query "CREATE (:P3911_V30 {tag: 'v2030', emb: vectorf32(\$v)})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - PropertyValueTooLarge
+  tags: [property-size, eng-3911, control, positive, vector]
+
+- name: control-2030-dim-vector-reads-back
+  description: |
+    CONTROL (green on v0.8.5) — the 2030-dim vector is genuinely persisted: the
+    node is there AND the vector property is not null. Proves the control above
+    stored data rather than merely returning 00000.
+  query: MATCH (n:P3911_V30) RETURN n.tag AS t, n.emb IS NULL AS embnull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"v2030"'
+    - '"embnull":false'
+    row_count: 1
+  tags: [property-size, eng-3911, control, positive, vector]
+
+- name: control-8132-char-string-stores
+  description: |
+    CONTROL (green on v0.8.5) — the largest STRING that fits the per-entry
+    budget: 8132 characters. Must stay green.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    S=$(python3 -c "print('\"'+'x'*8132+'\"')")
+    ./zig-out/bin/geode query "CREATE (:P3911_S8132 {tag: 's8132', s: \$s})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param s "$S" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - PropertyValueTooLarge
+  tags: [property-size, eng-3911, control, positive, string]
+
+- name: control-8132-char-string-reads-back
+  description: |
+    CONTROL (green on v0.8.5) — the 8132-character string round-trips at full
+    length.
+  query: MATCH (n:P3911_S8132) RETURN n.tag AS t, size(n.s) AS len
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"s8132"'
+    - '"len":8132'
+    row_count: 1
+  tags: [property-size, eng-3911, control, positive, string]
+
+# ---------------------------------------------------------------------------
+# Key assertions — oversized VALUES. FAIL on v0.8.5.
+# ---------------------------------------------------------------------------
+- name: oversized-vector-value-reports-truthful-error
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — a 2048-dimension VECTOR<f32> exceeds the
+    8142-byte per-entry budget and must be refused with a TRUTHFUL error naming
+    the VALUE, under SQLSTATE 54000 (program_limit_exceeded). Probed real
+    behaviour on v0.8.5:
+
+      {"status_class":"58000","error_code":"58000","error":"PropertyKeyTooLong"}
+
+    The property key is `emb` — three characters. Post-fix: 54000 with
+    PropertyValueTooLarge, and PropertyKeyTooLong must not appear at all.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    V=$(python3 -c "print('['+','.join(['0.5']*2048)+']')")
+    ./zig-out/bin/geode query "CREATE (:P3911_V48 {tag: 'v2048', emb: vectorf32(\$v)})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param v "$V" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - PropertyValueTooLarge
+    - '"status_class":"54000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - '"status_class":"58000"'
+    - '"status_class":"00000"'
+  tags: [property-size, eng-3911, regression, key-assertion, wrong-error, vector]
+
+- name: oversized-string-value-reports-truthful-error
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — an 8200-character STRING crosses the same
+    budget and must produce the same truthful refusal. Probed: 58000
+    "PropertyKeyTooLong" (property key is `s`, one character).
+  type: bash
+  timeout_ms: 60000
+  command: |
+    S=$(python3 -c "print('\"'+'x'*8200+'\"')")
+    ./zig-out/bin/geode query "CREATE (:P3911_S8200 {tag: 's8200', s: \$s})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param s "$S" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - PropertyValueTooLarge
+    - '"status_class":"54000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - '"status_class":"58000"'
+    - '"status_class":"00000"'
+  tags: [property-size, eng-3911, regression, key-assertion, wrong-error, string]
+
+- name: oversized-list-value-reports-truthful-error
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — a 700-element LIST parameter crosses the
+    budget as well (the documented ceiling is 624 elements). Probed: 58000
+    "PropertyKeyTooLong". Included because it is a third, structurally different
+    value type reaching the same mis-attributed error, which is what makes this
+    a mapping defect rather than a vector-specific one.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    L=$(python3 -c "print('['+','.join(['1']*700)+']')")
+    ./zig-out/bin/geode query "CREATE (:P3911_L700 {tag: 'l700', l: \$l})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 \
+      --param l "$L" 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - PropertyValueTooLarge
+    - '"status_class":"54000"'
+    stdout_not_contains:
+    - PropertyKeyTooLong
+    - '"status_class":"58000"'
+    - '"status_class":"00000"'
+  tags: [property-size, eng-3911, regression, key-assertion, wrong-error, list]
+
+# ---------------------------------------------------------------------------
+# Guard — a genuine KEY overflow must keep its own key-specific rejection.
+# ---------------------------------------------------------------------------
+- name: guard-oversized-property-key-still-a-key-error
+  description: |
+    GUARD (green on v0.8.5) — a genuinely oversized property KEY (65600
+    characters) is rejected with a key-specific diagnostic. Probed:
+
+      {"status_class":"42000","error_code":"42000","error":"property key"}
+
+    i.e. the parser refuses it before storage is reached, so it never takes the
+    value path at all. Pinned so the ENG-3911 remap stays a targeted fix for the
+    mis-attributed VALUE case and does not relabel key overflows.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    K=$(python3 -c "print('k'*65600)")
+    ./zig-out/bin/geode query "CREATE (:P3911_K {\`$K\`: 1})" \
+      --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" --format json --timeout 60 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42000"'
+    - property key
+    stdout_not_contains:
+    - PropertyValueTooLarge
+    - '"status_class":"00000"'
+  tags: [property-size, eng-3911, guard, negative, key]
+
+# ---------------------------------------------------------------------------
+# LIMITATION-PIN — the failing CREATE is not atomic. Current reality, not a
+# desired outcome; out of scope for the ENG-3911 error-mapping fix.
+# ---------------------------------------------------------------------------
+- name: limitation-pin-oversized-value-leaves-a-partial-node
+  description: |
+    LIMITATION-PIN (green on v0.8.5, and expected to stay green through the
+    ENG-3911 fix, which only changes the error text and SQLSTATE).
+
+    The CREATE that failed with the oversized 2048-dim vector still PERSISTED
+    the node: `tag` is stored, `emb` is absent. Probed on v0.8.5:
+
+      MATCH (n:P3911_V48) RETURN n.tag, n.emb IS NULL -> {"t":"v2048","e":true}
+
+    So a caller who received an error nonetheless has a row in the graph that is
+    missing the property they asked for. That is silent partial data and it
+    deserves its own ticket (statement-level atomicity for property writes);
+    pinning it here means the behaviour cannot change unnoticed in either
+    direction.
+  query: MATCH (n:P3911_V48) RETURN n.tag AS t, n.emb IS NULL AS embnull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"v2048"'
+    - '"embnull":true'
+    row_count: 1
+  tags: [property-size, eng-3911, limitation-pin, partial-write]
+
+- name: limitation-pin-oversized-string-leaves-a-partial-node
+  description: |
+    LIMITATION-PIN (green on v0.8.5) — the same partial write for the
+    8200-character string: the node exists with `tag` set and `s` absent.
+  query: MATCH (n:P3911_S8200) RETURN n.tag AS t, n.s IS NULL AS snull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"t":"s8200"'
+    - '"snull":true'
+    row_count: 1
+  tags: [property-size, eng-3911, limitation-pin, partial-write]
+
+# ---------------------------------------------------------------------------
+- name: cleanup-vector-nodes
+  description: Clean up the vector fixture nodes.
+  query: MATCH (n:P3911_V30) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-partial-vector-nodes
+  description: Clean up the partially-written vector node.
+  query: MATCH (n:P3911_V48) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-string-nodes
+  description: Clean up the string fixture node.
+  query: MATCH (n:P3911_S8132) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-partial-string-nodes
+  description: Clean up the partially-written string node.
+  query: MATCH (n:P3911_S8200) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+- name: cleanup-list-nodes
+  description: Clean up the partially-written list node.
+  query: MATCH (n:P3911_L700) DETACH DELETE n
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- property-size
+- eng-3911
+- storage
+- error-mapping
+- limitation-pin
+- regression

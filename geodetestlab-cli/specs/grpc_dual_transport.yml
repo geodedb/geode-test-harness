@@ -1,0 +1,292 @@
+version: '1.0'
+name: gRPC transport — dual-listener deadlock, help drift, plaintext CLI (ENG-3907)
+description: |
+  Regression spec for ENG-3907. The gRPC transport was reported as "removed";
+  it was NEVER removed. It is present, reachable, and carries three distinct
+  defects, all verified on v0.8.5 (5c37d58a):
+
+  (B1) DUAL-TRANSPORT STARTUP DEADLOCK.
+       `geode serve --listen <quic> --listen-grpc <grpc>` binds the gRPC TCP
+       listener and then DEADLOCKS before QUIC is ever bound, so the server
+       serves nothing. Root cause: the gRPC block at src/server/main.zig:
+       2060-2094 scopes its `defer`s to the block, so the gRPC server's deinit
+       (which joins its serving thread) fires at the end of that block instead
+       of at process exit. Probed directly:
+
+         serve --listen 127.0.0.1:4591 --listen-grpc 127.0.0.1:4592
+           -> TCP 4592 LISTENING
+           -> UDP 4591 NOT BOUND
+           -> no "[startup] QUIC transport listening", no "[startup] server ready"
+           -> "warning: thread-pool deinit timed out after 2000ms with 1 active task"
+           -> process hangs until killed
+
+  (B2) `serve --help` DOES NOT DOCUMENT --listen-grpc.
+       The intercept at src/cli/main.zig:857-863 prints a reduced usage block
+       that lists only --data-dir/--listen/--cert/--key/--log-level/
+       --idle-timeout/--persist-interval. The COMPLETE help — the one that does
+       list `--listen-grpc <addr:port>` — lives in
+       src/server/cli_args.zig:207-236 (printHelp) and is DEAD CODE, never
+       reached. An operator has no way to discover the flag from the CLI.
+       (Note: `serve --help` writes to STDERR via std.debug.print, hence the
+       `2>&1` in the test below.)
+
+  (B3) `geode query --grpc` FAILS WITH A BARE `ReadFailed`.
+       The CLI gRPC client is plaintext-only (src/cli/main.zig:1901-1907) while
+       the server's gRPC listener requires TLS. Probed against a live gRPC
+       listener:
+
+         geode query "RETURN 1 AS x" --server 127.0.0.1:4592 --grpc ...
+           -> exit 1, stdout empty, stderr exactly: ReadFailed
+
+       Nine characters, no mention of gRPC, TLS, or what the operator should
+       do. Post-fix contract (either is acceptable): the round trip WORKS, or
+       the CLI emits an actionable error naming both gRPC and TLS. A bare
+       `ReadFailed` satisfies neither.
+
+  WHY THIS SPEC MANAGES ITS OWN SERVER (probe finding, deliberate):
+    Running B1 under the harness-managed server does reproduce the deadlock —
+    the runner retries three times and reports "Server failed to start within
+    60.0 seconds" — but it then reports `{"total":0,"passed":0,"failed":0}` and
+    prints "All tests passed" with exit 0. A spec whose managed server never
+    starts is a FALSE GREEN, so it cannot serve as a red baseline for exactly
+    the bug that stops the server from starting. (That reporting behaviour is a
+    harness defect in its own right and is worth its own ticket; it is recorded
+    here rather than silently worked around.)
+
+    So `server.enabled` is false and the dual-transport server is started, port
+    -probed and torn down explicitly by the bash tests below. Ports are
+    allocated from the ephemeral range at run time, so parallel runs do not
+    collide.
+
+  POST-FIX CONTRACT encoded below:
+    1. `serve --help` lists --listen-grpc.
+    2. `serve --listen X --listen-grpc Y` binds BOTH listeners.
+    3. A plain QUIC query against that dual-transport server succeeds.
+    4. `query --grpc` either round-trips or fails with a message naming gRPC
+       AND TLS — never a bare ReadFailed.
+
+  OUT OF SCOPE: CI release builds compile TLS out (enable_openssl defaults true
+  for native builds only). That is a CI configuration fix and is not observable
+  from this harness, so it is not asserted here.
+
+  CANARY: REQ=REQ-ENG-3907-GRPC-TRANSPORT; FEATURE="GrpcTransport"; ASPECT=DualListenerAndCli; STATUS=TESTED; TEST=geodetestlab/specs/grpc_dual_transport.yml; OWNER=transport; UPDATED=2026-08-24
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+tests:
+# ---------------------------------------------------------------------------
+# B2 — help drift. Needs no server at all.
+# ---------------------------------------------------------------------------
+- name: serve-help-documents-listen-grpc
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — `geode serve --help` must list the
+    --listen-grpc flag. Probed real behaviour: the reduced usage block from
+    src/cli/main.zig:857-863 is printed and --listen-grpc is absent, while the
+    complete help in src/server/cli_args.zig:207-236 that DOES list it is dead
+    code. Help goes to stderr (std.debug.print), so it is merged with 2>&1.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    GEODE_BIN=./zig-out/bin/geode
+    echo "SERVE_HELP_BEGIN"
+    "$GEODE_BIN" serve --help 2>&1
+    echo "SERVE_HELP_END"
+    if "$GEODE_BIN" serve --help 2>&1 | grep -F -- '--listen-grpc' > /dev/null; then
+      echo "LISTEN_GRPC_DOCUMENTED"
+    else
+      echo "LISTEN_GRPC_MISSING_FROM_HELP"
+    fi
+    exit 0
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - LISTEN_GRPC_DOCUMENTED
+    stdout_not_contains:
+    - LISTEN_GRPC_MISSING_FROM_HELP
+  tags: [grpc, eng-3907, cli, help, regression, key-assertion]
+
+# ---------------------------------------------------------------------------
+# B1 — dual-transport startup. Starts the server this spec manages itself.
+# ---------------------------------------------------------------------------
+- name: dual-transport-binds-both-listeners
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — with both --listen and --listen-grpc, the
+    server must bind BOTH the QUIC UDP socket and the gRPC TCP socket.
+
+    Probed real behaviour: the gRPC TCP port accepts connections, the QUIC UDP
+    port is never bound, and the process hangs before "[startup] server ready"
+    with "thread-pool deinit timed out ... 1 active task" — the defer-scoping
+    bug at src/server/main.zig:2060-2094 running the gRPC deinit (which joins
+    the serving thread) at the end of the block.
+
+    Liveness is probed without external tools: a UDP bind that FAILS means the
+    server holds the port, and a successful TCP connect means the gRPC listener
+    is accepting. Up to 30s is allowed for startup.
+  type: bash
+  timeout_ms: 90000
+  command: |
+    GEODE_BIN=./zig-out/bin/geode
+    STATE=/tmp/geode_eng3907
+    rm -rf "$STATE"
+    mkdir -p "$STATE/data"
+
+    PORTS=$(python3 -c "import socket; u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(('127.0.0.1', 0)); qp = u.getsockname()[1]; u.close(); t = socket.socket(); t.bind(('127.0.0.1', 0)); gp = t.getsockname()[1]; t.close(); print(qp, gp)")
+    QP=$(echo "$PORTS" | cut -d' ' -f1)
+    GP=$(echo "$PORTS" | cut -d' ' -f2)
+    printf 'QUIC_PORT=%s\nGRPC_PORT=%s\n' "$QP" "$GP" > "$STATE/ports.env"
+    echo "ALLOCATED quic_udp=$QP grpc_tcp=$GP"
+
+    nohup "$GEODE_BIN" serve \
+      --data-dir "$STATE/data" \
+      --log-level info \
+      --listen 127.0.0.1:"$QP" \
+      --listen-grpc 127.0.0.1:"$GP" \
+      > "$STATE/server.log" 2>&1 &
+    echo $! > "$STATE/server.pid"
+
+    QUIC_OK=0
+    GRPC_OK=0
+    I=0
+    while [ "$I" -lt 60 ]; do
+      # A UDP bind that FAILS means the server already holds the QUIC port.
+      if ! python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('127.0.0.1', $QP))" > /dev/null 2>&1; then
+        QUIC_OK=1
+      fi
+      # A TCP connect that SUCCEEDS means the gRPC listener is accepting.
+      if python3 -c "import socket; s = socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', $GP))" > /dev/null 2>&1; then
+        GRPC_OK=1
+      fi
+      if [ "$QUIC_OK" -eq 1 ] && [ "$GRPC_OK" -eq 1 ]; then
+        break
+      fi
+      I=$((I + 1))
+      sleep 0.5
+    done
+
+    if [ "$GRPC_OK" -eq 1 ]; then echo "GRPC_TCP_BOUND"; else echo "GRPC_TCP_NOT_BOUND"; fi
+    if [ "$QUIC_OK" -eq 1 ]; then echo "QUIC_UDP_BOUND"; else echo "QUIC_UDP_NOT_BOUND"; fi
+
+    echo "SERVER_LOG_TAIL_BEGIN"
+    tail -n 15 "$STATE/server.log" 2>&1
+    echo "SERVER_LOG_TAIL_END"
+    exit 0
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GRPC_TCP_BOUND
+    - QUIC_UDP_BOUND
+    stdout_not_contains:
+    - QUIC_UDP_NOT_BOUND
+    - GRPC_TCP_NOT_BOUND
+  tags: [grpc, eng-3907, transport, deadlock, regression, key-assertion]
+
+- name: dual-transport-quic-query-succeeds
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — with a gRPC listener configured, ordinary
+    QUIC clients must keep working. Today the QUIC socket is never bound, so
+    this connection cannot be established at all: the server is serving nothing.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    GEODE_BIN=./zig-out/bin/geode
+    STATE=/tmp/geode_eng3907
+    . "$STATE/ports.env"
+    echo "QUIC_RESULT_BEGIN"
+    "$GEODE_BIN" query "RETURN 1 AS x" \
+      --server 127.0.0.1:"$QUIC_PORT" $GEODE_CLIENT_TLS \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" \
+      --format json --timeout 20 2>&1
+    echo "QUIC_RESULT_END"
+    exit 0
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+  tags: [grpc, eng-3907, transport, deadlock, regression, key-assertion]
+
+# ---------------------------------------------------------------------------
+# B3 — the CLI gRPC client.
+# ---------------------------------------------------------------------------
+- name: grpc-cli-either-works-or-explains-itself
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — `geode query --grpc` against the gRPC
+    listener must EITHER round-trip successfully OR fail with an actionable
+    message that names both gRPC and TLS. Probed real behaviour: exit 1, empty
+    stdout, stderr exactly `ReadFailed` — the plaintext-only CLI client
+    (src/cli/main.zig:1901-1907) meeting a TLS-required listener, reported as a
+    raw socket error.
+
+    The contract is expressed as a three-way classification so the fixer can
+    satisfy it either way, and the raw CLI output is echoed between markers so a
+    failure is self-explanatory.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    GEODE_BIN=./zig-out/bin/geode
+    STATE=/tmp/geode_eng3907
+    . "$STATE/ports.env"
+    OUT=$("$GEODE_BIN" query "RETURN 1 AS x" \
+      --server 127.0.0.1:"$GRPC_PORT" --grpc \
+      -U geode -P "$GEODE_ADMIN_PASSWORD" \
+      --format json --timeout 20 2>&1)
+    echo "GRPC_CLI_OUTPUT_BEGIN"
+    echo "$OUT"
+    echo "GRPC_CLI_OUTPUT_END"
+    if echo "$OUT" | grep -F '"status_class":"00000"' > /dev/null; then
+      echo "GRPC_CLI_CONTRACT_OK_ROUNDTRIP"
+    elif echo "$OUT" | grep -i -F 'grpc' > /dev/null && echo "$OUT" | grep -i -F 'tls' > /dev/null; then
+      echo "GRPC_CLI_CONTRACT_OK_ACTIONABLE_ERROR"
+    else
+      echo "GRPC_CLI_CONTRACT_VIOLATED_OPAQUE_ERROR"
+    fi
+    exit 0
+  expected:
+    exit_code: 0
+    stdout_regex:
+    - GRPC_CLI_CONTRACT_OK_(ROUNDTRIP|ACTIONABLE_ERROR)
+    stdout_not_contains:
+    - GRPC_CLI_CONTRACT_VIOLATED_OPAQUE_ERROR
+  tags: [grpc, eng-3907, cli, regression, key-assertion]
+
+# ---------------------------------------------------------------------------
+- name: cleanup-stop-dual-transport-server
+  description: |
+    Tear down the spec-managed server. Deliberately tolerant: on v0.8.5 the
+    process is deadlocked with a hung thread-pool join, so SIGTERM may not be
+    enough and SIGKILL is used as the fallback.
+  type: bash
+  timeout_ms: 30000
+  command: |
+    STATE=/tmp/geode_eng3907
+    if [ -f "$STATE/server.pid" ]; then
+      PID=$(cat "$STATE/server.pid")
+      kill "$PID" 2> /dev/null || true
+      sleep 2
+      kill -9 "$PID" 2> /dev/null || true
+    fi
+    rm -rf "$STATE"
+    echo "DUAL_TRANSPORT_SERVER_STOPPED"
+    exit 0
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - DUAL_TRANSPORT_SERVER_STOPPED
+  tags: [cleanup]
+
+tags:
+- grpc
+- eng-3907
+- transport
+- cli
+- deadlock
+- regression

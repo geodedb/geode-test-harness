@@ -1,0 +1,389 @@
+version: '1.0'
+name: IN / NOT IN — non-LIST right-hand side fails open (ENG-3910)
+description: |
+  Regression spec for ENG-3910: the IN / NOT IN predicate silently returns a
+  wrong boolean when its right-hand side is not a LIST, and the two spellings
+  fail in OPPOSITE directions:
+
+    src/eval.zig:1142  .InListExpr    -> if (list_val != .List) return Bool(false)
+    src/eval.zig:1155  .NotInListExpr -> if (list_val != .List) return Bool(true)
+
+  A client that binds a scalar where a list belongs — the classic
+  `--param s '"a string"'` typo, or a driver that serialised a single-element
+  collection as a scalar — gets SILENT wrong answers:
+
+    WHERE d.x IN $scalar      -> matches NOTHING     (looks like "no results")
+    WHERE NOT d.x IN $scalar  -> matches EVERYTHING  (fail-OPEN)
+
+  If that predicate carries an authorization decision (`WHERE NOT u.role IN
+  $blocked_roles`), a one-character parameter mistake converts a deny-list into
+  an allow-all and the query still reports SQLSTATE 00000.
+
+  Probed on a scratch server (v0.8.5 / 5c37d58a), two :C3910 nodes with x = 1
+  and x = 2 — every line is real observed output:
+
+    --param s '"a string"'   WHERE d.x IN $s        -> 00000, 0 rows   (THE BUG)
+    --param s '"a string"'   WHERE NOT d.x IN $s    -> 00000, 2 rows   (THE BUG,
+                                                        fail-open direction)
+    --param n '7'            WHERE d.x IN $n        -> 00000, 0 rows   (THE BUG)
+    RETURN 1 IN 'abc'                               -> 00000, false    (THE BUG)
+    --param l '[1]'          WHERE d.x IN $l        -> 00000, 1 row    (CONTROL)
+    --param l '[1]'          WHERE NOT d.x IN $l    -> 00000, 1 row    (CONTROL)
+
+  NULL PROBE — the triage expected NULL to already follow ISO three-valued
+  logic. It does NOT; NULL takes the same two faulty lines:
+
+    RETURN 1 IN null                                -> 00000, false
+                                                       (ISO: UNKNOWN / null)
+    --param z 'null'         WHERE NOT d.x IN $z    -> 00000, 2 rows
+                                                       (ISO: 0 rows — UNKNOWN
+                                                        is not TRUE)
+    --param z 'null'         WHERE d.x IN $z        -> 00000, 0 rows
+                                                       (right answer, wrong
+                                                        reason: FALSE and
+                                                        UNKNOWN both filter out)
+
+  So the NULL cases below are KEY ASSERTIONS, not controls: they fail today and
+  are part of the fix contract, which is that the two lines stop inventing a
+  definite boolean for ANY non-list right-hand side.
+
+  POST-FIX CONTRACT encoded below:
+
+    1. A non-NULL, non-LIST right-hand side is a TYPE ERROR — a data-exception
+       class (22xxx) status, never 00000. Asserted as `"status_class":"22`
+       plus an explicit ban on 00000, so the fixer picks the exact code.
+    2. A NULL right-hand side yields UNKNOWN for both IN and NOT IN: the row is
+       filtered out either way, and `RETURN 1 IN null` projects null.
+    3. A genuine LIST right-hand side keeps its EXACT current semantics —
+       membership, non-membership, and the empty list. These controls are green
+       today and are what stops the fix from being "error on everything".
+
+  `geode query` returns exit 0 for GQL-level outcomes, so exit_code proves
+  nothing on its own; every key assertion pins the status_class or the row
+  values themselves.
+
+  Node labels are prefixed I3910_ so this spec cannot collide with any other
+  spec's data.
+
+  Engine-side sibling: tests/test_eng3910_in_type_safety.zig
+  (`zig build test-eng3910`).
+
+  CANARY: REQ=REQ-ENG-3910-IN-PREDICATE-TYPE-SAFETY; FEATURE="InOperator"; ASPECT=NonListRightHandSide; STATUS=TESTED; TEST=geodetestlab/specs/in_predicate_type_safety.yml; OWNER=eval; UPDATED=2026-08-24
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# Fixture — two rows to filter.
+# ---------------------------------------------------------------------------
+- name: setup-seed-node-1
+  description: Fixture — first row (x = 1).
+  query: 'CREATE (:I3910_N {x: 1})'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [in-predicate, eng-3910, setup]
+
+- name: setup-seed-node-2
+  description: Fixture — second row (x = 2).
+  query: 'CREATE (:I3910_N {x: 2})'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [in-predicate, eng-3910, setup]
+
+- name: setup-verify-two-rows
+  description: |
+    Fixture check — exactly two rows exist. Makes the "matched everything"
+    assertions below meaningful (2 is the whole table).
+  query: MATCH (d:I3910_N) RETURN count(d) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+    row_count: 1
+  tags: [in-predicate, eng-3910, setup]
+
+# ---------------------------------------------------------------------------
+# Controls — a genuine LIST right-hand side. Green on v0.8.5, must stay green.
+# ---------------------------------------------------------------------------
+- name: control-list-param-in-matches-membership
+  description: |
+    CONTROL (green on v0.8.5) — a LIST parameter selects exactly the member row.
+    This is the working shape the fix must not disturb.
+  args:
+  - query
+  - --param
+  - l
+  - '[1]'
+  - MATCH (d:I3910_N) WHERE d.x IN $l RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+    stdout_not_contains:
+    - '"x":2'
+    row_count: 1
+  tags: [in-predicate, eng-3910, control, positive]
+
+- name: control-list-param-not-in-matches-complement
+  description: |
+    CONTROL (green on v0.8.5) — NOT IN over a LIST selects exactly the
+    complement.
+  args:
+  - query
+  - --param
+  - l
+  - '[1]'
+  - MATCH (d:I3910_N) WHERE NOT d.x IN $l RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":2'
+    stdout_not_contains:
+    - '"x":1'
+    row_count: 1
+  tags: [in-predicate, eng-3910, control, positive]
+
+- name: control-empty-list-param-is-not-a-type-error
+  description: |
+    CONTROL (green on v0.8.5) — an EMPTY list is still a list: nothing is in it.
+    Guards against a fix that treats "no members" as "not a list".
+  args:
+  - query
+  - --param
+  - l
+  - '[]'
+  - MATCH (d:I3910_N) WHERE d.x IN $l RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"x":1'
+    - '"x":2'
+    row_count: 0
+  tags: [in-predicate, eng-3910, control, positive]
+
+- name: control-empty-list-param-not-in-matches-all
+  description: |
+    CONTROL (green on v0.8.5) — and everything is NOT in an empty list, so both
+    rows come back. This must remain a success, not become a type error.
+  args:
+  - query
+  - --param
+  - l
+  - '[]'
+  - MATCH (d:I3910_N) WHERE NOT d.x IN $l RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+    - '"x":2'
+    row_count: 2
+  tags: [in-predicate, eng-3910, control, positive]
+
+# ---------------------------------------------------------------------------
+# Key assertions — scalar right-hand side. FAIL on v0.8.5.
+# ---------------------------------------------------------------------------
+- name: string-param-in-is-a-type-error
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — `WHERE d.x IN $s` with a STRING parameter
+    must be a type error, not a silent empty result set. Probed real behaviour:
+    00000 with 0 rows, indistinguishable from "your data genuinely has no
+    matches". Post-fix: a 22xxx data-exception status.
+  args:
+  - query
+  - --param
+  - s
+  - '"a string"'
+  - MATCH (d:I3910_N) WHERE d.x IN $s RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [in-predicate, eng-3910, regression, key-assertion, fail-open]
+
+- name: string-param-not-in-is-a-type-error
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — THE FAIL-OPEN. `WHERE NOT d.x IN $s` with
+    a STRING parameter returned 00000 and ALL 2 rows on v0.8.5: every row passes
+    a predicate the author wrote to exclude rows. Post-fix: a 22xxx type error,
+    and in particular NOT a success carrying the whole table.
+  args:
+  - query
+  - --param
+  - s
+  - '"a string"'
+  - MATCH (d:I3910_N) WHERE NOT d.x IN $s RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+    - '"x":2'
+  tags: [in-predicate, eng-3910, regression, key-assertion, fail-open]
+
+- name: integer-param-in-is-a-type-error
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — an INTEGER parameter is equally not a
+    list. Probed: 00000, 0 rows. Included because a driver collapsing a
+    one-element collection to a scalar produces exactly this shape.
+  args:
+  - query
+  - --param
+  - n
+  - '7'
+  - MATCH (d:I3910_N) WHERE d.x IN $n RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [in-predicate, eng-3910, regression, key-assertion, fail-open]
+
+- name: integer-param-not-in-is-a-type-error
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the fail-open direction for an INTEGER
+    parameter. Probed: 00000 with both rows returned.
+  args:
+  - query
+  - --param
+  - n
+  - '7'
+  - MATCH (d:I3910_N) WHERE NOT d.x IN $n RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+    - '"x":2'
+  tags: [in-predicate, eng-3910, regression, key-assertion, fail-open]
+
+- name: string-literal-in-is-a-type-error
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the same defect with no parameter
+    involved at all: `RETURN 1 IN 'abc'` returned 00000 with the value false.
+    Proves the bug lives in the evaluator, not in parameter binding.
+  query: RETURN 1 IN 'abc' AS r
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"r":false'
+  tags: [in-predicate, eng-3910, regression, key-assertion, fail-open]
+
+# ---------------------------------------------------------------------------
+# Key assertions — NULL right-hand side (ISO three-valued logic).
+# These FAIL on v0.8.5 too: the probe showed NULL takes the same faulty lines.
+# ---------------------------------------------------------------------------
+- name: null-literal-in-yields-unknown
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — ISO/IEC 39075 three-valued logic:
+    `1 IN NULL` is UNKNOWN, which projects as null. Probed real behaviour on
+    v0.8.5: 00000 with the value FALSE — a definite answer invented out of an
+    unknown. Post-fix: null.
+  query: RETURN 1 IN null AS r
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"r":null'
+    stdout_not_contains:
+    - '"r":false'
+    - '"r":true'
+    row_count: 1
+  tags: [in-predicate, eng-3910, regression, key-assertion, three-valued-logic]
+
+- name: null-param-not-in-filters-every-row
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — UNKNOWN is not TRUE, so a WHERE over
+    `NOT d.x IN $null` must admit NO rows. Probed real behaviour: 00000 with ALL
+    2 rows — the same fail-open shape as the scalar case, reached through NULL.
+  args:
+  - query
+  - --param
+  - z
+  - 'null'
+  - MATCH (d:I3910_N) WHERE NOT d.x IN $z RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"x":1'
+    - '"x":2'
+    row_count: 0
+  tags: [in-predicate, eng-3910, regression, key-assertion, three-valued-logic]
+
+- name: null-param-in-filters-every-row
+  description: |
+    PIN (green on v0.8.5, right answer for the wrong reason) — `WHERE d.x IN
+    $null` admits no rows today because FALSE filters out, and must still admit
+    no rows post-fix because UNKNOWN filters out. Kept so the NULL half of the
+    contract is pinned in both directions rather than only where it is
+    currently wrong.
+  args:
+  - query
+  - --param
+  - z
+  - 'null'
+  - MATCH (d:I3910_N) WHERE d.x IN $z RETURN d.x AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"x":1'
+    - '"x":2'
+    row_count: 0
+  tags: [in-predicate, eng-3910, control, three-valued-logic]
+
+# ---------------------------------------------------------------------------
+- name: cleanup-nodes
+  description: Clean up the fixture rows.
+  query: MATCH (d:I3910_N) DETACH DELETE d
+  expected:
+    exit_code: 0
+  tags: [cleanup]
+
+tags:
+- in-predicate
+- eng-3910
+- expressions
+- type-safety
+- fail-open
+- three-valued-logic
+- regression

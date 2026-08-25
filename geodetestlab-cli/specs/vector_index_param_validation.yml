@@ -1,0 +1,318 @@
+version: '1.0'
+name: CREATE INDEX WITH parameters — validation (ENG-3906)
+description: |
+  Regression spec for ENG-3906: `CREATE INDEX ... WITH (...)` index parameters
+  are only half-validated, and the half that IS validated is reachable by
+  exactly ONE of the two spellings the parser accepts.
+
+  (A1) THE COLON SPELLING BYPASSES METRIC VALIDATION.
+       src/gql/parser.zig:5151 captures `metric` only when the next token is
+       `.eq`, so the ISO map spelling `metric: 'x'` never reaches the validator
+       at src/execution.zig:1585-1597 and `ci.metric` stays null.
+
+  (A2) UNKNOWN / UNSUPPORTED WITH KEYS ARE SILENTLY DISCARDED.
+       The parser's WITH loop (src/gql/parser.zig:5140-5175) advances past every
+       token it does not recognise. A typo'd parameter, or an HNSW tuning knob
+       this engine does not implement, is accepted and thrown away. The operator
+       believes they tuned the index; nothing happened.
+
+  Probed on a scratch server (geode serve --data-dir <tmp> --listen 127.0.0.1:4581),
+  every line below is real observed output on v0.8.5 (5c37d58a):
+
+    WITH (metric = 'banana')                        -> 42704 "Unknown vector
+                                                       distance metric ..."   (CORRECT)
+    WITH (metric: 'banana')                         -> 00000                  (THE BUG)
+    USING HNSW WITH (metric: 'banana')              -> 00000                  (THE BUG)
+    WITH (banana: 42)                               -> 00000                  (THE BUG)
+    WITH (banana = 42)                              -> 00000                  (THE BUG)
+    WITH (m: 16, ef_construction: 200, ef_search: 100) -> 00000               (THE BUG)
+    WITH (metric = 'cosine', ef_construction = 200, M = 16) -> 00000          (THE BUG)
+    WITH (metric = 'cosine')                        -> 00000                  (CONTROL)
+    WITH (metric: 'cosine' | 'l2' | 'euclidean' | 'dot' | 'dot_product'
+          | 'inner_product')                        -> 00000                  (CONTROL)
+
+  POST-FIX CONTRACT encoded below:
+
+    1. `metric` validates IDENTICALLY in the `=` and `:` spellings, for every
+       USING alias that selects the vector index type (vector / HNSW /
+       vector_f32): a bad metric is 42704 in BOTH.
+    2. Every supported metric (l2, euclidean, cosine, dot, dot_product,
+       inner_product; case-insensitive) is still ACCEPTED in both spellings.
+       These are the guards against "fix it by rejecting everything".
+    3. STRICT REJECTION: on a vector-typed index, any WITH key other than
+       `metric` is an error in class 42 (the agreed shape is 42704-family,
+       undefined object). The key-assertion tests below require a class-42
+       status AND explicitly forbid 00000, rather than pinning one exact
+       5-character code the fixer has not chosen yet.
+
+  SCOPE NOTE (deliberate, not an oversight): strict rejection is asserted only
+  for vector-typed indexes, matching where the existing metric validation lives.
+  Non-vector index types discard their WITH parameters too — probed:
+  `CREATE INDEX ... USING btree WITH (fillfactor: 70)` -> 00000 — but that is
+  outside the ENG-3906 blast radius and is NOT asserted here in either
+  direction, so this spec stays valid whichever way that is decided later.
+
+  `geode query` returns exit 0 for GQL-level outcomes, so exit_code proves
+  nothing on its own; every key assertion pins the status_class itself.
+
+  Index names and labels are prefixed V3906_ so this spec cannot collide with
+  any other spec's catalog entries.
+
+  Engine-side sibling: tests/test_eng3906_index_with_params.zig
+  (`zig build test-eng3906`).
+
+  CANARY: REQ=REQ-ENG-3906-INDEX-WITH-PARAM-VALIDATION; FEATURE="VectorIndex"; ASPECT=WithParameterValidation; STATUS=TESTED; TEST=geodetestlab/specs/vector_index_param_validation.yml; OWNER=index; UPDATED=2026-08-24
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# Controls — the `=` spelling, which already behaves correctly.
+# ---------------------------------------------------------------------------
+- name: control-eq-good-metric-accepted
+  description: |
+    CONTROL (green on v0.8.5) — a supported metric in the `=` spelling is
+    accepted. Must stay green after the fix.
+  query: CREATE INDEX V3906_eq_ok ON V3906EqOk (emb) USING vector WITH (metric = 'cosine')
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, control, positive]
+
+- name: control-eq-bad-metric-rejected
+  description: |
+    CONTROL (green on v0.8.5) — an unknown metric in the `=` spelling is
+    correctly rejected with 42704. This is the behaviour the `:` spelling must
+    be made to match; if this test ever goes red the fix broke the working half.
+  query: CREATE INDEX V3906_eq_bad ON V3906EqBad (emb) USING vector WITH (metric = 'banana')
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42704"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, control, negative]
+
+# ---------------------------------------------------------------------------
+# A1 — the colon spelling must validate identically. FAILS on v0.8.5.
+# ---------------------------------------------------------------------------
+- name: colon-bad-metric-rejected
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — `WITH (metric: 'banana')` must be rejected
+    exactly like `WITH (metric = 'banana')`. Probed real behaviour on v0.8.5:
+    status_class 00000, index created with no metric at all. Post-fix: 42704.
+  query: "CREATE INDEX V3906_colon_bad ON V3906ColonBad (emb) USING vector WITH (metric: 'banana')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42704"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, regression, key-assertion, silent-accept]
+
+- name: colon-bad-metric-rejected-hnsw-alias
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — same defect reached through the HNSW
+    spelling of the vector index type. v0.8.5: 00000.
+  query: "CREATE INDEX V3906_colon_bad_hnsw ON V3906ColonBadHnsw (emb) USING HNSW WITH (metric: 'banana')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42704"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, regression, key-assertion, silent-accept]
+
+- name: colon-bad-metric-rejected-vector-f32-alias
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — and through the vector_f32 alias.
+    v0.8.5: 00000.
+  query: "CREATE INDEX V3906_colon_bad_f32 ON V3906ColonBadF32 (emb) USING vector_f32 WITH (metric: 'banana')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42704"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, regression, key-assertion, silent-accept]
+
+# ---------------------------------------------------------------------------
+# A1 guards — every supported metric must still be accepted, both spellings.
+# Green on v0.8.5; these are what stops the fix from being "reject everything".
+# ---------------------------------------------------------------------------
+- name: guard-colon-metric-l2-accepted
+  description: GUARD (green on v0.8.5) — l2 in the `:` spelling stays accepted.
+  query: "CREATE INDEX V3906_co_l2 ON V3906CoL2 (emb) USING vector WITH (metric: 'l2')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, guard, positive]
+
+- name: guard-colon-metric-euclidean-accepted
+  description: GUARD (green on v0.8.5) — euclidean in the `:` spelling.
+  query: "CREATE INDEX V3906_co_eu ON V3906CoEu (emb) USING vector WITH (metric: 'euclidean')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, guard, positive]
+
+- name: guard-colon-metric-cosine-accepted
+  description: GUARD (green on v0.8.5) — cosine in the `:` spelling.
+  query: "CREATE INDEX V3906_co_cos ON V3906CoCos (emb) USING vector WITH (metric: 'cosine')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, guard, positive]
+
+- name: guard-colon-metric-dot-accepted
+  description: GUARD (green on v0.8.5) — dot in the `:` spelling.
+  query: "CREATE INDEX V3906_co_dot ON V3906CoDot (emb) USING vector WITH (metric: 'dot')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, guard, positive]
+
+- name: guard-colon-metric-dot-product-accepted
+  description: GUARD (green on v0.8.5) — dot_product in the `:` spelling.
+  query: "CREATE INDEX V3906_co_dotp ON V3906CoDotp (emb) USING vector WITH (metric: 'dot_product')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, guard, positive]
+
+- name: guard-colon-metric-inner-product-accepted
+  description: GUARD (green on v0.8.5) — inner_product in the `:` spelling.
+  query: "CREATE INDEX V3906_co_inner ON V3906CoInner (emb) USING vector WITH (metric: 'inner_product')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, guard, positive]
+
+- name: guard-colon-metric-case-insensitive-accepted
+  description: |
+    GUARD (green on v0.8.5) — metric names match case-insensitively
+    (std.ascii.eqlIgnoreCase); the `:` spelling must keep that.
+  query: "CREATE INDEX V3906_co_case ON V3906CoCase (emb) USING HNSW WITH (metric: 'CoSiNe')"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, guard, positive]
+
+- name: guard-no-with-clause-accepted
+  description: |
+    GUARD (green on v0.8.5) — a vector index with no WITH clause at all is still
+    valid; strict rejection must not require a metric.
+  query: CREATE INDEX V3906_no_with ON V3906NoWith (emb) USING vector
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, guard, positive]
+
+# ---------------------------------------------------------------------------
+# A2 — unknown WITH keys must be rejected, not discarded. FAILS on v0.8.5.
+# ---------------------------------------------------------------------------
+- name: unknown-with-key-colon-rejected
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — a WITH key this engine does not implement
+    must be refused, not swallowed. Probed real behaviour: 00000, parameter
+    discarded. Post-fix: a class-42 (undefined-object family, agreed 42704)
+    error. The assertion requires class 42 and explicitly forbids 00000, so the
+    fixer is free to pick the exact code within that family.
+  query: 'CREATE INDEX V3906_unk_colon ON V3906UnkColon (emb) USING vector WITH (banana: 42)'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, regression, key-assertion, silent-accept]
+
+- name: unknown-with-key-eq-rejected
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the same unknown key in the `=` spelling.
+    v0.8.5: 00000.
+  query: CREATE INDEX V3906_unk_eq ON V3906UnkEq (emb) USING vector WITH (banana = 42)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, regression, key-assertion, silent-accept]
+
+- name: unimplemented-hnsw-tuning-params-rejected
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the HNSW tuning knobs operators copy out
+    of Neo4j / pgvector documentation (m, ef_construction, ef_search) are NOT
+    implemented by this engine. Accepting them is a correctness lie about the
+    index that was actually built: the operator thinks they configured recall
+    and build cost, and did not. Probed: 00000.
+  query: 'CREATE INDEX V3906_unk_hnsw ON V3906UnkHnsw (emb) USING vector WITH (m: 16, ef_construction: 200, ef_search: 100)'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, regression, key-assertion, silent-accept]
+
+- name: valid-metric-does-not-license-unknown-keys
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — a valid `metric` travelling in the same
+    WITH clause must not smuggle unknown keys through. Probed: 00000 (the metric
+    is honoured, ef_construction and M are dropped on the floor).
+  query: CREATE INDEX V3906_unk_mixed ON V3906UnkMixed (emb) USING vector WITH (metric = 'cosine', ef_construction = 200, M = 16)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, regression, key-assertion, silent-accept]
+
+- name: valid-metric-does-not-license-unknown-keys-colon
+  description: |
+    KEY ASSERTION (FAILS on v0.8.5) — the same, in the `:` spelling. v0.8.5:
+    00000.
+  query: "CREATE INDEX V3906_unk_mixed_co ON V3906UnkMixedCo (emb) USING vector WITH (metric: 'cosine', ef_search: 100)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector-index, eng-3906, regression, key-assertion, silent-accept]
+
+tags:
+- vector-index
+- eng-3906
+- ddl
+- validation
+- silent-accept
+- regression
