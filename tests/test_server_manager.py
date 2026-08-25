@@ -1,12 +1,7 @@
 """Unit tests for lib/server_manager.py."""
 
-import os
-import signal
 import socket
-import subprocess
 import sys
-import tempfile
-import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,7 +10,7 @@ import pytest
 # Add lib to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lib.server_manager import ServerManager
+from lib.server_manager import DEFAULT_ADMIN_PASSWORD, ServerManager
 
 
 class TestServerManagerInit:
@@ -42,7 +37,8 @@ class TestServerManagerInit:
         assert manager.args == []
         assert manager.env == {}
         assert manager.verbose is False
-        assert manager.disable_auth is True
+        assert manager.grpc_port is None
+        assert manager.admin_password == DEFAULT_ADMIN_PASSWORD
         assert manager.process is None
 
     def test_custom_values(self):
@@ -50,22 +46,24 @@ class TestServerManagerInit:
         manager = ServerManager(
             binary_path="/path/to/geode",
             port=8443,
+            grpc_port=50055,
             data_dir="/custom/data",
             startup_timeout_ms=30000,
             cleanup=False,
             args=["--flag"],
             env={"KEY": "VALUE"},
             verbose=True,
-            disable_auth=False,
+            admin_password="CustomPassword123!",
         )
         assert manager.port == 8443
+        assert manager.grpc_port == 50055
         assert manager.data_dir == "/custom/data"
         assert manager.startup_timeout_ms == 30000
         assert manager.cleanup is False
         assert manager.args == ["--flag"]
         assert manager.env == {"KEY": "VALUE"}
         assert manager.verbose is True
-        assert manager.disable_auth is False
+        assert manager.admin_password == "CustomPassword123!"
 
 
 class TestServerManagerAddress:
@@ -81,6 +79,16 @@ class TestServerManagerAddress:
         manager = ServerManager(binary_path="/fake/geode")
         assert f":{manager.port}" in manager.address
 
+    def test_grpc_address_none_when_disabled(self):
+        """gRPC address should be None when no gRPC port is configured."""
+        manager = ServerManager(binary_path="/fake/geode")
+        assert manager.grpc_address is None
+
+    def test_grpc_address_format(self):
+        """gRPC address should be in host:port format when configured."""
+        manager = ServerManager(binary_path="/fake/geode", grpc_port=50051)
+        assert manager.grpc_address == "127.0.0.1:50051"
+
 
 class TestServerManagerStart:
     """Tests for ServerManager.start method."""
@@ -95,7 +103,10 @@ class TestServerManagerStart:
             mock_process.poll.return_value = None
             mock_popen.return_value = mock_process
 
-            with patch("socket.socket"):
+            # os.killpg must be patched: the timeout path calls stop(), and the
+            # mocked process pid would otherwise resolve to process group 0,
+            # sending SIGTERM to the test runner's own process group.
+            with patch("socket.socket"), patch("os.killpg"):
                 try:
                     # Will timeout but data_dir should be set
                     manager.startup_timeout_ms = 100
