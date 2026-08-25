@@ -117,28 +117,38 @@ tests:
   tags: [phase6, positive, abac]
 
   # ============================================================================
-  # NEGATIVE: a policy with an unsupported predicate is parser-accepted but
-  # does NOT grant access (Phase 6 compileExpression returns null for unknown
-  # syntax → compiled = null → policy skipped by decide()).
+  # NEGATIVE: a policy with an unsupported predicate is REFUSED at DDL time.
+  # (ENG-3915, 2026-08-25. Formerly: parser-accepted, stored compiled=null and
+  # skipped by decide() — an inert policy installed with zero error signal.)
   # ============================================================================
 - name: phase6-create-unsupported-expression-policy
   description: |
-    POSITIVE/NEGATIVE — CREATE POLICY with an unsupported expression
-    (e.g. `user.department == 'eng'` — `==` and `user.X` are not in the
-    Phase 6 supported subset). The parser fails silently → compiled=null;
-    the catalog still records the policy. SHOW POLICIES shows it but
-    decide() will not match it.
+    NEGATIVE (flipped by ENG-3915, 2026-08-25) — CREATE POLICY with an
+    unsupported expression (`user.department == 'eng'` — neither `==` nor
+    `user.X` is in the Phase 6 supported subset) is now REFUSED at DDL time
+    with SQLSTATE 42000.
+
+    This test formerly asserted exit 0 / "Policy created": the compile
+    failure was swallowed by `compileExpression(...) catch null` and the
+    catalog recorded an inert policy that decide() fail-closed. The author
+    got no signal that their policy would never grant anything. ENG-3915
+    routes the DDL path through PolicyCatalog.addPolicyStrict, which
+    surfaces the compile error instead of storing compiled=null.
   args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY phase6_bad_expr ON GRAPH * FOR WRITE USING user.department == 'engineering']
   expect:
     exit_code: 0
-    stdout_contains: [Policy created]
+    stdout_contains: ['42000', Unsupported policy USING expression]
+    stdout_not_contains: ['"status_class":"00000"', Policy created]
   tags: [phase6, negative, abac]
 
 - name: phase6-bob-still-denied-write-with-bad-expr-policy
   description: |
-    NEGATIVE — phase6_bob (readonly) attempts CREATE despite the
-    phase6_bad_expr policy existing. Because the expression failed to
-    compile, the policy doesn't match anyone — bob is still denied.
+    NEGATIVE — phase6_bob (readonly) attempts CREATE. The phase6_bad_expr
+    policy no longer exists at all (refused above), so bob is denied by his
+    role. Before ENG-3915 the policy DID exist and bob was denied because it
+    could never match; either way the security outcome is identical, which is
+    why ENG-3915 removes no working behaviour — it only makes the authoring
+    failure visible.
   args: [query, -U, phase6_bob, -P, bob-pass-1234, '-']
   stdin: 'CREATE (n:Phase6BobNode {v: 1}) RETURN n'
   expect:

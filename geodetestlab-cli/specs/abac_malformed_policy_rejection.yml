@@ -9,29 +9,45 @@ description: |
 
   PROBE FINDINGS (2026-07-10, scratch server, ../geode/zig-out/bin/geode):
 
-  1. INVALID EXPRESSION IS SILENTLY ACCEPTED AT DDL TIME — KNOWN LIMITATION.
-     `src/gql/parser.zig::parseCreatePolicy` captures the USING clause as raw
-     SOURCE TEXT only; it does not parse/validate it. Compilation happens
-     lazily in `security/policy_catalog.zig::addPolicy`:
-       compiled = policy_expression.compileExpression(...) catch null;
-     A compile failure is swallowed (`catch null`) and the policy is stored
-     anyway with `compiled = null` — CREATE POLICY always returns exit 0 /
-     "Policy created", even for garbage like `... AND (` or `@@@ !!!`.
-     This is NOT a privilege-escalation bug: `security/gps.zig::decide()`
-     treats a null-compiled, non-"true" policy as fail-closed (it never
-     contributes an ALLOW — see the `expr_result = ... eql(expression_source,
-     "true")` fallback), which this spec verifies end-to-end. But the DDL
-     gives the operator ZERO feedback that their policy is inert. Tests
-     below pin the REAL behavior (accept + fail-closed), not the originally
-     hoped-for DDL-time rejection.
+  1. INVALID EXPRESSION IS REJECTED AT DDL TIME — FIXED by ENG-3915
+     (2026-08-25). FORMERLY a KNOWN LIMITATION, pinned here as a trip-wire:
 
-  2. DUPLICATE POLICY NAMES ARE SILENTLY ACCEPTED — KNOWN LIMITATION / BUG.
-     `PolicyCatalog.addPolicy` has no name-uniqueness check; it unconditionally
-     appends. Creating a second policy with a name that already exists
-     succeeds (exit 0, "Policy created") and SHOW POLICIES then lists TWO
-     rows with the identical name. Worse: `removePolicy` removes only the
-     FIRST match, so a single `DROP POLICY <name>` leaves one ghost duplicate
-     behind — this spec reproduces and pins that too.
+       `security/policy_catalog.zig::addPolicy` did
+         compiled = policy_expression.compileExpression(...) catch null;
+       A compile failure was swallowed (`catch null`) and the policy was
+       stored anyway with `compiled = null` — CREATE POLICY always returned
+       exit 0 / "Policy created", even for garbage like `... AND (`.
+       `security/gps.zig::decide()` then treated the null-compiled,
+       non-"true" policy as fail-closed, so it silently DENIED everything it
+       was written to allow, with zero operator feedback.
+
+     ENG-3915 split the entry point in two. The DDL path
+     (`addPolicyStrict`, used by execution.zig's .CreatePolicy arm) now
+     REFUSES an uncompilable USING expression with
+     error.UnsupportedPolicyExpression -> SQLSTATE 42000. The tolerant path
+     (`addPolicy`) survives for exactly one caller: startup hydration from
+     __geode_security, where a record persisted before a grammar change must
+     not brick startup — it is retained fail-closed and logged loudly.
+
+     ENG-3915 also found what the `catch null` had been hiding: the USING
+     source capture in src/gql/parser.zig included the TERMINATING SEMICOLON,
+     so EVERY `CREATE POLICY … USING …;` — the spelling every script uses —
+     stored compiled=null and denied everything, even for a predicate
+     squarely inside the supported subset. Fixed in the same change.
+
+     The trip-wire assertions below have been FLIPPED to the new, verified
+     behavior. The fail-closed compensating control is unchanged and still
+     asserted end-to-end.
+
+  2. DUPLICATE POLICY NAMES ARE REJECTED — FIXED by GAP-0923(b). FORMERLY a
+     KNOWN LIMITATION / BUG pinned here: `PolicyCatalog.addPolicy` had no
+     name-uniqueness check and unconditionally appended, so a second policy
+     with an existing name succeeded (exit 0, "Policy created"), SHOW POLICIES
+     listed TWO rows with the identical name, and — because `removePolicy`
+     returns after the FIRST match — a single `DROP POLICY <name>` left a
+     ghost duplicate behind. addPolicy now returns error.PolicyAlreadyExists
+     -> SQLSTATE 42710. The assertions below were flipped when that landed;
+     this header text had not been updated to match (corrected 2026-08-25).
 
   3. UNKNOWN ATTRIBUTE REFERENCE compiles fine (`principal.attributes.<key>
      = '<value>'` is valid grammar per policy_expression.zig) and is a
@@ -113,31 +129,35 @@ tests:
 
 - name: p5-invalid-expression-rejected
   description: |
-    KEY NEGATIVE / KNOWN LIMITATION — CREATE POLICY with an unbalanced,
-    garbage USING expression ("... AND (" — a dangling open paren with no
-    matching close, no right-hand operand). Per the probe above the parser
-    captures USING as raw text and only attempts to compile it inside
-    addPolicy, where a compile failure is swallowed (`catch null`). The
-    REAL behavior is that this DDL statement is ACCEPTED (exit 0, "Policy
-    created"), not rejected. This assertion pins that real behavior so a
-    future fix (DDL-time validation added) flips it — when geode starts
-    rejecting malformed USING expressions, this assertion will fail and
-    must be updated to expect the rejection instead.
-  args: [query, -U, geode, -P, '${secret:admin_password}', "CREATE POLICY p5_malformed_paren ON GRAPH * FOR WRITE USING current_user() = 'p5_malformed_user' AND ("]
+    KEY NEGATIVE (flipped from LIMITATION-PIN by ENG-3915, 2026-08-25) —
+    CREATE POLICY with an unbalanced, garbage USING expression ("... AND (" —
+    a dangling open paren with no matching close, no right-hand operand) is
+    now REJECTED at DDL time with SQLSTATE 42000.
+
+    This test formerly pinned the old behavior (exit 0 / "Policy created",
+    policy stored with compiled=null and silently denying everything) as a
+    declared trip-wire: "when geode starts rejecting malformed USING
+    expressions, this assertion will fail and must be updated to expect the
+    rejection instead". That is exactly what happened; the assertion now
+    expects the rejection.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY p5_malformed_paren ON GRAPH * FOR WRITE USING current_user() = 'p5_malformed_user' AND (]
   expect:
     exit_code: 0
-    stdout_contains: [Policy created]
-  tags: [abac, negative, known_limitation, trip_wire]
+    stdout_contains: ['42000', Unsupported policy USING expression]
+    stdout_not_contains: ['"status_class":"00000"', Policy created]
+  tags: [abac, negative, trip_wire]
 
 - name: p5-malformed-policy-fails-closed
   description: |
-    POSITIVE (compensating control) — even though the malformed policy
-    installed with zero error signal, it does NOT grant access: gps.zig's
-    decide() treats a null-compiled, non-"true" policy as fail-closed (it
-    never contributes an ALLOW). p5_malformed_user has no other WRITE grant
-    (readonly role only + this one malformed policy), so the WRITE below
-    must still be denied. This proves the missing DDL validation is a
-    silent-accept / observability gap, NOT a privilege-escalation bug.
+    POSITIVE (defence in depth) — the malformed policy no longer installs at
+    all (ENG-3915 rejects it above), so p5_malformed_user is left with the
+    readonly role and nothing else and the WRITE below is denied. Before
+    ENG-3915 this same assertion proved the compensating control: the
+    silently-accepted malformed policy never contributed an ALLOW because
+    gps.zig's decide() fail-closes a null-compiled, non-"true" policy. That
+    compensating control is UNCHANGED — it is still what protects a policy
+    retained by the tolerant hydration path — and this assertion still
+    proves the missing-validation gap was never a privilege escalation.
   args: [query, -U, p5_malformed_user, -P, P5-Malformed-1234, '-']
   stdin: 'CREATE (n:P5MalformedTest {v: 1}) RETURN n'
   expect:
@@ -151,7 +171,7 @@ tests:
     = '<value>'` is valid USING grammar (policy_expression.zig), so this
     compiles successfully and installs cleanly — unlike the malformed case
     above, this is expected/correct behavior, not a limitation.
-  args: [query, -U, geode, -P, '${secret:admin_password}', "CREATE POLICY p5_unknown_attr ON GRAPH * FOR WRITE USING principal.attributes.nosuch_xyz = 'anything'"]
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY p5_unknown_attr ON GRAPH * FOR WRITE USING principal.attributes.nosuch_xyz = 'anything']
   expect:
     exit_code: 0
     stdout_contains: [Policy created]
@@ -209,20 +229,22 @@ tests:
     stdout_contains: [duplicate_count=ok]
   tags: [abac, negative, known_limitation, bash]
 
-- name: p5-nothing-was-rejected
+- name: p5-only-valid-policies-installed
   description: |
-    NEGATIVE / KNOWN LIMITATION — this is the inverse of the originally
-    hoped-for "no-partial-install" check: since neither the malformed
-    expression nor the duplicate name was ever rejected, SHOW POLICIES
-    shows ALL FOUR install attempts (baseline, malformed, unknown-attr,
-    duplicate-baseline), not just the one valid baseline. Nothing partially
-    installed — everything FULLY installed, including the two that should
-    have been rejected. That is the gap this spec exists to pin.
+    FIX EVIDENCE (flipped from LIMITATION-PIN; renamed from
+    "p5-nothing-was-rejected") — both defects this spec was written to pin
+    are now closed, so SHOW POLICIES lists exactly the two VALID installs:
+    the baseline (current_user() = …) and the unknown-attribute policy
+    (valid grammar, documented deny-all). The malformed-paren policy was
+    refused at DDL by ENG-3915 and the duplicate name was refused by
+    GAP-0923(b), so neither appears. Nothing partially installed and nothing
+    silently installed.
   args: [query, -U, geode, -P, '${secret:admin_password}', SHOW POLICIES]
   expect:
     exit_code: 0
-    stdout_contains: [p5_valid_baseline, p5_malformed_paren, p5_unknown_attr]
-  tags: [abac, negative, known_limitation]
+    stdout_contains: [p5_valid_baseline, p5_unknown_attr]
+    stdout_not_contains: [p5_malformed_paren]
+  tags: [abac, negative, trip_wire]
 
 - name: p5-single-drop-leaves-duplicate-behind
   description: |
