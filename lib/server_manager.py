@@ -203,13 +203,30 @@ class ServerManager:
         self.stop()
         raise RuntimeError(f"Server failed to start within {timeout_seconds}s")
 
+    @staticmethod
+    def _signal_process_group(process: subprocess.Popen, sig: int) -> None:
+        """Signal the server's process group without ever hitting our own.
+
+        ``os.killpg(0, sig)`` targets the *caller's* process group, which would
+        take down the test harness itself. If the process group cannot be
+        resolved to a group that belongs solely to the server, signal the
+        process directly instead.
+        """
+        pgid = os.getpgid(process.pid)
+        if pgid and pgid != os.getpgid(0):
+            os.killpg(pgid, sig)
+        elif sig == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
+
     def stop(self):
         """Stop the Geode server and cleanup resources."""
         if self.process:
             try:
                 # Try graceful shutdown first
                 if os.name != "nt":
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                    self._signal_process_group(self.process, signal.SIGTERM)
                 else:
                     self.process.terminate()
 
@@ -219,7 +236,7 @@ class ServerManager:
                 except subprocess.TimeoutExpired:
                     # Force kill if graceful shutdown fails
                     if os.name != "nt":
-                        os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                        self._signal_process_group(self.process, signal.SIGKILL)
                     else:
                         self.process.kill()
                     self.process.wait()

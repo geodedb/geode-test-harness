@@ -1,5 +1,6 @@
 """Unit tests for lib/server_manager.py."""
 
+import os
 import socket
 import sys
 from pathlib import Path
@@ -163,6 +164,21 @@ class TestServerManagerStop:
             manager.stop()
 
         assert manager.process is None
+
+    def test_stop_never_signals_own_process_group(self):
+        """Stop must never SIGTERM the process group of the test harness."""
+        manager = ServerManager(binary_path="/fake/geode")
+        mock_process = MagicMock()
+        manager.process = mock_process
+
+        # A mocked/stale pid can resolve to our own process group; killpg would
+        # then terminate the harness itself.
+        with patch("os.getpgid", return_value=os.getpgid(0)):
+            with patch("os.killpg") as mock_killpg:
+                manager.stop()
+
+        mock_killpg.assert_not_called()
+        mock_process.terminate.assert_called_once()
 
     def test_stop_cleans_up_temp_dir(self):
         """Stop should clean up temp directory when cleanup=True."""
