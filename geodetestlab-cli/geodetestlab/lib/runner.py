@@ -63,6 +63,12 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+# Exit code for a runner / server lifecycle error (mirrors cli.EXIT_RUNNER_ERROR).
+EXIT_RUNNER_ERROR = 3
+
+# Name of the synthetic result recorded when the managed server never starts.
+SERVER_STARTUP_RESULT_NAME = "server-startup"
+
 _MAX_TRANSIENT_RETRIES = 2
 _RETRY_BASE_DELAY_S = 1.0
 
@@ -727,6 +733,74 @@ def _generate_report(
             json.dump(report, f, indent=2)
 
 
+def _finalize_summary(
+    summary: RunSummary,
+    start_time: float,
+    report_json: Path | None,
+    spec_path: str,
+) -> dict[str, Any]:
+    """Stamp the duration, flatten the results and write the JSON report."""
+    summary.duration_ms = (time.time() - start_time) * 1000
+
+    results_list = [
+        {
+            "name": r.name,
+            "passed": r.passed,
+            "duration_ms": r.duration_ms,
+            "output": r.output[:1000] if r.output else "",
+            "error": r.error,
+            "skip_reason": r.skip_reason,
+        }
+        for r in summary.results
+    ]
+
+    summary_dict = summary.to_dict()
+    summary_dict["results"] = results_list
+
+    _generate_report(report_json, summary, spec_path, results_list)
+    return summary_dict
+
+
+def _record_server_startup_failure(
+    summary: RunSummary,
+    error: str,
+    start_time: float,
+    report_json: Path | None,
+    spec_path: str,
+    failure_file: str | None,
+) -> tuple[int, dict[str, Any]]:
+    """Report a managed server that never came up as a failed run.
+
+    A spec whose server fails to start executes zero tests. Returning the
+    untouched (all-zero) summary made every consumer — the single-line JSON
+    summary, the aggregate report, the rich "✓ All tests passed!" banner —
+    report success for a spec that never ran a single case. Synthesizing one
+    failing result instead makes the infrastructure failure visible everywhere
+    a test failure is, while the ``EXIT_RUNNER_ERROR`` exit code still marks it
+    as a lifecycle problem rather than an assertion failure.
+    """
+    message = f"Managed server failed to start: {error}"
+    print(f"  ERROR: {message}", file=sys.stderr)
+    summary.total += 1
+    summary.failed += 1
+    summary.results.append(
+        TestResult(
+            name=SERVER_STARTUP_RESULT_NAME,
+            passed=False,
+            duration_ms=0.0,
+            error=message,
+        )
+    )
+    append_failure(
+        failure_file,
+        spec=spec_path,
+        test_name=SERVER_STARTUP_RESULT_NAME,
+        error=message,
+        kind="spec",
+    )
+    return EXIT_RUNNER_ERROR, _finalize_summary(summary, start_time, report_json, spec_path)
+
+
 def _apply_force_cluster_size(spec: TestSpec, size: int) -> None:
     """Promote a spec without a ``cluster:`` block to an N-node cluster.
 
@@ -833,19 +907,37 @@ def run_tests(
                 server_args.extend(["--cert", leaf_crt, "--key", leaf_key])
                 env["GEODE_TEST_CA_CERT"] = ca_crt
 
-        server_state.process = _start_initial_server(
-            spec,
-            binary,
-            data_dir,
-            server_state.port,
-            server_state.grpc_port,
-            env,
-            server_timeout_ms,
-            verbose,
-            server_port,
-            dry_run,
-            server_args=server_args,
-        )
+        try:
+            server_state.process = _start_initial_server(
+                spec,
+                binary,
+                data_dir,
+                server_state.port,
+                server_state.grpc_port,
+                env,
+                server_timeout_ms,
+                verbose,
+                server_port,
+                dry_run,
+                server_args=server_args,
+            )
+        except RunnerError as exc:
+            # No server means no test can run. Record the infrastructure
+            # failure and return a summary that says so, rather than
+            # abandoning the run with an empty summary (false green).
+            import shutil
+
+            shutil.rmtree(data_dir, ignore_errors=True)
+            if single_server_cert_dir is not None:
+                shutil.rmtree(single_server_cert_dir, ignore_errors=True)
+            return _record_server_startup_failure(
+                summary,
+                str(exc),
+                start_time,
+                report_json,
+                spec_path,
+                failure_file,
+            )
 
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{server_state.port}"
         env["PORT"] = str(server_state.port)
@@ -1090,23 +1182,7 @@ def run_tests(
 
             shutil.rmtree(single_server_cert_dir, ignore_errors=True)
 
-    summary.duration_ms = (time.time() - start_time) * 1000
-
-    summary_dict = summary.to_dict()
-    results_list = [
-        {
-            "name": r.name,
-            "passed": r.passed,
-            "duration_ms": r.duration_ms,
-            "output": r.output[:1000] if r.output else "",
-            "error": r.error,
-            "skip_reason": r.skip_reason,
-        }
-        for r in summary.results
-    ]
-    summary_dict["results"] = results_list
-
-    _generate_report(report_json, summary, spec_path, results_list)
+    summary_dict = _finalize_summary(summary, start_time, report_json, spec_path)
 
     exit_code = 0 if summary.failed == 0 else 1
     return exit_code, summary_dict

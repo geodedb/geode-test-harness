@@ -47,12 +47,7 @@ def _write_failing_binary(directory: Path) -> Path:
     """Write a fake geode binary whose ``serve`` subcommand never starts."""
     binary = directory / "fake-geode.sh"
     binary.write_text(
-        "#!/bin/sh\n"
-        'if [ "$1" = "serve" ]; then\n'
-        '  echo "fatal: unable to bind listener" >&2\n'
-        "  exit 1\n"
-        "fi\n"
-        "exit 0\n"
+        '#!/bin/sh\nif [ "$1" = "serve" ]; then\n  echo "fatal: unable to bind listener" >&2\n  exit 1\nfi\nexit 0\n'
     )
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR)
     return binary

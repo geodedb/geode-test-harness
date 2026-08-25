@@ -21,7 +21,11 @@ def _show_rich_summary(summary: dict[str, int], console: Console) -> None:
     console.print()
     console.print(table)
 
-    if failed == 0:
-        console.print("\n[green]✓ All tests passed![/green]")
-    else:
+    if failed > 0:
         console.print(f"\n[red]✗ {failed} test(s) failed[/red]")
+    elif total == 0:
+        # Zero cases executed is never a success: it means every spec was
+        # skipped or never ran (e.g. a managed server that failed to start).
+        console.print("\n[yellow]! No tests were executed[/yellow]")
+    else:
+        console.print("\n[green]✓ All tests passed![/green]")
