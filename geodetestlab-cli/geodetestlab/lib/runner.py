@@ -864,10 +864,11 @@ def run_tests(
     try:
         binary = find_geode_binary(geode_binary)
     except FileNotFoundError as e:
-        # Dry runs never execute the binary; a placeholder path keeps
-        # `--dry-run` usable (and its CLI tests green) on machines/CI
-        # without a geode build. Real runs still fail loudly.
-        if dry_run:
+        # Dry runs and empty specs never execute the binary; a
+        # placeholder path keeps `--dry-run` and no-op specs usable
+        # (and their CLI tests green) on machines/CI without a geode
+        # build. Real runs still fail loudly.
+        if dry_run or not spec.tests:
             binary = "geode"
         else:
             raise RunnerError(str(e)) from e
@@ -885,7 +886,9 @@ def run_tests(
     # the finally block.
     single_server_cert_dir: str | None = None
 
-    if spec.mode == "server":
+    # An empty spec runs zero tests: skip server provisioning entirely so
+    # it completes cleanly (exit 0, total 0) even without a geode binary.
+    if spec.mode == "server" and spec.tests:
         data_dir = Path(tempfile.mkdtemp(prefix="geode-test-"))
         server_state.port = server_port or get_free_port()
 
