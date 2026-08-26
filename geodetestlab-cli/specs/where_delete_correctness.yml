@@ -1,0 +1,422 @@
+version: '1.0'
+name: MATCH … WHERE … DELETE removes exactly the matching rows (ENG-3913)
+description: |
+  Wire-level spec for ENG-3913 — `MATCH … [WHERE …] DELETE …` lost data in
+  BOTH directions.
+
+  THE DEFECT. The DELETE executor did not reuse the matching path a `RETURN` of
+  the same variables takes. It reconstructed the match set by hand from
+  `chains[0].head` and evaluated `WHERE` against a one-entry `Env`. That was
+  independently wrong five ways:
+
+    (A) the WHERE `Env` carried NO parameter bindings, so a `$param` predicate
+        evaluated to NULL and the DELETE silently deleted NOTHING;
+    (B) the `Env` bound only `chains[0].head.name`, so a cross-variable
+        predicate resolved NULL (no-op), and when the delete target was a HOP
+        node the head variable's NAME was bound to the TARGET's value;
+    (C) the candidate set never traversed relationship hops — it was "every
+        node carrying the head label" — so a pattern-restricted DELETE
+        OVER-DELETED, destroying nodes the pattern cannot match;
+    (D) the relationship-delete branch had no `where_clause` handling at all,
+        so `WHERE r.w = 1 DELETE r` deleted EVERY matching edge;
+    (E) an evaluation error in the predicate was swallowed into
+        `should_delete = false` — a silent partial delete.
+
+  THE FIX. Both the standalone executor and the cluster-leader replication path
+  now resolve their target set through the SAME `executeQueryWithContext` entry
+  point a `RETURN` of the delete variables runs, and read the bound entities out
+  of the projected rows.
+
+  HOW THIS SPEC ASSERTS. Every check counts SURVIVORS, never statement status.
+  A DELETE that reports success while destroying the wrong rows is exactly the
+  failure mode, so `"status_class":"00000"` proves nothing on its own.
+
+  Labels are prefixed WD_ so this spec cannot collide with any other spec's
+  data.
+
+  Engine-side sibling: geode tests/test_eng3913_where_delete.zig
+  (`zig build test-eng3913`, 10 tests).
+
+  CANARY: REQ=REQ-DELETE-MATCH-SET-RESOLUTION; FEATURE="DeleteWhereEvaluation"; ASPECT=WireContract; STATUS=TESTED; TEST=geodetestlab/specs/where_delete_correctness.yml; OWNER=crud_operations; UPDATED=2026-08-25
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# (A) a $param WHERE predicate deletes exactly the matching rows
+# ---------------------------------------------------------------------------
+- name: paramwhere-setup
+  description: Four rows, two of which a $param predicate should select.
+  query: >-
+    CREATE (:WD_A {id: 1, tag: 'keep'}), (:WD_A {id: 2, tag: 'drop'}),
+           (:WD_A {id: 3, tag: 'keep'}), (:WD_A {id: 4, tag: 'drop'})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [delete, setup]
+
+- name: paramwhere-delete
+  description: |
+    `WHERE n.tag = $t DELETE n`. Before the fix the WHERE Env had no parameter
+    bindings at all, `$t` resolved NULL, and this was a silent no-op that still
+    reported success.
+  args:
+  - query
+  - --param
+  - t
+  - '"drop"'
+  - MATCH (n:WD_A) WHERE n.tag = $t DELETE n
+  expect:
+    exit_code: 0
+  tags: [delete, param]
+
+- name: paramwhere-survivors
+  description: |
+    KEY ASSERTION. Exactly the two 'keep' rows survive. RED before the fix:
+    count 4 (nothing was deleted).
+  query: >-
+    MATCH (n:WD_A) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [delete, param, key-assertion]
+
+- name: paramwhere-no-drop-rows-left
+  description: The rows the predicate selected are gone, not merely fewer.
+  query: >-
+    MATCH (n:WD_A {tag: 'drop'}) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+  tags: [delete, param]
+
+# ---------------------------------------------------------------------------
+# (C) OVER-DELETION GUARD — a node the pattern excludes must survive
+# ---------------------------------------------------------------------------
+- name: overdelete-setup-nodes
+  description: |
+    WD_B#1 is linked by a :WD_R edge; WD_B#2 is ISOLATED and can never match
+    `(a:WD_B)-[:WD_R]->(b:WD_C)`.
+  query: >-
+    CREATE (:WD_B {id: 1, tag: 'linked'}), (:WD_B {id: 2, tag: 'isolated'}),
+           (:WD_C {id: 10})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [delete, setup]
+
+- name: overdelete-setup-edge
+  description: Link only WD_B#1.
+  query: >-
+    MATCH (a:WD_B {id: 1}), (b:WD_C {id: 10}) CREATE (a)-[:WD_R]->(b)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [delete, setup]
+
+- name: overdelete-pattern-delete
+  description: |
+    A pattern-restricted DETACH DELETE with NO WHERE clause at all.
+  query: >-
+    MATCH (a:WD_B)-[:WD_R]->(b:WD_C) DETACH DELETE a
+  expect:
+    exit_code: 0
+  tags: [delete, overdeletion]
+
+- name: overdelete-isolated-node-survives
+  description: |
+    KEY ASSERTION. The isolated node cannot match the pattern and must still be
+    there. RED before the fix: count 0 — the candidate set was "every node
+    carrying the head label", so an edge-less, non-matching node was destroyed.
+  query: >-
+    MATCH (n:WD_B {tag: 'isolated'}) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  tags: [delete, overdeletion, key-assertion]
+
+- name: overdelete-linked-node-is-gone
+  description: The row the pattern DID match is deleted — the fix is not a no-op.
+  query: >-
+    MATCH (n:WD_B {tag: 'linked'}) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+  tags: [delete, overdeletion]
+
+# ---------------------------------------------------------------------------
+# (B) cross-variable predicate deletes only the target variable
+# ---------------------------------------------------------------------------
+- name: crossvar-setup
+  description: Two disjoint pairs; only the one whose RIGHT node is tagged 'yes' should go.
+  query: >-
+    CREATE (:WD_D {id: 1}), (:WD_D {id: 2}),
+           (:WD_E {id: 10, tag: 'yes'}), (:WD_E {id: 11, tag: 'no'})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [delete, setup]
+
+- name: crossvar-setup-edges
+  description: WD_D#1 -> WD_E#10 (tag 'yes'), WD_D#2 -> WD_E#11 (tag 'no').
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "MATCH (a:WD_D {id: 1}), (b:WD_E {id: 10}) CREATE (a)-[:WD_S]->(b)" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "MATCH (a:WD_D {id: 2}), (b:WD_E {id: 11}) CREATE (a)-[:WD_S]->(b)" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+  expect:
+    exit_code: 0
+  tags: [delete, setup]
+
+- name: crossvar-delete
+  description: |
+    `… WHERE b.tag = 'yes' DETACH DELETE a` — the predicate is over `b`, the
+    delete target is `a`. Before the fix `b` was not in the Env, the predicate
+    was NULL, and nothing at all was deleted.
+  query: >-
+    MATCH (a:WD_D)-[:WD_S]->(b:WD_E) WHERE b.tag = 'yes' DETACH DELETE a
+  expect:
+    exit_code: 0
+  tags: [delete, crossvar]
+
+- name: crossvar-only-the-right-node-went
+  description: |
+    KEY ASSERTION. WD_D#2 survives, WD_D#1 does not. RED before the fix: both
+    survived (count 2).
+  query: >-
+    MATCH (n:WD_D) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  tags: [delete, crossvar, key-assertion]
+
+- name: crossvar-surviving-node-is-the-right-one
+  description: The survivor is WD_D#2, not "some node".
+  query: >-
+    MATCH (n:WD_D) RETURN n.id AS id
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"id":2'
+    stdout_not_contains:
+    - '"id":1'
+  tags: [delete, crossvar]
+
+- name: crossvar-endpoints-untouched
+  description: Both WD_E rows survive an `a`-targeted delete.
+  query: >-
+    MATCH (n:WD_E) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [delete, crossvar]
+
+# ---------------------------------------------------------------------------
+# (D) WHERE on a relationship variable deletes only the matching edge
+# ---------------------------------------------------------------------------
+- name: reledge-setup-nodes
+  query: >-
+    CREATE (:WD_F {id: 1}), (:WD_F {id: 2})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [delete, setup]
+
+- name: reledge-setup-edges
+  description: Two parallel :WD_T edges between the same endpoints, w = 1 and w = 2.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "MATCH (a:WD_F {id: 1}), (b:WD_F {id: 2}) CREATE (a)-[:WD_T {w: 1}]->(b)" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "MATCH (a:WD_F {id: 1}), (b:WD_F {id: 2}) CREATE (a)-[:WD_T {w: 2}]->(b)" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+  expect:
+    exit_code: 0
+  tags: [delete, setup]
+
+- name: reledge-delete-w1
+  description: |
+    `MATCH ()-[r:WD_T]->() WHERE r.w = 1 DELETE r`. Before the fix the
+    relationship branch ignored the WHERE clause entirely and deleted 100% of
+    the :WD_T edges.
+  query: >-
+    MATCH ()-[r:WD_T]->() WHERE r.w = 1 DELETE r
+  expect:
+    exit_code: 0
+  tags: [delete, relationship]
+
+- name: reledge-w2-survives
+  description: |
+    KEY ASSERTION. Exactly the w = 2 edge is left. RED before the fix: count 0
+    — both edges were destroyed.
+  query: >-
+    MATCH ()-[r:WD_T]->() RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  tags: [delete, relationship, key-assertion]
+
+- name: reledge-survivor-is-w2
+  description: The survivor is the w = 2 edge specifically.
+  query: >-
+    MATCH ()-[r:WD_T]->() RETURN r.w AS w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"w":2'
+  tags: [delete, relationship]
+
+- name: reledge-endpoints-survive
+  description: An edge-only DELETE must not touch the nodes.
+  query: >-
+    MATCH (n:WD_F) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [delete, relationship]
+
+# ---------------------------------------------------------------------------
+# (B) a hop node is deletable as the DELETE target
+# ---------------------------------------------------------------------------
+- name: hoptarget-setup
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "CREATE (:WD_G {id: 1}), (:WD_H {id: 10, tag: 'yes'}), (:WD_H {id: 11, tag: 'no'})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "MATCH (a:WD_G {id: 1}), (b:WD_H {id: 10}) CREATE (a)-[:WD_U]->(b)" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "MATCH (a:WD_G {id: 1}), (b:WD_H {id: 11}) CREATE (a)-[:WD_U]->(b)" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+  expect:
+    exit_code: 0
+  tags: [delete, setup]
+
+- name: hoptarget-delete
+  description: |
+    `b` is a HOP node and both the predicate target and the delete target.
+    Before the fix the head variable's NAME was bound to the hop node's value,
+    so the predicate was evaluated against the wrong entity.
+  query: >-
+    MATCH (a:WD_G)-[:WD_U]->(b:WD_H) WHERE b.tag = 'yes' DETACH DELETE b
+  expect:
+    exit_code: 0
+  tags: [delete, hop]
+
+- name: hoptarget-only-the-yes-node-went
+  description: KEY ASSERTION. WD_H#11 ('no') survives; WD_H#10 ('yes') does not.
+  query: >-
+    MATCH (n:WD_H) RETURN n.id AS id
+  expected:
+    exit_code: 0
+    row_count: 1
+    stdout_contains:
+    - '"id":11'
+    stdout_not_contains:
+    - '"id":10'
+  tags: [delete, hop, key-assertion]
+
+- name: hoptarget-head-node-survives
+  description: The head of the pattern was not the delete target and must remain.
+  query: >-
+    MATCH (n:WD_G) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  tags: [delete, hop]
+
+# ---------------------------------------------------------------------------
+# Controls — the ordinary shapes must be untouched by the rewrite
+# ---------------------------------------------------------------------------
+- name: control-inline-property-delete
+  description: An inline-property DELETE removes exactly the matching rows.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "CREATE (:WD_I {id: 1, tag: 'a'}), (:WD_I {id: 2, tag: 'b'}), (:WD_I {id: 3, tag: 'a'})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "MATCH (n:WD_I {tag: 'a'}) DELETE n" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    OUT=$("$BIN" query "MATCH (n:WD_I) RETURN n.id AS id" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT"
+    echo "$OUT" | grep -q '"id":2' || { echo "FAIL: the tag='b' row did not survive"; exit 1; }
+    echo "$OUT" | grep -q '"id":1' && { echo "FAIL: a tag='a' row survived"; exit 1; }
+    echo "$OUT" | grep -q '"id":3' && { echo "FAIL: a tag='a' row survived"; exit 1; }
+    echo "PASS: inline-property delete removed exactly the tag='a' rows"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: inline-property delete'
+  tags: [delete, control]
+
+- name: control-plain-delete-of-connected-node-errors
+  description: |
+    Non-DETACH DELETE of a node that still has incident edges must still be
+    refused — the rewrite must not have quietly turned every DELETE into a
+    DETACH DELETE.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "CREATE (:WD_J {id: 1}), (:WD_K {id: 10})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "MATCH (a:WD_J {id: 1}), (b:WD_K {id: 10}) CREATE (a)-[:WD_V]->(b)" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    OUT=$("$BIN" query "MATCH (a:WD_J)-[:WD_V]->(b:WD_K) DELETE a" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT"
+    echo "$OUT" | grep -q '"status_class":"00000"' && { echo "FAIL: plain DELETE of a connected node reported success"; exit 1; }
+    SURV=$("$BIN" query "MATCH (n:WD_J) RETURN count(n) AS c" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$SURV"
+    echo "$SURV" | grep -q '"c":1' || { echo "FAIL: the refused DELETE still removed the node"; exit 1; }
+    echo "PASS: plain DELETE of a connected node refused and changed nothing"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: plain DELETE of a connected node refused'
+  tags: [delete, control, negative]

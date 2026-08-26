@@ -1,0 +1,188 @@
+version: '1.0'
+name: CREATE INDEX does not block unrelated writes (backfill outside the write lock)
+description: |
+  Wire-level liveness spec for the CREATE INDEX backfill.
+
+  THE DEFECT. `CREATE INDEX` is a mutating statement, so the transport handler
+  holds the per-graph EXCLUSIVE write lock for its duration — and the backfill
+  (the full label scan that populates the new index) ran INSIDE that lock. So
+  every unrelated write in the database, any label, any session, queued behind
+  a full scan of the indexed label. Measured at >150 s of dead air on a large
+  graph.
+
+  THE FIX. The backfill is queued onto the same `pending_index_rebuilds` path
+  the incremental rebuilds use. Both the QUIC and gRPC handlers RELEASE the
+  exclusive lock and only then drain it, under a SHARED lock.
+
+  WHAT THIS SPEC ASSERTS. Session B writes an UNRELATED label while session A's
+  `CREATE INDEX` is in flight, and B must finish inside a generous budget.
+
+  HONEST LIMITS OF THIS ASSERTION:
+
+    * The budget is deliberately generous (30 s) rather than tuned. A tuned
+      threshold on shared CI hardware is a flake generator; the defect this
+      guards against was >150 s, so a 30 s ceiling still separates the two by
+      an order of magnitude.
+    * The dataset here is a few thousand rows in a Debug build. It is enough to
+      make the backfill observable, not enough to reproduce the original 150 s.
+      The MECHANISM — that the backfill is deferred rather than run under the
+      writer lock — is asserted deterministically in geode's
+      tests/test_create_index_backfill_deferral.zig, which is the primary gate;
+      this spec is the end-to-end liveness sanity check on top of it.
+    * STILL TRUE AFTER THE FIX, by design: the CREATING session still waits for
+      the backfill, and a writer on the SAME graph can still be delayed by
+      shared-lock hand-off. Only unrelated writers are freed. See
+      docs/INDEX_MAINTENANCE_AND_BULK_INGEST.md.
+
+  Labels are prefixed CIL_ so this spec cannot collide with any other spec's
+  data.
+
+  CANARY: REQ=REQ-ENG-CREATE-INDEX-BACKFILL-OUTSIDE-WRITE-LOCK; FEATURE="AdvancedIndex"; ASPECT=WriteLiveness; STATUS=TESTED; TEST=geodetestlab/specs/create_index_write_liveness.yml; OWNER=index; UPDATED=2026-08-25
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed-indexable-rows
+  description: |
+    Seed a thousand vector rows on CIL_Doc so the backfill has real work to
+    do. Batched into multi-node CREATE statements to keep the seed itself short.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    for batch in $(seq 1 10); do
+      Q="CREATE"
+      SEP=""
+      for i in $(seq 1 100); do
+        ID=$(( batch * 1000 + i ))
+        Q="${Q}${SEP} (:CIL_Doc {id: ${ID}, emb: vectorf32('[1.0, 0.0, 0.0, 0.0]')})"
+        SEP=","
+      done
+      "$BIN" query "$Q" --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" > /dev/null || exit 1
+    done
+    OUT=$("$BIN" query "MATCH (n:CIL_Doc) RETURN count(n) AS c" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT"
+    # A retried seed step re-inserts, so assert a FLOOR rather than an exact
+    # count — the point is "enough rows for the backfill to be real work".
+    C=$(echo "$OUT" | grep -o '"c":[0-9]*' | head -1 | cut -d: -f2)
+    [ -n "$C" ] && [ "$C" -ge 1000 ] || { echo "FAIL: seeded only ${C:-0} rows"; exit 1; }
+    echo "PASS: seeded ${C} CIL_Doc rows"
+  timeout_ms: 300000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: seeded'
+  tags: [index, liveness, setup]
+
+- name: seed-unrelated-label
+  description: A row of an UNRELATED label for session B to write against.
+  query: >-
+    CREATE (:CIL_Other {id: 1, v: 0})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [index, liveness, setup]
+
+- name: unrelated-write-completes-while-create-index-runs
+  description: |
+    KEY ASSERTION. Session A issues CREATE INDEX over the seeded label; session
+    B writes an unrelated label right behind it. B must complete inside the
+    budget instead of queueing behind A's whole backfill.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BUDGET_S=30
+
+    # Session A — CREATE INDEX over the seeded label, in the background.
+    "$BIN" query "CREATE INDEX cil_doc_idx ON CIL_Doc (emb) USING vector WITH (metric = 'l2')" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" > /tmp/cil_session_a.log 2>&1 &
+    PIDA=$!
+
+    # Session B — an unrelated write, started immediately behind it.
+    START=$(date +%s)
+    "$BIN" query "MATCH (n:CIL_Other {id: 1}) SET n.v = 1" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" > /tmp/cil_session_b.log 2>&1
+    RC_B=$?
+    END=$(date +%s)
+    ELAPSED=$(( END - START ))
+
+    wait "$PIDA"
+    RC_A=$?
+
+    echo "session A (CREATE INDEX) rc=${RC_A}"
+    cat /tmp/cil_session_a.log
+    echo "session B (unrelated SET) rc=${RC_B} elapsed=${ELAPSED}s budget=${BUDGET_S}s"
+    cat /tmp/cil_session_b.log
+
+    [ "$RC_A" -eq 0 ] || { echo "FAIL: CREATE INDEX itself failed"; exit 1; }
+    [ "$RC_B" -eq 0 ] || { echo "FAIL: the unrelated write failed"; exit 1; }
+    [ "$ELAPSED" -le "$BUDGET_S" ] || { echo "FAIL: the unrelated write took ${ELAPSED}s (> ${BUDGET_S}s budget) — it is queued behind the backfill"; exit 1; }
+    echo "PASS: unrelated write completed in ${ELAPSED}s while CREATE INDEX was in flight"
+  timeout_ms: 300000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: unrelated write completed in'
+  tags: [index, liveness, key-assertion]
+
+- name: unrelated-write-actually-landed
+  description: The liveness assertion is worthless if the write was a no-op.
+  query: >-
+    MATCH (n:CIL_Other {id: 1}) RETURN n.v AS v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"v":1'
+  tags: [index, liveness]
+
+- name: index-exists-after-backfill
+  description: The deferred backfill must not have lost the index.
+  query: SHOW INDEXES
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - cil_doc_idx
+  tags: [index, liveness]
+
+- name: seeded-rows-untouched
+  description: |
+    Control — the backfill is a read; it must not have changed the data. A
+    floor rather than an exact count, because the seed step is retryable.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    OUT=$("$BIN" query "MATCH (n:CIL_Doc) RETURN count(n) AS c" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT"
+    C=$(echo "$OUT" | grep -o '"c":[0-9]*' | head -1 | cut -d: -f2)
+    [ -n "$C" ] && [ "$C" -ge 1000 ] || { echo "FAIL: rows disappeared (${C:-0})"; exit 1; }
+    echo "PASS: ${C} CIL_Doc rows still present after the backfill"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS:'
+  tags: [index, liveness, control]

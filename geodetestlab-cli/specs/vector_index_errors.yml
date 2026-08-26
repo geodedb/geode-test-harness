@@ -112,13 +112,13 @@ tests:
 
   # --------------------------------------------------------------- setup --
 - name: p7_setup_create_index
-  description: "Positive setup: create a valid HNSW vector index, dim=4, cosine metric"
+  description: 'Positive setup: create a valid HNSW vector index, dim=4, cosine metric'
   args: [query, '-']
   stdin: >-
     CREATE INDEX IF NOT EXISTS p7_vec_idx
     ON P7Vec (emb)
     USING HNSW
-    WITH (metric = 'cosine', ef_construction = 200, M = 16)
+    WITH (metric = 'cosine')
   expect:
     exit_code: 0
     stdout_contains:
@@ -136,7 +136,7 @@ tests:
   tags: [vector, setup, positive, show]
 
 - name: p7_setup_insert_valid_vectors
-  description: "Positive setup: insert 3 valid dim=4 vectors under the indexed label"
+  description: 'Positive setup: insert 3 valid dim=4 vectors under the indexed label'
   args: [query, '-']
   stdin: |
     CREATE (n1:P7Vec {id: 1, emb: vectorf32('[1.0, 0.0, 0.0, 0.0]')})
@@ -192,34 +192,34 @@ tests:
 
 - name: p7_wrong_dimension_stored_value_evidence
   description: >
-    Evidence for the rejection above (GAP-0918): the dim=3 vector was
-    REJECTED at HNSW index-insert time, so the mismatched vector did NOT
-    make it into the store — a same-space cosine comparison against n.emb
-    returns NULL (dist:null), proving n.emb holds no dim=3 vector. This is
-    the exact contract GAP-0918 established: refuse to hold a
-    mixed-dimension vector under the index, surface the 22000 error, and
-    store no bad vector. NOTE (scoped honesty): GAP-0918 rejects the
-    VECTOR, not the whole node — the `CREATE` errors (22000) yet the node
-    id=4 row is still committed with `emb` left unset (null). Full
-    statement-level rollback of the node on an index-constraint violation
-    is a SEPARATE, deeper atomicity concern: geode's node create touches
-    both an in-memory map and the durable engine, and the per-statement
-    engine-txn abort only unwinds the engine layer, so the in-memory row
-    survives. That two-layer rollback gap is distinct from GAP-0930 (which
-    made a bad property *expression* — e.g. malformed WKT — abort the
-    CREATE with no node at all, since expression eval now runs before any
-    write). This evidence test therefore asserts the real, verified
-    behavior: the readback succeeds (00000), the row exists, and n.emb is
-    null (dist:null) — i.e. the bad vector was not stored.
+    Evidence for the rejection above (GAP-0918): the dim=3 vector was REFUSED,
+    and the refusal is now STATEMENT-ATOMIC — no node at all is left behind.
+
+    UPDATED 2026-08-25. This step used to assert that the row for id=4 EXISTED
+    with `emb` unset (`"dist":null`), because GAP-0918 rejected the VECTOR while
+    the node itself stayed committed. Two things changed since:
+
+      * REQ-PROPERTY-WRITE-ATOMICITY hoisted the dimension refusal into the
+        statement-level pre-pass, so the CREATE is refused BEFORE its first
+        store mutation and leaves nothing behind;
+      * this spec's own `p7_setup_create_index` step had been silently FAILING
+        (it passed `ef_construction` / `M`, which ENG-3906 turned into a hard
+        error), so no index existed, no guard fired, and the dim=3 vector was
+        simply STORED — which is why the old `"dist":null` assertion passed. It
+        was green for the wrong reason. With the setup fixed the guard really
+        fires.
+
+    The contract asserted now: the readback succeeds (00000) and returns NO
+    rows, because the refused CREATE committed nothing.
   args: [query, '-']
   stdin: >-
     MATCH (n:P7Vec {id: 4})
     RETURN vector_cosine(n.emb, vectorf32('[1.0, 0.0, 0.0, 0.0]')) AS dist
   expect:
     exit_code: 0
+    row_count: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - '"dist":null'
     stdout_not_contains:
     - '"dist":0'
     - '"dist":1'
@@ -240,7 +240,7 @@ tests:
     CREATE INDEX IF NOT EXISTS p7_bad_metric_idx
     ON P7BadMetric (emb)
     USING HNSW
-    WITH (metric = 'banana', ef_construction = 200, M = 16)
+    WITH (metric = 'banana')
   expect:
     exit_code: 0
     stdout_contains:

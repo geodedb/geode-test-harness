@@ -1,0 +1,263 @@
+version: '1.0'
+name: MERGE is idempotent on the general path (ENG-3914)
+description: |
+  Wire-level spec for ENG-3914 — MERGE created DUPLICATES deterministically.
+
+  THIS IS NOT A CONCURRENCY BUG. A single-threaded re-run of the exact same
+  statement duplicated the row every time: three passes produced 3x the rows.
+
+  THE DEFECT. `graph_store.merge_prop_index` holds exactly ONE node id per
+  (graph, label, key, value) — `putOrUpdate` overwrites. The general MERGE path
+  probed only `evaluated_props[0]`, so for a multi-property merge key whose
+  FIRST property value is SHARED across rows, the bucket holds whichever row
+  was written last. When the returned candidate failed full verification, the
+  code fell through with `index_authoritative` still TRUE — which the next line
+  reads as "the index proved this node does not exist" and uses to SKIP the
+  label-scan fallback. MERGE then took the CREATE branch.
+
+  THE FIX. A candidate that fails verification clears `index_authoritative` (a
+  shared-value bucket can prove PRESENCE, never absence), and every evaluated
+  property is probed rather than only the first, so a discriminating property
+  still resolves the row in O(1) instead of always dropping to the scan.
+
+  SHAPES. C is the defect shape (multi-property key, SHARED first property,
+  non-scalar SET). A, B, D and E are controls that must stay idempotent:
+  single-property key; multi-property key with a UNIQUE first property; shared
+  first property with a scalar SET; shared first property with no SET at all.
+
+  Every check counts ROWS, three passes in, because "the statement succeeded"
+  is exactly what a duplicating MERGE also reports.
+
+  Labels are prefixed MIG_ so this spec cannot collide with any other spec's
+  data.
+
+  Engine-side sibling: geode tests/test_eng3914_merge_idempotency.zig
+  (`zig build test-eng3914`, 7 tests).
+
+  CANARY: REQ=REQ-ENG-3914-MERGE-GENERAL-PATH-IDEMPOTENCY; FEATURE="MergeIdempotency"; ASPECT=WireContract; STATUS=TESTED; TEST=geodetestlab/specs/merge_idempotency_general_path.yml; OWNER=crud_operations; UPDATED=2026-08-25
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# SHAPE C — the defect shape
+# ---------------------------------------------------------------------------
+- name: shape-c-three-passes
+  description: |
+    Both rows share tenant='acme', so both hash to the SAME
+    (graph, label, 'tenant', 'acme') bucket in the single-valued merge index.
+    The non-scalar SET keeps the statement off the bulk fast path (which has
+    composite keys and is immune), so this exercises the general path.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    for i in 1 2 3; do
+      "$BIN" query "MERGE (n:MIG_C {tenant: 'acme', code: 'a'}) ON CREATE SET n.tags = ['x']" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+      "$BIN" query "MERGE (n:MIG_C {tenant: 'acme', code: 'b'}) ON CREATE SET n.tags = ['y']" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    done
+  expect:
+    exit_code: 0
+  tags: [merge, idempotency, shape-c]
+
+- name: shape-c-row-count-unchanged
+  description: |
+    KEY ASSERTION. Three passes of a two-row MERGE pair leave two rows. RED
+    before the fix: 6.
+  query: >-
+    MATCH (n:MIG_C) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [merge, idempotency, shape-c, key-assertion]
+
+- name: shape-c-key-a-is-unique
+  description: Each distinct key resolves to exactly one row.
+  query: >-
+    MATCH (n:MIG_C {tenant: 'acme', code: 'a'}) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  tags: [merge, idempotency, shape-c]
+
+- name: shape-c-key-b-is-unique
+  query: >-
+    MATCH (n:MIG_C {tenant: 'acme', code: 'b'}) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  tags: [merge, idempotency, shape-c]
+
+# ---------------------------------------------------------------------------
+# CONTROL A — single-property key
+# ---------------------------------------------------------------------------
+- name: shape-a-three-passes
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    for i in 1 2 3; do
+      "$BIN" query "MERGE (n:MIG_A {code: 'a'}) ON CREATE SET n.tags = ['x']" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+      "$BIN" query "MERGE (n:MIG_A {code: 'b'}) ON CREATE SET n.tags = ['y']" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    done
+  expect:
+    exit_code: 0
+  tags: [merge, idempotency, control]
+
+- name: shape-a-row-count
+  query: >-
+    MATCH (n:MIG_A) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [merge, idempotency, control]
+
+# ---------------------------------------------------------------------------
+# CONTROL B — multi-property key with a UNIQUE first property
+# ---------------------------------------------------------------------------
+- name: shape-b-three-passes
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    for i in 1 2 3; do
+      "$BIN" query "MERGE (n:MIG_B {code: 'a', tenant: 'acme'}) ON CREATE SET n.tags = ['x']" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+      "$BIN" query "MERGE (n:MIG_B {code: 'b', tenant: 'acme'}) ON CREATE SET n.tags = ['y']" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    done
+  expect:
+    exit_code: 0
+  tags: [merge, idempotency, control]
+
+- name: shape-b-row-count
+  query: >-
+    MATCH (n:MIG_B) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [merge, idempotency, control]
+
+# ---------------------------------------------------------------------------
+# CONTROL D — shared first property, SCALAR SET
+# ---------------------------------------------------------------------------
+- name: shape-d-three-passes
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    for i in 1 2 3; do
+      "$BIN" query "MERGE (n:MIG_D {tenant: 'acme', code: 'a'}) ON CREATE SET n.v = 1" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+      "$BIN" query "MERGE (n:MIG_D {tenant: 'acme', code: 'b'}) ON CREATE SET n.v = 2" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    done
+  expect:
+    exit_code: 0
+  tags: [merge, idempotency, control]
+
+- name: shape-d-row-count
+  query: >-
+    MATCH (n:MIG_D) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [merge, idempotency, control]
+
+# ---------------------------------------------------------------------------
+# CONTROL E — shared first property, NO SET clause
+# ---------------------------------------------------------------------------
+- name: shape-e-three-passes
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    for i in 1 2 3; do
+      "$BIN" query "MERGE (n:MIG_E {tenant: 'acme', code: 'a'})" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+      "$BIN" query "MERGE (n:MIG_E {tenant: 'acme', code: 'b'})" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    done
+  expect:
+    exit_code: 0
+  tags: [merge, idempotency, control]
+
+- name: shape-e-row-count
+  query: >-
+    MATCH (n:MIG_E) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [merge, idempotency, control]
+
+# ---------------------------------------------------------------------------
+# MERGE must still MATCH, not merely "not duplicate"
+# ---------------------------------------------------------------------------
+- name: merge-takes-the-on-match-branch
+  description: |
+    The second MERGE of the same key must run ON MATCH, proving the fallback
+    scan RESOLVES the existing row rather than the statement quietly doing
+    nothing.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "MERGE (n:MIG_X {tenant: 'acme', code: 'a'}) ON CREATE SET n.origin = 'created'" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "MERGE (n:MIG_X {tenant: 'acme', code: 'a'}) ON MATCH SET n.origin = 'matched'" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    OUT=$("$BIN" query "MATCH (n:MIG_X) RETURN n.origin AS origin" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT"
+    echo "$OUT" | grep -q '"origin":"matched"' || { echo "FAIL: the second MERGE did not take ON MATCH"; exit 1; }
+    echo "$OUT" | grep -q '"origin":"created"' && { echo "FAIL: a duplicate row carrying the ON CREATE value exists"; exit 1; }
+    echo "PASS: second MERGE matched the existing row"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: second MERGE matched the existing row'
+  tags: [merge, idempotency, key-assertion]
+
+- name: merge-on-match-row-count
+  description: One row, not two.
+  query: >-
+    MATCH (n:MIG_X) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  tags: [merge, idempotency]

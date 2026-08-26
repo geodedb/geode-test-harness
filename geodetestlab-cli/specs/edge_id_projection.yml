@@ -1,0 +1,199 @@
+version: '1.0'
+name: id(r) names a relationship, and toString(NULL) is NULL (ENG-3916)
+description: |
+  Wire-level spec for ENG-3916(b) — two independent expression-layer defects.
+
+    1. `id()` had NO `.Edge` arm. `id(n)` on a node worked, `RETURN r`
+       projected a relationship object carrying that very id, but `id(r)` fell
+       through the switch to Null — so a relationship's identity could not be
+       named in ANY expression (no join key, no dedup key, no ORDER BY).
+
+    2. `toString(NULL)` returned the four-character STRING "null" instead of
+       NULL, in BOTH implementations (types/evaluator_functions.zig and the
+       duplicate in eval/call_handlers.zig). That violates ISO/IEC 39075 null
+       propagation and makes a missing value indistinguishable from a value
+       that literally spells "null": `toString(x) IS NULL` was always false and
+       `toString(x) = 'null'` was TRUE for a missing x.
+
+  NOT A DEFECT, PINNED HERE SO IT IS NOT "FIXED" BY MISTAKE: `r.id` is NULL.
+  That is a PROPERTY lookup, and the relationship has no property called `id`.
+  `id(r)` is how you name the identity.
+
+  Labels are prefixed EIP_ so this spec cannot collide with any other spec's
+  data.
+
+  Engine-side sibling: geode tests/test_eng3916_edge_id_projection.zig
+  (`zig build test-eng3916`, 4 tests).
+
+  CANARY: REQ=REQ-ENG-3916-EDGE-ID; FEATURE="GraphElementId"; ASPECT=WireContract; STATUS=TESTED; TEST=geodetestlab/specs/edge_id_projection.yml; OWNER=eval; UPDATED=2026-08-25
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 30000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: setup-nodes
+  query: >-
+    CREATE (:EIP_A {id: 1}), (:EIP_B {id: 2})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [eval, setup]
+
+- name: setup-edge
+  query: >-
+    MATCH (a:EIP_A {id: 1}), (b:EIP_B {id: 2}) CREATE (a)-[:EIP_R {w: 5}]->(b)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [eval, setup]
+
+- name: id-of-relationship-is-not-null
+  description: |
+    KEY ASSERTION. RED before the fix: `{"rid":null}` — id() had no .Edge case
+    at all, so a relationship's identity was unnameable.
+  query: >-
+    MATCH ()-[r:EIP_R]->() RETURN id(r) AS rid
+  expected:
+    exit_code: 0
+    row_count: 1
+    stdout_not_contains:
+    - '"rid":null'
+  tags: [eval, edge-id, key-assertion]
+
+- name: id-of-relationship-matches-the-projected-relationship
+  description: |
+    The relationship object a client already gets from `RETURN r` is the source
+    of truth for what id(r) must answer. This compares the two directly rather
+    than trusting a hardcoded number.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    FN=$("$BIN" query "MATCH ()-[r:EIP_R]->() RETURN id(r) AS rid" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1 \
+      | grep -o '"rid":[0-9]*' | head -1 | cut -d: -f2)
+    PROJ=$("$BIN" query "MATCH ()-[r:EIP_R]->() RETURN r" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "id(r) = ${FN}"
+    echo "RETURN r = ${PROJ}"
+    [ -n "$FN" ] || { echo "FAIL: id(r) produced no integer"; exit 1; }
+    echo "$PROJ" | grep -q "$FN" || { echo "FAIL: id(r) does not appear in the projected relationship"; exit 1; }
+    echo "PASS: id(r) equals the id carried by the projected relationship"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: id(r) equals the id carried by the projected relationship'
+  tags: [eval, edge-id, key-assertion]
+
+- name: tostring-of-edge-id-is-digits
+  description: |
+    RED before the fix: `{"s":"null"}` — id(r) was NULL and toString stringified
+    it into the literal text "null".
+  query: >-
+    MATCH ()-[r:EIP_R]->() RETURN toString(id(r)) AS s
+  expected:
+    exit_code: 0
+    row_count: 1
+    stdout_not_contains:
+    - '"s":"null"'
+  tags: [eval, edge-id, tostring]
+
+- name: tostring-of-null-is-null
+  description: |
+    KEY ASSERTION. RED before the fix: `{"s":"null"}` — the STRING, not the
+    null value.
+  query: >-
+    RETURN toString(null) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"s":null'
+    stdout_not_contains:
+    - '"s":"null"'
+  tags: [eval, tostring, key-assertion]
+
+- name: tostring-of-null-is-null-predicate
+  description: The predicate a caller would actually write must be TRUE.
+  query: >-
+    RETURN toString(null) IS NULL AS isnull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"isnull":true'
+  tags: [eval, tostring, key-assertion]
+
+- name: tostring-of-missing-property-is-null
+  description: |
+    A missing property is a missing value, not the text "null". Before the fix
+    `toString(n.absent) = 'null'` was TRUE.
+  query: >-
+    MATCH (n:EIP_A) RETURN toString(n.absent) IS NULL AS isnull
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"isnull":true'
+  tags: [eval, tostring]
+
+- name: tostring-of-non-null-is-unaffected
+  description: Control — null propagation must not have broken ordinary conversion.
+  query: >-
+    RETURN toString(5) AS a, toString(true) AS b
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"a":"5"'
+    - '"b":"true"'
+  tags: [eval, tostring, control]
+
+- name: node-id-is-unchanged
+  description: Control — the node arm of id() is untouched.
+  query: >-
+    MATCH (n:EIP_A) RETURN id(n) AS nid
+  expected:
+    exit_code: 0
+    row_count: 1
+    stdout_not_contains:
+    - '"nid":null'
+  tags: [eval, control]
+
+- name: relationship-property-lookup-id-stays-null
+  description: |
+    PINNED, NOT A DEFECT. `r.id` is a property lookup and the relationship has
+    no property called `id`, so NULL is correct here. `id(r)` is the identity.
+  query: >-
+    MATCH ()-[r:EIP_R]->() RETURN r.id AS p
+  expected:
+    exit_code: 0
+    row_count: 1
+    stdout_contains:
+    - '"p":null'
+  tags: [eval, edge-id, pinned-behaviour]
+
+- name: relationship-property-that-exists-still-reads
+  description: Control — real relationship properties are unaffected.
+  query: >-
+    MATCH ()-[r:EIP_R]->() RETURN r.w AS w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"w":5'
+  tags: [eval, control]

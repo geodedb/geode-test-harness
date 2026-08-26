@@ -1,0 +1,292 @@
+version: '1.0'
+name: The vector dimension guard has a correct lifecycle (ENG-3912)
+description: |
+  Wire-level spec for ENG-3912 — the GAP-0918 vector-dimension guard was armed
+  and disarmed in the wrong places.
+
+  THE DEFECTS.
+
+    (a) POISONING BY A REFUSED STATEMENT. `checkVectorDimensionForWrite`
+        ADOPTED the dimension it was merely validating, and it is called from
+        the statement-level atomicity PRE-PASS — i.e. BEFORE the write is
+        allowed. A statement that was then refused still pinned its first
+        vector's dimension, permanently, against a property holding ZERO rows,
+        with no statement able to clear it.
+
+    (b) DROP INDEX DID NOT CLEAR THE PIN. The pin lived in a registry the DROP
+        path never touched, so the dimension stayed enforced with no index
+        present at all — and no way to change it.
+
+    (d) THE GUARD VANISHED ACROSS A RESTART. Registration only ever happened in
+        DDL execution, never on reload, so after a restart `SHOW INDEXES` still
+        listed the index while mixed dimensions were accepted silently.
+
+  THE FIX. Validation is pure with respect to the candidate write; adoption
+  happens only AFTER a write commits; intra-statement consistency is carried by
+  a stack-scoped scratch so the refusal stays atomic; DROP INDEX unregisters;
+  and the guard is re-armed lazily from the catalog on the first vector write,
+  with the dimension derived from the first vector already committed under the
+  (label, property).
+
+  NOT ASSERTED HERE, AND WHY. Per-graph scoping of the pin is deliberately NOT
+  implemented: the HNSW index is a process-global object and index population
+  selects by label+property with no graph filter, so scoping the validator
+  alone would re-admit mixed-dimension vectors into ONE index — the corruption
+  GAP-0918 closed. That decision is pinned in geode's
+  tests/test_eng3912_dim_pinning.zig with the full reasoning.
+
+  `cleanup: false` so the data dir survives the restart step.
+
+  Labels are prefixed VDL_ so this spec cannot collide with any other spec's
+  data.
+
+  Engine-side sibling: geode tests/test_eng3912_dim_pinning.zig
+  (`zig build test-eng3912`).
+
+  CANARY: REQ=REQ-ENG-3912-VECTOR-DIM-LIFECYCLE; FEATURE="VectorIndex"; ASPECT=WireContract; STATUS=TESTED; TEST=geodetestlab/specs/vector_dim_lifecycle.yml; OWNER=index; UPDATED=2026-08-25
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# (a) a REFUSED statement must not pin anything
+# ---------------------------------------------------------------------------
+- name: poison-create-index
+  description: An HNSW index over VDL_Poison.emb. The dimension is NOT declared in DDL.
+  query: >-
+    CREATE INDEX vdl_poison_idx ON VDL_Poison (emb) USING HNSW WITH (metric = 'l2')
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup]
+
+- name: poison-refused-mixed-dimension-statement
+  description: |
+    One statement, two vectors, dim 3 then dim 4, against a property with no
+    established dimension. It must be REFUSED (the statement is internally
+    inconsistent) and refused ATOMICALLY.
+  query: >-
+    CREATE (:VDL_Poison {id: 1, emb: vectorf32('[1.0, 2.0, 3.0]')}),
+           (:VDL_Poison {id: 2, emb: vectorf32('[1.0, 2.0, 3.0, 4.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, negative]
+
+- name: poison-refusal-left-no-rows
+  description: The refused statement is all-or-nothing.
+  query: >-
+    MATCH (n:VDL_Poison) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+  tags: [vector, atomicity]
+
+- name: poison-following-valid-write-succeeds
+  description: |
+    KEY ASSERTION. The property is still UNESTABLISHED, so a perfectly good
+    dim-4 write must be accepted. RED before the fix: SQLSTATE 22000 forever —
+    the refused statement had pinned dim 3 against an EMPTY table and nothing
+    could clear it.
+  query: >-
+    CREATE (:VDL_Poison {id: 3, emb: vectorf32('[1.0, 2.0, 3.0, 4.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, key-assertion]
+
+- name: poison-guard-is-real-once-a-write-commits
+  description: |
+    Positive guard: with dim 4 now COMMITTED, a dim-3 write is refused. The fix
+    must not have simply disabled the check.
+  query: >-
+    CREATE (:VDL_Poison {id: 4, emb: vectorf32('[9.0, 9.0, 9.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+  tags: [vector, negative, guard]
+
+- name: poison-established-dimension-still-writes
+  description: The established dimension keeps working.
+  query: >-
+    CREATE (:VDL_Poison {id: 5, emb: vectorf32('[4.0, 3.0, 2.0, 1.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, control, positive]
+
+- name: poison-final-row-count
+  description: Exactly the two accepted rows exist.
+  query: >-
+    MATCH (n:VDL_Poison) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [vector, control]
+
+# ---------------------------------------------------------------------------
+# (b) DROP INDEX releases the pin
+# ---------------------------------------------------------------------------
+- name: drop-setup
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "CREATE INDEX vdl_drop_idx ON VDL_Drop (emb) USING HNSW WITH (metric = 'l2')" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "CREATE (:VDL_Drop {id: 1, emb: vectorf32('[1.0, 2.0, 3.0, 4.0]')})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+  expect:
+    exit_code: 0
+  tags: [vector, setup]
+
+- name: drop-pin-enforced-while-indexed
+  description: With the index in place a dim-3 write is refused.
+  query: >-
+    CREATE (:VDL_Drop {id: 2, emb: vectorf32('[1.0, 2.0, 3.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+  tags: [vector, negative]
+
+- name: drop-the-index
+  query: DROP INDEX vdl_drop_idx
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, ddl]
+
+- name: drop-releases-the-pin
+  description: |
+    KEY ASSERTION. With no index there is nothing to keep homogeneous, so the
+    dim-3 write is accepted. RED before the fix: the pin outlived its index and
+    this stayed refused with no statement able to clear it.
+  query: >-
+    CREATE (:VDL_Drop {id: 3, emb: vectorf32('[1.0, 2.0, 3.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, key-assertion]
+
+# ---------------------------------------------------------------------------
+# (d) restart parity
+# ---------------------------------------------------------------------------
+- name: restart-setup
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "CREATE INDEX vdl_restart_idx ON VDL_Restart (emb) USING HNSW WITH (metric = 'l2')" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "CREATE (:VDL_Restart {id: 1, emb: vectorf32('[1.0, 2.0, 3.0, 4.0]')})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+  expect:
+    exit_code: 0
+  tags: [vector, setup, restart]
+
+- name: restart-pin-enforced-before-restart
+  description: Baseline — the guard is armed in the process that ran the DDL.
+  query: >-
+    CREATE (:VDL_Restart {id: 2, emb: vectorf32('[1.0, 2.0, 3.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+  tags: [vector, negative, restart]
+
+- name: restart-checkpoint
+  description: |
+    Restart the server. The catalog reloads from disk; the dimension itself is
+    not persisted anywhere, so the guard must re-derive it from the vector
+    already stored under (VDL_Restart, emb).
+  type: bash
+  command: echo 'vector dim restart checkpoint'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [vector, restart]
+
+- name: restart-index-still-listed
+  description: The catalog row survived — this is what made the vanished guard so quiet.
+  query: SHOW INDEXES
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - vdl_restart_idx
+  tags: [vector, restart]
+
+- name: restart-guard-survives
+  description: |
+    KEY ASSERTION. A dim-3 write is still refused after the restart. RED before
+    the fix: SQLSTATE 00000 — the guard existed only for the lifetime of the
+    process that ran the CREATE INDEX, so mixed dimensions were accepted
+    silently into the same index.
+  query: >-
+    CREATE (:VDL_Restart {id: 3, emb: vectorf32('[7.0, 8.0, 9.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, restart, key-assertion]
+
+- name: restart-stored-dimension-still-writes
+  description: |
+    The re-derived pin is the STORED dimension (4), not merely "reject
+    everything".
+  query: >-
+    CREATE (:VDL_Restart {id: 4, emb: vectorf32('[7.0, 8.0, 9.0, 10.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, restart, control, positive]
+
+- name: restart-final-row-count
+  description: Two rows — the pre-restart dim-4 write and the post-restart dim-4 write.
+  query: >-
+    MATCH (n:VDL_Restart) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+  tags: [vector, restart, control]
