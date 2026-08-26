@@ -5,8 +5,8 @@ cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 60000
     cleanup: true
     args:
@@ -24,8 +24,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: 'CREATE (a:Person {name: ''Alice''}), (b:Person {name: ''Bob''}), (a)-[:KNOWS]->(b)
-    RETURN a, b'
+  stdin: "CREATE (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}), (a)-[:KNOWS]->(b) RETURN a, b"
   expect:
     exit_code: 0
     stdout_contains:
@@ -48,7 +47,6 @@ tests:
   tags:
   - gap-0088
   - path
-  - null
 - name: all-shortest-paths-basic
   description: Test allShortestPaths returns list
   args:
@@ -62,26 +60,65 @@ tests:
   - path
   - graph
 - name: spatial-point-creation
-  description: Test creating spatial points
+  description: |
+    Test creating spatial points.
+
+    Retargeted 2026-08-26 (FN-DISPATCH-PARITY): this pinned `point({x, y})`,
+    which the engine has NEVER implemented — it answered SQLSTATE 42883, and the
+    test passed anyway because `geode query` exits 0 and reports a failed
+    statement in the JSON body. `point` has now been removed from SHOW FUNCTIONS
+    (its map form carries an undecided CRS choice); `st_point` is the geometry
+    constructor this engine actually implements, and the assertion now pins the
+    statement's SQLSTATE instead of the exit code alone.
+  args:
+  - query
+  - '-'
+  stdin: RETURN st_point(1.0, 2.0) AS p
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"p"'
+  tags:
+  - gap-0089
+  - spatial
+  - point
+- name: spatial-point-map-form-is-unimplemented
+  description: |
+    The honest counterpart of the test above: `point(map)` is refused, not
+    silently absent. If a CRS-carrying point constructor ever lands, this
+    assertion should flip in the same commit that re-advertises the name.
   args:
   - query
   - '-'
   stdin: 'RETURN point({x: 1.0, y: 2.0}) AS p'
   expect:
     exit_code: 0
+    stdout_contains:
+    - '"status_class":"42883"'
   tags:
   - gap-0089
   - spatial
   - point
+  - negative
 - name: spatial-distance-calculation
-  description: Test distance between points
+  description: |
+    Test distance between points.
+
+    Retargeted 2026-08-26 (FN-DISPATCH-PARITY): the old form built its operands
+    with the unimplemented `point()` AND used `distance()`, which in this engine
+    is the VECTOR distance (docs/@BUGS_731.md bug 8f) — the geospatial one is
+    `ST_Distance`. Both halves are now the functions that exist, and the result
+    is pinned, not just the exit code.
   args:
   - query
   - '-'
-  stdin: 'WITH point({x: 0, y: 0}) AS p1, point({x: 3, y: 4}) AS p2 RETURN distance(p1,
-    p2) AS dist'
+  stdin: RETURN ST_Distance(st_point(0.0, 0.0), st_point(3.0, 4.0)) AS dist
   expect:
     exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"dist":"5.000000"'
   tags:
   - gap-0089
   - spatial
@@ -91,9 +128,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: "CREATE (a:City {name: 'London'}),\n       (b:City {name: 'Paris'}),\n  \
-    \     (c:City {name: 'Berlin'}),\n       (a)-[:CONNECTS {distance: 300}]->(b),\n\
-    \       (b)-[:CONNECTS {distance: 800}]->(c)\nRETURN count(*) AS cnt\n"
+  stdin: "CREATE (a:City {name: 'London'}),\n       (b:City {name: 'Paris'}),\n       (c:City {name: 'Berlin'}),\n       (a)-[:CONNECTS {distance: 300}]->(b),\n       (b)-[:CONNECTS {distance: 800}]->(c)\nRETURN count(*) AS cnt\n"
   expect:
     exit_code: 0
   tags:
@@ -105,8 +140,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: MATCH (a:City)-[r:CONNECTS]->(b:City) RETURN a.name AS from, b.name AS to,
-    r.distance AS dist
+  stdin: MATCH (a:City)-[r:CONNECTS]->(b:City) RETURN a.name AS from, b.name AS to, r.distance AS dist
   expect:
     exit_code: 0
     stdout_contains:

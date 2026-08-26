@@ -1,0 +1,501 @@
+version: '1.0'
+name: Advertise/dispatch parity leftovers, the ExtValue bridge, and grouped unknown functions
+description: |
+  Wire-level spec for the 2026-08-26 residual cycle. Four independent defects,
+  all of the same family: the engine PUBLISHED or ACCEPTED something it did not
+  actually answer.
+
+  (1) FN-DISPATCH-PARITY LEFTOVERS. The dispatch-parity sweep added in the
+      previous cycle walked `language_metadata.procedures` and CALLed every
+      procedure name and alias. There was NO equivalent walk for FUNCTIONS, so
+      twelve advertised function names rotted in place:
+
+        rand() pi() e() startsWith() endsWith() contains() nullIf() localtime()
+        elementId() point()          -> SQLSTATE 42883, undefined function
+        none(x IN … WHERE …) single(x IN … WHERE …)
+                                     -> not even parseable (no grammar)
+
+      …plus a thirteenth that answered WRONGLY rather than not at all:
+      `cosine()` understood only a LIST of numbers, so
+      `cosine(vectorf32([...]), vectorf32([...]))` returned NULL while its own
+      metadata documents it over VECTORF32/VECTORI32 and `vector_cosine`
+      answered the same query correctly.
+
+      Eleven were IMPLEMENTED (the semantics are exact and unambiguous:
+      `rand` is an alias of the already-tested `random`, `pi`/`e` are constants,
+      `startsWith`/`endsWith`/`contains` are the case-sensitive function forms
+      of operators the engine already had next to the dispatched `icontains`,
+      `localtime` mirrors `localdatetime`, `nullIf` delegates its equality to
+      `=`, `none`/`single` join `all`/`any` in one quantifier handler, and
+      `cosine` routes VECTOR arguments to the same core `vector_cosine` uses).
+
+      Two were UN-ADVERTISED because the semantics are NOT decided:
+      `elementId` is the ISO/Neo4j opaque element-id scheme this engine has
+      made no decision about (`id()` is the implemented identity), and
+      `point(map)` is the Cypher spatial constructor whose map form carries a
+      CRS decision (cartesian vs wgs-84, 2D vs 3D) that has not been made —
+      while `st_point`, `geometryfromtext` and `latlon`/`latlonalt` are the
+      constructors that DO exist. Both are pinned here as refused, so a future
+      re-advertisement has to land with an implementation.
+
+  (2) THE EXTVALUE BRIDGE. `src/eval_extended.zig`'s `toBuiltin`/`fromBuiltin`
+      was taught about Date/Time/Timestamp in the previous cycle; Interval and
+      Json stayed in its `else => Null` catch-all, so every registry function
+      taking one received a NULL argument and refused it:
+
+        duration_add(…) duration_sub(…) json_get(…)   -> type error
+
+      Those are all three of the registry's Interval/Json-taking functions.
+
+  (3) GROUPED UNKNOWN FUNCTIONS. The grouped projection path evaluated every
+      item with a blanket `catch -> NULL`, which also swallowed
+      "undefined function". `RETURN n.k, banana(n.v) GROUP BY n.k` came back as
+      a full, SUCCESSFUL result set with a NULL column, while the identical
+      ungrouped `RETURN banana(n.v)` raised 42883 — loud in one query shape and
+      silent in the other.
+
+  (4) ADVANCED INDEXES AFTER A RESTART. Nothing rebuilt advanced (HNSW) indexes
+      on catalog reload, so after a restart SHOW INDEXES still listed the index
+      while knn() silently brute-force scanned. The rows are the SAME either
+      way (the fallback scan is exact), so the wire cannot see which path ran —
+      the "an index instance exists again" assertion lives engine-side in
+      geode `tests/test_advanced_index_restart.zig`. What IS asserted here is
+      that the lazy rebuild does not change the answers, and that the metric
+      recorded by the DDL survives the restart with the catalog row.
+
+  NOTE ON `exit_code: 0`. `geode query` exits 0 and reports a failed statement
+  in the JSON body (`status_class`), so every assertion below pins the
+  SQLSTATE, never the exit code alone.
+
+  Labels are prefixed FDP_ so this spec cannot collide with any other spec's
+  data. `cleanup: false` so the data dir survives the restart step.
+
+  Engine-side siblings: geode tests/test_fn_dispatch_parity.zig
+  (`zig build test-fn-dispatch-parity`), tests/test_date_part_exact.zig
+  (`zig build test-date-part-exact`), tests/test_unsupported_aggregates.zig
+  (`zig build test-unsupported-aggregates`) and
+  tests/test_advanced_index_restart.zig (`zig build test-advanced-index-restart`).
+
+  CANARY: REQ=REQ-FN-DISPATCH-PARITY; FEATURE="AdvertiseDispatchParity"; ASPECT=WireContract; STATUS=TESTED; TEST=geodetestlab/specs/fn_dispatch_parity_leftovers.yml; OWNER=execution; UPDATED=2026-08-26
+  CANARY: REQ=REQ-EXTVALUE-BRIDGE-INTERVAL-JSON; FEATURE="ExtendedBuiltins"; ASPECT=WireContract; STATUS=TESTED; TEST=geodetestlab/specs/fn_dispatch_parity_leftovers.yml; OWNER=eval; UPDATED=2026-08-26
+  CANARY: REQ=REQ-GROUPED-UNKNOWN-FUNCTION; FEATURE="GroupedProjection"; ASPECT=WireContract; STATUS=TESTED; TEST=geodetestlab/specs/fn_dispatch_parity_leftovers.yml; OWNER=execution; UPDATED=2026-08-26
+  CANARY: REQ=REQ-ADVANCED-INDEX-RESTART-REBUILD; FEATURE="VectorIndex"; ASPECT=WireContract; STATUS=TESTED; TEST=geodetestlab/specs/fn_dispatch_parity_leftovers.yml; OWNER=index; UPDATED=2026-08-26
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# (1) the advertised names that are now DISPATCHED
+# ---------------------------------------------------------------------------
+- name: fdp-rand-is-a-float-in-unit-interval
+  description: |
+    RED: SQLSTATE 42883. `rand()` is advertised by SHOW FUNCTIONS and by
+    language_metadata ("Random float between 0 and 1") and dispatched nowhere.
+    It is an alias of the implemented `random()`.
+    The RANGE ([0,1), and not a constant) is pinned engine-side over sixteen
+    draws in tests/test_fn_dispatch_parity.zig; over the wire this pins that the
+    name dispatches at all and yields the advertised FLOAT (DOUBLE) type rather
+    than 42883. (`rand() < 1.0` cannot be used here: comparing a DOUBLE against
+    a decimal literal is an unrelated, pre-existing type-mismatch in the
+    comparison path.)
+  query: RETURN rand() AS r
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"r","type":"DOUBLE"'
+    stdout_not_contains:
+    - '"status_class":"42883"'
+  tags: [functions, dispatch-parity, key-assertion]
+
+- name: fdp-pi-and-e-are-the-constants
+  description: |
+    RED: SQLSTATE 42883 for both. `degrees(pi())` is degrees()'s own documented
+    example, so the composition is pinned too.
+  query: RETURN pi() AS pi_v, e() AS e_v, degrees(pi()) AS deg
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"pi_v":"3.141593"'
+    - '"e_v":"2.718282"'
+    - '"deg":"180.'
+  tags: [functions, dispatch-parity, key-assertion]
+
+- name: fdp-string-predicates-dispatch
+  description: |
+    RED: SQLSTATE 42883 for all three, while the case-INSENSITIVE `icontains`
+    sitting in the same metadata block dispatched fine.
+  query: >-
+    RETURN startsWith('hello', 'he') AS sw, endsWith('hello', 'lo') AS ew,
+           contains('hello', 'ell') AS ct, contains('Hello', 'hello') AS case_sensitive,
+           icontains('Hello', 'hello') AS case_insensitive
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"sw":true'
+    - '"ew":true'
+    - '"ct":true'
+    - '"case_sensitive":false'
+    - '"case_insensitive":true'
+  tags: [functions, dispatch-parity, key-assertion]
+
+- name: fdp-nullif-dispatches-both-ways
+  description: 'RED: SQLSTATE 42883. NULL when the arguments compare equal, the first argument otherwise.'
+  query: RETURN nullIf(1, 1) AS same, nullIf(1, 2) AS different
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"same":null'
+    - '"different":1'
+  tags: [functions, dispatch-parity, key-assertion]
+
+- name: fdp-localtime-parses-like-time
+  description: |
+    RED: SQLSTATE 42883, while `localdatetime` — its exact analogue one row
+    above in the same SHOW FUNCTIONS table — dispatched.
+  query: RETURN localtime('10:11:12') AS lt
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"value":"10:11:12"'
+  tags: [functions, dispatch-parity, temporal, key-assertion]
+
+- name: fdp-none-and-single-are-parseable
+  description: |
+    RED: a SYNTAX error — the grammar special-cased only all()/any(), so the
+    documented spelling of these two advertised predicates could not be written
+    at all.
+  query: >-
+    RETURN none(x IN [1,2,3] WHERE x > 5) AS none_over,
+           none(x IN [1,2,3] WHERE x > 2) AS none_under,
+           single(x IN [1,2,3] WHERE x > 2) AS single_one,
+           single(x IN [1,2,3] WHERE x > 1) AS single_two
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"none_over":true'
+    - '"none_under":false'
+    - '"single_one":true'
+    - '"single_two":false'
+  tags: [functions, dispatch-parity, predicates, key-assertion]
+
+- name: fdp-all-and-any-still-work
+  description: Control — the pre-existing quantifiers share the new handler and must be unchanged.
+  query: >-
+    RETURN all(x IN [1,2,3] WHERE x > 0) AS all_true,
+           all(x IN [1,2,3] WHERE x > 2) AS all_false,
+           any(x IN [1,2,3] WHERE x > 2) AS any_true,
+           any(x IN [1,2,3] WHERE x > 5) AS any_false
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"all_true":true'
+    - '"all_false":false'
+    - '"any_true":true'
+    - '"any_false":false'
+  tags: [functions, predicates, control]
+
+- name: fdp-cosine-answers-for-vectors
+  description: |
+    RED: NULL. `cosine()` understood only a LIST, so the VECTORF32/VECTORI32
+    values its own metadata documents answered NULL — indistinguishable from
+    "these vectors really have no similarity".
+  query: >-
+    RETURN cosine(vectorf32('[1.0, 2.0, 3.0]'), vectorf32('[1.0, 2.0, 3.0]')) AS identical,
+           vector_cosine(vectorf32('[1.0, 2.0, 3.0]'), vectorf32('[1.0, 2.0, 3.0]')) AS via_vector_cosine,
+           cosine(vectorf32('[1.0, 0.0]'), vectorf32('[0.0, 1.0]')) AS orthogonal
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"identical":"1.000000"'
+    - '"via_vector_cosine":"1.000000"'
+    - '"orthogonal":"0.000000"'
+    stdout_not_contains:
+    - '"identical":null'
+  tags: [functions, vector, dispatch-parity, key-assertion]
+
+- name: fdp-cosine-list-form-unchanged
+  description: Control — routing VECTORs to the vector core must not disturb the LIST form.
+  query: RETURN cosine([1.0, 2.0], [1.0, 2.0]) AS list_form
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"list_form":"0.999999"'
+  tags: [functions, vector, control]
+
+# ---------------------------------------------------------------------------
+# (1b) the advertised names that were UN-ADVERTISED instead
+# ---------------------------------------------------------------------------
+- name: fdp-element-id-is-refused
+  description: |
+    `elementId` was listed by SHOW FUNCTIONS and answered nowhere. It is the
+    ISO/Neo4j opaque element-id scheme, which this engine has not decided on;
+    `id()` is the implemented identity. Pinned as refused so a future
+    re-advertisement has to land with an implementation.
+  query: RETURN elementId(1) AS e
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42883"'
+  tags: [functions, dispatch-parity, negative]
+
+- name: fdp-point-map-form-is-refused
+  description: |
+    `point(map)` was listed by SHOW FUNCTIONS and answered nowhere. Its map form
+    carries a CRS decision (cartesian vs wgs-84, 2D vs 3D) that has not been
+    made; `st_point` / `geometryfromtext` / `latlon` are the constructors that
+    exist.
+  query: 'RETURN point({x: 1.0, y: 2.0}) AS p'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42883"'
+  tags: [functions, dispatch-parity, spatial, negative]
+
+- name: fdp-real-point-constructors-work
+  description: |
+    Control for the removal — it is not a capability loss. These are the
+    geometry constructors the engine actually implements.
+  query: >-
+    RETURN st_point(1.0, 2.0) AS geom, ST_Distance(st_point(0.0, 0.0), st_point(3.0, 4.0)) AS dist,
+           latlon(37.7749, -122.4194) AS loc
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"dist":"5.000000"'
+  tags: [functions, spatial, control]
+
+- name: fdp-show-functions-does-not-advertise-them
+  description: |
+    The recurrence guard on the METADATA side: a name that does not dispatch
+    must not be published.
+  query: SHOW FUNCTIONS
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"nullIf"'
+    - '"name":"localtime"'
+    - '"name":"rand"'
+    stdout_not_contains:
+    - elementId
+    - '"name":"point"'
+  tags: [functions, dispatch-parity, metadata]
+
+# ---------------------------------------------------------------------------
+# (2) the ExtValue bridge — Interval and Json
+# ---------------------------------------------------------------------------
+- name: fdp-duration-add-and-sub-are-reachable
+  description: |
+    RED: a type error for both. The Interval argument crossed the ExtValue
+    bridge as NULL, so these were unreachable from GQL for their entire
+    documented input domain.
+  query: >-
+    RETURN duration_add(duration('PT1H'), duration('PT2H')) AS sum,
+           duration_sub(duration('PT3H'), duration('PT1H')) AS diff
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"value":"PT3H"'
+    - '"value":"PT2H"'
+  tags: [functions, temporal, bridge, key-assertion]
+
+- name: fdp-duration-months-are-refused-not-fabricated
+  description: |
+    A month is not a fixed number of nanoseconds, and the bridge's target type
+    is a nanosecond length. A month-bearing interval is REFUSED rather than
+    folded onto an invented 30-day month — the same fabricated calendar that
+    was removed from date_part in the previous cycle.
+  query: RETURN duration_add(duration('P1M'), duration('P1M')) AS m
+  expected:
+    exit_code: 0
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [functions, temporal, bridge, negative]
+
+- name: fdp-json-get-is-reachable
+  description: |
+    RED: a type error. The Json argument crossed the ExtValue bridge as NULL.
+    The SECOND key is read too, so an implementation that always returns the
+    first field fails.
+  query: >-
+    RETURN json_get(json('{"a": 1, "b": 2}'), 'a') AS first_key,
+           json_get(json('{"a": 1, "b": 2}'), 'b') AS second_key,
+           json_get(json('{"a": 1}'), 'zzz') AS absent_key
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"value":"1"'
+    - '"value":"2"'
+    - '"absent_key":null'
+  tags: [functions, json, bridge, key-assertion]
+
+# ---------------------------------------------------------------------------
+# (3) an unknown function must escape the grouped path
+# ---------------------------------------------------------------------------
+- name: fdp-grouped-seed
+  description: Two rows in one group and one in another, so GROUP BY has real work.
+  query: >-
+    CREATE (:FDP_G {k: 'a', v: 1}), (:FDP_G {k: 'a', v: 3}), (:FDP_G {k: 'b', v: 5})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [grouping, setup]
+
+- name: fdp-ungrouped-unknown-function-is-loud
+  description: The reference behaviour — ungrouped, an unknown function has always raised 42883.
+  query: MATCH (n:FDP_G) RETURN banana(n.v) AS b
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42883"'
+  tags: [grouping, negative, control]
+
+- name: fdp-grouped-unknown-function-is-loud-too
+  description: |
+    KEY ASSERTION. RED: SQLSTATE 00000 with two rows and a NULL second column —
+    a full, successful result set for a query with a typo in it.
+  query: MATCH (n:FDP_G) RETURN n.k, banana(n.v) GROUP BY n.k
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42883"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [grouping, negative, key-assertion]
+
+- name: fdp-grouped-unknown-function-in-group-key-is-loud
+  description: The GROUP BY key expression carried the same swallow.
+  query: MATCH (n:FDP_G) RETURN banana(n.k), count(*) GROUP BY banana(n.k)
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42883"'
+  tags: [grouping, negative]
+
+- name: fdp-grouped-real-aggregates-still-work
+  description: |
+    Control — the six implemented aggregates and ordinary scalar functions
+    inside a grouped projection must be untouched, values included.
+  query: MATCH (n:FDP_G) RETURN n.k, sum(n.v) AS total, upper(n.k) AS up GROUP BY n.k
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"total":4'
+    - '"total":5'
+    - '"up":"A"'
+    - '"up":"B"'
+  tags: [grouping, control]
+
+# ---------------------------------------------------------------------------
+# (4) advanced index rebuild after a restart
+# ---------------------------------------------------------------------------
+- name: fdp-knn-restart-setup
+  description: A cosine HNSW index plus three unit-axis vectors to search.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "CREATE INDEX fdp_knn_idx ON FDP_Knn (emb) USING vector WITH (metric = 'cosine')" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "CREATE (:FDP_Knn {id: 1, emb: vectorf32('[1.0, 0.0, 0.0]')})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "CREATE (:FDP_Knn {id: 2, emb: vectorf32('[0.0, 1.0, 0.0]')})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "CREATE (:FDP_Knn {id: 3, emb: vectorf32('[0.0, 0.0, 1.0]')})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+  expect:
+    exit_code: 0
+  tags: [vector, knn, setup, restart]
+
+- name: fdp-knn-before-restart
+  description: Baseline in the process that ran the DDL, where the index really was built.
+  query: RETURN knn('emb', vectorf32('[1.0, 0.0, 0.0]'), 3, 'cosine') AS hits
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, knn, restart]
+
+- name: fdp-knn-restart-checkpoint
+  description: |
+    Restart the server. The catalog reloads from disk; before the fix nothing
+    rebuilt the advanced index, so knn() silently brute-force scanned from here
+    on. The wire cannot tell the two apart — the fallback scan is exact — so
+    the "an index instance exists again" assertion lives engine-side in
+    tests/test_advanced_index_restart.zig. What this pins is that the lazy
+    rebuild does not change the ANSWERS, and that the catalog row (with the
+    metric now persisted alongside it) survives.
+  type: bash
+  command: echo 'advanced index restart checkpoint'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [vector, knn, restart]
+
+- name: fdp-knn-index-still-listed-after-restart
+  description: The catalog row survived — this is what made the vanished index so quiet.
+  query: SHOW INDEXES
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - fdp_knn_idx
+  tags: [vector, knn, restart]
+
+- name: fdp-knn-after-restart-answers-the-same
+  description: |
+    The lazy rebuild runs on this query. Its answers must be identical to the
+    pre-restart ones — a rebuilt index with the wrong metric would be the
+    regression this fix had to avoid, which is why the metric is now persisted
+    with the catalog row.
+  query: RETURN knn('emb', vectorf32('[1.0, 0.0, 0.0]'), 3, 'cosine') AS hits
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, knn, restart, key-assertion]
+
+- name: fdp-knn-rows-intact-after-restart
+  description: Control — the rebuild is a read-side action and must not touch the data.
+  query: MATCH (n:FDP_Knn) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":3'
+  tags: [vector, knn, restart, control]
