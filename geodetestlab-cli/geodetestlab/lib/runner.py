@@ -864,7 +864,13 @@ def run_tests(
     try:
         binary = find_geode_binary(geode_binary)
     except FileNotFoundError as e:
-        raise RunnerError(str(e)) from e
+        # Dry runs never execute the binary; a placeholder path keeps
+        # `--dry-run` usable (and its CLI tests green) on machines/CI
+        # without a geode build. Real runs still fail loudly.
+        if dry_run:
+            binary = "geode"
+        else:
+            raise RunnerError(str(e)) from e
 
     env = os.environ.copy()
     env.update(env_overrides)
