@@ -1079,7 +1079,9 @@ def _run_signal_step(step: TestStep, cluster_ctx: ClusterControlContext | None) 
     pid = node.process.pid
     try:
         pgid = os.getpgid(pid)
-        os.killpg(pgid, sig)
+        from .server import _safe_killpg
+
+        _safe_killpg(pgid, sig)
     except ProcessLookupError:
         # The process is already gone. SIGKILL/SIGTERM on a dead node is a
         # benign no-op; treat it as success. SIGSTOP/SIGCONT cannot apply.

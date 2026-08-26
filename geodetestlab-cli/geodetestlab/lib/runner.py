@@ -531,8 +531,10 @@ def _recover_hung_server(
                     if verbose:
                         print("  Server hung (unresponsive), force-killing and restarting...")
                     try:
+                        from .server import _safe_killpg
+
                         pgid = os.getpgid(server_state.process.pid)
-                        os.killpg(pgid, signal.SIGKILL)
+                        _safe_killpg(pgid, signal.SIGKILL)
                     except (OSError, ProcessLookupError):
                         pass
                     server_state.process.kill()

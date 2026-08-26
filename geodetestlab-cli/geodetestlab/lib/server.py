@@ -23,6 +23,24 @@ logger = logging.getLogger(__name__)
 _active_servers: list[subprocess.Popen[str]] = []
 
 
+def _safe_killpg(pgid: int, sig: int) -> None:
+    """killpg, but never our own process group.
+
+    Servers are normally spawned with start_new_session=True, giving
+    them their own group. If a tracked process ended up sharing OUR
+    group (a test double, or a spawn without a new session), killpg
+    would take down pytest and the CI job shell with it — which is
+    exactly what happened on GitLab runners, where the non-interactive
+    job shell shares one process group with everything it runs.
+    """
+    try:
+        if pgid == os.getpgid(0):
+            return
+    except OSError:
+        return
+    os.killpg(pgid, sig)
+
+
 class ServerError(Exception):
     """Raised when a server operation fails."""
 
@@ -35,9 +53,9 @@ def cleanup_servers() -> None:
                 # Kill the entire process group first (for servers started with start_new_session)
                 try:
                     pgid = os.getpgid(process.pid)
-                    os.killpg(pgid, signal.SIGTERM)
+                    _safe_killpg(pgid, signal.SIGTERM)
                     time.sleep(0.5)
-                    os.killpg(pgid, signal.SIGKILL)
+                    _safe_killpg(pgid, signal.SIGKILL)
                 except (OSError, ProcessLookupError):
                     pass
                 # Then kill the process directly as fallback
@@ -231,7 +249,7 @@ def stop_server(process: subprocess.Popen[str], verbose: bool = False) -> None:
         # Try graceful termination of process group first
         if pgid:
             try:
-                os.killpg(pgid, signal.SIGTERM)
+                _safe_killpg(pgid, signal.SIGTERM)
             except (OSError, ProcessLookupError):
                 pass
 
@@ -258,7 +276,7 @@ def stop_server(process: subprocess.Popen[str], verbose: bool = False) -> None:
             # Force kill the entire process group
             if pgid:
                 try:
-                    os.killpg(pgid, signal.SIGKILL)
+                    _safe_killpg(pgid, signal.SIGKILL)
                 except (OSError, ProcessLookupError):
                     pass
             process.kill()
