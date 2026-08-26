@@ -1089,7 +1089,10 @@ def run_tests(
                 if cluster_state is not None and spec.cluster_config and spec.cluster_config.target_node == "all":
                     for node in cluster_state.nodes:
                         if interrupted:
-                            break
+                            # mypy narrows `interrupted` to False after the
+                            # outer check and cannot see the signal-handler
+                            # mutation, so it flags this break unreachable.
+                            break  # type: ignore[unreachable]
                         summary.total += 1
                         env["GEODE_SERVER_ADDRESS"] = node.address
                         env["PORT"] = str(node.port)

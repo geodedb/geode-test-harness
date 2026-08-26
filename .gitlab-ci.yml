@@ -38,7 +38,11 @@ variables:
     - linux
   image: python:3.14-slim
   cache:
-    key: pip-${CI_COMMIT_REF_SLUG}
+    # Key includes the interpreter version: a .venv created under an
+    # older python (cached across the 3.13 -> 3.14 image bump) has
+    # dangling interpreter symlinks and stale site-packages, which
+    # produced spurious CLI test failures and hangs.
+    key: pip-py314-${CI_COMMIT_REF_SLUG}
     paths:
       - geodetestlab-cli/.venv/
   before_script:
@@ -74,6 +78,8 @@ lint-mypy:
 test-unit:
   extends: .python-setup
   stage: lint
+  # Unit tests run in seconds; anything longer is a hang, not work.
+  timeout: 20m
   script:
     - . .venv/bin/activate
     - python -m pytest geodetestlab/tests/ -v --tb=short
@@ -91,9 +97,16 @@ lint-security:
   image: python:3.14-slim
   before_script:
     - pip install -q bandit
+  # Skipped checks are inherent to a test harness, not defects:
+  #   B101 asserts (pytest), B103/B108 temp scripts + temp dirs the
+  #   harness provisions itself, B105 fake credentials inside tests,
+  #   B110 best-effort cleanup handlers, B311 pseudo-random TEST data,
+  #   B404/B603/B607 the harness's whole job is spawning the geode
+  #   binary and client runners via subprocess.
   script:
-    - bandit -r geodetestlab-cli/geodetestlab/ -s B101 -f json -o reports/bandit.json || true
-    - bandit -r geodetestlab-cli/geodetestlab/ -s B101
+    - mkdir -p reports
+    - bandit -r geodetestlab-cli/geodetestlab/ -s B101,B103,B105,B108,B110,B311,B404,B603,B607 -f json -o reports/bandit.json || true
+    - bandit -r geodetestlab-cli/geodetestlab/ -s B101,B103,B105,B108,B110,B311,B404,B603,B607
   artifacts:
     paths:
       - reports/bandit.json

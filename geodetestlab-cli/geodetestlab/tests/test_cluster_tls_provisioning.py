@@ -23,6 +23,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -39,7 +40,7 @@ class _FakeProc:
         return None
 
 
-def _patch_cluster_io(monkeypatch) -> list[dict]:
+def _patch_cluster_io(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     """Patch start_cluster's heavy I/O so the env/args wiring is testable.
 
     Returns a list that accumulates ``{"env": ..., "args": ...}`` for each
@@ -47,9 +48,9 @@ def _patch_cluster_io(monkeypatch) -> list[dict]:
     """
     import geodetestlab.lib.cluster as clustermod
 
-    captured: list[dict] = []
+    captured: list[dict[str, Any]] = []
 
-    def fake_start_server(**kwargs):
+    def fake_start_server(**kwargs: Any) -> _FakeProc:
         captured.append({"env": dict(kwargs["env"]), "args": list(kwargs["args"])})
         return _FakeProc()
 
@@ -95,7 +96,7 @@ def test_provision_cluster_tls_emits_verifiable_ca_and_leaf() -> None:
 
 
 @openssl_required
-def test_start_cluster_uses_verified_tls_not_insecure(monkeypatch) -> None:
+def test_start_cluster_uses_verified_tls_not_insecure(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default forced-cluster path: every node gets GEODE_CLUSTER_CA_CERT plus
     --cert/--key and NObody gets the debug-only GEODE_CLUSTER_INSECURE=1."""
     from geodetestlab.lib.cluster import start_cluster, stop_cluster
@@ -131,7 +132,7 @@ def test_start_cluster_uses_verified_tls_not_insecure(monkeypatch) -> None:
     assert not Path(cert_dir).exists()
 
 
-def test_start_cluster_honors_explicit_insecure_override(monkeypatch) -> None:
+def test_start_cluster_honors_explicit_insecure_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """A spec that explicitly opts into GEODE_CLUSTER_INSECURE (Debug-only)
     keeps that choice and skips cert provisioning."""
     from geodetestlab.lib.cluster import start_cluster, stop_cluster

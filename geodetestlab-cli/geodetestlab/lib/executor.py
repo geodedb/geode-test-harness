@@ -569,7 +569,7 @@ def _build_cli_command(
                     env["GEODE_ALLOW_INSECURE_TLS"] = "1"
                     cmd.append("--insecure-tls-skip-verify")
             elif "--data-dir" not in args and data_dir:
-                cmd.extend(["--data-dir", data_dir])
+                cmd.extend(["--data-dir", str(data_dir)])
         elif args and _is_remote_admin_command(args):
             if use_grpc:
                 logger.warning(

@@ -564,7 +564,7 @@ def load_spec(path: str | Path) -> TestSpec:
 
     try:
         with open(path, encoding="utf-8") as f:
-            data = yaml.load(f, Loader=_SafeLoaderNoSexagesimal)  # noqa: S506
+            data = yaml.load(f, Loader=_SafeLoaderNoSexagesimal)  # noqa: S506  # nosec B506 - SafeLoader subclass
     except yaml.YAMLError as e:
         raise SpecValidationError(f"Invalid YAML syntax: {e}") from e
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass, field
+from typing import Any
 
 _MIN_CLUSTER_NODES = 2
 _MAX_CLUSTER_NODES = 10
@@ -19,7 +20,7 @@ class ClusterNodeConfig:
     grpc_port: int | None = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> ClusterNodeConfig:
+    def from_dict(cls, data: dict[str, Any]) -> ClusterNodeConfig:
         return cls(
             args=data.get("args", []),
             env=data.get("env", {}),
@@ -47,7 +48,7 @@ class ClusterConfig:
     independent: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict) -> ClusterConfig:
+    def from_dict(cls, data: dict[str, Any]) -> ClusterConfig:
         raw_count = data.get("nodes", 3)
         node_count = max(_MIN_CLUSTER_NODES, min(_MAX_CLUSTER_NODES, raw_count))
 

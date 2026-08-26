@@ -10,10 +10,10 @@ import re
 
 import httpx
 
-from .spec import HttpExpected, TestCase
+from .spec import ExpectedResult, HttpExpected, TestCase
 
 
-def _check_exit_code(expected, exit_code: int) -> bool:
+def _check_exit_code(expected: ExpectedResult, exit_code: int) -> bool:
     if expected.exit_code is not None:
         if isinstance(expected.exit_code, list):
             if exit_code not in expected.exit_code:
@@ -23,7 +23,7 @@ def _check_exit_code(expected, exit_code: int) -> bool:
     return True
 
 
-def _check_status(expected, exit_code: int) -> bool:
+def _check_status(expected: ExpectedResult, exit_code: int) -> bool:
     if expected.exit_code is None:
         if expected.status == "success" and exit_code != 0:
             return False
@@ -32,7 +32,7 @@ def _check_status(expected, exit_code: int) -> bool:
     return True
 
 
-def _check_result_contains(expected, output: str) -> bool:
+def _check_result_contains(expected: ExpectedResult, output: str) -> bool:
     if expected.result_contains:
         if isinstance(expected.result_contains, dict):
             for k, v in expected.result_contains.items():
@@ -53,7 +53,7 @@ def _check_result_contains(expected, output: str) -> bool:
     return True
 
 
-def _check_result_not_contains(expected, output: str) -> bool:
+def _check_result_not_contains(expected: ExpectedResult, output: str) -> bool:
     if expected.result_not_contains:
         if isinstance(expected.result_not_contains, dict):
             all_found = True
@@ -82,7 +82,7 @@ def _check_result_not_contains(expected, output: str) -> bool:
     return True
 
 
-def _check_result_matches(expected, output: str) -> bool:
+def _check_result_matches(expected: ExpectedResult, output: str) -> bool:
     if expected.result_matches:
         if isinstance(expected.result_matches, list):
             for pattern in expected.result_matches:
@@ -93,7 +93,7 @@ def _check_result_matches(expected, output: str) -> bool:
     return True
 
 
-def _check_error_contains(expected, error: str) -> bool:
+def _check_error_contains(expected: ExpectedResult, error: str) -> bool:
     if expected.error_contains:
         if isinstance(expected.error_contains, list):
             for item in expected.error_contains:
@@ -105,7 +105,7 @@ def _check_error_contains(expected, error: str) -> bool:
     return True
 
 
-def _check_stdout_contains(expected, output: str, error: str) -> bool:
+def _check_stdout_contains(expected: ExpectedResult, output: str, error: str) -> bool:
     if expected.stdout_contains:
         combined = output + error
         for item in expected.stdout_contains:
@@ -122,7 +122,7 @@ def _check_stdout_contains(expected, output: str, error: str) -> bool:
     return True
 
 
-def _check_output_contains(expected, output: str, error: str) -> bool:
+def _check_output_contains(expected: ExpectedResult, output: str, error: str) -> bool:
     if expected.output_contains:
         combined = output + error
         for item in expected.output_contains:
@@ -139,7 +139,7 @@ def _check_output_contains(expected, output: str, error: str) -> bool:
     return True
 
 
-def _check_stderr_contains(expected, error: str) -> bool:
+def _check_stderr_contains(expected: ExpectedResult, error: str) -> bool:
     if expected.stderr_contains:
         for item in expected.stderr_contains:
             substring = str(item) if not isinstance(item, str) else item
@@ -148,7 +148,7 @@ def _check_stderr_contains(expected, error: str) -> bool:
     return True
 
 
-def _check_stdout_not_contains(expected, output: str) -> bool:
+def _check_stdout_not_contains(expected: ExpectedResult, output: str) -> bool:
     if expected.stdout_not_contains:
         for item in expected.stdout_not_contains:
             if isinstance(item, dict):
@@ -166,7 +166,7 @@ def _check_stdout_not_contains(expected, output: str) -> bool:
     return True
 
 
-def _check_stderr_not_contains(expected, error: str) -> bool:
+def _check_stderr_not_contains(expected: ExpectedResult, error: str) -> bool:
     if expected.stderr_not_contains:
         for item in expected.stderr_not_contains:
             substring = str(item) if not isinstance(item, str) else item
@@ -175,7 +175,7 @@ def _check_stderr_not_contains(expected, error: str) -> bool:
     return True
 
 
-def _check_stdout_regex(expected, output: str, error: str) -> bool:
+def _check_stdout_regex(expected: ExpectedResult, output: str, error: str) -> bool:
     if expected.stdout_regex:
         for pattern in expected.stdout_regex:
             if not re.search(pattern, output) and not re.search(pattern, error):
@@ -183,7 +183,7 @@ def _check_stdout_regex(expected, output: str, error: str) -> bool:
     return True
 
 
-def _check_stderr_regex(expected, error: str) -> bool:
+def _check_stderr_regex(expected: ExpectedResult, error: str) -> bool:
     if expected.stderr_regex:
         for pattern in expected.stderr_regex:
             if not re.search(pattern, error):
@@ -191,7 +191,7 @@ def _check_stderr_regex(expected, error: str) -> bool:
     return True
 
 
-def _check_stdout_exact(expected, output: str, error: str) -> bool:
+def _check_stdout_exact(expected: ExpectedResult, output: str, error: str) -> bool:
     if expected.stdout_exact is not None:
         expected_stripped = expected.stdout_exact.strip()
         output_stripped = output.strip()
@@ -201,7 +201,7 @@ def _check_stdout_exact(expected, output: str, error: str) -> bool:
     return True
 
 
-def _check_stderr_exact(expected, error: str) -> bool:
+def _check_stderr_exact(expected: ExpectedResult, error: str) -> bool:
     if expected.stderr_exact is not None:
         if error.strip() != expected.stderr_exact.strip():
             return False

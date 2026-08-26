@@ -20,6 +20,7 @@ import json
 import logging
 import subprocess
 import time
+from typing import Any
 
 from .cluster_types import ClusterState
 
@@ -32,7 +33,7 @@ def _probe_node(
     admin_password: str,
     timeout_s: float = 2.0,
     ca_cert: str | None = None,
-) -> dict | None:
+) -> dict[str, Any] | None:
     """Issue ``SHOW CLUSTER STATUS`` against the node's client port via geode query.
 
     Returns a dict with keys ``leader_id``, ``member_count``, ``members`` (list
@@ -72,7 +73,7 @@ def _probe_node(
         # with a `rows` array containing the actual result rows. Older code
         # mistakenly treated each output line as one row (which gave
         # member_count=1 for any cluster). Parse the object and extract rows.
-        rows: list[dict] = []
+        rows: list[dict[str, Any]] = []
         for line in result.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -125,7 +126,7 @@ def wait_for_cluster_ready(
     last_obs_count = 0
 
     while time.monotonic() - start < deadline_s:
-        observations: list[dict] = []
+        observations: list[dict[str, Any]] = []
         for node in cluster_state.nodes:
             obs = _probe_node(binary, node.port, admin_password, ca_cert=ca_cert)
             if obs is None:
