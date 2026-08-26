@@ -31,11 +31,11 @@ pub fn build(b: *std.Build) void {
     });
 
     // Link system libraries
-    runner.linkLibC();
-    runner.linkSystemLibrary("ssl");
-    runner.linkSystemLibrary("crypto");
+    runner.root_module.link_libc = true;
+    runner.root_module.linkSystemLibrary("ssl", .{});
+    runner.root_module.linkSystemLibrary("crypto", .{});
     if (target.result.os.tag == .linux) {
-        runner.linkSystemLibrary("dl");
+        runner.root_module.linkSystemLibrary("dl", .{});
     }
 
     // Add modules to the runner

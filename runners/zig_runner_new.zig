@@ -7,18 +7,35 @@ const yaml = @import("yaml");
 
 const Allocator = std.mem.Allocator;
 
-fn getStdErr() std.fs.File {
-    return if (builtin.os.tag == .windows)
-        std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_ERROR_HANDLE) catch unreachable }
-    else
-        std.fs.File{ .handle = std.posix.STDERR_FILENO };
+fn runnerIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn getStdOut() std.fs.File {
+// Zig 0.16 compat: std.time.milliTimestamp was removed.
+fn milliTimestamp() i64 {
+    var ts: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
+    if (comptime builtin.os.tag == .linux) {
+        const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
+        if (rc != 0) return 0;
+    } else {
+        const rc = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+        if (rc != 0) return 0;
+    }
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
+fn getStdErr() std.Io.File {
     return if (builtin.os.tag == .windows)
-        std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE) catch unreachable }
+        std.Io.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_ERROR_HANDLE) catch unreachable, .flags = .{ .nonblocking = false } }
     else
-        std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+        std.Io.File{ .handle = std.posix.STDERR_FILENO, .flags = .{ .nonblocking = false } };
+}
+
+fn getStdOut() std.Io.File {
+    return if (builtin.os.tag == .windows)
+        std.Io.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE) catch unreachable, .flags = .{ .nonblocking = false } }
+    else
+        std.Io.File{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } };
 }
 
 const JsonArray = std.json.Array;
@@ -147,7 +164,7 @@ fn freeJsonValue(allocator: Allocator, value: *JsonValue) void {
                 allocator.free(entry.key_ptr.*);
                 freeJsonValue(allocator, entry.value_ptr);
             }
-            obj.deinit();
+            obj.deinit(allocator);
         },
         else => {},
     }
@@ -171,13 +188,13 @@ fn cloneJsonValue(allocator: Allocator, src: JsonValue) !JsonValue {
             break :blk JsonValue{ .array = new_arr };
         },
         .object => |obj| blk: {
-            var new_obj = JsonObject.init(allocator);
-            errdefer new_obj.deinit();
+            var new_obj = JsonObject.empty;
+            errdefer new_obj.deinit(allocator);
             var it = obj.iterator();
             while (it.next()) |entry| {
                 const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
                 const cloned = try cloneJsonValue(allocator, entry.value_ptr.*);
-                try new_obj.put(key_copy, cloned);
+                try new_obj.put(allocator, key_copy, cloned);
             }
             break :blk JsonValue{ .object = new_obj };
         },
@@ -209,8 +226,8 @@ fn serializeJsonValue(buf: *std.ArrayList(u8), allocator: Allocator, value: Json
                 try buf.appendSlice(allocator, "false");
             }
         },
-        .integer => |i| try buf.writer(allocator).print("{d}", .{i}),
-        .float => |f| try buf.writer(allocator).print("{}", .{f}),
+        .integer => |i| try buf.print(allocator, "{d}", .{i}),
+        .float => |f| try buf.print(allocator, "{d}", .{f}),
         .number_string => |s| try buf.appendSlice(allocator, s),
         .string => |s| try writeEscapedString(buf, allocator, s),
         .array => |arr| {
@@ -306,8 +323,8 @@ fn yamlToJsonValue(allocator: Allocator, node: yaml.Value) !JsonValue {
             break :blk JsonValue{ .array = arr };
         },
         .map => |map| blk: {
-            var obj = JsonObject.init(allocator);
-            errdefer obj.deinit();
+            var obj = JsonObject.empty;
+            errdefer obj.deinit(allocator);
             for (map) |kv| {
                 // Keys should be strings
                 const key_str = switch (kv.k) {
@@ -316,7 +333,7 @@ fn yamlToJsonValue(allocator: Allocator, node: yaml.Value) !JsonValue {
                 };
                 const key_copy = try allocator.dupe(u8, key_str);
                 const v = try yamlToJsonValue(allocator, kv.v);
-                try obj.put(key_copy, v);
+                try obj.put(allocator, key_copy, v);
             }
             break :blk JsonValue{ .object = obj };
         },
@@ -551,15 +568,15 @@ fn freeSpec(allocator: Allocator, spec: TestSpec) void {
 }
 
 fn buildRunMessage(allocator: Allocator, query: []const u8, params: ?JsonValue) ![]u8 {
-    var obj = JsonObject.init(allocator);
+    var obj = JsonObject.empty;
 
-    try obj.put("type", JsonValue{ .string = try allocator.dupe(u8, "RUN_GQL") });
-    try obj.put("text", JsonValue{ .string = try allocator.dupe(u8, query) });
-    try obj.put("request_id", JsonValue{ .integer = 1 });
+    try obj.put(allocator, "type", JsonValue{ .string = try allocator.dupe(u8, "RUN_GQL") });
+    try obj.put(allocator, "text", JsonValue{ .string = try allocator.dupe(u8, query) });
+    try obj.put(allocator, "request_id", JsonValue{ .integer = 1 });
 
     if (params) |p| {
         const cloned = try cloneJsonValue(allocator, p);
-        try obj.put("params", cloned);
+        try obj.put(allocator, "params", cloned);
     }
 
     const msg_val = JsonValue{ .object = obj };
@@ -569,18 +586,18 @@ fn buildRunMessage(allocator: Allocator, query: []const u8, params: ?JsonValue) 
 }
 
 fn buildSimpleMessage(allocator: Allocator, msg_type: []const u8) ![]u8 {
-    var obj = JsonObject.init(allocator);
-    try obj.put("type", JsonValue{ .string = try allocator.dupe(u8, msg_type) });
+    var obj = JsonObject.empty;
+    try obj.put(allocator, "type", JsonValue{ .string = try allocator.dupe(u8, msg_type) });
     const msg_val = JsonValue{ .object = obj };
     const msg = try jsonToString(allocator, msg_val);
     return msg;
 }
 
 fn buildPullMessage(allocator: Allocator, page_size: usize) ![]u8 {
-    var obj = JsonObject.init(allocator);
-    try obj.put("type", JsonValue{ .string = try allocator.dupe(u8, "PULL") });
-    try obj.put("request_id", JsonValue{ .integer = 1 });
-    try obj.put("page_size", JsonValue{ .integer = @intCast(page_size) });
+    var obj = JsonObject.empty;
+    try obj.put(allocator, "type", JsonValue{ .string = try allocator.dupe(u8, "PULL") });
+    try obj.put(allocator, "request_id", JsonValue{ .integer = 1 });
+    try obj.put(allocator, "page_size", JsonValue{ .integer = @intCast(page_size) });
     const msg_val = JsonValue{ .object = obj };
     const msg = try jsonToString(allocator, msg_val);
     return msg;
@@ -687,8 +704,9 @@ fn parseServer(allocator: Allocator, server: []const u8) !struct { host: []const
     return .{ .host = host, .port = port };
 }
 
-fn parseArgs(allocator: Allocator) !RunnerConfig {
-    var args = std.process.args();
+fn parseArgs(allocator: Allocator, proc_args: std.process.Args, environ: std.process.Environ) !RunnerConfig {
+    var args = std.process.Args.Iterator.init(proc_args);
+    defer args.deinit();
     _ = args.next(); // program name
 
     var spec_path_opt: ?[]const u8 = null;
@@ -717,8 +735,8 @@ fn parseArgs(allocator: Allocator) !RunnerConfig {
     }
 
     // Get credentials from environment or use defaults
-    const username = std.posix.getenv("GEODE_USERNAME") orelse DEFAULT_USERNAME;
-    const password = std.posix.getenv("GEODE_ADMIN_PASSWORD") orelse DEFAULT_PASSWORD;
+    const username = environ.getPosix("GEODE_USERNAME") orelse DEFAULT_USERNAME;
+    const password = environ.getPosix("GEODE_ADMIN_PASSWORD") orelse DEFAULT_PASSWORD;
 
     const spec_path = spec_path_opt orelse return error.MissingSpec;
     const server_parts = try parseServer(allocator, server);
@@ -891,14 +909,14 @@ const ClientContext = struct {
                 // Parse rows from data page
                 if (exec.page) |page| {
                     for (page.rows.items) |row| {
-                        var row_obj = JsonObject.init(self.allocator);
-                        errdefer row_obj.deinit();
+                        var row_obj = JsonObject.empty;
+                        errdefer row_obj.deinit(self.allocator);
 
                         for (row.values.items, 0..) |val, idx| {
                             const col_name = if (idx < columns.items.len) columns.items[idx] else "";
                             const json_val = try protoValueToJson(self.allocator, val);
                             const key_copy = try self.allocator.dupe(u8, col_name);
-                            try row_obj.put(key_copy, json_val);
+                            try row_obj.put(self.allocator, key_copy, json_val);
                         }
                         try all_rows.append(self.allocator, JsonValue{ .object = row_obj });
                     }
@@ -1009,13 +1027,13 @@ fn runBenchmarkTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, 
     };
     defer latencies.deinit(allocator);
     var error_count: usize = 0;
-    const start_total = std.time.milliTimestamp();
+    const start_total = milliTimestamp();
 
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
-        const start = std.time.milliTimestamp();
+        const start = milliTimestamp();
         const result = runSingleTest(allocator, ctx, test_case, verbose);
-        const latency_ms: f64 = @floatFromInt(std.time.milliTimestamp() - start);
+        const latency_ms: f64 = @floatFromInt(milliTimestamp() - start);
         latencies.append(allocator, latency_ms) catch {};
 
         if (!std.mem.eql(u8, result.status, "passed")) {
@@ -1023,7 +1041,7 @@ fn runBenchmarkTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, 
         }
     }
 
-    const total_time_ms: f64 = @floatFromInt(std.time.milliTimestamp() - start_total);
+    const total_time_ms: f64 = @floatFromInt(milliTimestamp() - start_total);
 
     if (latencies.items.len == 0) {
         return TestResult{
@@ -1095,7 +1113,7 @@ fn runBenchmarkTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, 
 }
 
 fn runSingleTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, verbose: bool) TestResult {
-    const start = std.time.milliTimestamp();
+    const start = milliTimestamp();
 
     var status: []const u8 = "passed";
     var error_msg: ?[]const u8 = null;
@@ -1116,7 +1134,7 @@ fn runSingleTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, ver
     if (test_case.query.len > 0) {
         const res = ctx.runQuery(test_case.query, test_case.params, verbose) catch {
             handle_error("Query failed", test_case.expect_error, &status, &error_msg);
-            return TestResult{ .test_name = test_case.name, .status = status, .error_msg = error_msg, .result = null, .duration_ms = @floatFromInt(std.time.milliTimestamp() - start) };
+            return TestResult{ .test_name = test_case.name, .status = status, .error_msg = error_msg, .result = null, .duration_ms = @floatFromInt(milliTimestamp() - start) };
         };
         result = res;
         validateExpectations(res, test_case.expect) catch {
@@ -1195,7 +1213,7 @@ fn runSingleTest(allocator: Allocator, ctx: *ClientContext, test_case: Test, ver
         error_msg = "Test must have 'query' or 'steps'";
     }
 
-    const duration = @as(f64, @floatFromInt(std.time.milliTimestamp() - start));
+    const duration = @as(f64, @floatFromInt(milliTimestamp() - start));
     return TestResult{
         .test_name = test_case.name,
         .status = status,
@@ -1209,9 +1227,8 @@ fn outputJson(allocator: Allocator, summary: Summary, results: []TestResult) !vo
     var output = try std.ArrayList(u8).initCapacity(allocator, 0);
     defer output.deinit(allocator);
 
-    const writer = output.writer(allocator);
 
-    try writer.print("{{\"summary\":{{\"total\":{d},\"passed\":{d},\"failed\":{d},\"errors\":{d},\"skipped\":{d}}},\"results\":[", .{
+    try output.print(allocator, "{{\"summary\":{{\"total\":{d},\"passed\":{d},\"failed\":{d},\"errors\":{d},\"skipped\":{d}}},\"results\":[", .{
         summary.total,
         summary.passed,
         summary.failed,
@@ -1220,16 +1237,16 @@ fn outputJson(allocator: Allocator, summary: Summary, results: []TestResult) !vo
     });
 
     for (results, 0..) |result, i| {
-        if (i > 0) try writer.writeAll(",");
-        try writer.print("{{\"test\":\"{s}\",\"status\":\"{s}\"", .{ result.test_name, result.status });
+        if (i > 0) try output.appendSlice(allocator, ",");
+        try output.print(allocator, "{{\"test\":\"{s}\",\"status\":\"{s}\"", .{ result.test_name, result.status });
         if (result.error_msg) |err| {
-            try writer.print(",\"error\":\"{s}\"", .{err});
+            try output.print(allocator, ",\"error\":\"{s}\"", .{err});
         }
         if (result.skip_reason) |reason| {
-            try writer.print(",\"skip_reason\":\"{s}\"", .{reason});
+            try output.print(allocator, ",\"skip_reason\":\"{s}\"", .{reason});
         }
         if (result.benchmark) |bench| {
-            try writer.print(",\"benchmark\":{{\"iterations\":{d},\"avg_latency_ms\":{d:.2},\"p95_latency_ms\":{d:.2},\"min_latency_ms\":{d:.2},\"max_latency_ms\":{d:.2},\"total_time_ms\":{d:.2},\"errors\":{d}}}", .{
+            try output.print(allocator, ",\"benchmark\":{{\"iterations\":{d},\"avg_latency_ms\":{d:.2},\"p95_latency_ms\":{d:.2},\"min_latency_ms\":{d:.2},\"max_latency_ms\":{d:.2},\"total_time_ms\":{d:.2},\"errors\":{d}}}", .{
                 bench.iterations,
                 bench.avg_latency_ms,
                 bench.p95_latency_ms,
@@ -1239,31 +1256,30 @@ fn outputJson(allocator: Allocator, summary: Summary, results: []TestResult) !vo
                 bench.errors,
             });
         }
-        try writer.print(",\"duration_ms\":{d}}}", .{result.duration_ms});
+        try output.print(allocator, ",\"duration_ms\":{d}}}", .{result.duration_ms});
     }
 
-    try writer.writeAll("]}\n");
-    try getStdOut().writeAll(output.items);
+    try output.appendSlice(allocator, "]}\n");
+    try getStdOut().writeStreamingAll(runnerIo(), output.items);
 }
 
 fn outputText(summary: Summary, results: []TestResult) !void {
     var buf = try std.ArrayList(u8).initCapacity(std.heap.page_allocator, 0);
     defer buf.deinit(std.heap.page_allocator);
-    const stdout_writer = buf.writer(std.heap.page_allocator);
-    try stdout_writer.print("Tests: {d}\n", .{summary.total});
-    try stdout_writer.print("Passed: {d}\n", .{summary.passed});
-    try stdout_writer.print("Failed: {d}\n", .{summary.failed});
-    try stdout_writer.print("Errors: {d}\n", .{summary.errors});
+    try buf.print(std.heap.page_allocator, "Tests: {d}\n", .{summary.total});
+    try buf.print(std.heap.page_allocator, "Passed: {d}\n", .{summary.passed});
+    try buf.print(std.heap.page_allocator, "Failed: {d}\n", .{summary.failed});
+    try buf.print(std.heap.page_allocator, "Errors: {d}\n", .{summary.errors});
 
     if (summary.errors > 0 or summary.failed > 0) {
-        try stdout_writer.writeAll("\nErrors/Failures:\n");
+        try buf.appendSlice(std.heap.page_allocator, "\nErrors/Failures:\n");
         for (results) |result| {
             if (result.error_msg) |err| {
-                try stdout_writer.print("  {s}: {s}\n", .{ result.test_name, err });
+                try buf.print(std.heap.page_allocator, "  {s}: {s}\n", .{ result.test_name, err });
             }
         }
     }
-    try getStdOut().writeAll(buf.items);
+    try getStdOut().writeStreamingAll(runnerIo(), buf.items);
 }
 
 const Summary = struct {
@@ -1274,18 +1290,18 @@ const Summary = struct {
     skipped: usize,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(proc_init: std.process.Init.Minimal) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Parse command-line arguments
-    var config = parseArgs(allocator) catch |err| {
+    var config = parseArgs(allocator, proc_init.args, proc_init.environ) catch |err| {
         switch (err) {
-            error.MissingSpec => try getStdErr().writeAll("ERROR: --spec is required\n"),
-            error.MissingSpecValue => try getStdErr().writeAll("ERROR: --spec requires a value\n"),
-            error.MissingServerValue => try getStdErr().writeAll("ERROR: --server requires a value\n"),
-            else => try getStdErr().writeAll("ERROR: failed to parse arguments\n"),
+            error.MissingSpec => try getStdErr().writeStreamingAll(runnerIo(), "ERROR: --spec is required\n"),
+            error.MissingSpecValue => try getStdErr().writeStreamingAll(runnerIo(), "ERROR: --spec requires a value\n"),
+            error.MissingServerValue => try getStdErr().writeStreamingAll(runnerIo(), "ERROR: --server requires a value\n"),
+            else => try getStdErr().writeStreamingAll(runnerIo(), "ERROR: failed to parse arguments\n"),
         }
         std.process.exit(2);
     };
@@ -1297,10 +1313,7 @@ pub fn main() !void {
     }
 
     // Load spec file
-    const spec_file = try std.fs.cwd().openFile(config.spec_path, .{});
-    defer spec_file.close();
-
-    const spec_content = try spec_file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    const spec_content = try std.Io.Dir.cwd().readFileAlloc(runnerIo(), config.spec_path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(spec_content);
 
     const spec = try parseSpec(allocator, spec_content);
