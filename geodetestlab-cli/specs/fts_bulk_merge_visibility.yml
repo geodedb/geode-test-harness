@@ -56,6 +56,43 @@ cli:
     tls_verify: false
     format: json
 tests:
+# --- idempotent pre-teardown so reruns start clean (CANARY) ---
+# Review Finding 2 (Task 4, geode-vectorization-and-reranking A4b §6): the
+# spec previously opened with a bare CREATE INDEX (no IF NOT EXISTS) and no
+# defensive teardown, so a rerun after a prior partial/failed run left both
+# `bulk_vis_idx` and `batch_vis_idx` already present and failed outright.
+# Mirrors `kmm_teardown_canary` (knn_metric_mismatch.yml:55-62).
+- name: bulk-merge-teardown-canary
+  description: Idempotent pre-teardown of bulk_vis_idx so reruns start clean (CANARY)
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX IF EXISTS bulk_vis_idx
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+  - setup
+  - canary
+- name: batch-merge-teardown-canary
+  description: Idempotent pre-teardown of batch_vis_idx so reruns start clean (CANARY)
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX IF EXISTS batch_vis_idx
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+  - batch
+  - setup
+  - canary
 # --- bootstrap the fulltext index BEFORE any BulkVisDoc nodes exist ---
 - name: bulk-merge-create-fulltext-index
   description: Create a fulltext index on BulkVisDoc.body before any bulk-MERGE writes
@@ -162,6 +199,107 @@ tests:
   tags:
   - fts
   - bulk-merge
+# --- review Finding 1 pin: re-running the SAME 5 simple-MERGE statements
+#     (idempotent re-MERGE against already-indexed nodes, no property
+#     change) must NOT duplicate FTS postings. Before the fix, the
+#     unconditional `fts_should_maintain = true` on this call site would
+#     re-append each doc's postings on every re-run; the search below would
+#     still return exactly 5 rows (duplicate postings don't fabricate a new
+#     doc_id) but doubled term-frequency would be observable via BM25 score
+#     drift — the unit regression in tests/test_fts_bulk_merge_maintenance.zig
+#     pins that score-stability assertion directly. Here we pin the
+#     row-count invariant end-to-end through the real QUIC wire path. ---
+- name: bulk-merge-remerge-doc-1
+  description: Idempotent re-MERGE 1/5 (same key, no property change) — review Finding 1 regression
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 1}) ON CREATE SET n.body = 'searchable text one'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-remerge-doc-2
+  description: Idempotent re-MERGE 2/5 (same key, no property change) — review Finding 1 regression
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 2}) ON CREATE SET n.body = 'searchable text two'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-remerge-doc-3
+  description: Idempotent re-MERGE 3/5 (same key, no property change) — review Finding 1 regression
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 3}) ON CREATE SET n.body = 'searchable text three'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-remerge-doc-4
+  description: Idempotent re-MERGE 4/5 (same key, no property change) — review Finding 1 regression
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 4}) ON CREATE SET n.body = 'searchable text four'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-remerge-doc-5
+  description: Idempotent re-MERGE 5/5 (same key, no property change) — review Finding 1 regression
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 5}) ON CREATE SET n.body = 'searchable text five'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-search-still-finds-exactly-five
+  description: After idempotent re-MERGE, CALL geode.fts.search still returns exactly 5 rows (no duplicate postings) — review Finding 1 regression
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('bulk_vis_idx', 'searchable')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    # NOTE: like `bulk-merge-search-finds-all` above, `{5}` asserts "at least
+    # 5 consecutive row objects present" (the harness has no exact
+    # row-count/length assertion facility — see the file header). This is a
+    # coarse E2E smoke check that the docs are still visible and the search
+    # still returns rows at all after the re-merge; it would NOT by itself
+    # catch a 10-row duplicate. The authoritative duplicate-append proof is
+    # the BM25 score-stability assertion in
+    # tests/test_fts_bulk_merge_maintenance.zig (review Finding 1 regression).
+    - (?:\{"node":\d+,"score":[0-9.]+\}\s*,?\s*){5}
+  tags:
+  - fts
+  - bulk-merge
+  - canary
 # --- recovery path still works: CALL geode.fts.rebuild reports all 5 nodes
 #     (idempotent re-backfill on top of the already-live-maintained index) ---
 - name: bulk-merge-rebuild-reports-all
