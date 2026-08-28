@@ -1,0 +1,164 @@
+version: '1.0'
+name: KNN Metric Mismatch Validation + inner_product Query-Side Parity
+description: >
+  Task 2 (engine recommendations from specs/geode-vectorization-and-reranking.md).
+  Two defects verified and fixed at the engine level:
+
+  1. `VectorIndexWrapper.searchWithMetric` (src/index/advanced_types_index.zig)
+     ignored the caller's metric entirely for neighbour selection: the HNSW
+     graph is always built and searched with the index's own `self.metric`,
+     so `knn('emb', $q, k, 'cosine')` against an l2-built index silently
+     returned the l2-index neighbour set relabeled with post-hoc cosine
+     scores -- a silent wrong answer, not an error. Fixed by rejecting a
+     mismatched query metric with `error.VectorMetricMismatch`, surfaced as
+     GQLSTATE 42704 (the same undefined_object class the DDL metric
+     validator uses, GAP-0918).
+
+  2. `inner_product` was accepted as a metric name by the DDL validator
+     (src/execution.zig) and by the index-build metric mapper
+     (src/execution/statement_dispatcher.zig, which maps it to
+     dot_product), but the query-side `parseVectorMetric` (src/eval.zig)
+     rejected it with InvalidArgs -- so `CREATE INDEX ... WITH (metric =
+     'inner_product')` succeeded, yet `distance(..., 'inner_product')`, the
+     very call a caller would use to score against that index, failed.
+     Fixed by adding `inner_product` as a query-side synonym for
+     `dot_product` in `parseVectorMetric`.
+
+  CANARY: REQ=REQ-VECTOR-KNN-METRIC-VALIDATE-001; FEATURE="VectorIndex"; ASPECT=QueryMetricMatchesIndex; STATUS=TESTED; TEST=geodetestlab-cli/specs/knn_metric_mismatch.yml; OWNER=qa; UPDATED=2026-08-28
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- vector
+- index
+- knn
+- metric
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: kmm_teardown_canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:KmmVec) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [vector, setup, canary]
+
+  # --------------------------------------------------------------- setup --
+- name: kmm_setup_create_index
+  description: Create an HNSW vector index built with metric = l2 (dim=4)
+  args: [query, '-']
+  stdin: >-
+    CREATE INDEX IF NOT EXISTS kmm_vec_idx
+    ON KmmVec (emb)
+    USING HNSW
+    WITH (metric = 'l2')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, positive, ddl]
+
+- name: kmm_setup_insert_vectors
+  description: Insert dim=4 vectors under the l2-indexed label
+  args: [query, '-']
+  stdin: |
+    CREATE (n1:KmmVec {id: 1, emb: vectorf32('[1.0, 0.0, 0.0, 0.0]')})
+    CREATE (n2:KmmVec {id: 2, emb: vectorf32('[0.0, 1.0, 0.0, 0.0]')})
+    CREATE (n3:KmmVec {id: 3, emb: vectorf32('[0.0, 0.0, 1.0, 0.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, positive, insert]
+
+  # ------------------------------------------------------- metric mismatch --
+- name: kmm_knn_mismatched_metric_rejected
+  description: >
+    KEY negative: querying the l2-built index with a mismatched query
+    metric ('cosine') must be REJECTED (status_class 42704), not silently
+    answered with the l2-index neighbour set relabeled with cosine scores.
+  args: [query, '-']
+  stdin: >-
+    RETURN knn('emb', vectorf32('[1.0, 0.0, 0.0, 0.0]'), 2, 'cosine') AS ids
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42704"'
+    - knn metric does not match the vector index metric
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, metric, negative]
+
+- name: kmm_knn_matching_metric_succeeds
+  description: >
+    Positive: querying the l2-built index with the matching query metric
+    ('l2') succeeds and returns real neighbours.
+  args: [query, '-']
+  stdin: >-
+    RETURN knn('emb', vectorf32('[1.0, 0.0, 0.0, 0.0]'), 2, 'l2') AS ids
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42704"'
+  tags: [vector, metric, positive]
+
+  # ------------------------------------------------ inner_product parity --
+- name: kmm_distance_inner_product_accepted
+  description: >
+    inner_product is accepted as a query-side metric synonym for
+    dot_product (previously InvalidArgs even though the DDL validator and
+    index-build metric mapper already accepted it).
+  args: [query, '-']
+  stdin: >-
+    RETURN distance(vectorf32('[1.0, 0.0]'), vectorf32('[0.0, 1.0]'), 'inner_product') AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, metric, positive]
+
+- name: kmm_distance_inner_product_matches_dot_product
+  description: >
+    inner_product and dot_product produce the identical distance value,
+    confirming inner_product is a true synonym and not a distinct
+    (mis-)implementation.
+  args: [query, '-']
+  stdin: >-
+    RETURN
+      distance(vectorf32('[1.0, 0.0]'), vectorf32('[0.0, 1.0]'), 'inner_product') AS inner,
+      distance(vectorf32('[1.0, 0.0]'), vectorf32('[0.0, 1.0]'), 'dot_product') AS dot
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, metric, positive, evidence]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: kmm_teardown
+  description: Remove all Kmm test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:KmmVec) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [vector, cleanup, canary]
