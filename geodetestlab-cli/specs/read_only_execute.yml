@@ -1,0 +1,146 @@
+version: '1.0'
+name: Per-request read-only floor — ExecuteRequest.read_only (field 6)
+description: >
+  Task 5 (hybrid-RAG audit spec, "authorization must be enforced below the
+  LLM"). Adds a per-REQUEST hard read-only floor to ExecuteRequest (field 6),
+  independent of the authenticated principal's role: the QUIC and gRPC
+  transport handlers reject any mutating program with GQLSTATE 42501 the
+  moment `read_only=true` is set, BEFORE the role-based mutation gate and
+  regardless of whether auth is enabled. This CLI spec exercises the in-repo
+  `geode query --read-only` flag (src/cli/main.zig), which threads
+  ExecuteRequest.read_only through the in-repo QUIC client transport
+  (src/client/quic_query_runner.zig) — the CLI does NOT go through the
+  external geode-client-zig package for the QUIC query path, so client-side
+  emission is live in this build (no external client bump needed).
+
+  Verifies:
+    1. A mutating program (`CREATE ...`) sent with `--read-only` is rejected
+       with GQLSTATE 42501 and the node is NOT created.
+    2. The identical mutating program WITHOUT `--read-only` succeeds
+       (positive baseline — proves the flag, not something else, causes the
+       rejection).
+    3. A pure read (`RETURN 1 AS x`) sent with `--read-only` succeeds
+       normally — the floor only blocks mutating programs.
+
+  CANARY: REQ=REQ-EXEC-READ-ONLY-REQUEST-001; FEATURE="ReadOnlyExecute"; ASPECT=CliE2E; STATUS=TESTED; TEST=geodetestlab-cli/specs/read_only_execute.yml; OWNER=engine; UPDATED=2026-08-28
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- transport
+- read-only
+- authorization
+- execute-request
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: roe_teardown_canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:RoeExecTest) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [read-only, setup, canary]
+
+  # -------------------------------------------------- read-only mutation --
+- name: roe_read_only_rejects_mutating_create
+  description: >
+    KEY ASSERTION: `--read-only` sends ExecuteRequest.read_only=true. The
+    engine classifies `CREATE (n:RoeExecTest ...)` as a mutating program
+    (query_traits.isMutatingProgram) and must reject it with GQLSTATE 42501
+    BEFORE the role-based mutation gate, regardless of the connection's role.
+  args: [query, --read-only, '-']
+  stdin: 'CREATE (n:RoeExecTest {v: 1}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42501"'
+    - 'Read-only request: data modification rejected'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [read-only, negative, key-assertion]
+
+- name: roe_read_only_create_did_not_persist
+  description: >
+    Confirms the rejected CREATE above had no effect on the store — the gate
+    fired before any mutation reached the store, not merely returned an
+    error alongside a partial write.
+  args: [query, MATCH (n:RoeExecTest) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags: [read-only, negative, evidence]
+
+  # --------------------------------------------- positive baseline (no flag) --
+- name: roe_same_create_succeeds_without_read_only_flag
+  description: >
+    POSITIVE baseline — the identical mutating statement succeeds when
+    `--read-only` is NOT set, proving the flag itself (not some unrelated
+    fault) causes the 42501 rejection above.
+  args: [query, '-']
+  stdin: 'CREATE (n:RoeExecTest {v: 2}) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - RoeExecTest
+    stdout_not_contains:
+    - '"status_class":"42501"'
+  tags: [read-only, positive]
+
+  # ------------------------------------------------- read-only pure read --
+- name: roe_read_only_allows_pure_read
+  description: >
+    `--read-only` must NOT block a non-mutating program — RETURN 1 succeeds
+    normally with the flag set.
+  args: [query, --read-only, RETURN 1 AS x]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+    stdout_not_contains:
+    - '"status_class":"42501"'
+  tags: [read-only, positive, key-assertion]
+
+- name: roe_read_only_allows_pure_read_match
+  description: >
+    `--read-only` also permits ordinary MATCH reads against real data — not
+    just the trivial scalar RETURN above.
+  args: [query, --read-only, MATCH (n:RoeExecTest) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42501"'
+  tags: [read-only, positive]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: roe_teardown
+  description: Remove all Roe test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:RoeExecTest) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [read-only, cleanup, canary]
