@@ -1,0 +1,263 @@
+# Bulk-MERGE Fast Path — Live FTS Visibility Spec
+#
+# Spec geode-vectorization-and-reranking + A4b §6 / Task 4: closes the
+# documented blind spot in fts_index_ops.zig:267-271 ("callers on worker
+# threads ... reindex post-bulk on the connection thread instead") —
+# quic_connection_handler.zig's bulk-MERGE fast path (executeBulkSimpleMerge,
+# reached whenever a program is a single simple `MERGE (n:Label {k: v})`
+# pattern — see geode.bulk_ingest.matchSimpleNodeMergeSpecStmt) AND its
+# concurrent batch-mode sibling (executeBatchSimpleMerge, reached via a
+# `/*+BATCH*/`-prefixed multi-statement program) now run live FTS
+# maintenance on the connection thread right after the apply completes and
+# all locks are released, so bulk-MERGE'd nodes are searchable IMMEDIATELY —
+# no `CALL geode.fts.rebuild` required.
+#
+# PRE-FIX (RED) evidence, captured against the unfixed binary
+# (zig-out/bin/geode, commit ac29593d, before src/server/quic_connection_handler.zig
+# was touched by this task): running this spec's `bulk-merge-search-finds-all`
+# test returned an EMPTY row set —
+#   {"status_class":"00000", ...,"columns":[{"name":"node","type":"NULL"},
+#    {"name":"score","type":"NULL"}],"rows":[],...}
+# — i.e. `stdout_not_contains: ['"rows":[]']` FAILED (the string WAS present),
+# confirming the bulk-MERGE fast path bypassed FTS maintenance exactly as
+# documented. Also manually verified against a standalone server: 5
+# `MERGE ... ON CREATE SET` statements (the exact shape the fast-path
+# detector accepts) followed by `CALL geode.fts.search` returned `"rows":[]`
+# pre-fix.
+#
+# POST-FIX (GREEN): the same 5 MERGEs are all found by the search, and
+# `CALL geode.fts.rebuild` still works afterward (idempotent recovery path,
+# reports nodes_indexed == 5 since the live hook already indexed them).
+#
+# Assertions go through stdout_contains / stdout_not_contains / stdout_regex
+# on the JSON client output (cli.client.format = json) — the only keys
+# lib/checks.py enforces; there is no row_count assertion facility, so
+# "all 5 rows present" is asserted via a regex requiring 5 consecutive
+# `"node":<id>` occurrences inside the rows array.
+
+version: '1.0'
+name: Bulk-MERGE Fast Path Live FTS Visibility
+description: Bulk-MERGE fast-path nodes are searchable immediately via CALL geode.fts.search, no rebuild required (Task 4, geode-vectorization-and-reranking)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+# --- bootstrap the fulltext index BEFORE any BulkVisDoc nodes exist ---
+- name: bulk-merge-create-fulltext-index
+  description: Create a fulltext index on BulkVisDoc.body before any bulk-MERGE writes
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX bulk_vis_idx FOR (d:BulkVisDoc) ON (d.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+  - canary
+# --- 5 simple-MERGE statements: the exact shape matchSimpleNodeMergeSpec
+#     accepts (single label, one scalar merge-key filter, ON CREATE SET of
+#     scalar values) so each one runs the connection-thread bulk fast path
+#     (executeBulkSimpleMerge), not the general executor. ---
+- name: bulk-merge-write-doc-1
+  description: Bulk-MERGE fast-path write 1/5
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 1}) ON CREATE SET n.body = 'searchable text one'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-write-doc-2
+  description: Bulk-MERGE fast-path write 2/5
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 2}) ON CREATE SET n.body = 'searchable text two'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-write-doc-3
+  description: Bulk-MERGE fast-path write 3/5
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 3}) ON CREATE SET n.body = 'searchable text three'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-write-doc-4
+  description: Bulk-MERGE fast-path write 4/5
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 4}) ON CREATE SET n.body = 'searchable text four'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+- name: bulk-merge-write-doc-5
+  description: Bulk-MERGE fast-path write 5/5
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:BulkVisDoc {k: 5}) ON CREATE SET n.body = 'searchable text five'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+# --- the crux: all 5 bulk-MERGE'd nodes are searchable WITHOUT a rebuild ---
+- name: bulk-merge-search-finds-all
+  description: CALL geode.fts.search finds all 5 bulk-MERGE'd nodes immediately (no rebuild)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('bulk_vis_idx', 'searchable')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"node"'
+    - '"name":"score"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    # 5 distinct (node, score) row objects present in the rows array — proves
+    # every bulk-MERGE'd node was indexed live, not just the first/last one.
+    - (?:\{"node":\d+,"score":[0-9.]+\}\s*,?\s*){5}
+  tags:
+  - fts
+  - bulk-merge
+# --- recovery path still works: CALL geode.fts.rebuild reports all 5 nodes
+#     (idempotent re-backfill on top of the already-live-maintained index) ---
+- name: bulk-merge-rebuild-reports-all
+  description: CALL geode.fts.rebuild reports nodes_indexed == 5 (recovery/backfill path still functions)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.rebuild('bulk_vis_idx')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"index":"bulk_vis_idx"'
+    - '"nodes_indexed":5'
+  tags:
+  - fts
+  - bulk-merge
+# --- batch fast path: /*+BATCH*/-prefixed multi-statement MERGE program
+#     (executeBatchSimpleMerge — the concurrent per-statement sibling of the
+#     single-MERGE fast path above). Live FTS maintenance must cover this
+#     call site too, not just the single-statement one. ---
+- name: batch-merge-create-fulltext-index
+  description: Create a fulltext index on BatchVisDoc.body before any batch-MERGE writes
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX batch_vis_idx FOR (d:BatchVisDoc) ON (d.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+  - batch
+- name: batch-merge-write-both
+  description: Batch-MERGE fast path writes 2 BatchVisDoc nodes in one /*+BATCH*/ program
+  args:
+  - query
+  - '-'
+  stdin: |
+    /*+BATCH*/
+    MERGE (n:BatchVisDoc {k: 1}) ON CREATE SET n.body = 'batchable text one';
+    MERGE (n:BatchVisDoc {k: 2}) ON CREATE SET n.body = 'batchable text two';
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+  - batch
+- name: batch-merge-search-finds-both
+  description: CALL geode.fts.search finds both batch-MERGE'd nodes immediately (no rebuild)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('batch_vis_idx', 'batchable')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - (?:\{"node":\d+,"score":[0-9.]+\}\s*,?\s*){2}
+  tags:
+  - fts
+  - bulk-merge
+  - batch
+- name: batch-merge-drop-index-teardown
+  description: DROP INDEX cleans up batch_vis_idx (idempotent teardown)
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX IF EXISTS batch_vis_idx
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+  - batch
+# --- idempotent teardown ---
+- name: bulk-merge-drop-index-teardown
+  description: DROP INDEX cleans up bulk_vis_idx (idempotent teardown)
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX IF EXISTS bulk_vis_idx
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - bulk-merge
+  - canary
