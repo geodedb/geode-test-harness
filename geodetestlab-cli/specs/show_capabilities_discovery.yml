@@ -1,0 +1,106 @@
+version: '1.0'
+name: Truthful discovery-grade SHOW CAPABILITIES
+description: >
+  Task 7 (hybrid-RAG audit spec, "Determine the deployed version and
+  available capabilities from trusted runtime metadata or supported
+  discovery interfaces"). Prior to this change `executeShowCapabilities`
+  (src/execution/admin_ddl.zig) was a hardcoded 9-row admin list and
+  `policy_ddl=false` was stale — GAP-0858 landed durable GPS policy DDL
+  persistence. This spec exercises `SHOW CAPABILITIES` end-to-end over the
+  real CLI/QUIC wire and asserts a handful of the new discovery rows
+  (`fts_rebuild`, `read_only_execute`, `knn_metric_validation`) — features
+  that landed in Tasks 1-6 of this plan — are present and truthful, plus the
+  paired `SHOW VERSION` version-discovery statement.
+
+  This is a pure-read, no-mutation spec (SHOW CAPABILITIES/SHOW VERSION
+  touch no graph data), so the usual teardown-first/teardown-last `canary`
+  convention has nothing to tear down. Per the harness convention (mirroring
+  read_only_execute.yml, the most similar read-only sibling spec) the
+  canary-tagged pair below is a trivial idempotent no-op
+  (`MATCH (n:ShowCapabilitiesDiscoveryTest) DETACH DELETE n`, matching no
+  real data) satisfying the structural convention without pretending this
+  spec has state to clean up.
+
+  CANARY: REQ=REQ-CAPABILITY-DISCOVERY-001; FEATURE="SHOW CAPABILITIES"; ASPECT=HarnessE2E; STATUS=TESTED; TEST=geodetestlab-cli/specs/show_capabilities_discovery.yml; OWNER=execution; UPDATED=2026-08-28
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- discovery
+- admin
+- show
+- capabilities
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: scd_teardown_canary
+  description: >
+    Trivial idempotent pre-teardown (CANARY) — this spec is pure-read and
+    touches no graph data, so this is a structural no-op mirroring the
+    teardown-first convention rather than real cleanup.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:ShowCapabilitiesDiscoveryTest) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [discovery, setup, canary]
+
+  # --------------------------------------------------------- capabilities --
+- name: scd_show_capabilities_discovery_rows
+  description: >
+    KEY ASSERTION: SHOW CAPABILITIES reports the new discovery rows added
+    for hybrid-RAG capability discovery — fts_rebuild (Task 4's
+    `geode.fts.rebuild` backfill procedure), read_only_execute (Task 5's
+    per-request read-only floor), and knn_metric_validation (Task 2's
+    knn/index metric-mismatch rejection) — all `true`, over the real
+    statement dispatch.
+  args: [query, SHOW CAPABILITIES]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - fts_rebuild
+    - read_only_execute
+    - knn_metric_validation
+  tags: [discovery, capabilities, key-assertion]
+
+  # --------------------------------------------------- version discovery --
+- name: scd_show_version_pairs_with_capabilities
+  description: >
+    SHOW VERSION is the version half of the spec's discovery pairing —
+    "Determine the deployed version and available capabilities" — verified
+    alongside SHOW CAPABILITIES above.
+  args: [query, SHOW VERSION]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [discovery, version]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: scd_teardown
+  description: >
+    Trivial idempotent post-teardown (CANARY) — no-op for the same reason as
+    the pre-teardown above.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:ShowCapabilitiesDiscoveryTest) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [discovery, cleanup, canary]
