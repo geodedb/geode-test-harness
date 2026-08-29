@@ -134,6 +134,24 @@ class TestStep:
                 and ``sig`` (SIGSTOP | SIGCONT | SIGKILL | SIGTERM).
     restart_node — stop (if running) then restart a single cluster node
                 on its original port + data directory. Requires ``target``.
+
+    Capture / compare (gql steps only)
+    -----------------------------------
+    capture_regex — a regex with EXACTLY one capture group, applied to the
+                step's stdout. The captured group-1 text becomes this
+                step's "current" capture value.
+    capture_as    — a name under which this step's capture value is stored
+                for later steps to reference. Requires ``capture_regex``.
+    gql_expected.equals_capture — the name of a previously stored capture
+                (via a prior step's ``capture_as``); the *current* step's
+                own ``capture_regex`` extraction must equal it, or the step
+                fails with a clear message. Requires ``capture_regex`` on
+                the same step.
+
+    All three are validated at step-execution time (unknown capture name,
+    a ``capture_regex`` with no/multiple groups or no match, or
+    ``capture_as``/``equals_capture`` without ``capture_regex``) and fail
+    only the offending step with a spec-error message — never a crash.
     """
 
     step_type: str  # "gql", "http", "wait", "bash", "signal", "restart_node"
@@ -153,6 +171,9 @@ class TestStep:
     # When set, a gql step asserting the surviving server is reachable may
     # tolerate a non-zero exit (used after SIGSTOP/SIGKILL on a peer node).
     allow_failure: bool = False
+    # Capture / compare fields (gql steps only) — see class docstring.
+    capture_regex: str | None = None
+    capture_as: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TestStep:
@@ -173,6 +194,8 @@ class TestStep:
             target=data.get("target"),
             sig=data.get("sig"),
             allow_failure=bool(data.get("allow_failure", False)),
+            capture_regex=data.get("capture_regex"),
+            capture_as=data.get("capture_as"),
         )
 
 

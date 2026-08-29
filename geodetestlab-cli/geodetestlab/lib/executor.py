@@ -55,6 +55,36 @@ def _escape_gql_string(s: str) -> str:
     return s.replace("'", "\\'").replace("\\", "\\\\")
 
 
+def _extract_capture(step: TestStep, stdout: str) -> tuple[str | None, str | None]:
+    """Extract a sequential gql step's ``capture_regex`` group-1 value from stdout.
+
+    Returns ``(value, error)``. When the step declares no capture at all
+    (neither ``capture_regex`` nor ``capture_as``) both are ``None``.
+    Never raises: an invalid regex, a regex without exactly one capture
+    group, or a regex that doesn't match stdout all surface as a clear
+    ``error`` string so the calling step fails cleanly instead of
+    crashing the runner.
+    """
+    if step.capture_regex is None:
+        if step.capture_as is not None:
+            return None, "capture_as requires capture_regex"
+        return None, None
+
+    try:
+        pattern = re.compile(step.capture_regex)
+    except re.error as exc:
+        return None, f"invalid capture_regex {step.capture_regex!r}: {exc}"
+
+    if pattern.groups != 1:
+        return None, f"capture_regex must have exactly one capture group: {step.capture_regex!r}"
+
+    match = pattern.search(stdout)
+    if not match:
+        return None, f"capture_regex {step.capture_regex!r} did not match stdout"
+
+    return match.group(1), None
+
+
 def _convert_auth_to_call(args: list[str]) -> str | None:
     """GAP-0270: Convert CLI auth command args to a CALL geode.auth.* GQL query.
 
@@ -1139,6 +1169,9 @@ def _run_sequential_test(
     start_time = time.time()
     outputs: list[str] = []
     errors: list[str] = []
+    # Named capture values stashed by earlier gql steps' capture_as, for
+    # later steps' gql_expected.equals_capture comparisons.
+    captures: dict[str, str] = {}
 
     # Get authentication credentials from environment
     admin_password = env.get("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
@@ -1262,6 +1295,16 @@ def _run_sequential_test(
                     step_failed = result.returncode != 0
                     failure_detail = ""
 
+                    # capture_regex / capture_as: extract this step's current
+                    # capture value (if declared) and stash it under capture_as
+                    # for later steps' equals_capture comparisons.
+                    capture_value, capture_error = _extract_capture(step, result.stdout)
+                    if capture_error:
+                        step_failed = True
+                        failure_detail = capture_error
+                    elif step.capture_as:
+                        captures[step.capture_as] = capture_value  # type: ignore[assignment]
+
                     if step.gql_expected:
                         expected_status = step.gql_expected.get("status_class")
                         if expected_status and expected_status not in result.stdout:
@@ -1277,6 +1320,21 @@ def _run_sequential_test(
                             if needle in result.stdout:
                                 step_failed = True
                                 failure_detail = f"stdout unexpectedly contains {needle!r}"
+
+                        equals_capture_name = step.gql_expected.get("equals_capture")
+                        if equals_capture_name is not None and not capture_error:
+                            if capture_value is None:
+                                step_failed = True
+                                failure_detail = "equals_capture requires capture_regex on the same step"
+                            elif equals_capture_name not in captures:
+                                step_failed = True
+                                failure_detail = f"unknown capture name: {equals_capture_name!r}"
+                            elif captures[equals_capture_name] != capture_value:
+                                step_failed = True
+                                failure_detail = (
+                                    f"equals_capture mismatch: {equals_capture_name}="
+                                    f"{captures[equals_capture_name]!r} != {capture_value!r}"
+                                )
 
                     if step_failed and not step.allow_failure:
                         detail = failure_detail or (result.stderr.strip() or "non-zero exit")
