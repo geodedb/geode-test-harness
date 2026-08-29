@@ -78,6 +78,10 @@ def _extract_capture(step: TestStep, stdout: str) -> tuple[str | None, str | Non
     if pattern.groups != 1:
         return None, f"capture_regex must have exactly one capture group: {step.capture_regex!r}"
 
+    # First-match semantics: uses re.search (first match only), not
+    # re.findall. The query is expected to return exactly one row, so the
+    # first match is the only match — a multi-row result set is not
+    # supported and would silently capture only the first row's value.
     match = pattern.search(stdout)
     if not match:
         return None, f"capture_regex {step.capture_regex!r} did not match stdout"
@@ -1296,14 +1300,15 @@ def _run_sequential_test(
                     failure_detail = ""
 
                     # capture_regex / capture_as: extract this step's current
-                    # capture value (if declared) and stash it under capture_as
-                    # for later steps' equals_capture comparisons.
+                    # capture value (if declared). Storage under capture_as is
+                    # deferred until after the gql_expected checks below finalize
+                    # step_failed — a step that fails its own checks (even one
+                    # with allow_failure: true) must not commit a garbage value
+                    # that later equals_capture comparisons would silently trust.
                     capture_value, capture_error = _extract_capture(step, result.stdout)
                     if capture_error:
                         step_failed = True
                         failure_detail = capture_error
-                    elif step.capture_as:
-                        captures[step.capture_as] = capture_value  # type: ignore[assignment]
 
                     if step.gql_expected:
                         expected_status = step.gql_expected.get("status_class")
@@ -1335,6 +1340,13 @@ def _run_sequential_test(
                                     f"equals_capture mismatch: {equals_capture_name}="
                                     f"{captures[equals_capture_name]!r} != {capture_value!r}"
                                 )
+
+                    # Commit the capture only now that the step's failure state
+                    # is finalized — a step that failed (status/expectation
+                    # checks or allow_failure) never poisons a later step's
+                    # equals_capture comparison.
+                    if step.capture_as and not step_failed and not capture_error:
+                        captures[step.capture_as] = capture_value  # type: ignore[assignment]
 
                     if step_failed and not step.allow_failure:
                         detail = failure_detail or (result.stderr.strip() or "non-zero exit")
