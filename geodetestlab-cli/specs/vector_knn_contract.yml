@@ -1,0 +1,435 @@
+version: '1.0'
+name: Vector Scalar + KNN Contract (geode#873 / geode#877)
+description: >
+  Over-the-wire proof for the vector surface's silent-wrong-answer and
+  denial-of-service defects. Every case below was verified READ-ONLY against
+  v0.8.8 (587e6801) before the fix; the unit-level twin is
+  tests/test_vector_knn_silent_failures.zig (zig build test-vector-knn-failures).
+
+  geode#873-A  vector_dot() returned `.{ .Int = @intFromFloat(sum) }`
+               (src/eval_extended.zig:2114) while its two siblings in the same
+               file return a scale-6 Decimal and the published contract
+               (src/gql/language_metadata.zig:1000-1002,
+               src/execution/statement_handlers.zig:444) says FLOAT. Every
+               unit-vector dot product floored to 0, so a 0.96 similarity was
+               indistinguishable from "orthogonal".
+
+  geode#873-B  The unchecked @intFromFloat in that same family PANICS the
+               server on a large-magnitude operand (vector_dot, vector_l2,
+               distance / euclidean / manhattan / similarity-with-dot_product)
+               and yields i128 garbage for vector_cosine. One unauthenticated
+               query took the process down; the liveness probes here are the
+               point of the exercise.
+
+  geode#877-a  A LIST-typed embedding property ({embedding: [1.0, 0.0]} — the
+               natural shape for a client-side / JSON embedding) was never a
+               knn candidate: propertyVectorCandidate (src/eval.zig:2205) and
+               the index side (src/index/index_manager.zig:1779, :1793) accept
+               only VectorF32/VectorI32 and return null otherwise. Silent [].
+
+  geode#877-b  findAdvancedVectorIndexForProperty (index_manager.zig:1416-1425)
+               matches on PROPERTY NAME ONLY, ignoring the label, and
+               evalVectorKnn commits to whatever it finds (src/eval.zig:2459),
+               falling back only on error.IndexNotFound (:2462) — which an
+               empty HNSW never raises. So a CREATE INDEX on a COMPLETELY
+               UNRELATED label that happens to reuse the property name silently
+               emptied a working knn result.
+
+  geode#877-c  knn() on a misspelled property returned [] instead of a
+               diagnostic — a typo was reported as "no neighbours".
+
+  Assertions are written as GQL-level booleans (`... > 0.9 AS x`) rather than as
+  substrings of a rendered Decimal so they pin SEMANTICS, not result formatting.
+
+  CANARY: REQ=REQ-GEODE-873-VECTOR-DOT-FLOAT; FEATURE="VectorSimilarityFunctions"; ASPECT=DotProductIsFloat; STATUS=TESTED; TEST=geodetestlab-cli/specs/vector_knn_contract.yml; OWNER=qa; UPDATED=2026-08-29
+  CANARY: REQ=REQ-GEODE-873-VECTOR-DECIMAL-OVERFLOW; FEATURE="VectorSimilarityFunctions"; ASPECT=CheckedFloatToDecimal; STATUS=TESTED; TEST=geodetestlab-cli/specs/vector_knn_contract.yml; OWNER=qa; UPDATED=2026-08-29
+  CANARY: REQ=REQ-GEODE-877-KNN-INDEX-SHADOW; FEATURE="VectorKnn"; ASPECT=UnrelatedIndexMustNotShadowScan; STATUS=TESTED; TEST=geodetestlab-cli/specs/vector_knn_contract.yml; OWNER=qa; UPDATED=2026-08-29
+  CANARY: REQ=REQ-GEODE-877-KNN-LIST-PROPERTY; FEATURE="VectorKnn"; ASPECT=NumericListCoercion; STATUS=TESTED; TEST=geodetestlab-cli/specs/vector_knn_contract.yml; OWNER=qa; UPDATED=2026-08-29
+  CANARY: REQ=REQ-GEODE-877-KNN-UNKNOWN-PROPERTY; FEATURE="VectorKnn"; ASPECT=UnknownPropertyDiagnostic; STATUS=TESTED; TEST=geodetestlab-cli/specs/vector_knn_contract.yml; OWNER=qa; UPDATED=2026-08-29
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- vector
+- knn
+- regression
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: vkc_teardown_canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:VkcDoc) DETACH DELETE n
+    MATCH (n:VkcList) DETACH DELETE n
+    MATCH (n:VkcUnrelated) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [vector, setup, canary]
+
+  # ============================================================ geode#873-A =
+- name: vkc_dot_is_a_real_float
+  description: >
+    KEY (geode#873-A). 0.6*0.8 + 0.8*0.6 = 0.96. RED on v0.8.8: vector_dot
+    returned Int 0, so this comparison answered false — a perfectly good
+    similarity reported as orthogonal.
+  args: [query, '-']
+  stdin: >-
+    RETURN vector_dot(vectorf32('[0.6, 0.8]'), vectorf32('[0.8, 0.6]')) > 0.9 AS is_real_float
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"is_real_float":true'
+    stdout_not_contains:
+    - '"is_real_float":false'
+  tags: [vector, dot, regression, negative]
+
+- name: vkc_dot_value_is_exact
+  description: >
+    The dot product is not merely fractional, it is the RIGHT fraction:
+    0.96 within 1e-6. Guards against "make it a float" landing as a rescaled
+    or rounded value.
+  args: [query, '-']
+  stdin: >-
+    RETURN
+      vector_dot(vectorf32('[0.6, 0.8]'), vectorf32('[0.8, 0.6]')) > 0.959999
+      AND vector_dot(vectorf32('[0.6, 0.8]'), vectorf32('[0.8, 0.6]')) < 0.960001
+      AS exact
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"exact":true'
+    stdout_not_contains:
+    - '"exact":false'
+  tags: [vector, dot, regression, evidence]
+
+- name: vkc_dot_sibling_parity
+  description: >
+    Control (green before the fix): vector_l2 and vector_cosine already answer
+    as scale-6 FLOATs. This is what makes vector_dot's Int an inconsistency
+    rather than a design choice.
+  args: [query, '-']
+  stdin: >-
+    RETURN
+      vector_cosine(vectorf32('[1.0, 0.0]'), vectorf32('[1.0, 0.0]')) > 0.999999
+      AND vector_l2(vectorf32('[0.0, 0.0]'), vectorf32('[0.5, 0.0]')) < 0.500001
+      AS siblings_are_floats
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"siblings_are_floats":true'
+  tags: [vector, control, positive]
+
+  # ============================================================ geode#873-B =
+- name: vkc_dot_overflow_is_an_error_not_a_crash
+  description: >
+    KEY (geode#873-B, P0 DoS). f32 1e20*1e20 overflows the i64 the result was
+    cast into; @intFromFloat of an out-of-range float is illegal behaviour.
+    RED on v0.8.8: "panic: integer part of floating point value out of bounds"
+    — the SERVER dies on one unauthenticated query. GREEN: a clean
+    numeric_value_out_of_range (22003) diagnostic.
+  args: [query, '-']
+  stdin: >-
+    RETURN vector_dot(vectorf32('[1e20, 1e20]'), vectorf32('[1e20, 1e20]')) AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dot, overflow, negative, dos]
+
+- name: vkc_liveness_after_dot_overflow
+  description: >
+    THE POINT OF THE PREVIOUS CASE. The server must still be answering
+    queries. On v0.8.8 this probe could not run — the process was gone.
+  args: [query, '-']
+  stdin: RETURN 1 AS alive
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, liveness, positive]
+
+- name: vkc_l2_overflow_is_an_error_not_a_crash
+  description: >
+    Same unchecked conversion in vectorL2 (src/eval_extended.zig:2128): the
+    scale-6 coefficient of a 2e35 distance exceeds i128.
+  args: [query, '-']
+  stdin: >-
+    RETURN vector_l2(vectorf32('[1e35]'), vectorf32('[-1e35]')) AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, overflow, negative, dos]
+
+- name: vkc_distance_family_overflow_is_an_error_not_a_crash
+  description: >
+    The shared Decimal conversion at src/eval.zig:2390 backs distance(),
+    euclidean(), manhattan() and similarity(); all four panicked identically.
+  args: [query, '-']
+  stdin: >-
+    RETURN distance(vectorf32('[1e35]'), vectorf32('[-1e35]'), 'l2') AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, overflow, negative, dos]
+
+- name: vkc_similarity_dot_metric_overflow_is_an_error_not_a_crash
+  description: >
+    The cosine arm is bounded to [-1,1]; the dot_product arm is unbounded and
+    reaches the same unchecked conversion.
+  args: [query, '-']
+  stdin: >-
+    RETURN similarity(vectorf32('[1e35]'), vectorf32('[1e35]'), 'dot_product') AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, overflow, negative, dos]
+
+- name: vkc_cosine_large_magnitude_is_a_real_ratio
+  description: >
+    The OTHER face of the same defect: vectorCosine accumulates in f32, so
+    1e20 saturates to +inf, the ratio becomes NaN, and the conversion yields
+    i128 MIN. RED on v0.8.8: the engine reported a "cosine similarity" of
+    -1.7e32 with SQLSTATE 00000. A cosine similarity can never leave [-1, 1],
+    and two identical vectors are 1.0 at every magnitude.
+  args: [query, '-']
+  stdin: >-
+    RETURN vector_cosine(vectorf32('[1e20, 1e20]'), vectorf32('[1e20, 1e20]')) > 0.999999 AS bounded
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"bounded":true'
+    stdout_not_contains:
+    - '"bounded":false'
+  tags: [vector, cosine, regression, negative]
+
+- name: vkc_in_range_magnitudes_still_answer
+  description: >
+    Control (green before the fix): the checked conversion must reject only
+    what genuinely does not fit, never an ordinary embedding magnitude.
+  args: [query, '-']
+  stdin: >-
+    RETURN distance(vectorf32('[1000.0]'), vectorf32('[-1000.0]'), 'l2') > 1999.999 AS in_range_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"in_range_ok":true'
+  tags: [vector, control, positive]
+
+- name: vkc_liveness_after_all_overflow_probes
+  description: The server survived every over-cap probe above.
+  args: [query, '-']
+  stdin: RETURN 1 AS alive
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, liveness, positive]
+
+  # ============================================================ geode#877-a =
+- name: vkc_setup_list_embeddings
+  description: >
+    Seed three nodes whose embedding is a plain numeric LIST — the shape a
+    client that computed embeddings elsewhere naturally writes.
+  args: [query, '-']
+  stdin: |
+    CREATE (:VkcList {lid: 1, list_emb: [1.0, 0.0]})
+    CREATE (:VkcList {lid: 2, list_emb: [0.0, 1.0]})
+    CREATE (:VkcList {lid: 3, list_emb: [1, 1]})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, positive]
+
+- name: vkc_knn_over_list_property_returns_ids
+  description: >
+    KEY (geode#877-a). RED on v0.8.8: propertyVectorCandidate returns null for
+    a List, so all three nodes were invisible and knn answered [] with
+    SQLSTATE 00000. The integer list ([1, 1]) must coerce too.
+  args: [query, '-']
+  stdin: >-
+    RETURN size(knn('list_emb', vectorf32('[1.0, 0.0]'), 10, 'l2')) = 3 AS found_all
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"found_all":true'
+    stdout_not_contains:
+    - '"found_all":false'
+  tags: [vector, knn, list, regression, negative]
+
+- name: vkc_knn_over_list_property_orders_by_metric
+  description: >
+    The list coercion must feed the REAL metric, not just make rows appear:
+    the nearest neighbour of [1,0] is the lid=1 node.
+  args: [query, '-']
+  stdin: >-
+    MATCH (n:VkcList {lid: 1})
+    RETURN head(knn('list_emb', vectorf32('[1.0, 0.0]'), 10, 'l2')) = id(n) AS nearest_is_lid1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"nearest_is_lid1":true'
+    stdout_not_contains:
+    - '"nearest_is_lid1":false'
+  tags: [vector, knn, list, regression, evidence]
+
+  # ============================================================ geode#877-b =
+- name: vkc_setup_vector_docs
+  description: Seed two real VECTORF32 documents under their own label.
+  args: [query, '-']
+  stdin: |
+    CREATE (:VkcDoc {did: 1, vkc_emb: vectorf32('[1.0, 0.0]')})
+    CREATE (:VkcDoc {did: 2, vkc_emb: vectorf32('[0.0, 1.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, positive]
+
+- name: vkc_knn_before_unrelated_index
+  description: Control (green before the fix) — the brute-force scan finds both.
+  args: [query, '-']
+  stdin: >-
+    RETURN size(knn('vkc_emb', vectorf32('[1.0, 0.0]'), 10, 'l2')) = 2 AS both_found
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"both_found":true'
+    stdout_not_contains:
+    - '"both_found":false'
+  tags: [vector, knn, control, positive]
+
+- name: vkc_setup_unrelated_label_and_index
+  description: >
+    A COMPLETELY UNRELATED label that merely reuses the property name gets a
+    vector index. Nothing about :VkcDoc changes.
+  args: [query, '-']
+  # NOTE: the `;` is load-bearing. Consecutive CREATE *patterns* chain as one
+  # composite query statement, but `CREATE INDEX` is a separate statement kind
+  # and needs an explicit terminator — without it the parser reads the second
+  # CREATE as another pattern and fails with
+  # "expected token 'l_paren', got 'INDEX'".
+  stdin: |
+    CREATE (:VkcUnrelated {vkc_emb: vectorf32('[100.0, 100.0]')});
+    CREATE INDEX IF NOT EXISTS vkc_unrelated_idx ON VkcUnrelated (vkc_emb) USING vector;
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, ddl, positive]
+
+- name: vkc_unrelated_index_must_not_empty_knn
+  description: >
+    KEY (geode#877-b). RED on v0.8.8: findAdvancedVectorIndexForProperty
+    matched on the property NAME alone, evalVectorKnn committed to that index,
+    and the two real documents vanished with SQLSTATE 00000.
+  args: [query, '-']
+  stdin: >-
+    RETURN size(knn('vkc_emb', vectorf32('[1.0, 0.0]'), 10, 'l2')) >= 2 AS docs_still_found
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"docs_still_found":true'
+    stdout_not_contains:
+    - '"docs_still_found":false'
+  tags: [vector, knn, index, regression, negative]
+
+  # ============================================================ geode#877-c =
+- name: vkc_knn_unknown_property_is_a_diagnostic
+  description: >
+    KEY (geode#877-c). RED on v0.8.8: a misspelled property returned an empty
+    list with SQLSTATE 00000, so a typo was indistinguishable from "your data
+    has no neighbours". GREEN: undefined_column (42703), the same
+    diagnostic class the error.UnknownFunction precedent uses.
+  args: [query, '-']
+  stdin: >-
+    RETURN knn('vkc_embeddings', vectorf32('[1.0, 0.0]'), 10, 'l2') AS ids
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42703"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, knn, negative, regression]
+
+- name: vkc_knn_known_property_zero_neighbours_stays_empty
+  description: >
+    The counter-contract: "property exists, nothing scoreable" must stay a
+    CLEAN empty result. The 42703 diagnostic must not be implemented as
+    "empty result -> error".
+  args: [query, '-']
+  stdin: >-
+    RETURN size(knn('vkc_emb', vectorf32('[1.0, 0.0, 0.0]'), 10, 'l2')) = 0 AS empty_not_error
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"empty_not_error":true'
+  tags: [vector, knn, control, positive]
+
+- name: vkc_liveness_final
+  description: Final liveness probe — the server survived the whole spec.
+  args: [query, '-']
+  stdin: RETURN 1 AS alive
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, liveness, positive]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: vkc_teardown_index
+  description: Drop the unrelated vector index (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: DROP INDEX IF EXISTS vkc_unrelated_idx
+  expect:
+    exit_code: 0
+  tags: [vector, cleanup, canary]
+
+- name: vkc_teardown
+  description: Remove all Vkc test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:VkcDoc) DETACH DELETE n
+    MATCH (n:VkcList) DETACH DELETE n
+    MATCH (n:VkcUnrelated) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [vector, cleanup, canary]

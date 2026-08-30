@@ -1,0 +1,326 @@
+version: '1.0'
+name: Data directory exclusive lock (ENG-3921)
+description: |
+  ENG-3921: NOTHING stops two `geode serve` processes from opening the same
+  --data-dir, and nothing stops an offline CLI writer from mutating a live
+  server's data dir.
+
+  Live-verified at geode 0.8.8 (pre-fix):
+    * `serve --listen 127.0.0.1:23901 --data-dir D` -> "[startup] server ready"
+    * `serve --listen 127.0.0.1:23902 --data-dir D` -> "[startup] server ready"
+      (two processes, one on-disk store: split-brain; last snapshot wins =
+      silent data loss)
+    * `geode auth reseal --data-dir D` while the first server is live ->
+      "HMAC chain resealed successfully (2 records)." exit 0
+      (an offline CLI writer rewrote a running server's __geode_security
+      graph out from under it)
+
+  Contract this spec asserts (post-fix):
+    1. A second `geode serve` on a data dir held by a live server exits
+       NON-ZERO with "data directory is locked by pid <N>".
+    2. `geode auth reseal --data-dir <live dir>` is refused the same way.
+    3. A SIGKILLed holder leaves NO stale lock — a fresh serve on the same
+       dir starts normally (flock is released by the kernel on process
+       death; no TTL or manual cleanup step for an operator to get wrong).
+
+  Env contract: GEODE_DATA_DIR_LOCK_TIMEOUT_MS is the bounded handoff-retry
+  budget in ms; 0 = refuse immediately.  Pinned to 0 here so the refusal
+  path is deterministic and fast.
+
+  This is the harness lane for the same behaviour covered in-repo by
+  `zig build test-datadir-lock-subprocess`
+  (geode/tests/test_datadir_lock_subprocess.zig).  Scratch-server hygiene
+  (mktemp workdir, PID/DIR files, idempotent self-heal, port preflight,
+  no self-matching pkill) follows config_buffer_pool_pages.yml.
+
+  CANARY: REQ=REQ-ENG-3921-DATA-DIR-LOCK-004; FEATURE="DataDirLock"; ASPECT=HarnessE2E; STATUS=IMPL; TEST=self; OWNER=storage; UPDATED=2026-08-29
+
+single_node_only: true  # process-local file lock; multi-node promotion is meaningless
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: info
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: second-serve-on-live-datadir-refused
+  description: |
+    Scratch server A holds a data dir; server B is launched on a DIFFERENT
+    port against the SAME dir (a shared port would make this pass for the
+    wrong reason).  B must exit non-zero with the lock diagnostic and must
+    never print "[startup] server ready".
+  type: bash
+  timeout_ms: 180000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # never let a scratch server see the managed server's data dir
+    PORT_A=4491
+    PORT_B=4492
+    PIDFILE=/tmp/eng3921_lock_a.pid
+    DIRFILE=/tmp/eng3921_lock.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true; sleep 1; kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT_A}" 2>/dev/null || true
+    pkill -f "geode serve.*127.0.0.1:${PORT_B}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/eng3921_lock.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    for P in "$PORT_A" "$PORT_B"; do
+      if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${P}$"; then
+        echo "PORT_${P}_OCCUPIED_BY_FOREIGN_PROCESS"; exit 1
+      fi
+    done
+
+    WORKDIR=$(mktemp -d /tmp/eng3921_lock.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+    DATA="$WORKDIR/data"
+
+    GEODE_ADMIN_PASSWORD="$PW" nohup "$BIN" serve --data-dir "$DATA" \
+      --log-level info --listen "127.0.0.1:${PORT_A}" \
+      > "$WORKDIR/a.log" 2>&1 < /dev/null &
+    APID=$!
+    echo "$APID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 200); do
+      grep -q "server ready" "$WORKDIR/a.log" 2>/dev/null && { READY=1; break; }
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SERVER_A_TIMEOUT"; tail -40 "$WORKDIR/a.log"
+      kill -9 "$APID" 2>/dev/null || true; rm -f "$PIDFILE"
+      exit 1
+    fi
+
+    # Server B: same data dir, different port, zero handoff budget.
+    GEODE_ADMIN_PASSWORD="$PW" GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0 \
+      timeout 60 "$BIN" serve --data-dir "$DATA" \
+      --log-level info --listen "127.0.0.1:${PORT_B}" \
+      > "$WORKDIR/b.log" 2>&1 < /dev/null
+    BRC=$?
+
+    kill -TERM "$APID" 2>/dev/null || true
+    for i in $(seq 1 100); do kill -0 "$APID" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$APID" 2>/dev/null || true
+    rm -f "$PIDFILE"
+
+    if [ "$BRC" -eq 0 ]; then
+      echo "SECOND_SERVE_ACCEPTED_LIVE_DATADIR rc=0"; tail -20 "$WORKDIR/b.log"
+      case "$WORKDIR" in /tmp/eng3921_lock.*) rm -rf "$WORKDIR" ;; esac; rm -f "$DIRFILE"
+      exit 1
+    fi
+    if grep -q "server ready" "$WORKDIR/b.log" 2>/dev/null; then
+      echo "SECOND_SERVE_BECAME_READY rc=$BRC"; tail -20 "$WORKDIR/b.log"
+      case "$WORKDIR" in /tmp/eng3921_lock.*) rm -rf "$WORKDIR" ;; esac; rm -f "$DIRFILE"
+      exit 1
+    fi
+    if grep -q "data directory is locked by pid" "$WORKDIR/b.log" 2>/dev/null; then
+      echo "SECOND_SERVE_REFUSED"
+    else
+      echo "SECOND_SERVE_NO_LOCK_DIAGNOSTIC rc=$BRC"; tail -20 "$WORKDIR/b.log"
+      case "$WORKDIR" in /tmp/eng3921_lock.*) rm -rf "$WORKDIR" ;; esac; rm -f "$DIRFILE"
+      exit 1
+    fi
+
+    case "$WORKDIR" in /tmp/eng3921_lock.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+  expect:
+    exit_code: 0
+    stdout_contains: [SECOND_SERVE_REFUSED]
+  tags: [durability, cli, datadir-lock, eng-3921]
+
+- name: auth-reseal-on-live-datadir-refused
+  description: |
+    `geode auth reseal --data-dir <live dir>` must be refused while a
+    server holds that dir.  GEODE_AUTH_HMAC_KEY is supplied so the command
+    would otherwise SUCCEED — a non-zero exit here can only come from the
+    lock, not from an unresolvable HMAC key.
+  type: bash
+  timeout_ms: 180000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    PORT=4493
+    PIDFILE=/tmp/eng3921_reseal.pid
+    DIRFILE=/tmp/eng3921_reseal.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+    HMAC=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90
+
+    if [ -f "$PIDFILE" ]; then
+      OLDPID=$(cat "$PIDFILE" 2>/dev/null || echo "")
+      if [ -n "$OLDPID" ] && kill -0 "$OLDPID" 2>/dev/null; then
+        kill "$OLDPID" 2>/dev/null || true; sleep 1; kill -9 "$OLDPID" 2>/dev/null || true
+      fi
+      rm -f "$PIDFILE"
+    fi
+    pkill -f "geode serve.*127.0.0.1:${PORT}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/eng3921_reseal.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    if ss -tuln 2>/dev/null | awk '{print $5}' | grep -qE "[:.]${PORT}$"; then
+      echo "PORT_${PORT}_OCCUPIED_BY_FOREIGN_PROCESS"; exit 1
+    fi
+
+    WORKDIR=$(mktemp -d /tmp/eng3921_reseal.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+    DATA="$WORKDIR/data"
+
+    GEODE_ADMIN_PASSWORD="$PW" nohup "$BIN" serve --data-dir "$DATA" \
+      --log-level info --listen "127.0.0.1:${PORT}" \
+      > "$WORKDIR/server.log" 2>&1 < /dev/null &
+    SPID=$!
+    echo "$SPID" > "$PIDFILE"
+
+    READY=0
+    for i in $(seq 1 200); do
+      grep -q "server ready" "$WORKDIR/server.log" 2>/dev/null && { READY=1; break; }
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SERVER_TIMEOUT"; tail -40 "$WORKDIR/server.log"
+      kill -9 "$SPID" 2>/dev/null || true; rm -f "$PIDFILE"; exit 1
+    fi
+
+    GEODE_AUTH_HMAC_KEY="$HMAC" GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0 \
+      timeout 60 "$BIN" auth reseal --data-dir "$DATA" > "$WORKDIR/reseal.log" 2>&1
+    RRC=$?
+
+    kill -TERM "$SPID" 2>/dev/null || true
+    for i in $(seq 1 100); do kill -0 "$SPID" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$SPID" 2>/dev/null || true
+    rm -f "$PIDFILE"
+
+    OK=1
+    [ "$RRC" -eq 0 ] && { echo "RESEAL_MUTATED_LIVE_DATADIR rc=0"; OK=0; }
+    grep -q "resealed successfully" "$WORKDIR/reseal.log" 2>/dev/null && \
+      { echo "RESEAL_REWROTE_LIVE_CHAIN"; OK=0; }
+    grep -q "data directory is locked by pid" "$WORKDIR/reseal.log" 2>/dev/null || \
+      { echo "RESEAL_NO_LOCK_DIAGNOSTIC rc=$RRC"; OK=0; }
+    [ "$OK" -eq 1 ] && echo "RESEAL_REFUSED" || tail -20 "$WORKDIR/reseal.log"
+
+    case "$WORKDIR" in /tmp/eng3921_reseal.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+    [ "$OK" -eq 1 ] || exit 1
+  expect:
+    exit_code: 0
+    stdout_contains: [RESEAL_REFUSED]
+  tags: [security, cli, datadir-lock, eng-3921]
+
+- name: sigkilled-holder-leaves-no-stale-lock
+  description: |
+    Guard against the classic over-correction: a SIGKILLed server must not
+    wedge its data dir.  flock is released by the kernel on process death,
+    so a fresh serve on the same dir must reach "server ready".
+  type: bash
+  timeout_ms: 180000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    PORT_A=4494
+    PORT_B=4495
+    DIRFILE=/tmp/eng3921_stale.dir
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BIN="${GEODE_BINARY:-geode}"
+
+    pkill -f "geode serve.*127.0.0.1:${PORT_A}" 2>/dev/null || true
+    pkill -f "geode serve.*127.0.0.1:${PORT_B}" 2>/dev/null || true
+    if [ -f "$DIRFILE" ]; then
+      OLDDIR=$(cat "$DIRFILE" 2>/dev/null || echo "")
+      case "$OLDDIR" in /tmp/eng3921_stale.*) rm -rf "$OLDDIR" ;; esac
+      rm -f "$DIRFILE"
+    fi
+    sleep 0.3
+
+    WORKDIR=$(mktemp -d /tmp/eng3921_stale.XXXXXX)
+    echo "$WORKDIR" > "$DIRFILE"
+    DATA="$WORKDIR/data"
+
+    GEODE_ADMIN_PASSWORD="$PW" nohup "$BIN" serve --data-dir "$DATA" \
+      --log-level info --listen "127.0.0.1:${PORT_A}" \
+      > "$WORKDIR/a.log" 2>&1 < /dev/null &
+    APID=$!
+    READY=0
+    for i in $(seq 1 200); do
+      grep -q "server ready" "$WORKDIR/a.log" 2>/dev/null && { READY=1; break; }
+      sleep 0.3
+    done
+    if [ "$READY" -ne 1 ]; then
+      echo "SERVER_A_TIMEOUT"; tail -40 "$WORKDIR/a.log"
+      kill -9 "$APID" 2>/dev/null || true; exit 1
+    fi
+
+    # Hard kill: no graceful shutdown, no cleanup hook runs.
+    kill -9 "$APID" 2>/dev/null || true
+    for i in $(seq 1 100); do kill -0 "$APID" 2>/dev/null || break; sleep 0.1; done
+
+    GEODE_ADMIN_PASSWORD="$PW" GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0 \
+      nohup "$BIN" serve --data-dir "$DATA" \
+      --log-level info --listen "127.0.0.1:${PORT_B}" \
+      > "$WORKDIR/b.log" 2>&1 < /dev/null &
+    BPID=$!
+    READY_B=0
+    for i in $(seq 1 200); do
+      grep -q "server ready" "$WORKDIR/b.log" 2>/dev/null && { READY_B=1; break; }
+      sleep 0.3
+    done
+
+    kill -TERM "$BPID" 2>/dev/null || true
+    for i in $(seq 1 100); do kill -0 "$BPID" 2>/dev/null || break; sleep 0.1; done
+    kill -9 "$BPID" 2>/dev/null || true
+
+    if [ "$READY_B" -eq 1 ]; then
+      echo "STALE_LOCK_CLEARED"
+    else
+      echo "STALE_LOCK_BLOCKED_RESTART"; tail -30 "$WORKDIR/b.log"
+    fi
+
+    case "$WORKDIR" in /tmp/eng3921_stale.*) rm -rf "$WORKDIR" ;; esac
+    rm -f "$DIRFILE"
+    [ "$READY_B" -eq 1 ] || exit 1
+  expect:
+    exit_code: 0
+    stdout_contains: [STALE_LOCK_CLEARED]
+  tags: [durability, cli, datadir-lock, eng-3921]

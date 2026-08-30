@@ -1,0 +1,358 @@
+version: '1.0'
+name: ENG-3922 — vector dimension guard covers unindexed properties, and an over-cap literal cannot kill the server
+description: |
+  Over-the-wire contract for ENG-3922. Three defects, all reachable by an
+  ordinary authenticated client:
+
+    (a) NO DIMENSION GUARD FOR AN UNINDEXED (label, property). The guard
+        registry is keyed by INDEX NAME and populated only by CREATE INDEX DDL,
+        so a property with no vector index matches zero entries and silently
+        accepts mixed dimensions. Downstream that is silent data loss:
+        vector_cosine over a dim-4/dim-8 pair yields NULL and a knn scan drops
+        the non-conforming rows with no signal at all. An INDEXED pair is
+        correctly refused (22000) — coverage is the bug, not the logic.
+
+    (b) AN OVER-CAP VECTOR STRING LITERAL IS LAUNDERED. `VectorF32.fromString`
+        raises a perfectly good `error.VectorTooLarge` above 65535 elements;
+        that identity is collapsed to InvalidFormat, then to TypeMismatch, and
+        `proto_util.mapError` has no arm for it — so the client is told
+        SQLSTATE 58000 ("internal system error") for a documented resource
+        limit it simply crossed. Same wrong-class bug ENG-3911 fixed for
+        PropertyValueTooLarge; same shape of fix — SQLSTATE 54000
+        (program_limit_exceeded) with a message naming the 65535 cap.
+
+    (c) P0 CRASH / DoS. The string path checks the 65535 cap; the LIST path
+        does not. Every list-literal vector constructor does an unchecked
+        u16 @intCast of the list length, so a 65536-element ARRAY literal is an
+        integer-overflow PANIC that takes the whole server process down. It is
+        reachable from a READ-ONLY statement with no stored data and no index:
+
+            RETURN size(vectorf32([ ...65536 elements... ]))
+
+        Any authenticated read-only client can halt the database. THE CENTRAL
+        ASSERTION OF THIS SPEC IS THE LIVENESS CHECK AFTER EACH OVER-CAP
+        QUERY — a refusal is a refusal; a dead server is a different outcome
+        and this spec must be able to tell them apart.
+
+  WHY THE OVER-CAP QUERIES GO THROUGH STDIN. A 65536-element literal is ~130 KB
+  of query text and Linux caps a SINGLE argv entry at MAX_ARG_STRLEN (128 KiB),
+  so passing it as an argument fails with E2BIG before the server is ever
+  reached — the spec would "pass" while testing nothing. `geode query -` reads
+  the query from stdin, which has no such limit.
+
+  RED BEFORE THE FIX. On the pre-fix tree: the (a) mixed-dimension write
+  SUCCEEDS, the (b) over-cap string returns 58000/TypeMismatch, and the (c)
+  over-cap array literals CRASH the server — after which every following step
+  in this spec fails to connect, which is precisely the evidence.
+
+  `cleanup: false` so the liveness steps see the same server and data dir.
+
+  Labels are prefixed VDG_ so this spec cannot collide with any other spec's
+  data.
+
+  Sibling specs: vector_dim_lifecycle.yml (ENG-3912, the INDEXED pin
+  lifecycle), large_vector_embeddings.yml (large but in-cap embeddings),
+  vector_index_errors.yml.
+
+  Engine-side sibling: geode tests/test_eng3922_dim_guard.zig
+  (`zig build test-eng3922`).
+
+  CANARY: REQ=REQ-ENG-3922-VECTOR-DIM-GUARD; FEATURE="VectorIndex"; ASPECT=WireContract; STATUS=IMPL; TEST=geodetestlab/specs/vector_dim_guard.yml; OWNER=index; UPDATED=2026-08-29
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+tests:
+# ---------------------------------------------------------------------------
+# (a) The guard must cover an UNINDEXED (label, property).
+#     No CREATE INDEX appears anywhere in this section — that is the point.
+# ---------------------------------------------------------------------------
+- name: unindexed-first-write-establishes-dimension
+  description: |
+    A dim-4 vector into a property that has NO vector index. This is the write
+    that establishes what the property IS. Must succeed.
+  query: >-
+    CREATE (:VDG_Free {id: 1, emb: vectorf32('[1.0, 2.0, 3.0, 4.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, unindexed, setup]
+
+- name: unindexed-mixed-dimension-write-is-refused
+  description: |
+    KEY ASSERTION (a). A dim-8 vector into the same unindexed property must be
+    REFUSED with the dimension-mismatch class (22000), not silently stored.
+
+    RED before the fix: 00000. The property then holds a dim-4 and a dim-8
+    vector under one name, and every reader degrades silently.
+  query: >-
+    CREATE (:VDG_Free {id: 2, emb: vectorf32('[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, unindexed, negative]
+
+- name: unindexed-refusal-stored-nothing
+  description: The refusal is atomic — exactly the one dim-4 row survives.
+  query: >-
+    MATCH (n:VDG_Free) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  tags: [vector, dim-guard, atomicity]
+
+- name: unindexed-established-dimension-still-writes
+  description: |
+    GUARD. The fix must refuse the WRONG dimension, not the property. Another
+    dim-4 write is accepted.
+  query: >-
+    CREATE (:VDG_Free {id: 3, emb: vectorf32('[4.0, 3.0, 2.0, 1.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, unindexed, positive]
+
+- name: unindexed-array-literal-form-hits-the-same-guard
+  description: |
+    The array-literal constructor reaches the same property-write chokepoint,
+    so it must be refused the same way as the string form.
+  query: >-
+    CREATE (:VDG_Free {id: 4, emb: vectorf32([1.0, 2.0, 3.0])})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, unindexed, negative]
+
+- name: unindexed-different-label-same-property-name-is-unconstrained
+  description: |
+    GUARD against the fix over-reaching. A different label that happens to
+    reuse the property NAME is a DIFFERENT property with its own dimension.
+    (Passes before and after the fix.)
+  query: >-
+    CREATE (:VDG_Other {id: 1, emb: vectorf32('[9.0, 9.0, 9.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, scope, positive]
+
+# ---------------------------------------------------------------------------
+# (b) The over-cap STRING literal: a structured, correctly-classed refusal.
+# ---------------------------------------------------------------------------
+- name: overcap-string-literal-is-a-limit-error-not-a-system-error
+  description: |
+    KEY ASSERTION (b). 65536 elements in the STRING constructor form. The cap
+    is real and already enforced — what is wrong is what the client is TOLD.
+    It must arrive as SQLSTATE 54000 (program_limit_exceeded) with the 65535
+    cap named, not as 58000/TypeMismatch.
+
+    RED before the fix: {"status_class":"58000","error":"TypeMismatch"}.
+
+    Query text is ~130 KB, so it goes in on stdin (`geode query -`) — a single
+    argv entry is capped at 128 KiB by the kernel.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    python3 -c "print(\"RETURN vectorf32('[\" + ','.join(['1.0']*65536) + \"]')\")" \
+      | "$BIN" query - --server "$ADDR" ${GEODE_CLIENT_TLS} \
+          -U geode -P "$PW" --format json --timeout 60 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"54000"'
+    - '65535'
+    stdout_not_contains:
+    - '"status_class":"58000"'
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, overcap, negative]
+
+- name: overcap-string-literal-server-alive
+  description: LIVENESS. The refusal did not disturb the server.
+  query: >-
+    RETURN 1 AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+  tags: [vector, dim-guard, liveness]
+
+- name: at-cap-string-literal-still-works
+  description: |
+    BOUNDARY GUARD. 65535 is the largest REPRESENTABLE dimension and must keep
+    working — the fix must reject 65536, not 65535. An off-by-one here would be
+    a functional regression for legitimately large embeddings.
+
+    Constructed-ness is asserted with `IS NULL` -> false rather than `size()`,
+    because `size()` over the wire is a documented surface gap on this build
+    (see the readback note in large_vector_embeddings.yml) and would silently
+    assert nothing. The exact dimension at the cap is pinned in-process by
+    geode tests/test_eng3922_dim_guard.zig.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    python3 -c "print(\"RETURN vectorf32('[\" + ','.join(['1.0']*65535) + \"]') IS NULL AS isnull\")" \
+      | "$BIN" query - --server "$ADDR" ${GEODE_CLIENT_TLS} \
+          -U geode -P "$PW" --format json --timeout 60 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"isnull":false'
+    stdout_not_contains:
+    - '"status_class":"54000"'
+  tags: [vector, dim-guard, boundary, positive]
+
+# ---------------------------------------------------------------------------
+# (c) P0 — the over-cap ARRAY literal must be refused, and the server must
+#     still be there afterwards. Every over-cap query below is immediately
+#     followed by a liveness probe: that pairing is the whole test.
+# ---------------------------------------------------------------------------
+- name: overcap-array-literal-readonly-does-not-crash-the-server
+  description: |
+    KEY ASSERTION (c) — the P0 reproducer verbatim. A READ-ONLY statement, no
+    write privilege exercised, no stored data, no index. It must come back as a
+    structured 54000 refusal.
+
+    RED before the fix: the server PANICS ("integer does not fit in destination
+    type", the unchecked u16 @intCast of the list length) and the process dies.
+    The client sees a transport failure and every later step in this spec is
+    unable to connect.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    python3 -c "print('RETURN size(vectorf32([' + ','.join(['1.0']*65536) + ']))')" \
+      | "$BIN" query - --server "$ADDR" ${GEODE_CLIENT_TLS} \
+          -U geode -P "$PW" --format json --timeout 60 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"54000"'
+    - '65535'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, overcap, crash, p0, negative]
+
+- name: overcap-array-literal-server-alive
+  description: |
+    LIVENESS — THE POINT OF (c). If the server crashed on the previous step
+    this cannot connect, and that failure is the bug report.
+  query: >-
+    RETURN 1 AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+  tags: [vector, dim-guard, liveness, p0]
+
+- name: overcap-vectori32-array-literal-does-not-crash-the-server
+  description: |
+    The integer-vector constructor has the same unchecked @intCast on the list
+    path and must be refused the same way.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    python3 -c "print('RETURN vectori32([' + ','.join(['1']*65536) + '])')" \
+      | "$BIN" query - --server "$ADDR" ${GEODE_CLIENT_TLS} \
+          -U geode -P "$PW" --format json --timeout 60 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"54000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, overcap, crash, p0, negative]
+
+- name: overcap-vectori32-server-alive
+  description: LIVENESS after the vectori32 refusal.
+  query: >-
+    RETURN 1 AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+  tags: [vector, dim-guard, liveness, p0]
+
+- name: overcap-vector-array-literal-does-not-crash-the-server
+  description: |
+    The generic `vector([...])` constructor is a third copy of the same
+    unchecked cast.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    python3 -c "print('RETURN vector([' + ','.join(['1.0']*65536) + '])')" \
+      | "$BIN" query - --server "$ADDR" ${GEODE_CLIENT_TLS} \
+          -U geode -P "$PW" --format json --timeout 60 2>&1
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"54000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, dim-guard, overcap, crash, p0, negative]
+
+# ---------------------------------------------------------------------------
+# Final state: the server is still serving AND the data written before the
+# over-cap storm is intact — a refusal is not a restart.
+# ---------------------------------------------------------------------------
+- name: final-server-alive-and-data-intact
+  description: |
+    Two dim-4 rows were committed in section (a); the mixed-dimension and
+    over-cap refusals must have changed nothing.
+  query: >-
+    MATCH (n:VDG_Free) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+  tags: [vector, dim-guard, liveness, durability]

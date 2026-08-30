@@ -1,0 +1,351 @@
+version: '1.0'
+name: ISO GQL FOR … IN composed with a write body (geode#876)
+description: >
+  geode#876 — ISO GQL `FOR … IN` cannot compose with write statements. The
+  parser hard-requires a RETURN immediately after the FOR header
+  (`_ = try self.expect(.RETURN);`, src/gql/parser.zig:5814 inside
+  parseForStatement 5776-5878), so every data-modifying continuation is a
+  syntax error over the wire:
+
+      FOR i IN range(1, 4) CREATE (n:For876Doc {v: i})
+      → 42601 "expected token 'RETURN', got 'CREATE' at line 1 col 22"
+
+  Per ISO/IEC 39075:2024 (grammar/ISO_IEC_39075(en).bnf.txt:413, 455, 288) FOR
+  is a <primitive query statement>; a <data-modifying statement> may follow it
+  and the RETURN is OPTIONAL. Cypher `UNWIND` is explicitly OUT OF SCOPE — it
+  is not ISO GQL and is not being added.
+
+  This is the end-to-end wire proof for the in-repo Zig regression
+  `tests/test_for_write_body.zig` (`zig build test-for-write-body`). It goes
+  further than the unit suite in one respect that only the wire path can
+  cover: the SECURITY classification. A write-bodied FOR must be classified
+  mutating by query_traits.isMutatingProgram (src/query/query_traits.zig:351,
+  where `.For` currently falls into `else => false`), otherwise it slips past
+  the per-request read-only floor, takes the SHARED read lock while mutating
+  shared state, and bypasses the cluster unreplicated-write gate. The
+  `--read-only` flag (ExecuteRequest.read_only field 6, see
+  specs/read_only_execute.yml) is the cheapest auth-free probe of that
+  classification, so it is asserted in BOTH directions here: a write-bodied
+  FOR must be REFUSED with 42501, and a read-only `FOR … RETURN` must still
+  be ALLOWED (no over-classification, which would force the exclusive write
+  lock on read-only loops and regress concurrency).
+
+  PRE-FIX (RED) expectation: every `for876_*` test below whose statement has
+  a write body fails with `"status_class":"42601"` and
+  `expected token 'RETURN'`. The three control tests
+  (for876_control_read_only_for_return_parses,
+  for876_control_range_is_half_open,
+  for876_control_read_only_flag_allows_for_return) are GREEN today and must
+  stay green.
+
+  NOTE on range(): geode's `range(start, stop)` is HALF-OPEN — `range(1, 4)`
+  is `[1, 2, 3]`. `for876_control_range_is_half_open` pins that so the node
+  counts below are trustworthy.
+
+  CANARY: REQ=REQ-GQL-FOR-WRITE-BODY-876; FEATURE="ForStatement"; ASPECT=CliE2E; STATUS=TESTED; TEST=geodetestlab-cli/specs/for_write_body.yml; OWNER=parser; UPDATED=2026-08-29
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- gql
+- iso-gql
+- for
+- write-body
+- geode-876
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: for876_teardown_canary_create
+  description: Idempotent pre-teardown of For876Doc so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876Doc) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, setup, canary]
+
+- name: for876_teardown_canary_merge
+  description: Idempotent pre-teardown of For876Merge so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876Merge) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, setup, canary]
+
+- name: for876_teardown_canary_set
+  description: Idempotent pre-teardown of For876Set so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876Set) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, setup, canary]
+
+- name: for876_teardown_canary_readonly
+  description: Idempotent pre-teardown of For876Ro so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876Ro) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, setup, canary]
+
+  # ------------------------------------------------------------- controls --
+- name: for876_control_read_only_for_return_parses
+  description: >
+    CONTROL (green today, must stay green): the read-only `FOR … RETURN` form
+    still parses and projects every element.
+  args: [query, 'FOR x IN [1, 2, 3] RETURN x AS x']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":1'
+    - '"x":2'
+    - '"x":3'
+    stdout_not_contains:
+    - '"rows":[]'
+  tags: [for, control]
+
+- name: for876_control_range_is_half_open
+  description: >
+    CONTROL (green today): pins that `range(1, 4)` is `[1, 2, 3]` (half-open),
+    which the node counts in the write-body tests below depend on.
+  args: [query, 'FOR i IN range(1, 4) RETURN i AS i']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"i":1'
+    - '"i":2'
+    - '"i":3'
+    stdout_not_contains:
+    - '"i":4'
+    - '"rows":[]'
+  tags: [for, control]
+
+  # ------------------------------------------------- FOR … CREATE (crux) --
+- name: for876_for_create_accepted
+  description: >
+    KEY ASSERTION: the exact reproducer from geode#876. `FOR … CREATE` must be
+    ACCEPTED. Pre-fix this returns 42601 "expected token 'RETURN', got
+    'CREATE' at line 1 col 22".
+  args: [query, '-']
+  stdin: 'FOR i IN range(1, 4) CREATE (n:For876Doc {v: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42601"'
+    - expected token 'RETURN'
+  tags: [for, write-body, key-assertion]
+
+- name: for876_for_create_persisted_three_nodes
+  description: >
+    The write body really ran once per element — exactly 3 For876Doc nodes,
+    not 0 (silent no-op) and not 1 (loop collapsed to a single iteration).
+  args: [query, MATCH (n:For876Doc) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":3'
+  tags: [for, write-body, evidence]
+
+- name: for876_for_create_bound_values_are_correct
+  description: >
+    The loop variable is visible to the write body — the created nodes carry
+    the values 1, 2, 3 (not NULL, and not the same value three times).
+  args: [query, MATCH (n:For876Doc) RETURN n.v AS v ORDER BY v]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"v":1'
+    - '"v":2'
+    - '"v":3'
+    stdout_not_contains:
+    - '"v":null'
+  tags: [for, write-body, evidence]
+
+  # -------------------------------------------------- FOR … MERGE (idem) --
+- name: for876_for_merge_accepted
+  description: "`FOR … MERGE` must be ACCEPTED. Pre-fix: 42601 \"expected token 'RETURN', got 'MERGE'\"."
+  args: [query, '-']
+  stdin: 'FOR i IN [1, 2] MERGE (n:For876Merge {v: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42601"'
+  tags: [for, write-body]
+
+- name: for876_for_merge_created_two
+  description: First FOR … MERGE run creates exactly 2 nodes.
+  args: [query, MATCH (n:For876Merge) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+  tags: [for, write-body, evidence]
+
+- name: for876_for_merge_rerun
+  description: Re-run the identical FOR … MERGE — must MATCH, not duplicate.
+  args: [query, '-']
+  stdin: 'FOR i IN [1, 2] MERGE (n:For876Merge {v: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [for, write-body]
+
+- name: for876_for_merge_is_idempotent
+  description: >
+    After the second run the count is STILL 2 — the FOR body composes with
+    MERGE's match-or-create semantics rather than blindly creating.
+  args: [query, MATCH (n:For876Merge) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+    stdout_not_contains:
+    - '"c":4'
+  tags: [for, write-body, key-assertion]
+
+  # ------------------------------------------------- FOR … MATCH … SET ---
+- name: for876_set_seed
+  description: Seed three For876Set nodes (k = 1, 2, 3; all v = 0) for the SET body test.
+  args: [query, '-']
+  stdin: |
+    /*+BATCH*/
+    CREATE (n:For876Set {k: 1, v: 0});
+    CREATE (n:For876Set {k: 2, v: 0});
+    CREATE (n:For876Set {k: 3, v: 0});
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [for, write-body, setup]
+
+- name: for876_for_match_set_accepted
+  description: >
+    The broadest composition named in the issue — a FOR feeding a MATCH-scoped
+    SET. Pre-fix: 42601 "expected token 'RETURN', got 'MATCH'".
+  args: [query, '-']
+  stdin: 'FOR i IN [1, 2] MATCH (n:For876Set {k: i}) SET n.v = i'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42601"'
+  tags: [for, write-body]
+
+- name: for876_for_match_set_updated_only_matched_rows
+  description: >
+    k=1 → v=1 and k=2 → v=2, while k=3 stays at v=0. No node is added or lost
+    (count is still 3), so an over-broad SET is caught too.
+  args: [query, 'MATCH (n:For876Set) RETURN n.k AS k, n.v AS v ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":1,"v":1'
+    - '"k":2,"v":2'
+    - '"k":3,"v":0'
+  tags: [for, write-body, evidence]
+
+  # --------------------------------- security: mutation classification ----
+- name: for876_read_only_flag_rejects_for_create
+  description: >
+    KEY SECURITY ASSERTION: a write-bodied FOR must be classified MUTATING by
+    query_traits.isMutatingProgram, so the per-request read-only floor
+    (ExecuteRequest.read_only, field 6) REFUSES it with GQLSTATE 42501. If
+    `.For` stays in the `else => false` arm of isMutatingStatement
+    (src/query/query_traits.zig:351) this write sails straight through the
+    read-only gate.
+  args: [query, --read-only, '-']
+  stdin: 'FOR i IN [7, 8] CREATE (n:For876Ro {v: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"42501"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [for, write-body, authorization, key-assertion]
+
+- name: for876_read_only_rejected_create_did_not_persist
+  description: >
+    The refused write had NO effect on the store — the gate fired before any
+    mutation reached it, not merely returned an error alongside a partial write.
+  args: [query, MATCH (n:For876Ro) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags: [for, write-body, authorization, evidence]
+
+- name: for876_control_read_only_flag_allows_for_return
+  description: >
+    CONTROL (green today, must stay green): a read-only `FOR … RETURN` must NOT
+    be over-classified as mutating. Promoting every FOR to mutating would force
+    the exclusive write lock on read-only loops and regress concurrency.
+  args: [query, --read-only, 'FOR x IN [1, 2, 3] RETURN x AS x']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":3'
+    stdout_not_contains:
+    - '"status_class":"42501"'
+  tags: [for, control, authorization]
+
+  # ------------------------------------------------------------ teardown --
+- name: for876_teardown_create
+  description: Idempotent teardown of For876Doc.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876Doc) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, teardown, canary]
+
+- name: for876_teardown_merge
+  description: Idempotent teardown of For876Merge.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876Merge) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, teardown, canary]
+
+- name: for876_teardown_set
+  description: Idempotent teardown of For876Set.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876Set) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, teardown, canary]
