@@ -40,15 +40,18 @@ description: |
 
     - decimal-arithmetic-overflow (bonus negative) — `decimal_mul` of two
       operands whose product would exceed 38 digits is also genuinely
-      rejected: status_class 58000, error "DecimalOverflow". Arithmetic
-      overflow IS checked for multiplication.
+      rejected: status_class 22003 (numeric_value_out_of_range), error
+      "Numeric value out of range for DECIMAL" (geode#873-B de-58000'd the
+      former generic 58000/"DecimalOverflow" fallback, 2026-08-29).
+      Arithmetic overflow IS checked for multiplication.
 
     - decimal-add-overflow (was silent-accept; fixed by GAP-0925) —
       `decimal_add` of a 38-digit max value plus 1 would produce a 39-digit
       result. This used to be silently accepted (status_class 00000);
       GAP-0925 made the 38-digit precision ceiling consistent, so addition
       now enforces it just like multiplication. Real behavior: status_class
-      58000, error "DecimalOverflow" — REJECTED, matching `decimal_mul`.
+      22003, error "Numeric value out of range for DECIMAL" — REJECTED,
+      matching `decimal_mul` (de-58000'd by geode#873-B, 2026-08-29).
 
     - decimal-scale-rounding (bonus, documented behavior) — `Decimal('123.456',
       2)` (3 fractional digits against a declared scale of 2) does not
@@ -116,8 +119,8 @@ cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 30000
     cleanup: true
     args:
@@ -139,7 +142,7 @@ tests:
     below. Also includes a Decimal coefficient at exactly the documented
     38-digit maximum precision to prove that boundary constructs cleanly
     (contrast with decimal-precision-overflow, one digit past it).
-  query: "RETURN Decimal('123.45', 2) AS dec, Decimal('99999999999999999999999999999999999999', 0) AS dec_max38, Interval('P1Y2M3DT4H5M6S') AS iv, Date('2025-01-15') AS d, Timestamp('2025-06-15 12:00:00') AS ts"
+  query: RETURN Decimal('123.45', 2) AS dec, Decimal('99999999999999999999999999999999999999', 0) AS dec_max38, Interval('P1Y2M3DT4H5M6S') AS iv, Date('2025-01-15') AS d, Timestamp('2025-06-15 12:00:00') AS ts
   expected:
     exit_code: 0
     stdout_contains:
@@ -159,7 +162,7 @@ tests:
     58000, error "TypeMismatch". Contrast with valid-controls' 38-digit
     max, which constructs cleanly — this is a genuine boundary
     enforcement, not exit_code noise.
-  query: "RETURN Decimal('999999999999999999999999999999999999999', 0) AS d"
+  query: RETURN Decimal('999999999999999999999999999999999999999', 0) AS d
   expected:
     exit_code: 0
     stdout_contains:
@@ -172,16 +175,17 @@ tests:
 - name: p28_decimal-arithmetic-overflow
   description: |
     Bonus negative — decimal_mul() of two operands whose product exceeds
-    38 significant digits is genuinely rejected: status_class 58000,
-    error "DecimalOverflow". Shows arithmetic-level overflow IS checked
+    38 significant digits is genuinely rejected: status_class 22003
+    numeric_value_out_of_range (de-58000'd by geode#873-B, 2026-08-29).
+    Shows arithmetic-level overflow IS checked
     for multiplication (contrast with decimal-add-silent-overflow below,
     where addition is NOT checked).
-  query: "RETURN decimal_mul(Decimal('99999999999999999999999999999999999999', 0), Decimal('2', 0)) AS d"
+  query: RETURN decimal_mul(Decimal('99999999999999999999999999999999999999', 0), Decimal('2', 0)) AS d
   expected:
     exit_code: 0
     stdout_contains:
-    - '"status_class":"58000"'
-    - DecimalOverflow
+    - '"status_class":"22003"'
+    - Numeric value out of range for DECIMAL
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [advanced-types, negative, decimal, arithmetic-overflow]
@@ -195,14 +199,15 @@ tests:
     rejected the equivalent overflow. GAP-0925 made the 38-digit decimal
     precision ceiling consistent across operations: decimal_add now REJECTS
     the overflow exactly as decimal_mul does. Expected real behavior:
-    status_class 58000, error "DecimalOverflow" — the addition overflow check
-    now matches multiplication.
-  query: "RETURN decimal_add(Decimal('99999999999999999999999999999999999999', 0), Decimal('1', 0)) AS d"
+    status_class 22003, "Numeric value out of range for DECIMAL" (de-58000'd
+    by geode#873-B, 2026-08-29) — the addition overflow check now matches
+    multiplication.
+  query: RETURN decimal_add(Decimal('99999999999999999999999999999999999999', 0), Decimal('1', 0)) AS d
   expected:
     exit_code: 0
     stdout_contains:
-    - '"status_class":"58000"'
-    - DecimalOverflow
+    - '"status_class":"22003"'
+    - Numeric value out of range for DECIMAL
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [advanced-types, limitation, decimal, silent-accept]
@@ -214,7 +219,7 @@ tests:
     rounds to 123.46 (half-even per docs) and constructs cleanly,
     status_class 00000. This is the "OR documented rounding" branch
     of the decimal-precision-overflow case's brief.
-  query: "RETURN Decimal('123.456', 2) AS d"
+  query: RETURN Decimal('123.456', 2) AS d
   expected:
     exit_code: 0
     stdout_contains:
@@ -233,7 +238,7 @@ tests:
     a different, checked code path: std.fmt.parseInt's own overflow error,
     caught gracefully. Probed real behavior: status_class 58000, error
     "TimeParse", no crash.
-  query: "RETURN Interval('P9999999999Y') AS iv"
+  query: RETURN Interval('P9999999999Y') AS iv
   expected:
     exit_code: 0
     stdout_contains:
@@ -250,7 +255,7 @@ tests:
     Also confirmed Date('999999-01-15') (6-digit year) and
     Timestamp('999999-06-15 12:00:00') hit the identical 58000/TimeParse
     path — genuine calendar-field validation, no crash.
-  query: "RETURN Date('2025-13-15') AS d"
+  query: RETURN Date('2025-13-15') AS d
   expected:
     exit_code: 0
     stdout_contains:
@@ -269,7 +274,7 @@ tests:
     exactly i64::max (9223372036854775807) parses and returns cleanly
     (status_class 00000) — confirming this is a genuine boundary
     rejection, not a blanket parser failure.
-  query: "RETURN 99999999999999999999999999999 AS n"
+  query: RETURN 99999999999999999999999999999 AS n
   expected:
     exit_code: 0
     stdout_contains:

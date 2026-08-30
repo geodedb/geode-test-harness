@@ -13,14 +13,19 @@ description: |
   The migration path is exercised by the internal unit test
   src/security/test_argon2id_hashing.zig ("legacy Blake2b migration support").
 
-  BLOCKED PATHS:
-    - Seeding a BLAKE2b hash into a live user record requires either:
-        a) `geode admin user-import` — command not yet exposed via the
-           CLI (no user-import subcommand in user_mgmt_cli.zig).
-        b) Direct graph manipulation via GQL INSERT — the password_hash
-           column is write-protected on the __geode_security internal graph.
-    - Therefore the end-to-end "login with BLAKE2b credential" flow
-      cannot be exercised through the CLI black-box interface.
+  SEEDING PATH (ENG-3979): `geode user import <name> --hash <h>
+  --algorithm blake2b` now exists on BOTH sides — offline (data-dir) and
+  over the wire (`CALL geode.auth.user_import(...)`, admin-only, cluster
+  fail-closed, AuthGraphManager write-through). Against a running server
+  only the wire arm is usable: ENG-3921's data-dir lock refuses an
+  out-of-process auth write while the server owns the directory.
+
+  STILL NOT COVERED HERE: the end-to-end "log in with a BLAKE2b
+  credential" flow. `user_management.verifyPassword` only accepts
+  `$argon2id$` PHC strings, so an imported legacy hash is fail-closed
+  (never authenticates) until the legacy verify path is reachable from the
+  wire login. That round trip stays pinned by the internal unit test
+  src/security/test_argon2id_hashing.zig.
 
   TESTED HERE:
     1. Static oracle: confirm dual-path verify function exists in source.
@@ -151,9 +156,16 @@ tests:
     `geode user import <name> --hash <h> --algorithm blake2b` seeds a user
     with a pre-computed password hash rather than a plaintext password.
     This is the migration path for importing users from a legacy store
-    that carries BLAKE2b hashes. The command persists the hash verbatim
-    into the __geode_security graph's password_hash column via the offline
-    auth store; this test pins that the import command exists and succeeds.
+    that carries BLAKE2b hashes. The hash is persisted verbatim into the
+    __geode_security graph's password_hash column.
+
+    ENG-3979: this rides the WIRE (`CALL geode.auth.user_import(...)`), like
+    every other `user` subcommand in this harness. The offline `--data-dir`
+    path cannot serve it here: ENG-3921's data-dir lock correctly refuses an
+    out-of-process auth write while this spec's server owns the directory.
+    The wire procedure carries the same posture as `user_create` —
+    admin-only, cluster fail-closed, AuthGraphManager write-through into the
+    HMAC-chained __geode_security graph.
   args:
   - user
   - import
@@ -168,6 +180,8 @@ tests:
     exit_code: 0
     stdout_contains:
     - imported successfully
+    - legacy_blake2b_user
+    - blake2b
   tags: [blake2b, migration, user-import]
 
   # ---- cleanup ----

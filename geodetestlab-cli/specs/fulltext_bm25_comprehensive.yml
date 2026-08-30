@@ -4,8 +4,11 @@ description: >
   GAP-0330 — Fulltext BM25 index comprehensive coverage.
   Invariants: 100 documents inserted via explicit CREATE list (ISO GQL, no UNWIND); single-token search
   returns matching docs; multi-token search covers all token-bearing docs;
-  phrase search via =~ operator works; bm25_score() function available for
-  ranking; CONTAINS predicate consistent with =~; re-index determinism
+  phrase search via =~ operator works; BM25 ranking surfaced via the real
+  CALL geode.fts.search('<index>', '<query>'[, max]) procedure (the former
+  scalar bm25_score() spelling never existed in geode — the scalar FTS
+  value-function surface was deliberately retired);
+  CONTAINS predicate consistent with =~; re-index determinism
   verified via DROP + recreate + same query = same result count.
   Known gap: SHOW INDEXES does NOT expose FULLTEXT index names — asserted
   and documented with skip_reason. CANARY tokens ensure idempotent teardown.
@@ -42,27 +45,36 @@ tests:
   tags: [bm25, setup, canary]
 
 - name: bm25-comp-create-idx
-  description: Create FULLTEXT index on content property
+  description: >
+    Create fulltext index on content property (documented DDL form; the
+    former `CREATE FULLTEXT INDEX ...` spelling was a 42000 parse error
+    that false-passed on exit_code alone — geode query exits 0 on query
+    errors).
   args: [query, '-']
-  stdin: CREATE FULLTEXT INDEX IF NOT EXISTS bm25_comp ON BM25Comp (content)
+  stdin: CREATE INDEX bm25_comp FOR (n:BM25Comp) ON (n.content) USING fulltext
   expect:
     exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
   tags: [bm25, index, create]
 
-  # Known gap: FULLTEXT indexes not surfaced in SHOW INDEXES
-  # This test documents the current behavior as a negative assertion.
-- name: bm25-comp-show-idx-not-visible
+  # The former "KNOWN GAP — fulltext indexes not surfaced in SHOW INDEXES"
+  # pin was an artifact: the old `CREATE FULLTEXT INDEX ...` DDL was a 42000
+  # parse error that false-passed on exit_code, so no index ever existed to
+  # show. With the real `USING fulltext` DDL the index IS visible.
+- name: bm25-comp-show-idx-visible
   description: >
-    KNOWN GAP — FULLTEXT index names not exposed in SHOW INDEXES.
-    This test documents current behavior: bm25_comp is NOT visible.
-    (See GAP-0330 tracking item for resolution.)
+    SHOW INDEXES surfaces the fulltext index created above (supersedes the
+    stale GAP-0330 "not visible" pin, which only reproduced because the
+    index-creation DDL silently failed to parse).
   args: [query, '-']
   stdin: SHOW INDEXES
   expect:
     exit_code: 0
-    stdout_not_contains:
+    stdout_contains:
+    - '"status_class":"00000"'
     - bm25_comp
-  tags: [bm25, show, known-gap]
+  tags: [bm25, show]
 
   # ---------------------------------------------------------------- bulk load --
   # 900 "base" docs with rotating vocabulary, plus 100 specialized docs
@@ -292,76 +304,78 @@ tests:
     - cnt_regex
   tags: [bm25, contains, consistency]
 
-  # ----------------------------------------------- bm25_score() ranking --
+  # ------------------------------------------- BM25 ranking (fts.search) --
+  # A per-row scalar bm25_score(prop, query) never existed and is
+  # mathematically ill-posed (BM25 needs corpus IDF + avg doc length, which
+  # live in the index, not in the row). The real, documented BM25 surface is
+  # CALL geode.fts.search('<index>', '<query>'[, max]) YIELD node, score.
 - name: bm25-comp-bm25-score-returns
-  description: bm25_score() function returns numeric score for matching docs
+  description: geode.fts.search returns real BM25 scores for matching docs
   args: [query, '-']
   stdin: >-
-    MATCH (d:BM25Comp) WHERE d.content =~ 'performance'
-    RETURN d.id AS id, bm25_score(d.content, 'performance') AS score
-    ORDER BY score DESC
-    LIMIT 5
+    CALL geode.fts.search('bm25_comp', 'performance', 5)
+    YIELD node, score RETURN node, score
   expect:
     exit_code: 0
     stdout_contains:
-    - score
+    - '"status_class":"00000"'
+    - '"score":'
+    - '"node":'
   tags: [bm25, scoring]
 
 - name: bm25-comp-bm25-score-ordering
-  description: bm25_score() DESC order — top result has score >= second result
+  description: >
+    geode.fts.search results carry a numeric BM25 score column; ORDER BY
+    score DESC over the yielded rows succeeds (engine returns ranked hits).
   args: [query, '-']
   stdin: >-
-    MATCH (d:BM25Comp) WHERE d.content =~ 'database'
-    RETURN d.id AS id, bm25_score(d.content, 'database') AS score
-    ORDER BY score DESC
-    LIMIT 10
+    CALL geode.fts.search('bm25_comp', 'database', 10)
+    YIELD node, score RETURN node, score ORDER BY score DESC
   expect:
     exit_code: 0
     stdout_contains:
-    - score
+    - '"status_class":"00000"'
+    - '"score":'
   tags: [bm25, scoring, ordering]
 
 - name: bm25-comp-bm25-score-multi-token
-  description: bm25_score() with multi-token query
+  description: geode.fts.search with a multi-token query returns scored hits
   args: [query, '-']
   stdin: >-
-    MATCH (d:BM25Comp) WHERE d.content =~ 'graph database'
-    RETURN d.id AS id, bm25_score(d.content, 'graph database') AS score
-    ORDER BY score DESC
-    LIMIT 5
+    CALL geode.fts.search('bm25_comp', 'graph database', 5)
+    YIELD node, score RETURN node, score
   expect:
     exit_code: 0
     stdout_contains:
-    - score
+    - '"status_class":"00000"'
+    - '"score":'
   tags: [bm25, scoring, multi-token]
 
   # ----------------------------------------------- ranking determinism --
 - name: bm25-comp-ranking-first-run-ids
-  description: First ranking run — capture top-5 IDs for 'performance' (baseline)
+  description: First ranking run — top-5 scored hits for 'performance' (baseline)
   args: [query, '-']
   stdin: >-
-    MATCH (d:BM25Comp) WHERE d.content =~ 'performance'
-    RETURN d.id AS id, bm25_score(d.content, 'performance') AS score
-    ORDER BY score DESC, id ASC
-    LIMIT 5
+    CALL geode.fts.search('bm25_comp', 'performance', 5)
+    YIELD node, score RETURN node, score ORDER BY score DESC, node ASC
   expect:
     exit_code: 0
     stdout_contains:
-    - score
+    - '"status_class":"00000"'
+    - '"score":'
   tags: [bm25, determinism]
 
 - name: bm25-comp-ranking-second-run-ids
-  description: Second identical query — same result set confirms determinism
+  description: Second identical query — same ranked surface answers again (determinism smoke)
   args: [query, '-']
   stdin: >-
-    MATCH (d:BM25Comp) WHERE d.content =~ 'performance'
-    RETURN d.id AS id, bm25_score(d.content, 'performance') AS score
-    ORDER BY score DESC, id ASC
-    LIMIT 5
+    CALL geode.fts.search('bm25_comp', 'performance', 5)
+    YIELD node, score RETURN node, score ORDER BY score DESC, node ASC
   expect:
     exit_code: 0
     stdout_contains:
-    - score
+    - '"status_class":"00000"'
+    - '"score":'
   tags: [bm25, determinism]
 
   # ----------------------------------------------- drop / re-create --
@@ -384,11 +398,13 @@ tests:
   tags: [bm25, drop, fallback]
 
 - name: bm25-comp-recreate-idx
-  description: Re-create FULLTEXT index after DROP
+  description: Re-create fulltext index after DROP (documented DDL form)
   args: [query, '-']
-  stdin: CREATE FULLTEXT INDEX IF NOT EXISTS bm25_comp ON BM25Comp (content)
+  stdin: CREATE INDEX bm25_comp FOR (n:BM25Comp) ON (n.content) USING fulltext
   expect:
     exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
   tags: [bm25, recreate]
 
 - name: bm25-comp-search-after-recreate

@@ -139,6 +139,18 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
         if "--generate-password" in flags:
             password = "auto_generated_password_placeholder"
         return f"CALL geode.auth.user_create('{esc(username)}', '{esc(password)}', '{esc(email)}', '{esc(role)}')"
+    elif subcmd == "user" and action == "import":
+        # Migration import of a PRE-COMPUTED password hash (no plaintext).
+        # user import <username> --hash <h> [--algorithm <a>] [--email <e>] [--role <r>]
+        username = positionals[0] if positionals else flags.get("--username", "")
+        pw_hash = flags.get("--hash", "")
+        algorithm = flags.get("--algorithm", "argon2id")
+        email = flags.get("--email", "")
+        role = flags.get("--role", "user")
+        return (
+            f"CALL geode.auth.user_import('{esc(username)}', '{esc(pw_hash)}', "
+            f"'{esc(algorithm)}', '{esc(email)}', '{esc(role)}')"
+        )
     elif subcmd == "user" and action == "list":
         return "CALL geode.auth.user_list()"
     elif subcmd == "user" and action == "delete":

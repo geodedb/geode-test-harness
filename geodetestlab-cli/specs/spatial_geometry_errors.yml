@@ -20,11 +20,14 @@ description: >
   inside `ST_AsText`/`ST_Contains`, or as a CREATE property value -- which
   now fails the write and stores nothing). The pre-fix findings-2/4 prose
   below is retained as the dated observation; the converted tests further
-  down assert the new, correct 58000 behavior. STILL-VALID EXCEPTION: the
-  genuinely NONEXISTENT function `ST_GeomFromText` with WELL-FORMED WKT
-  remains a NULL-collapse of an unrecognized expression (a different
-  mechanism, unchanged by GAP-0924) -- so the ST_GeomFromText evidence
-  tests below still assert 00000/null bare and 58000 only when composed.
+  down assert the new, correct 58000 behavior. SUPERSEDED (2026-08-30):
+  the former "STILL-VALID EXCEPTION" for the nonexistent `ST_GeomFromText`
+  no longer holds -- geode bug 8b (commit 3871d678) made an unresolved
+  function name SQLSTATE 42883 undefined_function, and the nested-argument
+  NULL-collapse residual was closed via isPropagatableEvalError, so the
+  ST_GeomFromText evidence tests now assert 42883 both bare and composed.
+  Wrong-arity ST_Point calls are now SQLSTATE 22023 invalid_parameter_value
+  (bug 8d de-58000-ing), no longer the generic 58000 fallback.
 
 
   1. FUNCTION NAME + THE CORE PATTERN: the task brief's `ST_GeomFromText`
@@ -63,10 +66,11 @@ description: >
   3. WRONG ARITY IS A GENUINE, CORRECTLY-REJECTED ERROR — NOT a silent
      accept, and NOT NULL-swallowed. `ST_Point(1)` (missing arg),
      `ST_Point()` (no args), and `ST_Point(1,2,3)` (extra args) all
-     return a real `status_class":"58000"`/`error":"InvalidArgs"` bare,
-     with no wrapping function needed — asserted as the expected
-     rejection (not a limitation pin). `ST_Point('abc', 2)` (non-numeric
-     arg) is a separate, also-genuine
+     return a real `status_class":"22023"` invalid_parameter_value bare
+     (originally observed as the generic 58000/`InvalidArgs` fallback;
+     de-58000'd by geode bug 8d, 2026-07-31), with no wrapping function
+     needed — asserted as the expected rejection (not a limitation pin).
+     `ST_Point('abc', 2)` (non-numeric arg) is a separate, also-genuine
      `status_class":"58000"`/`error":"TypeMismatch"` rejection. Unlike
      `GeometryFromText`, `ST_Point` validates its own argument count/types
      immediately rather than deferring to NULL.
@@ -162,14 +166,14 @@ tests:
 
   # --------------------------------------------------------------- setup --
 - name: p10_setup_st_point_roundtrip
-  description: "Positive setup: ST_Point -> ST_AsText WKT round trip"
+  description: 'Positive setup: ST_Point -> ST_AsText WKT round trip'
   args: [query, '-']
   stdin: RETURN ST_AsText(ST_Point(1.5, 2.5)) AS wkt
   expect:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - 'POINT(1.5 2.5)'
+    - POINT(1.5 2.5)
   tags: [spatial, setup, positive, point]
 
 - name: p10_setup_geometryfromtext_roundtrip
@@ -182,39 +186,42 @@ tests:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - 'POINT(3 4)'
+    - POINT(3 4)
   tags: [spatial, setup, positive, wkt]
 
 - name: p10_setup_st_geomfromtext_absent_bare_evidence
   description: >
     Evidence for PROBE FINDING 1 -- ST_GeomFromText does not exist on this
-    binary. Bare, it silently resolves to NULL (status_class 00000) just
-    like malformed WKT does -- the nonexistent-function problem is not
-    caught at call time.
+    binary. Since geode bug 8b (commit 3871d678, 2026-07-31) an unresolved
+    function name is a genuine diagnostic: SQLSTATE 42883
+    undefined_function, no longer a silent NULL-collapse.
   args: [query, '-']
   stdin: RETURN ST_GeomFromText('POINT(1 2)') AS g
   expect:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"42883"'
+    - Unknown function
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"g":null'
   tags: [spatial, setup, evidence, function-name]
 
 - name: p10_setup_st_geomfromtext_absent_composed_evidence
   description: >
-    Further evidence for PROBE FINDING 1 -- composing the same
-    ST_GeomFromText call (well-formed WKT) with ST_AsText DOES raise a
-    genuine TypeMismatch, confirming ST_GeomFromText's NULL is rejected by
-    a real geometry-consuming function -- i.e. ST_GeomFromText genuinely
-    does not exist / never produces a real geometry value, and
-    GeometryFromText (not ST_GeomFromText) is the real constructor name.
+    Further evidence for PROBE FINDING 1 -- the same nonexistent
+    ST_GeomFromText call NESTED inside ST_AsText must raise the SAME 42883
+    undefined_function diagnostic, not collapse to NULL inside the
+    extended-registry argument path (regression pin for the
+    isPropagatableEvalError UnknownFunction fix; the grouped projection
+    path already had this contract). GeometryFromText (not
+    ST_GeomFromText) remains the real constructor name.
   args: [query, '-']
   stdin: RETURN ST_AsText(ST_GeomFromText('POINT(1 2)')) AS g
   expect:
     exit_code: 0
     stdout_contains:
-    - '"status_class":"58000"'
-    - TypeMismatch
+    - '"status_class":"42883"'
+    - Unknown function
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [spatial, setup, evidence, function-name]
@@ -300,42 +307,42 @@ tests:
   # ------------------------------------------------------------- wrong arity --
 - name: p10_wrong_arity_missing_arg
   description: >
-    Negative -- ST_Point(1), missing the y argument. Verified real
-    outcome: genuine rejection, status_class 58000, error InvalidArgs.
-    This IS the expected rejection (not a limitation pin).
+    Negative -- ST_Point(1), missing the y argument. Genuine rejection:
+    SQLSTATE 22023 invalid_parameter_value (bug 8d de-58000-ing -- a
+    wrong-arity call is a caller error, not a server fault).
   args: [query, '-']
   stdin: RETURN ST_Point(1) AS p
   expect:
     exit_code: 0
     stdout_contains:
-    - '"status_class":"58000"'
-    - InvalidArgs
+    - '"status_class":"22023"'
+    - Invalid arguments for function
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [spatial, point, arity, negative]
 
 - name: p10_wrong_arity_no_args
-  description: Negative -- ST_Point() with zero args. Genuine rejection, InvalidArgs.
+  description: Negative -- ST_Point() with zero args. Genuine rejection, 22023 invalid_parameter_value.
   args: [query, '-']
   stdin: RETURN ST_Point() AS p
   expect:
     exit_code: 0
     stdout_contains:
-    - '"status_class":"58000"'
-    - InvalidArgs
+    - '"status_class":"22023"'
+    - Invalid arguments for function
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [spatial, point, arity, negative]
 
 - name: p10_wrong_arity_extra_args
-  description: Negative -- ST_Point(1,2,3), one extra arg. Genuine rejection, InvalidArgs.
+  description: Negative -- ST_Point(1,2,3), one extra arg. Genuine rejection, 22023 invalid_parameter_value.
   args: [query, '-']
   stdin: RETURN ST_Point(1,2,3) AS p
   expect:
     exit_code: 0
     stdout_contains:
-    - '"status_class":"58000"'
-    - InvalidArgs
+    - '"status_class":"22023"'
+    - Invalid arguments for function
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [spatial, point, arity, negative]
@@ -473,7 +480,7 @@ tests:
 
   # -------------------------------------------------------------- inverted bbox --
 - name: p10_bbox_setup_known_point
-  description: "Positive setup: insert one known in-range point (5,5) for the bbox boundary check."
+  description: 'Positive setup: insert one known in-range point (5,5) for the bbox boundary check.'
   args: [query, '-']
   stdin: |
     CREATE (n1:P10Bbox {id: 1, geo: ST_Point(5.0, 5.0)})
@@ -484,7 +491,7 @@ tests:
   tags: [spatial, bbox, setup]
 
 - name: p10_bbox_normal_finds_point
-  description: "Sanity check: a normal (min<=max) bbox containing (5,5) finds it."
+  description: 'Sanity check: a normal (min<=max) bbox containing (5,5) finds it.'
   args: [query, '-']
   stdin: >-
     MATCH (p:P10Bbox)

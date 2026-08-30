@@ -16,6 +16,12 @@ description: |
     (b) DROP INDEX DID NOT CLEAR THE PIN. The pin lived in a registry the DROP
         path never touched, so the dimension stayed enforced with no index
         present at all — and no way to change it.
+        POLICY CHANGE (ENG-3922, 2026-08-29): with committed vectors still
+        stored, dropping the index deliberately does NOT release enforcement —
+        the per-graph unindexed pin takes over (dropping an index must not
+        expose stored rows to silent mixed-dimension corruption). The release
+        path is deleting the establishing rows; the (b) section below asserts
+        the inverted contract plus that release path.
 
     (d) THE GUARD VANISHED ACROSS A RESTART. Registration only ever happened in
         DDL execution, never on reload, so after a restart `SHOW INDEXES` still
@@ -194,9 +200,40 @@ tests:
 
 - name: drop-releases-the-pin
   description: |
-    KEY ASSERTION. With no index there is nothing to keep homogeneous, so the
-    dim-3 write is accepted. RED before the fix: the pin outlived its index and
-    this stayed refused with no statement able to clear it.
+    POLICY CHANGE — ENG-3922, 2026-08-29 (this assertion is INVERTED from the
+    original ENG-3912(b) expectation). Dropping the index no longer abandons
+    the stored rows to silent mixed-dimension writes: with dim-4 vectors still
+    committed under (VDL_Drop, emb), the per-graph UNINDEXED pin keeps
+    enforcing homogeneity, so the dim-3 write stays refused. To change the
+    property's dimension you delete the rows that establish it — asserted by
+    the two follow-up tests below — not the index.
+  query: >-
+    CREATE (:VDL_Drop {id: 3, emb: vectorf32('[1.0, 2.0, 3.0]')})
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"22000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags: [vector, key-assertion]
+
+- name: drop-delete-establishing-rows
+  description: The sanctioned release path — remove every row holding the pinned dimension.
+  query: >-
+    MATCH (n:VDL_Drop) DETACH DELETE n
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, lifecycle]
+
+- name: delete-releases-the-pin
+  description: |
+    KEY ASSERTION. With every establishing row deleted, the pin is re-derived
+    from live committed data and released — the ENG-3922 policy's escape hatch
+    ("delete the rows that establish the dimension") actually works in-process,
+    no restart or DROP GRAPH needed. RED before the lifecycle fix: the cached
+    pin survived the deletion of all of its establishing rows.
   query: >-
     CREATE (:VDL_Drop {id: 3, emb: vectorf32('[1.0, 2.0, 3.0]')})
   expected:
