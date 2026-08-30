@@ -1,0 +1,339 @@
+version: '1.0'
+name: MERGE is idempotent ACROSS concurrent sessions (ENG-3914 RC-2)
+description: |
+  Wire-level spec for ENG-3914 RC-2 — cross-session MERGE duplication.
+
+  RC-1 (the DETERMINISTIC single-threaded duplication) is covered by
+  `merge_idempotency_general_path.yml` and was fixed in e53a4519. RC-2 is a
+  genuine RACE between geode's TWO MERGE implementations, which use DISJOINT
+  mutual-exclusion schemes:
+
+    bulk path    `StorageAdapter.bulkMergeNodeWithReservedIdMultiPropForTenant`
+                 (src/storage/graph_storage_adapter.zig:4427). Serializes
+                 same-key writers on the striped `mg.merge_tuple_locks` table
+                 (:4466-4479), probes under `mg.rwlock` SHARED (:4481-4530),
+                 then RELEASES that lock before delegating the insert to
+                 `bulkInsertNodeWithReservedIdForTenant` (:4556), which
+                 re-acquires SHARED on its own (:3562).
+
+    general path `execution.crud_operations.executeMerge`
+                 (src/execution/crud_operations.zig:3545). Probes via
+                 `findFirstMatchingNodeId` (:221) and takes NO tuple lock at
+                 all — its mutual exclusion is the whole-graph `mg.rwlock`
+                 EXCLUSIVE the connection handler wraps around the statement
+                 (src/server/quic_connection_handler.zig:6977).
+
+  bulk-vs-bulk is safe (both take the tuple lock). general-vs-general is safe
+  (both take the graph EXCLUSIVE). bulk-vs-general shares NOTHING, and the
+  bulk writer's probe->insert gap is exactly the window the general writer
+  needs to take the EXCLUSIVE:
+
+    bulk    : tuple-lock, rwlock SHARED, probe(K) -> MISS, drop rwlock ....
+    general :                                   .... rwlock EXCLUSIVE,
+                                                     probe(K) -> MISS,
+                                                     CREATE(K), drop rwlock
+    bulk    : .................................. INSERT(K)
+
+  -> two nodes for one merge key, from two concurrent client sessions.
+
+  HOW THIS SPEC SELECTS THE TWO PATHS. The dispatcher
+  (quic_connection_handler.zig:6850) routes a mutation to the bulk fast path
+  only when `bulk_ingest.isEnabled()` (server env `GEODE_BULK_INGEST=1`) AND
+  `matchSimpleNodeMergeSpec` accepts the statement. That detector requires all
+  merge-key values AND all `ON CREATE SET` values to be strictly scalar
+  (bulk_ingest.zig:601 / :645). So:
+
+    * `MERGE (n:XSESS {docId: D, seq: S})`  -> scalar-only  -> BULK path
+    * `MERGE (n:XSESS {docId: D, seq: S}) ON CREATE SET n.tags = ['g']`
+      -> non-scalar list SET -> rejected by the detector -> GENERAL path
+
+  Two client connections run the bulk form and two run the general form, all
+  over the SAME overlapping {docId, seq} key range, at the same time.
+
+  KEY ASSERTION. After every writer drains, `count(n)` over the label must
+  equal the number of DISTINCT keys merged. Anything higher is RC-2.
+
+  RED/GREEN. This spec is EXPECTED TO FAIL before the RC-2 fix. The engine-side
+  sibling is geode `tests/test_eng3914_cross_path_merge_race.zig`
+  (`zig build test-eng3914-cross-path`, tests T2 and T2b), which reproduces the
+  same race in-process against the same two entry points.
+
+  SIZING NOTE. The duplication window for a key exists ONLY while that key is
+  still absent — once any writer creates it, every later MERGE probes and HITS.
+  So the race gets exactly ONE chance per DISTINCT key, which is why this spec
+  uses a large key range walked in the same order by every writer rather than
+  re-merging a handful of keys many times.
+
+  Labels are prefixed XSESS_ so this spec cannot collide with any other spec's
+  data.
+
+  CANARY: REQ=REQ-ENG-3914-MERGE-CROSS-PATH-RACE; FEATURE="MergeIdempotency"; ASPECT=CrossSessionWireContract; STATUS=TESTED; TEST=geodetestlab/specs/merge_cross_session_idempotency.yml; OWNER=storage; UPDATED=2026-08-29
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      # Required: without it `bulk_ingest.isEnabled()` is false and EVERY
+      # MERGE takes the general path, so the two paths never collide and the
+      # spec would pass for the wrong reason. Path selection is asserted
+      # in-process by `zig build test-eng3914-cross-path` (T1 reads the
+      # bulk-only `mg_merge_tuple_lock_acquired_total` counter); it is not
+      # observable over the wire (see `both-merge-shapes-are-accepted`).
+      GEODE_BULK_INGEST: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+
+invariants:
+- type: server_running
+
+tests:
+
+- name: cross-session-preflight-cleanup
+  description: Idempotent pre-flight so a re-run starts from an empty label.
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:XSESS_Doc) DETACH DELETE n]
+  expect:
+    exit_code: 0
+  tags: [merge, setup]
+
+- name: both-merge-shapes-are-accepted
+  description: |
+    SMOKE / SHAPE GUARD. Both statement forms used by the race step must
+    execute cleanly and be idempotent on their own, so a failure in the race
+    step can only be the cross-path race and not a malformed statement.
+
+    HONEST LIMIT: this cannot prove from the wire which PATH each form took.
+    `mg_merge_tuple_lock_acquired_total` — the counter that only the bulk
+    MERGE path increments (graph_storage_adapter.zig:4307 / :4471) — lives in
+    the runtime-metrics registry, which the Prometheus exporter
+    (src/monitoring/prometheus.zig) does NOT export, and there is no
+    `geode.metrics.*` procedure. Path selection is therefore asserted
+    in-process by the engine-side sibling
+    (`zig build test-eng3914-cross-path`, test T1, which reads that counter
+    directly); here it is enforced by construction: `GEODE_BULK_INGEST=1` is
+    set in the server env above, and the two forms sit on opposite sides of
+    the `isScalarPropExpr` gate at bulk_ingest.zig:601 / :645.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    # scalar-only form (bulk-path shape), run twice — must not duplicate
+    "$BIN" query "MERGE (n:XSESS_Probe {docId: 1, seq: 1})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    "$BIN" query "MERGE (n:XSESS_Probe {docId: 1, seq: 1})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    # non-scalar-SET form (general-path shape) on the SAME key — must MATCH
+    "$BIN" query "MERGE (n:XSESS_Probe {docId: 1, seq: 1}) ON CREATE SET n.tags = ['g']" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    OUT=$("$BIN" query "MATCH (n:XSESS_Probe) RETURN count(n) AS c" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT"
+    echo "$OUT" | grep -q '"c":1' \
+      || { echo "FAIL: the two MERGE forms do not agree on one key SEQUENTIALLY"; exit 1; }
+    echo "PASS: both MERGE shapes accepted and cross-path idempotent when serialized"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: both MERGE shapes accepted and cross-path idempotent when serialized'
+  tags: [merge, guard, control]
+
+- name: cross-session-concurrent-overlapping-merge
+  description: |
+    THE RACE. Four concurrent client connections MERGE the SAME 200
+    {docId, seq} keys, in the same order:
+
+      * writers A1/A2 send scalar-only MERGE statements -> BULK path
+      * writers B1/B2 send the same keys with a non-scalar `ON CREATE SET
+        n.tags = ['g']` -> GENERAL path
+
+    Each writer pipes its statement list into ONE `geode query --batch`
+    invocation. `--batch` (src/cli/main.zig:1603 -> `executeBatchQueries`)
+    splits stdin on NEWLINES and sends one query per line over a SINGLE QUIC
+    connection. That matters twice over:
+
+      * it is a long-lived session issuing sequential statements — the
+        production shape, not 800 process spawns; and
+      * each statement arrives as its own 1-statement program, which is what
+        `matchSimpleNodeMergeSpec` requires (`statements.len != 1 -> null`,
+        bulk_ingest.zig:454). Sending the same text as ONE multi-statement
+        program via `query -` would push every statement to the general path
+        and the two implementations would never collide.
+
+    Hence: exactly one statement per line, and no trailing semicolons.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    WORKDIR=$(mktemp -d)
+    trap 'rm -rf "$WORKDIR"' EXIT
+
+    KEYS=200
+    BULK_SQL="$WORKDIR/bulk.gql"
+    GEN_SQL="$WORKDIR/general.gql"
+    : > "$BULK_SQL"
+    : > "$GEN_SQL"
+    i=0
+    while [ "$i" -lt "$KEYS" ]; do
+      D=$((i / 8))
+      S=$((i % 8))
+      # scalar-only -> accepted by matchSimpleNodeMergeSpec -> BULK path
+      echo "MERGE (n:XSESS_Doc {docId: $D, seq: $S})" >> "$BULK_SQL"
+      # non-scalar list SET -> rejected by the detector -> GENERAL path
+      echo "MERGE (n:XSESS_Doc {docId: $D, seq: $S}) ON CREATE SET n.tags = ['g']" >> "$GEN_SQL"
+      i=$((i + 1))
+    done
+
+    run_writer() {
+      # $1 = statement file, $2 = label for logging
+      "$BIN" query --batch --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+        < "$1" > "$WORKDIR/$2.out" 2>&1
+      echo "$?" > "$WORKDIR/$2.rc"
+    }
+
+    run_writer "$BULK_SQL" bulk1 &
+    P1=$!
+    run_writer "$GEN_SQL"  gen1  &
+    P2=$!
+    run_writer "$BULK_SQL" bulk2 &
+    P3=$!
+    run_writer "$GEN_SQL"  gen2  &
+    P4=$!
+    wait $P1 $P2 $P3 $P4
+
+    FAILED=0
+    for w in bulk1 gen1 bulk2 gen2; do
+      RC=$(cat "$WORKDIR/$w.rc" 2>/dev/null || echo 1)
+      echo "writer $w rc=$RC"
+      if [ "$RC" -ne 0 ]; then
+        echo "--- $w output (tail) ---"
+        tail -20 "$WORKDIR/$w.out" || true
+        FAILED=1
+      fi
+    done
+    [ "$FAILED" -eq 0 ] || { echo "FAIL: a writer session errored"; exit 1; }
+    echo "PASS: all four writer sessions drained"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: all four writer sessions drained'
+  tags: [merge, idempotency, race, concurrent, cross-session]
+
+- name: cross-session-row-count-equals-distinct-keys
+  description: |
+    KEY ASSERTION. 200 distinct {docId, seq} keys were merged by four
+    concurrent sessions across both MERGE implementations, so exactly 200
+    rows must exist. RED before the ENG-3914 RC-2 fix: > 200 (each duplicated
+    key contributes one extra row).
+  query: >-
+    MATCH (n:XSESS_Doc) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":200'
+  tags: [merge, idempotency, race, cross-session, key-assertion]
+
+- name: cross-session-no-key-resolves-to-two-rows
+  description: |
+    Same invariant stated per-key, so a failure NAMES the duplicated keys
+    instead of only reporting a total. Walks every merged key and reports the
+    first offenders.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    KEYS=200
+    DUPES=0
+    i=0
+    while [ "$i" -lt "$KEYS" ]; do
+      D=$((i / 8))
+      S=$((i % 8))
+      OUT=$("$BIN" query "MATCH (n:XSESS_Doc {docId: $D, seq: $S}) RETURN count(n) AS c" \
+        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+      if ! echo "$OUT" | grep -q '"c":1'; then
+        DUPES=$((DUPES + 1))
+        if [ "$DUPES" -le 8 ]; then
+          echo "DUPLICATE merge key {docId: $D, seq: $S} -> $OUT"
+        fi
+      fi
+      i=$((i + 1))
+    done
+    echo "duplicated_keys=$DUPES of $KEYS"
+    [ "$DUPES" -eq 0 ] || { echo "FAIL: cross-session MERGE duplicated $DUPES keys"; exit 1; }
+    echo "PASS: every merge key resolves to exactly one row"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: every merge key resolves to exactly one row'
+  tags: [merge, idempotency, race, cross-session, key-assertion]
+
+- name: cross-session-merge-still-matches
+  description: |
+    CONTROL. The fix must not turn MERGE into "never create" or "always
+    create". After the race, a fresh MERGE of an ALREADY-EXISTING key must
+    take the ON MATCH branch and add no row.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    "$BIN" query "MERGE (n:XSESS_Doc {docId: 0, seq: 0}) ON MATCH SET n.origin = 'matched'" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" || exit 1
+    OUT=$("$BIN" query "MATCH (n:XSESS_Doc {docId: 0, seq: 0}) RETURN n.origin AS origin" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT"
+    echo "$OUT" | grep -q '"origin":"matched"' \
+      || { echo "FAIL: MERGE of an existing key did not take ON MATCH"; exit 1; }
+    echo "PASS: MERGE still matches an existing row"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: MERGE still matches an existing row'
+  tags: [merge, idempotency, control]
+
+- name: cross-session-row-count-unchanged-after-match
+  description: The ON MATCH re-merge above must not have added a row.
+  query: >-
+    MATCH (n:XSESS_Doc) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":200'
+  tags: [merge, idempotency, control]
+
+- name: cross-session-cleanup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    MATCH (n:XSESS_Doc) DETACH DELETE n;
+    MATCH (n:XSESS_Probe) DETACH DELETE n;
+  expect:
+    exit_code: 0
+  tags: [merge, teardown]
+
+tags:
+- merge
+- idempotency
+- concurrency
+- race
+- cross-session
+- eng3914
