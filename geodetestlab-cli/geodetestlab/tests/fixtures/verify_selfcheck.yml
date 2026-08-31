@@ -1,0 +1,61 @@
+# Self-check fixture for the geodetestlab `verify:` silent-drop defect.
+#
+# This spec is a DELIBERATE control for the dead-code bug where `verify:`
+# blocks on a TestCase are silently discarded by TestCase.from_dict / load_spec
+# and therefore NEVER executed by the executor.
+#
+# It is intentionally kept OUT of `specs/` (the runnable suite) and lives in the
+# pytest fixtures dir so the harness's spec glob never auto-runs it: the
+# `verify-false-claim-must-fail` case is ENGINEERED to fail once verify blocks
+# actually execute.
+#
+# Contract:
+#   - Before the fix: `verify:` is dropped, so BOTH cases pass green (the bug).
+#   - After the fix:  the false-claim case MUST report FAILURE (its verify query
+#                     returns `999`, but the verify asserts stdout contains
+#                     `424242` — an impossible match), while the true-claim case
+#                     keeps passing.
+#
+# Every query is a self-contained literal RETURN against the default graph — no
+# data setup, no ordering dependency — so the result is deterministic. A geode
+# binary is still required to actually run the queries live.
+name: verify_selfcheck
+description: Control proving verify blocks execute (and fail on false claims)
+mode: server
+tests:
+- name: verify-true-claim-must-pass
+  description: main step passes; the verify block makes a TRUE claim and must pass post-fix
+  args:
+  - query
+  - --insecure
+  - RETURN 7 AS x
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - RETURN 7 AS x
+    expect:
+      stdout_contains:
+      - '7'
+
+- name: verify-false-claim-must-fail
+  description: >-
+    main step passes; the verify block makes a DELIBERATELY FALSE claim.
+    Once verify executes, this case MUST report FAILURE. Today it passes
+    green because verify is silently dropped — that green is the bug.
+  args:
+  - query
+  - --insecure
+  - RETURN 1 AS x
+  expect:
+    exit_code: 0
+  verify:
+  - args:
+    - query
+    - --insecure
+    - RETURN 999 AS x
+    expect:
+      stdout_contains:
+      - '424242'
