@@ -1,0 +1,199 @@
+version: '1.0'
+name: geode#875 — Vector KNN / CREATE INDEX survive a bounded-cache cold restart
+description: >
+  Over-the-wire twin of tests/test_advanced_index_restart.zig (geode#875 RC-2 /
+  RC-3 / RC-9). geode is disk-backed with a BOUNDED resident node cache
+  (GEODE_NODE_CACHE_ENTRIES, default 1M). After a restart the resident node
+  cache is EMPTY — it fills only on access.
+
+  Verified READ-ONLY before the fix:
+    * RC-3: the brute-force knn fallback `scanVectorKnn` (src/eval.zig:2476)
+      snapshots the RESIDENT node cache only. After a cold restart it snapshots
+      an empty set, so a bare `RETURN knn('emb', ...)` sees ZERO rows, reports
+      the property as never-supplied, and the query FAILS with
+      error.UnknownProperty (GQLSTATE 42703) — a valid property on 30 persisted
+      nodes looks unknown purely because the cache is cold.
+    * RC-2: `IndexManager.populateAdvancedIndex` (index_manager.zig:1998-2019)
+      backfills by iterating the resident node cache, so `CREATE INDEX` after a
+      cold restart indexes ~nothing.
+
+  This spec pins the STATUS FLIP as the deterministic wire observable: the exact
+  same bare-knn query returns GQLSTATE 00000 before the restart and (pre-fix)
+  42703 after it. The only thing that changed is the cold cache. GREEN after the
+  fix: 00000 in both, because the scan/backfill enumerate the full persisted set
+  via the durable engine (the pattern the edge half already uses,
+  store.allEdgeIds + getEdgePtrHydrated).
+
+  Kept small and fast (30 nodes): the cold cache is empty at ANY scale, so the
+  contract is scale-invariant and needs no slow 100k+ ingest.
+
+  CANARY: REQ=REQ-GEODE-875-KNN-BOUNDED-CACHE-WIRE; FEATURE="VectorKnn"; ASPECT=ColdRestartScanEnumeratesFullSet; STATUS=TESTED; TEST=geodetestlab-cli/specs/vector_knn_bounded_cache_restart.yml; OWNER=qa; UPDATED=2026-08-31
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tags:
+- vector
+- index
+- knn
+- restart
+- geode875
+tests:
+
+  # ------------------------------------------------------------ pre-clean --
+- name: bc_teardown_canary
+  description: Idempotent pre-teardown so reruns start clean (CANARY)
+  args: [query, '-']
+  stdin: |
+    MATCH (n:WV875) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [vector, setup, canary]
+
+  # --------------------------------------------------------------- setup --
+- name: bc_setup_graph
+  description: Dedicated graph for the bounded-cache restart proof
+  args: [query, '-']
+  stdin: >-
+    CREATE GRAPH IF NOT EXISTS wv875_g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, ddl]
+
+- name: bc_setup_insert_30_vectors
+  description: >
+    Insert 30 dim-2 vectors emb = [i, 0] under :WV875 (wid = i). No CREATE
+    INDEX — this exercises the brute-force scan path (RC-3).
+  args: [query, '-']
+  stdin: |
+    USE GRAPH wv875_g;
+    CREATE (:WV875 {wid: 0, emb: vectorf32('[0.0, 0.0]')});
+    CREATE (:WV875 {wid: 1, emb: vectorf32('[1.0, 0.0]')});
+    CREATE (:WV875 {wid: 2, emb: vectorf32('[2.0, 0.0]')});
+    CREATE (:WV875 {wid: 3, emb: vectorf32('[3.0, 0.0]')});
+    CREATE (:WV875 {wid: 4, emb: vectorf32('[4.0, 0.0]')});
+    CREATE (:WV875 {wid: 5, emb: vectorf32('[5.0, 0.0]')});
+    CREATE (:WV875 {wid: 6, emb: vectorf32('[6.0, 0.0]')});
+    CREATE (:WV875 {wid: 7, emb: vectorf32('[7.0, 0.0]')});
+    CREATE (:WV875 {wid: 8, emb: vectorf32('[8.0, 0.0]')});
+    CREATE (:WV875 {wid: 9, emb: vectorf32('[9.0, 0.0]')});
+    CREATE (:WV875 {wid: 10, emb: vectorf32('[10.0, 0.0]')});
+    CREATE (:WV875 {wid: 11, emb: vectorf32('[11.0, 0.0]')});
+    CREATE (:WV875 {wid: 12, emb: vectorf32('[12.0, 0.0]')});
+    CREATE (:WV875 {wid: 13, emb: vectorf32('[13.0, 0.0]')});
+    CREATE (:WV875 {wid: 14, emb: vectorf32('[14.0, 0.0]')});
+    CREATE (:WV875 {wid: 15, emb: vectorf32('[15.0, 0.0]')});
+    CREATE (:WV875 {wid: 16, emb: vectorf32('[16.0, 0.0]')});
+    CREATE (:WV875 {wid: 17, emb: vectorf32('[17.0, 0.0]')});
+    CREATE (:WV875 {wid: 18, emb: vectorf32('[18.0, 0.0]')});
+    CREATE (:WV875 {wid: 19, emb: vectorf32('[19.0, 0.0]')});
+    CREATE (:WV875 {wid: 20, emb: vectorf32('[20.0, 0.0]')});
+    CREATE (:WV875 {wid: 21, emb: vectorf32('[21.0, 0.0]')});
+    CREATE (:WV875 {wid: 22, emb: vectorf32('[22.0, 0.0]')});
+    CREATE (:WV875 {wid: 23, emb: vectorf32('[23.0, 0.0]')});
+    CREATE (:WV875 {wid: 24, emb: vectorf32('[24.0, 0.0]')});
+    CREATE (:WV875 {wid: 25, emb: vectorf32('[25.0, 0.0]')});
+    CREATE (:WV875 {wid: 26, emb: vectorf32('[26.0, 0.0]')});
+    CREATE (:WV875 {wid: 27, emb: vectorf32('[27.0, 0.0]')});
+    CREATE (:WV875 {wid: 28, emb: vectorf32('[28.0, 0.0]')});
+    CREATE (:WV875 {wid: 29, emb: vectorf32('[29.0, 0.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [vector, setup, insert]
+
+  # ---------------------------------- pre-restart control (warm cache) --
+- name: bc_pre_restart_knn_ok
+  description: >
+    CONTROL (green today): a bare RETURN knn over the warm cache answers the
+    valid property successfully (00000). Establishes that the query itself is
+    valid and the data is present, so the post-restart flip is attributable
+    SOLELY to the cold cache.
+  args: [query, '-']
+  stdin: >-
+    USE GRAPH wv875_g; RETURN knn('emb', vectorf32('[7.0, 0.0]'), 1, 'l2') AS ids
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42703"'
+  tags: [vector, knn, control]
+
+  # ------------------------------------------------------------ restart --
+- name: bc_restart_server
+  description: >
+    Restart the server against the SAME data dir (cleanup:false). The resident
+    node cache comes back EMPTY; the 30 nodes live only in the durable engine
+    until accessed.
+  type: bash
+  command: echo 'geode#875 bounded-cache cold restart'
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags: [restart]
+
+  # ------------------------------- KEY: post-restart cold-cache knn --
+- name: bc_post_restart_knn_must_not_be_unknown_property
+  description: >
+    KEY ASSERTION. The IDENTICAL bare-knn query, now over a COLD cache. RED
+    (pre-fix): scanVectorKnn snapshots the empty resident cache, sees zero rows,
+    and the query fails with error.UnknownProperty -> GQLSTATE 42703; the valid
+    'emb' property on 30 persisted nodes is invisible. GREEN (post-fix): the scan
+    enumerates the full persisted set from the engine -> 00000 with real
+    neighbours.
+  args: [query, '-']
+  stdin: >-
+    USE GRAPH wv875_g; RETURN knn('emb', vectorf32('[7.0, 0.0]'), 1, 'l2') AS ids
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"status_class":"42703"'
+  tags: [vector, knn, restart, critical]
+
+  # --------------- correctness: the cold-cache knn maps to the right node --
+- name: bc_post_restart_knn_correct_neighbour
+  description: >
+    After the fix, the cold-cache knn's nearest neighbour of the probe [7,0] is
+    the node with wid = 7. The MATCH re-projects the returned engine id to the
+    stable wid property. (Runs after the bare-knn probe above so the KEY
+    assertion is evaluated against a genuinely cold cache first.)
+  args: [query, '-']
+  stdin: >-
+    USE GRAPH wv875_g; MATCH (n:WV875) WHERE id(n) IN knn('emb', vectorf32('[7.0, 0.0]'), 1, 'l2') RETURN n.wid AS wid
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"wid":7'
+  tags: [vector, knn, restart, correctness]
+
+  # ---------------------------------------------------------------- cleanup --
+- name: bc_teardown
+  description: Remove all WV875 test nodes (CANARY idempotent teardown)
+  args: [query, '-']
+  stdin: |
+    USE GRAPH wv875_g; MATCH (n:WV875) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [vector, cleanup, canary]
