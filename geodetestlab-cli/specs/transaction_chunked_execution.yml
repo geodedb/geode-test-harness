@@ -3821,22 +3821,46 @@ tests:
   - --file
   - /tmp/geode_txn_partial_error.gql
   expect:
-    exit_code:
-    - 0
-    - 1
-  verify:
-  - args:
-    - query
-    - --insecure
-    - USE GRAPH txn_chunked_test; MATCH (n:PartialFail) RETURN count(n) AS cnt
-    expect:
-      stdout_contains:
-      - '0'
+    exit_code: 1
+    stderr_contains:
+    - 'Errors: 1'
   tags:
   - transaction
   - chunked
   - error
   - rollback
+  - regression
+- name: txn-partial-failure-valid-statements-persist
+  description: |
+    Read-back for txn-partial-failure-syntax-error. Split out of that test's
+    `verify:` block, which the geodetestlab spec parser
+    (geodetestlab/lib/spec.py) does not know about — `verify` keys are parsed
+    away and NEVER evaluated, so the old `stdout_contains: '0'` assertion had
+    been dead the whole time (and would have matched any count containing the
+    digit 0 anyway).
+
+    Measured at geode e46ece27: the 71,196-byte fixture splits into three
+    chunks (1-333, 334-730, 731-804); the syntax error sits in chunk 2, whose
+    397 statements are ALL discarded, so only 404 of the 800 valid CREATEs
+    persist while the CLI exits 0. Contract: a rejected chunk is retried
+    statement by statement, so exactly the one bad statement is lost and all
+    800 valid CREATEs commit.
+  args:
+  - query
+  - --insecure
+  - --graph
+  - txn_chunked_test
+  - MATCH (n:PartialFail) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"cnt"\s*:\s*800\b'
+  tags:
+  - transaction
+  - chunked
+  - error
+  - data-loss
+  - regression
 - name: txn-partial-failure-constraint-violation
   description: Constraint violation in middle chunk should fail transaction
   setup:

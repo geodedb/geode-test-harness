@@ -1,0 +1,216 @@
+version: '1.0'
+name: Query --file Chunked Error Propagation
+description: |
+  CRITICAL silent-data-loss reproduction for `geode query --file`.
+
+  A --file over the 16KB chunking threshold (src/cli/main.zig:1384) is split
+  into 32KB chunks (:2332) and each chunk is shipped to the server as ONE
+  program (:2516-2535). A server-side statement error comes back as a normal
+  response carrying a GQLSTATE — it is NOT a Zig error — so the
+  `catch |err|` at :2532-2535 never fires, `executed += chunk_count` credits
+  the whole rejected chunk, executeChunkedQueries returns void, and cmdQuery
+  exits 0.
+
+  Live-reproduced at geode e46ece27 with 400 valid CREATEs plus ONE invalid
+  statement at index 200 (28,320 bytes, one chunk):
+
+      stdout : {"status_class":"42000","error_code":"42000",...}
+      stderr : Statements executed: 401     <-- claims all 401 ran
+               (no "Errors:" line at all)
+      exit   : 0
+      MATCH (n:ChunkErrProbe) RETURN count(n)  ->  0
+
+  Four hundred valid writes were destroyed and the process reported success.
+  `geode query --batch` exits non-zero for the identical condition
+  (src/cli/main.zig:1660-1664, ExitCode.general_error = 1).
+
+  Pinned contract (the all-valid control at the end of this spec proves
+  400/400 is achievable on this exact fixture and server):
+    1. exit code 1
+    2. "Errors: 1" in the summary
+    3. "Statements executed: 400" — never 401
+    4. exactly 400 nodes persist: a rejected chunk falls back to
+       statement-by-statement execution so only the genuinely bad statement
+       is lost
+
+  In-repo sibling lane: geode `zig build test-cli-file-chunked`
+  (tests/test_cli_file_chunked.zig).
+
+  NOTE on assertions: this spec uses standalone test entries for the count
+  read-backs, NOT `verify:` blocks. The geodetestlab spec parser
+  (geodetestlab/lib/spec.py) has no `verify` key — such blocks are parsed
+  away and NEVER evaluated, which is how the pre-existing dead assertion in
+  transaction_chunked_execution.yml went unnoticed.
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    startup_timeout_ms: 60000
+    args:
+    - --disable-auth
+    - --insecure
+    - --log-level
+    - error
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+default_timeout_ms: 180000
+secrets: {}
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tests:
+- name: setup-chunked-error-graph
+  description: Create the graph the chunked fixtures write into.
+  args:
+  - query
+  - --insecure
+  - CREATE GRAPH IF NOT EXISTS chunked_err_graph
+  expect:
+    exit_code: 0
+  tags:
+  - setup
+
+- name: chunked-error-build-fixture
+  description: |
+    Materialise the poisoned fixture: 400 padded CREATEs with ONE unparseable
+    statement spliced in after index 200. The padding puts the file over the
+    16KB chunking threshold; the total stays inside a single 32KB chunk, which
+    is the tightest shape that still loses everything. The graph comes from
+    --graph on the command line, so the file holds exactly 401 statements and
+    the truthful executed count is exactly 400.
+  type: bash
+  command: |
+    set -euo pipefail
+    python3 - <<'PY'
+    out = []
+    for i in range(400):
+        if i == 200:
+            out.append("THIS IS NOT VALID GQL AT ALL;")
+        out.append(
+            "CREATE (n:ChunkErrProbe {i: %d, pad: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'});" % i
+        )
+    with open("/tmp/geode_chunked_error_propagation.gql", "w") as f:
+        f.write("\n".join(out) + "\n")
+    PY
+    test "$(wc -c < /tmp/geode_chunked_error_propagation.gql)" -gt 16384
+    echo CHUNKED_ERROR_FIXTURE_READY
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CHUNKED_ERROR_FIXTURE_READY
+  tags:
+  - setup
+  - chunked
+
+- name: chunked-error-propagates-failure
+  description: |
+    A chunk the server rejects must be reported, not credited as a success.
+    RED at geode e46ece27: exit 0, no "Errors:" line, and the summary claims
+    "Statements executed: 401".
+  type: bash
+  timeout_ms: 180000
+  command: |
+    ${GEODE_BINARY} query --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
+      -U geode -P "${GEODE_ADMIN_PASSWORD}" \
+      --graph chunked_err_graph --format json \
+      --file /tmp/geode_chunked_error_propagation.gql
+  expected:
+    exit_code: 1
+    stderr_contains:
+    - 'Errors: 1'
+    - 'Statements executed: 400'
+    stderr_not_contains:
+    - 'Statements executed: 401'
+  tags:
+  - chunked
+  - error
+  - data-loss
+  - regression
+
+- name: chunked-error-valid-statements-persist
+  description: |
+    Exactly the invalid statement is lost — its 400 innocent chunk-mates must
+    still be committed. RED at geode e46ece27: the read-back returns 0.
+    Asserted with a full-value regex, not a bare substring.
+  args:
+  - query
+  - --insecure
+  - --graph
+  - chunked_err_graph
+  - MATCH (n:ChunkErrProbe) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"cnt"\s*:\s*400\b'
+  tags:
+  - chunked
+  - error
+  - data-loss
+  - regression
+
+- name: chunked-control-build-fixture
+  description: |
+    Control fixture: the same 400 CREATEs with NOTHING poisoned. This is what
+    makes the 400 above a measured number rather than an aspiration.
+  type: bash
+  command: |
+    set -euo pipefail
+    python3 - <<'PY'
+    out = []
+    for i in range(400):
+        out.append(
+            "CREATE (n:ChunkOkProbe {i: %d, pad: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'});" % i
+        )
+    with open("/tmp/geode_chunked_control.gql", "w") as f:
+        f.write("\n".join(out) + "\n")
+    PY
+    test "$(wc -c < /tmp/geode_chunked_control.gql)" -gt 16384
+    echo CHUNKED_CONTROL_FIXTURE_READY
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CHUNKED_CONTROL_FIXTURE_READY
+  tags:
+  - setup
+  - chunked
+
+- name: chunked-control-all-valid-file-succeeds
+  description: |
+    GUARD (passes today, must keep passing): an all-valid chunked file exits 0
+    and reports no errors. Stops the fix from "solving" the bug by failing the
+    happy path.
+  type: bash
+  timeout_ms: 180000
+  command: |
+    ${GEODE_BINARY} query --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
+      -U geode -P "${GEODE_ADMIN_PASSWORD}" \
+      --graph chunked_err_graph --format json \
+      --file /tmp/geode_chunked_control.gql
+  expected:
+    exit_code: 0
+    stderr_contains:
+    - 'Statements executed: 400'
+    stderr_not_contains:
+    - 'Errors:'
+  tags:
+  - chunked
+  - control
+
+- name: chunked-control-all-valid-statements-persist
+  description: |
+    GUARD (passes today, must keep passing): every statement of the all-valid
+    chunked file is committed.
+  args:
+  - query
+  - --insecure
+  - --graph
+  - chunked_err_graph
+  - MATCH (n:ChunkOkProbe) RETURN count(n) AS cnt
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"cnt"\s*:\s*400\b'
+  tags:
+  - chunked
+  - control

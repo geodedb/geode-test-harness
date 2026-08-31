@@ -52,11 +52,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode test with spaces.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        CREATE (n:PathSpace {id: 1});
-
-        '
+      content: "USE GRAPH edge_case_graph;\nCREATE (n:PathSpace {id: 1});\n"
   args:
   - query
   - --insecure
@@ -79,11 +75,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test-file@2024#1.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        CREATE (n:SpecialPath {id: 2});
-
-        '
+      content: "USE GRAPH edge_case_graph;\nCREATE (n:SpecialPath {id: 2});\n"
   args:
   - query
   - --insecure
@@ -113,18 +105,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_only_comments.gql
-      content: '-- Comment 1
-
-        # Comment 2
-
-
-
-        -- Comment 3
-
-
-        # Comment 4
-
-        '
+      content: "-- Comment 1\n# Comment 2\n\n\n-- Comment 3\n\n# Comment 4\n"
   args:
   - query
   - --insecure
@@ -143,11 +124,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_multi_semi.gql
-      content: 'USE GRAPH edge_case_graph;;;
-
-        CREATE (n:MultiSemi {id: 21});;;
-
-        '
+      content: "USE GRAPH edge_case_graph;;;\nCREATE (n:MultiSemi {id: 21});;;\n"
   args:
   - query
   - --insecure
@@ -245,11 +222,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_syntax_error.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        CREATE (n:SyntaxError {id: 40 INVALID SYNTAX});
-
-        '
+      content: "USE GRAPH edge_case_graph;\nCREATE (n:SyntaxError {id: 40 INVALID SYNTAX});\n"
   args:
   - query
   - --insecure
@@ -265,13 +238,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_partial.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        CREATE (n:Complete {id: 50});
-
-        CREATE (n:Incomplete {id:
-
-        '
+      content: "USE GRAPH edge_case_graph;\nCREATE (n:Complete {id: 50});\nCREATE (n:Incomplete {id:\n"
   args:
   - query
   - --insecure
@@ -315,13 +282,80 @@ tests:
   tags:
   - concurrent
   - race
-- name: file-flag-out-of-memory
-  description: Test behavior when file exceeds maximum size (>16MB)
-  args:
-  - --help
+- name: file-flag-over-size-cap-build-fixture
+  description: |
+    Materialise a REAL 17 MiB file, comfortably over the `1 << 24` cap at
+    src/cli/main.zig:1325-1327. Replaces a placeholder that ran `--help` and
+    therefore asserted nothing about the cap at all.
+  type: bash
+  command: |
+    set -euo pipefail
+    python3 - <<'PY'
+    unit = b"-- padding comment line to clear the 16 MiB file cap\n"
+    target = (1 << 24) + (1 << 20)
+    with open("/tmp/geode_over_size_cap.gql", "wb") as f:
+        written = 0
+        while written < target:
+            f.write(unit)
+            written += len(unit)
+        f.write(b"RETURN 1 AS x;\n")
+    PY
+    test "$(wc -c < /tmp/geode_over_size_cap.gql)" -gt 16777216
+    echo OVER_SIZE_CAP_FIXTURE_READY
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - OVER_SIZE_CAP_FIXTURE_READY
+  tags:
+  - setup
+  - resource
+  - boundary
+- name: file-flag-over-size-cap-is-actionable
+  description: |
+    A file over the 16 MiB cap must be refused with a message an operator can
+    act on: the file's actual size, the limit, and a remedy.
+
+    RED at geode e46ece27 — the refusal is the bare string "Error: File too
+    large" (src/cli/main.zig:1325-1327 compares against an unnamed `1 << 24`).
+    The exit code (2 = ExitCode.usage_error) is already correct and is pinned
+    here so a reword cannot drift it. The check fires while reading the file,
+    before any connection is opened.
+  type: bash
+  command: |
+    ${GEODE_BINARY} query --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
+      --file /tmp/geode_over_size_cap.gql
+  expected:
+    exit_code: 2
+    stderr_contains:
+    - 16 MiB
+    - '17825823'
+    - split
   tags:
   - resource
   - boundary
+  - error
+  - regression
+- name: file-flag-size-cap-is-documented
+  description: |
+    The cap must be discoverable. RED at geode e46ece27 — the --file help line
+    (src/cli/main.zig:259) says only "Execute GQL statements from a file
+    (supports ~)" and never mentions a maximum size, so a user who hits the
+    limit has nowhere to look it up.
+
+    `geode query --help` writes to stderr (std.debug.print) and exits 0;
+    asserted accordingly.
+  type: bash
+  command: |
+    ${GEODE_BINARY} query --help
+  expected:
+    exit_code: 0
+    stderr_contains:
+    - --file
+    - 16 MiB
+  tags:
+  - resource
+  - boundary
+  - docs
 - name: file-flag-directory-instead-of-file
   description: Test error when path is a directory, not a file
   args:
@@ -360,13 +394,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_unclosed_txn.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        BEGIN;
-
-        CREATE (n:UnclosedTxn {id: 60});
-
-        '
+      content: "USE GRAPH edge_case_graph;\nBEGIN;\nCREATE (n:UnclosedTxn {id: 60});\n"
   args:
   - query
   - --insecure
@@ -394,15 +422,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_rollback.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        BEGIN;
-
-        CREATE (n:RolledBack {id: 70});
-
-        ROLLBACK;
-
-        '
+      content: "USE GRAPH edge_case_graph;\nBEGIN;\nCREATE (n:RolledBack {id: 70});\nROLLBACK;\n"
   args:
   - query
   - --insecure
@@ -426,21 +446,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_nested_txn.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        BEGIN;
-
-        CREATE (n:OuterTxn {id: 80});
-
-        BEGIN;
-
-        CREATE (m:InnerTxn {id: 81});
-
-        COMMIT;
-
-        COMMIT;
-
-        '
+      content: "USE GRAPH edge_case_graph;\nBEGIN;\nCREATE (n:OuterTxn {id: 80});\nBEGIN;\nCREATE (m:InnerTxn {id: 81});\nCOMMIT;\nCOMMIT;\n"
   args:
   - query
   - --insecure
@@ -465,11 +471,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_idempotent.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        MERGE (n:IdempotentTest {id: 100}) ON CREATE SET n.created = true;
-
-        '
+      content: "USE GRAPH edge_case_graph;\nMERGE (n:IdempotentTest {id: 100}) ON CREATE SET n.created = true;\n"
   args:
   - query
   - --insecure
@@ -504,23 +506,7 @@ tests:
   setup:
     files:
     - path: /tmp/geode_test_complex.gql
-      content: 'USE GRAPH edge_case_graph;
-
-        CREATE (a:Complex {id: 200, type: ''A''});
-
-        CREATE (b:Complex {id: 201, type: ''B''});
-
-        CREATE (c:Complex {id: 202, type: ''C''});
-
-        MATCH (x:Complex {type: ''A''}), (y:Complex {type: ''B''}), (z:Complex {type: ''C''})
-
-        CREATE (x)-[:LINK]->(y)-[:LINK]->(z);
-
-        MATCH (start:Complex {type: ''A''})-[:LINK*]->(end:Complex)
-
-        RETURN count(end) AS reachable;
-
-        '
+      content: "USE GRAPH edge_case_graph;\nCREATE (a:Complex {id: 200, type: 'A'});\nCREATE (b:Complex {id: 201, type: 'B'});\nCREATE (c:Complex {id: 202, type: 'C'});\nMATCH (x:Complex {type: 'A'}), (y:Complex {type: 'B'}), (z:Complex {type: 'C'})\nCREATE (x)-[:LINK]->(y)-[:LINK]->(z);\nMATCH (start:Complex {type: 'A'})-[:LINK*]->(end:Complex)\nRETURN count(end) AS reachable;\n"
   args:
   - query
   - --insecure
