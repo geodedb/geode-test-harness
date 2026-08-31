@@ -1,0 +1,175 @@
+version: '1.0'
+name: Authn cross-principal lockout (ENG-3954 RC-1)
+description: |
+  END-TO-END REPRODUCTION of ENG-3954 RC-1: the authentication rate limiter is
+  keyed on the SOURCE IP ALONE, so failed logins for ONE principal lock out
+  EVERY OTHER principal that shares that IP — including the admin.
+
+  Wire path exercised: QUIC HELLO -> src/server/quic_connection_handler.zig
+  :5905-5919 (the lockout gate) -> src/server/auth_rate_limiter.zig
+  (StringHashMap keyed on the peer-IP string produced by
+  src/transport/quic.zig:1329-1352 `getPeerAddressString`, which carries no
+  port and no principal).
+
+  Scenario (all from 127.0.0.1, the shared "NAT egress" of the incident):
+    1. Admin creates the legitimate user alice_xp.
+    2. alice_xp logs in successfully — baseline.
+    3. Three failed logins for a username that DOES NOT EXIST. Each is a
+       checked-and-rejected credential (error.Unauthenticated,
+       user_management.zig:830-841) so it legitimately counts — against
+       MALLORY, and against nobody else.
+    4. KEY ASSERTION: alice_xp's VALID login still succeeds.
+    5. KEY ASSERTION: the admin's own connection still works.
+    6. The attacked principal IS still locked — the fix must not trade the
+       collateral-damage bug for no brute-force protection at all.
+
+  RED at HEAD (reproduced 2026-08-31 against dfe77858, one server, one client
+  host, GEODE_AUTH_RATE_MAX_ATTEMPTS=3):
+    step 4 -> exit 3, "Authentication failed: Too many failed authentication
+              attempts. Please try again later."
+    step 5 -> exit 3, "Too many failed authentication attempts."
+  GREEN after the fix: steps 4 and 5 succeed, step 6 still reports "Too many".
+
+  The threshold is lowered to 3 via GEODE_AUTH_RATE_MAX_ATTEMPTS (an existing
+  knob — auth_rate_limiter.resolveConfig) purely to keep the spec inside the
+  suite time budget; the defect reproduces identically at the production
+  default of 10. The window is shortened to 30 s so a red run does not leave
+  the server refusing its own teardown for a full minute.
+
+  The per-IP DoS BACKSTOP that must survive the fix (a spray across many
+  distinct usernames still trips a higher, IP-wide ceiling) is pinned in the
+  unit lane — `zig build test-auth-rate-limiter`, tests tagged ENG-3954 RC-1c
+  — because it needs more attempts than an e2e spec should spend.
+
+  CANARY: REQ=REQ-SEC-RATE-LIMIT-009; FEATURE="AuthRateLimiting"; ASPECT=CrossPrincipalIsolation; STATUS=TESTED; TEST=geodetestlab-cli/specs/authn_cross_principal_lockout.yml; OWNER=security; UPDATED=2026-08-31
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - info
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_AUTH_RATE_MAX_ATTEMPTS: '3'
+      GEODE_AUTH_RATE_LOCKOUT_SECS: '30'
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: xprincipal-create-victim-user
+  description: |
+    Admin creates the legitimate user whose access the attacker must NOT be
+    able to deny. Uses the GQL auth DDL over the wire (CREATE USER), so the
+    running server owns the write.
+  args:
+  - query
+  - CREATE USER alice_xp SET PASSWORD 'Alice_XP_Pass_2026!' EMAIL 'alice_xp@test.example.com' ROLE ReadWrite
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - created alice_xp
+  tags: [rate-limiter, cross-principal, setup]
+
+- name: xprincipal-victim-baseline-login
+  description: POSITIVE baseline — alice_xp's credentials work before the attack.
+  args: [auth, login, --user, alice_xp, --password, Alice_XP_Pass_2026!]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [rate-limiter, cross-principal, positive-baseline]
+
+- name: xprincipal-attacker-fail-01
+  description: |
+    Failed login 1 of 3 for a username that does not exist on this server.
+    The attacker never proves anything about alice_xp — this is exactly the
+    traffic that took the database down in the field.
+  args: [auth, login, --user, mallory_does_not_exist, --password, Wrong_01!]
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Authentication failed
+  tags: [rate-limiter, cross-principal, failed-attempt]
+
+- name: xprincipal-attacker-fail-02
+  description: Failed login 2 of 3 for the nonexistent username.
+  args: [auth, login, --user, mallory_does_not_exist, --password, Wrong_02!]
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Authentication failed
+  tags: [rate-limiter, cross-principal, failed-attempt]
+
+- name: xprincipal-attacker-fail-03
+  description: |
+    Failed login 3 of 3 — reaches GEODE_AUTH_RATE_MAX_ATTEMPTS. At HEAD this
+    arms a lockout on the whole IP; after the fix it arms one on the
+    (127.0.0.1, mallory_does_not_exist) principal only.
+  args: [auth, login, --user, mallory_does_not_exist, --password, Wrong_03!]
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Authentication failed
+  tags: [rate-limiter, cross-principal, failed-attempt, threshold]
+
+- name: xprincipal-victim-login-still-succeeds
+  description: |
+    KEY ASSERTION (ENG-3954 RC-1): a failure budget spent on one principal
+    must never be charged to another. alice_xp presents CORRECT credentials
+    from the same IP and must be let in.
+
+    RED at HEAD: exit 3, "Authentication failed: Too many failed
+    authentication attempts. Please try again later."
+  args: [auth, login, --user, alice_xp, --password, Alice_XP_Pass_2026!]
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - Successfully authenticated
+  tags: [rate-limiter, cross-principal, key-assertion, regression]
+
+- name: xprincipal-admin-not-collaterally-locked
+  description: |
+    KEY ASSERTION (ENG-3954 RC-1): the operator must not be locked out of
+    their own server by an unauthenticated stranger. This runs as the admin
+    (the harness supplies -U geode -P $GEODE_ADMIN_PASSWORD).
+
+    RED at HEAD: exit 3, "Too many failed authentication attempts."
+  args:
+  - query
+  - RETURN 1 AS lockout_collateral_check
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - lockout_collateral_check
+  tags: [rate-limiter, cross-principal, key-assertion, admin]
+
+- name: xprincipal-attacked-principal-stays-locked
+  description: |
+    The protection that must SURVIVE the fix: the principal that actually
+    burned its attempts is refused, with the lockout message rather than a
+    plain credential rejection. Passes at HEAD too — it is a guard against
+    "fixing" RC-1 by deleting brute-force protection.
+  args: [auth, login, --user, mallory_does_not_exist, --password, Wrong_04!]
+  expected:
+    exit_code: 3
+    stderr_contains:
+    - Too many
+  tags: [rate-limiter, cross-principal, brute-force-guard, negative]
+
+tags:
+- rate-limiter
+- cross-principal
+- authn
+- security
+- brute-force
+- eng-3954
