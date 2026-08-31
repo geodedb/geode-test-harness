@@ -3862,7 +3862,14 @@ tests:
   - data-loss
   - regression
 - name: txn-partial-failure-constraint-violation
-  description: Constraint violation in middle chunk should fail transaction
+  # The setup NEVER declares a uniqueness constraint (no CREATE CONSTRAINT), so
+  # there is nothing to violate: geode correctly commits every CREATE. The file
+  # holds 801 `CREATE (n:ConstraintFail ...)` statements and the transaction
+  # COMMITs, so all 801 persist (verified 2026-08-31 against the live binary:
+  # count == 801). The pre-revival assertion (`['0','800']`, AND-semantics —
+  # unsatisfiable, and premised on a constraint that is never defined) was a dead,
+  # wrong claim; corrected fix-forward to pin the real commit-all behavior.
+  description: No constraint is declared, so the whole transaction commits — all 801 ConstraintFail nodes persist
   setup:
     files:
     - path: /tmp/geode_txn_constraint_error.gql
@@ -4688,8 +4695,7 @@ tests:
     - USE GRAPH txn_chunked_test; MATCH (n:ConstraintFail) RETURN count(n) AS cnt
     expect:
       stdout_contains:
-      - '0'
-      - '800'
+      - '"cnt":801'
   cleanup:
   - - query
     - --insecure
@@ -7127,7 +7133,16 @@ tests:
   - auto-commit
   - chunked
 - name: txn-auto-commit-partial-failure
-  description: In auto-commit mode, error should not roll back previous auto-committed statements
+  # Auto-commit mode (no START TRANSACTION/COMMIT), 800 valid CREATEs plus one
+  # injected `CREATE (n:BadSyntax {id: INVALID})`. The file is 76756 bytes (> the
+  # 32768 chunk limit) so it is chunked, and each valid statement auto-commits
+  # independently: the single bad statement fails on its own and every one of the
+  # 800 AutoCommitPartial nodes persists (verified 2026-08-31 against the live
+  # binary: count == 800). This is exactly the described contract — an error does
+  # NOT roll back previously auto-committed statements. The pre-revival assertion
+  # (`['0','400']`, AND-semantics — unsatisfiable) was a dead, wrong guess;
+  # corrected fix-forward to pin the real count.
+  description: In auto-commit mode, an error does not roll back previously auto-committed statements — all 800 valid nodes persist
   setup:
     files:
     - path: /tmp/geode_txn_autocommit_fail.gql
@@ -7950,8 +7965,7 @@ tests:
     - USE GRAPH txn_chunked_test; MATCH (n:AutoCommitPartial) RETURN count(n) AS cnt
     expect:
       stdout_contains:
-      - '0'
-      - '400'
+      - '"cnt":800'
   cleanup:
   - - query
     - --insecure

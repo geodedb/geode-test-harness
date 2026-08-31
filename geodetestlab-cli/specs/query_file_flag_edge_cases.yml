@@ -120,7 +120,15 @@ tests:
   - edge-case
   - error
 - name: file-flag-multiple-semicolons
-  description: Test statement with multiple trailing semicolons
+  # geode's parser strictly rejects EMPTY statements: consecutive semicolons
+  # (`;;` / `;;;`) surface a `42000 parse error` and the WHOLE batch is atomically
+  # rejected — no partial writes (verified 2026-08-31 against the live binary:
+  # `;;` inline, trailing `;;`, and `;;;` all parse-error; a single `;` separator
+  # works). The pre-revival assertion (node created, count == 1) assumed lenient
+  # empty-statement tolerance geode does not have; corrected fix-forward to pin the
+  # real, safe strict-parse behavior. If geode later chooses to tolerate empty
+  # statements, this test is the regression signal that the contract changed.
+  description: Multiple/consecutive semicolons yield a parse error; the batch is atomically rejected (no node created)
   setup:
     files:
     - path: /tmp/geode_test_multi_semi.gql
@@ -132,6 +140,8 @@ tests:
   - /tmp/geode_test_multi_semi.gql
   expect:
     exit_code: 0
+    stdout_contains:
+    - parse error
   verify:
   - args:
     - query
@@ -139,7 +149,7 @@ tests:
     - USE GRAPH edge_case_graph; MATCH (n:MultiSemi) RETURN count(n) AS cnt
     expect:
       stdout_contains:
-      - '1'
+      - '"cnt":0'
   cleanup:
   - - query
     - --insecure

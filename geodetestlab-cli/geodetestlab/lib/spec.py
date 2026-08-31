@@ -311,6 +311,8 @@ class TestCase:
     setup_files: list[dict[str, str]] = field(default_factory=list)
     # Per-test setup queries to run before the test command
     setup_queries: list[dict[str, Any]] = field(default_factory=list)
+    # Per-test verify queries to run after the main command passes (post-conditions)
+    verify_queries: list[dict[str, Any]] = field(default_factory=list)
     # Per-test timeout override (if larger than global timeout, this takes precedence)
     timeout_ms: int = 0
     # Request a managed server restart after this test succeeds
@@ -421,6 +423,12 @@ class TestCase:
             # Per-test setup queries: list of dicts with args/expect keys
             setup_queries = [item for item in setup_data if isinstance(item, dict)]
 
+        # Parse per-test verify queries (post-conditions run after the main step)
+        verify_queries: list[dict[str, Any]] = []
+        verify_data = data.get("verify")
+        if isinstance(verify_data, list):
+            verify_queries = [item for item in verify_data if isinstance(item, dict)]
+
         return cls(
             name=data["name"],
             description=data.get("description", ""),
@@ -436,6 +444,7 @@ class TestCase:
             plaintext_check=PlaintextCheck.from_dict(plaintext_data),
             setup_files=setup_files,
             setup_queries=setup_queries,
+            verify_queries=verify_queries,
             timeout_ms=data.get("timeout_ms", 0),
             restart_server=data.get("restart_server", False),
             http_requests=http_requests,

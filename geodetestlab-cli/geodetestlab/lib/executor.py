@@ -33,6 +33,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DEFAULT_HTTP_TIMEOUT_S = 30.0
 DEFAULT_SHELL_TIMEOUT_S = 30.0
+
+# Valueless (boolean) geode CLI flags — flags that take NO following value.
+# Mirrors the `CliFlagType.bool` entries in the geode CLI (cli_dispatcher.zig /
+# main.zig). Used by the query-positional heuristic in `_build_cli_command` so a
+# positional query following one of these flags is NOT mistaken for the flag's
+# value (which would leave the multi-statement ';' query in the sanitize scan and
+# wrongly reject it). Keep this in sync with the geode CLI's boolean flags.
+_VALUELESS_CLI_FLAGS = frozenset(
+    {
+        "--help",
+        "--version",
+        "--verbose",
+        "--json",
+        "--audit",
+        "--insecure",
+        "--insecure-tls-skip-verify",
+        "--no-saved-session",
+        "--no-cluster",
+        "--no-color",
+        "--no-header",
+    }
+)
 SSL_VERIFY = os.environ.get("GEODE_VERIFY_SSL", "0").lower() in ("1", "true", "yes")
 if not SSL_VERIFY:
     logging.getLogger(__name__).debug(
@@ -652,7 +674,12 @@ def _build_cli_command(
             query_text_idx = None
             for idx in range(1, len(args_to_check)):
                 if not args_to_check[idx].startswith("--"):
-                    if idx > 1 and args_to_check[idx - 1].startswith("--"):
+                    # A positional is the value of the preceding flag ONLY when
+                    # that flag actually takes a value. A valueless/boolean flag
+                    # (e.g. --insecure) takes no value, so the positional after it
+                    # is the query itself and must be excluded from the ';' scan.
+                    prev = args_to_check[idx - 1]
+                    if idx > 1 and prev.startswith("--") and prev not in _VALUELESS_CLI_FLAGS:
                         continue
                     query_text_idx = idx
                     break
@@ -862,7 +889,49 @@ def run_cli_test(
     if error_result:
         return error_result
 
-    return _execute_and_check(test_case, cmd, env, secrets, timeout_ms, data_dir, verbose, start_time)
+    main_result = _execute_and_check(test_case, cmd, env, secrets, timeout_ms, data_dir, verbose, start_time)
+
+    # Run per-test verify queries (post-conditions) only if the main step passed,
+    # mirroring the setup_queries semantics. A failing verify fails the whole test.
+    if main_result.passed and test_case.verify_queries:
+        for i, verify_item in enumerate(test_case.verify_queries):
+            verify_tc = TestCase.from_dict(
+                {
+                    "name": f"{test_case.name}-verify-{i}",
+                    "description": f"Verify query {i} for {test_case.name}",
+                    **verify_item,
+                }
+            )
+            if verbose:
+                print(f"    Executing verify-{i}...")
+            verify_cmd, verify_err = _build_cli_command(
+                verify_tc, binary, env, secrets, timeout_ms, data_dir, start_time
+            )
+            if verify_err:
+                return TestResult(
+                    name=test_case.name,
+                    passed=False,
+                    duration_ms=(time.time() - start_time) * 1000,
+                    output=main_result.output,
+                    error=f"Verify query {i} failed to build: {verify_err.error}",
+                )
+            verify_result = _execute_and_check(
+                verify_tc, verify_cmd, env, secrets, timeout_ms, data_dir, verbose, start_time
+            )
+            if not verify_result.passed:
+                if verbose:
+                    print(f"    Verify-{i}: FAILED - {verify_result.error}")
+                return TestResult(
+                    name=test_case.name,
+                    passed=False,
+                    duration_ms=(time.time() - start_time) * 1000,
+                    output=main_result.output,
+                    error=f"Verify query {i} failed: {verify_result.error}",
+                )
+            if verbose:
+                print(f"    Verify-{i}: OK")
+
+    return main_result
 
 
 def _run_http_test(
