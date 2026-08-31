@@ -257,29 +257,73 @@ tests:
     Same invariant stated per-key, so a failure NAMES the duplicated keys
     instead of only reporting a total. Walks every merged key and reports the
     first offenders.
+
+    ONE CONNECTION, NOT 200 (changed 2026-08-30, ENG-3914 RC-4). This step used
+    to spawn a separate `geode query` process — i.e. a separate AUTHENTICATED
+    QUIC connection — per key. Every connection re-runs the password KDF, and
+    geode hashes with OWASP-minimum Argon2id (t=2, m=19 MiB, p=1 —
+    src/security/geode_auth_lib.zig:1880). Measured on this repo's Debug
+    binary: 961 ms per spawned `geode query` (78 ms of that is process start,
+    and a WRONG password costs the same 925 ms — so the cost is the KDF, not
+    the query). 200 spawns therefore needs ~190 s against the harness's 30 s
+    shell budget and could never pass, no matter how fast the engine is. The
+    SAME 200 statements over ONE `--batch` connection run in 3.6 s.
+
+    That is not a timeout bump and it does not weaken the assertion: still 200
+    distinct keys, still per-key, still names offenders, and it additionally
+    now fails if the server does not answer every key. It also matches the
+    connection shape this spec already argues for in the race step above
+    ("a long-lived session issuing sequential statements — the production
+    shape, not 800 process spawns").
+
+    `--batch` sends one statement per line over a single QUIC stream in
+    submission order, so result line N corresponds to key N; the response
+    count is asserted to be exactly KEYS before the mapping is trusted. A key
+    with 0 rows (`"rows":[]`) or >1 rows both fail.
   type: bash
   command: |
     ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
     BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    WORKDIR=$(mktemp -d)
+    trap 'rm -rf "$WORKDIR"' EXIT
+
     KEYS=200
-    DUPES=0
+    AUDIT="$WORKDIR/audit.gql"
+    : > "$AUDIT"
     i=0
     while [ "$i" -lt "$KEYS" ]; do
       D=$((i / 8))
       S=$((i % 8))
-      OUT=$("$BIN" query "MATCH (n:XSESS_Doc {docId: $D, seq: $S}) RETURN count(n) AS c" \
-        --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
-      if ! echo "$OUT" | grep -q '"c":1'; then
-        DUPES=$((DUPES + 1))
-        if [ "$DUPES" -le 8 ]; then
-          echo "DUPLICATE merge key {docId: $D, seq: $S} -> $OUT"
-        fi
-      fi
+      echo "MATCH (n:XSESS_Doc {docId: $D, seq: $S}) RETURN count(n) AS c" >> "$AUDIT"
       i=$((i + 1))
     done
-    echo "duplicated_keys=$DUPES of $KEYS"
-    [ "$DUPES" -eq 0 ] || { echo "FAIL: cross-session MERGE duplicated $DUPES keys"; exit 1; }
+
+    "$BIN" query --batch --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+      < "$AUDIT" > "$WORKDIR/audit.out" 2>&1 \
+      || { echo "FAIL: audit session errored"; tail -20 "$WORKDIR/audit.out"; exit 1; }
+
+    grep 'status_class' "$WORKDIR/audit.out" > "$WORKDIR/rows.txt" || true
+    GOT=$(wc -l < "$WORKDIR/rows.txt")
+    if [ "$GOT" -ne "$KEYS" ]; then
+      echo "FAIL: expected $KEYS per-key audit responses, got $GOT"
+      tail -20 "$WORKDIR/audit.out"
+      exit 1
+    fi
+
+    awk '{
+      if ($0 !~ /"c":1[},]/) {
+        dupes++
+        if (dupes <= 8) {
+          printf "DUPLICATE merge key {docId: %d, seq: %d} -> %s\n", int((NR-1)/8), (NR-1)%8, $0
+        }
+      }
+    }
+    END {
+      printf "duplicated_keys=%d of %d\n", dupes+0, NR
+      exit (dupes+0 > 0)
+    }' "$WORKDIR/rows.txt" \
+      || { echo "FAIL: cross-session MERGE duplicated keys"; exit 1; }
     echo "PASS: every merge key resolves to exactly one row"
   expect:
     exit_code: 0
