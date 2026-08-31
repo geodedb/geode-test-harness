@@ -322,6 +322,179 @@ tests:
     - '"status_class":"42501"'
   tags: [for, control, authorization]
 
+  # ============================================================ params ====
+  # FOR..IN parameter-bound list: `FOR n IN $param` must iterate the bound
+  # list, not collapse to ONE null iteration. RC: executeFor evaluates the FOR
+  # collection in an Env with no request params wired in
+  # (src/execution/statement_handlers.zig:832-836), so a `$param` collection
+  # resolves to Null (src/eval.zig:886-893), then a non-conformant
+  # "treat non-list as single-item list" fallback (:843-853) mints ONE
+  # iteration with the loop var = Null. Same seam at the per-iteration RETURN
+  # env (:895-899) and in executeForWithBindings (:694-700, :760-764).
+  #
+  # WRITE-LOSS sibling (must be fixed together): isStorageNativeQuery
+  # (src/execution/planned_read_runtime.zig:3714-3742) does NOT reject a query
+  # carrying q.for_statement — with chains.len==0 it returns true at :3737 — so
+  # `WITH … FOR … CREATE`/`RETURN` is served over the wire as a plain WITH
+  # projection and the FOR is dropped entirely (its 4 sibling gates at
+  # :2157/:3680/:3848/:3932 DO check q.for_statement). Only the wire path
+  # exercises this planned-read routing, which is why it lives here.
+  #
+  # Per ISO/IEC 39075:2024 `<for item source>` is a `<list value expression>`,
+  # so `FOR n IN $nums` is valid and must iterate the bound list.
+  #
+  # PRE-FIX (RED) evidence captured against HEAD over QUIC:
+  #   FOR n IN $nums RETURN n AS v      (nums=[10,20,30]) -> ONE row {"v":null}
+  #   FOR row IN $rows CREATE …         (rows=2 maps)     -> ONE null-prop node
+  #   WITH 1 AS w FOR n IN $nums CREATE (nums=[1,2,3])    -> ZERO nodes (write loss)
+  #   WITH 1 AS w FOR n IN [1,2,3] RETURN                 -> ONE row {"v":null,"w":1}
+  # In-repo unit proof: tests/test_for_write_body.zig (execWithParams cases),
+  # wire proof also pinned by tests/gql_conformance.zig T20.
+  #
+  # CANARY: REQ=REQ-GQL-FOR-IN-PARAM-LIST; FEATURE="ForStatement"; ASPECT=ParamBoundCollection; STATUS=TESTED; TEST=geodetestlab-cli/specs/for_write_body.yml; OWNER=engine; UPDATED=2026-08-31
+
+- name: forparam_teardown_pre_create
+  description: Idempotent pre-teardown of For876ParamCreate so reruns start clean.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876ParamCreate) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, params, setup]
+
+- name: forparam_teardown_pre_with
+  description: Idempotent pre-teardown of For876ParamWith so reruns start clean.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876ParamWith) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, params, setup]
+
+- name: forparam_for_return_projects_every_bound_element
+  description: >
+    KEY ASSERTION (RC): `FOR n IN $nums RETURN n` must project EVERY bound
+    element (3 rows: 10, 20, 30). Pre-fix it collapses to a single `{"v":null}`
+    row because the FOR collection env drops the request param.
+  args: [query, --param, nums, '[10, 20, 30]', 'FOR n IN $nums RETURN n AS v']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"v":10'
+    - '"v":20'
+    - '"v":30'
+    stdout_not_contains:
+    - '"v":null'
+    - '"type":"NULL"'
+  tags: [for, params, key-assertion]
+
+- name: forparam_for_create_from_param_list
+  description: >
+    `FOR row IN $rows CREATE (…)` must run once per element. Pre-fix $rows is
+    Null so the body runs once with row=Null, minting a single null-prop node.
+  args: [query, --param, rows, '[{"k":1,"v":"a"},{"k":2,"v":"b"}]', 'FOR row IN $rows CREATE (n:For876ParamCreate {k: row.k, v: row.v})']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [for, params, write-body]
+
+- name: forparam_for_create_persisted_exactly_two
+  description: >
+    EXACT COUNT: the param-driven CREATE persisted exactly 2 nodes — not 1
+    (loop collapsed to a single null iteration) and not 0 (silent no-op).
+  args: [query, MATCH (n:For876ParamCreate) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+    stdout_not_contains:
+    - '"c":1'
+    - '"c":0'
+  tags: [for, params, evidence, key-assertion]
+
+- name: forparam_for_create_values_are_distinct_and_non_null
+  description: >
+    The map-valued loop rows landed distinct, non-null properties (k=1/v="a"
+    and k=2/v="b"), not a single {k:null, v:null} node.
+  args: [query, 'MATCH (n:For876ParamCreate) RETURN n.k AS k, n.v AS v ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":1,"v":"a"'
+    - '"k":2,"v":"b"'
+    stdout_not_contains:
+    - '"k":null'
+    - '"v":null'
+  tags: [for, params, evidence]
+
+- name: forparam_with_for_create_write_loss
+  description: >
+    `WITH … FOR … CREATE` with a param list. Pre-fix the planned-read runtime
+    serves this as a plain WITH projection (isStorageNativeQuery does not
+    reject q.for_statement) and the FOR body never runs — ZERO nodes written.
+  args: [query, --param, nums, '[1, 2, 3]', 'WITH 1 AS w FOR n IN $nums CREATE (:For876ParamWith {n: n, w: w})']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: [for, params, write-body]
+
+- name: forparam_with_for_create_persisted_exactly_three
+  description: >
+    EXACT COUNT + WRITE-LOSS GUARD: the `WITH … FOR … CREATE` persisted exactly
+    3 nodes. Pre-fix this is 0 (the FOR was dropped by the planned-read
+    routing).
+  args: [query, MATCH (n:For876ParamWith) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":3'
+    stdout_not_contains:
+    - '"c":0'
+    - '"c":1'
+  tags: [for, params, evidence, key-assertion]
+
+- name: forparam_with_for_inline_return_projects_three_rows
+  description: >
+    WRITE-LOSS GUARD, inline collection (no param seam): the isStorageNativeQuery
+    routing defect in isolation. `WITH 1 AS w FOR n IN [1,2,3] RETURN n, w` must
+    return 3 rows (n=1/2/3, w=1). Pre-fix the FOR is dropped and only the single
+    WITH projection row `{"v":null,"w":1}` comes back.
+  args: [query, 'WITH 1 AS w FOR n IN [1, 2, 3] RETURN n AS v, w AS w']
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"v":1,"w":1'
+    - '"v":2,"w":1'
+    - '"v":3,"w":1'
+    stdout_not_contains:
+    - '"v":null'
+  tags: [for, params, key-assertion]
+
+- name: forparam_teardown_create
+  description: Idempotent teardown of For876ParamCreate.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876ParamCreate) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, params, teardown]
+
+- name: forparam_teardown_with
+  description: Idempotent teardown of For876ParamWith.
+  args: [query, '-']
+  stdin: |
+    MATCH (n:For876ParamWith) DETACH DELETE n
+  expect:
+    exit_code: 0
+  tags: [for, params, teardown]
+
   # ------------------------------------------------------------ teardown --
 - name: for876_teardown_create
   description: Idempotent teardown of For876Doc.
