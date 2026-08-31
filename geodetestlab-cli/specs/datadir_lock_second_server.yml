@@ -1,0 +1,115 @@
+version: '1.0'
+name: Data-directory single-writer lock (second `geode serve` refused)
+description: |
+  ENG-3921: two `geode serve` processes used to be able to open the SAME
+  --data-dir. Each held its own in-memory store over one on-disk store
+  (split-brain), and the last snapshot written won — silent data loss.
+
+  src/server/data_dir_lock.zig now takes a non-blocking advisory
+  flock(LOCK_EX|LOCK_NB) on `{data_dir}/.geode.lock` at
+  src/server/main.zig:1121-1149, BEFORE any component opens the store.
+
+  This spec is the harness-level end-to-end proof, complementing the in-repo
+  subprocess lane (geode/tests/test_datadir_lock_subprocess.zig):
+
+    1. baseline — the harness's live server answers `RETURN 1 AS x`.
+    2. a SECOND `geode serve` on that same live data dir (distinct port, so
+       the data directory is the only contended resource) exits NON-ZERO,
+       never reaches "server ready", and names the incumbent with
+       "locked by pid".
+    3. the incumbent is untouched: it still answers `RETURN 1 AS x`.
+
+  GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0 pins the handoff-retry budget to zero so
+  the refusal is immediate and deterministic (the non-zero production
+  default exists for restart handoff, which is not what this spec covers).
+
+  CANARY: REQ=REQ-ENG-3921-DATA-DIR-LOCK-003; FEATURE="DataDirLock"; ASPECT=SubprocessExclusion; STATUS=TESTED; TEST=self; OWNER=storage; UPDATED=2026-08-31
+
+single_node_only: true  # single-writer exclusion over ONE local data dir
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: datadir-lock-incumbent-answers-before
+  description: baseline — the live server serving the locked data dir answers queries
+  args: [query, RETURN 1 AS x]
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns: [x]
+    stdout_json_assert:
+    - expression: results[0].x
+      equals: 1
+  tags: [datadir-lock, eng-3921, baseline]
+
+- name: datadir-lock-second-server-refused
+  description: a second `geode serve` on the live data dir exits non-zero with "locked by pid"
+  type: bash
+  command: |
+    set -uo pipefail
+    D="${GEODE_DATA_DIR:?GEODE_DATA_DIR not exported by the harness}"
+    # Distinct free port: the DATA DIRECTORY must be the only contended
+    # resource, otherwise a port clash would make this pass for the wrong
+    # reason.
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    OUT=$(GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0 \
+          GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}" \
+          timeout 60 "${GEODE_BINARY:-geode}" serve \
+            --listen "127.0.0.1:${PORT}" --data-dir "$D" --log-level warn 2>&1)
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+      echo "second_server=FAIL accepted-live-data-dir (exit 0)"
+      echo "$OUT"
+      exit 1
+    fi
+    if echo "$OUT" | grep -q "server ready"; then
+      echo "second_server=FAIL became-ready-on-locked-dir"
+      echo "$OUT"
+      exit 1
+    fi
+    if ! echo "$OUT" | grep -q "locked by pid"; then
+      echo "second_server=FAIL no-lock-diagnostic rc=$RC"
+      echo "$OUT"
+      exit 1
+    fi
+    echo "second_server=refused rc=$RC"
+  timeout_ms: 90000
+  expect:
+    exit_code: 0
+    stdout_contains: [second_server=refused]
+  tags: [datadir-lock, eng-3921, exclusion]
+
+- name: datadir-lock-incumbent-answers-after
+  description: the refusal leaves the incumbent server untouched
+  args: [query, RETURN 1 AS x]
+  expect:
+    exit_code: 0
+    geode_query:
+      row_count: 1
+      columns: [x]
+    stdout_json_assert:
+    - expression: results[0].x
+      equals: 1
+  tags: [datadir-lock, eng-3921, incumbent-liveness]
