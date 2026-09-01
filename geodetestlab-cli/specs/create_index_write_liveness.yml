@@ -1,43 +1,71 @@
 version: '1.0'
 name: CREATE INDEX does not block unrelated writes (backfill outside the write lock)
 description: |
-  Wire-level liveness spec for the CREATE INDEX backfill.
+  Wire-level liveness spec for the CREATE INDEX backfill and for ordinary
+  writes into an already-indexed vector property.
 
-  THE DEFECT. `CREATE INDEX` is a mutating statement, so the transport handler
-  holds the per-graph EXCLUSIVE write lock for its duration — and the backfill
-  (the full label scan that populates the new index) ran INSIDE that lock. So
-  every unrelated write in the database, any label, any session, queued behind
-  a full scan of the indexed label. Measured at >150 s of dead air on a large
-  graph.
+  THE ORIGINAL DEFECT. `CREATE INDEX` is a mutating statement, so the transport
+  handler holds the per-graph EXCLUSIVE write lock for its duration — and the
+  backfill (the full label scan that populates the new index) ran INSIDE that
+  lock. So every unrelated write in the database, any label, any session,
+  queued behind a full scan of the indexed label. Measured at >150 s of dead
+  air on a large graph.
 
-  THE FIX. The backfill is queued onto the same `pending_index_rebuilds` path
-  the incremental rebuilds use. Both the QUIC and gRPC handlers RELEASE the
-  exclusive lock and only then drain it, under a SHARED lock.
+  THE FIX FOR IT. The backfill is queued onto the same `pending_index_rebuilds`
+  path the incremental rebuilds use. Both the QUIC and gRPC handlers RELEASE
+  the exclusive lock and only then drain it, under a SHARED lock.
 
-  WHAT THIS SPEC ASSERTS. Session B writes an UNRELATED label while session A's
-  `CREATE INDEX` is in flight, and B must finish inside a generous budget.
+  THE RESIDUAL THIS SPEC WAS HARDENED TO CATCH (geode#875, 2026-09-01). Moving
+  the scan out of the EXCLUSIVE lock did not stop it pinning a SHARED one for
+  the whole build:
 
-  HONEST LIMITS OF THIS ASSERTION:
+    * `rebuildPendingIndexes` (src/server/quic_connection_handler.zig:415-429,
+      cloned at src/transport/grpc_server.zig:184-195) holds the per-graph
+      rwlock SHARED across the entire hydrating scan + HNSW build, and
+      `StorageAdapter.acquireGraphWriteLock` spins until readers drain — so an
+      unrelated EXCLUSIVE writer still stalls for the full build.
+    * Every ordinary write to an indexed vector property runs a FULL O(N)
+      drop+rebuild, because `advancedIndexRebuildIsDeferred`
+      (src/execution/property_mutation.zig:208-216) short-circuits on the mere
+      PRESENCE of the transport's per-statement pending-rebuild map — which the
+      handler installs for EVERY statement.
 
-    * The budget is deliberately generous (30 s) rather than tuned. A tuned
-      threshold on shared CI hardware is a flake generator; the defect this
-      guards against was >150 s, so a 30 s ceiling still separates the two by
-      an order of magnitude.
-    * The dataset here is a few thousand rows in a Debug build. It is enough to
-      make the backfill observable, not enough to reproduce the original 150 s.
-      The MECHANISM — that the backfill is deferred rather than run under the
-      writer lock — is asserted deterministically in geode's
-      tests/test_create_index_backfill_deferral.zig, which is the primary gate;
-      this spec is the end-to-end liveness sanity check on top of it.
+  MEASURED AGAINST THIS SCALE (3 000 rows x 256 dims, Debug build, 2026-09-01,
+  before the fix):
+
+      CREATE INDEX backfill ................................. ~50 s
+      unrelated session's SET while it runs ................. ~49 s   (budget 20 s)
+      one CREATE of a new node on the indexed label ......... ~50 s   (budget 10 s)
+      one SET of the vector property on one node ............ ~50 s   (budget 10 s)
+      the same CREATE on an UNindexed label .................    1 s   (control)
+
+  The previous scale (1 000 rows x 4 dims) built in well under the budget, so
+  it could not distinguish either behaviour; 256 dims is also the realistic
+  embedding width this feature exists for.
+
+  HONEST LIMITS OF THESE ASSERTIONS:
+
+    * The budgets are deliberately coarse (20 s / 10 s) rather than tuned. A
+      tuned threshold on shared CI hardware is a flake generator; the
+      behaviours guarded against are ~50 s and the healthy path is ~1 s, so
+      these ceilings sit an order of magnitude away from both.
+    * The MECHANISMS are asserted deterministically (no wall clock) in geode's
+      tests/test_create_index_backfill_deferral.zig,
+      tests/test_geode875_nonblocking_backfill.zig and
+      tests/test_geode875_incremental_index.zig — those are the primary gates;
+      this spec is the end-to-end wire proof on top of them.
     * STILL TRUE AFTER THE FIX, by design: the CREATING session still waits for
-      the backfill, and a writer on the SAME graph can still be delayed by
-      shared-lock hand-off. Only unrelated writers are freed. See
-      docs/INDEX_MAINTENANCE_AND_BULK_INGEST.md.
+      its own backfill, and an OVERWRITE of an already-indexed vector still
+      falls back to a full rebuild (HNSW cannot un-insert), which is why the
+      fast-write cases below write a vector for an id the index has never seen.
+      See docs/INDEX_MAINTENANCE_AND_BULK_INGEST.md.
 
   Labels are prefixed CIL_ so this spec cannot collide with any other spec's
   data.
 
-  CANARY: REQ=REQ-ENG-CREATE-INDEX-BACKFILL-OUTSIDE-WRITE-LOCK; FEATURE="AdvancedIndex"; ASPECT=WriteLiveness; STATUS=TESTED; TEST=geodetestlab/specs/create_index_write_liveness.yml; OWNER=index; UPDATED=2026-08-25
+  CANARY: REQ=REQ-ENG-CREATE-INDEX-BACKFILL-OUTSIDE-WRITE-LOCK; FEATURE="AdvancedIndex"; ASPECT=WriteLiveness; STATUS=TESTED; TEST=geodetestlab/specs/create_index_write_liveness.yml; OWNER=index; UPDATED=2026-09-01
+  CANARY: REQ=REQ-GEODE-875-NONBLOCKING-BACKFILL; FEATURE="VectorIndex"; ASPECT=WriteLivenessDuringBackfill; STATUS=TESTED; TEST=geodetestlab/specs/create_index_write_liveness.yml; OWNER=index; UPDATED=2026-09-01
+  CANARY: REQ=REQ-GEODE-875-INCREMENTAL-INSERT; FEATURE="VectorIndex"; ASPECT=SingleWriteLatencyOnIndexedProperty; STATUS=TESTED; TEST=geodetestlab/specs/create_index_write_liveness.yml; OWNER=index; UPDATED=2026-09-01
 
 cli:
   binary: ./zig-out/bin/geode
@@ -61,32 +89,55 @@ invariants:
 tests:
 - name: seed-indexable-rows
   description: |
-    Seed a thousand vector rows on CIL_Doc so the backfill has real work to
-    do. Batched into multi-node CREATE statements to keep the seed itself short.
+    Seed 3 000 vector rows of 256 dimensions on CIL_Doc so the backfill is real
+    work (~50 s in a Debug build — the previous 1 000 x 4 dims built too fast
+    for any of the budgets below to mean anything). Batched into multi-node
+    CREATE statements to keep the seed itself short (~80 s measured); the
+    vector literal is built ONCE and reused, since the cost here must stay in
+    the server, not in shell string building.
   type: bash
   command: |
     ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
     BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
-    for batch in $(seq 1 10); do
+
+    DIM=256
+    ROWS=3000
+    BATCH=50
+
+    VEC="["
+    SEP=""
+    for d in $(seq 1 $DIM); do
+      VEC="${VEC}${SEP}1.0"
+      SEP=", "
+    done
+    VEC="${VEC}]"
+
+    i=0
+    while [ "$i" -lt "$ROWS" ]; do
       Q="CREATE"
       SEP=""
-      for i in $(seq 1 100); do
-        ID=$(( batch * 1000 + i ))
-        Q="${Q}${SEP} (:CIL_Doc {id: ${ID}, emb: vectorf32('[1.0, 0.0, 0.0, 0.0]')})"
+      j=0
+      while [ "$j" -lt "$BATCH" ]; do
+        ID=$(( i + j ))
+        Q="${Q}${SEP} (:CIL_Doc {id: ${ID}, emb: vectorf32('${VEC}')})"
         SEP=","
+        j=$(( j + 1 ))
       done
-      "$BIN" query "$Q" --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" > /dev/null || exit 1
+      "$BIN" query "$Q" --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+        --timeout 300 > /dev/null || exit 1
+      i=$(( i + BATCH ))
     done
+
     OUT=$("$BIN" query "MATCH (n:CIL_Doc) RETURN count(n) AS c" \
-      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --timeout 300 2>&1)
     echo "$OUT"
     # A retried seed step re-inserts, so assert a FLOOR rather than an exact
     # count — the point is "enough rows for the backfill to be real work".
     C=$(echo "$OUT" | grep -o '"c":[0-9]*' | head -1 | cut -d: -f2)
-    [ -n "$C" ] && [ "$C" -ge 1000 ] || { echo "FAIL: seeded only ${C:-0} rows"; exit 1; }
+    [ -n "$C" ] && [ "$C" -ge 3000 ] || { echo "FAIL: seeded only ${C:-0} rows"; exit 1; }
     echo "PASS: seeded ${C} CIL_Doc rows"
-  timeout_ms: 300000
+  timeout_ms: 600000
   expect:
     exit_code: 0
     stdout_contains:
@@ -113,17 +164,26 @@ tests:
     ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
     BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
-    BUDGET_S=30
+    BUDGET_S=20
 
     # Session A — CREATE INDEX over the seeded label, in the background.
+    # --timeout 300 on BOTH sessions so a stall shows up as an elapsed-time
+    # budget failure with a real number, not as a client-side give-up at the
+    # 30 s CLI default (which would report the wrong defect).
     "$BIN" query "CREATE INDEX cil_doc_idx ON CIL_Doc (emb) USING vector WITH (metric = 'l2')" \
-      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" > /tmp/cil_session_a.log 2>&1 &
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+      --timeout 300 > /tmp/cil_session_a.log 2>&1 &
     PIDA=$!
+
+    # Give session A time to get past its own exclusive-lock phase and into the
+    # backfill, so session B lands squarely inside the build window.
+    sleep 3
 
     # Session B — an unrelated write, started immediately behind it.
     START=$(date +%s)
     "$BIN" query "MATCH (n:CIL_Other {id: 1}) SET n.v = 1" \
-      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" > /tmp/cil_session_b.log 2>&1
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+      --timeout 300 > /tmp/cil_session_b.log 2>&1
     RC_B=$?
     END=$(date +%s)
     ELAPSED=$(( END - START ))
@@ -166,6 +226,114 @@ tests:
     - cil_doc_idx
   tags: [index, liveness]
 
+- name: single-write-into-indexed-property-is-fast
+  description: |
+    KEY ASSERTION (geode#875). With the index BUILT and quiet, ONE ordinary
+    write of a vector for an id the index has never seen must cost roughly one
+    HNSW insert — not a full O(N) drop-and-rescan of the whole label.
+
+    Two shapes, because both reach the same chokepoint
+    (execution/property_mutation.zig setNodePropertyFromValue):
+      a) CREATE of a new node carrying the vector, and
+      b) SET of the vector on an existing node of the indexed label that has
+         no vector yet.
+
+    A control on an UNindexed label runs the identical write so the budget is
+    measured against this machine, not against a fixed guess: pre-fix the
+    indexed writes measured ~50 s each against ~1 s for the control.
+
+    NOT asserted here (correct behaviour, not a defect): an OVERWRITE of an
+    already-indexed vector still falls back to a full rebuild, because HNSW
+    cannot un-insert an id.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    BUDGET_S=10
+
+    DIM=256
+    VEC="["
+    SEP=""
+    for d in $(seq 1 $DIM); do
+      VEC="${VEC}${SEP}0.5"
+      SEP=", "
+    done
+    VEC="${VEC}]"
+
+    run_timed() {
+      # $1 = label for the report, $2 = statement
+      local START END
+      START=$(date +%s)
+      "$BIN" query "$2" --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" \
+        --timeout 300 > "/tmp/cil_${1}.log" 2>&1
+      RC=$?
+      END=$(date +%s)
+      ELAPSED=$(( END - START ))
+      echo "${1}: rc=${RC} elapsed=${ELAPSED}s"
+    }
+
+    # Control FIRST: the same write on a label with no vector index at all.
+    run_timed control_create "CREATE (:CIL_NoIdx {id: 900001, emb: vectorf32('${VEC}')})"
+    RC_CTL=$RC; T_CTL=$ELAPSED
+    [ "$RC_CTL" -eq 0 ] || { cat /tmp/cil_control_create.log; echo "FAIL: the control write failed"; exit 1; }
+
+    # (a) CREATE of a new node on the INDEXED label.
+    run_timed indexed_create "CREATE (:CIL_Doc {id: 900002, emb: vectorf32('${VEC}')})"
+    RC_C=$RC; T_C=$ELAPSED
+    cat /tmp/cil_indexed_create.log
+
+    # (b) SET of the vector on an existing vector-less node of the indexed label.
+    "$BIN" query "CREATE (:CIL_Doc {id: 900003})" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --timeout 300 > /dev/null 2>&1
+    run_timed indexed_set "MATCH (n:CIL_Doc {id: 900003}) SET n.emb = vectorf32('${VEC}')"
+    RC_S=$RC; T_S=$ELAPSED
+    cat /tmp/cil_indexed_set.log
+
+    echo "control(unindexed CREATE)=${T_CTL}s indexed CREATE=${T_C}s indexed SET=${T_S}s budget=${BUDGET_S}s"
+
+    [ "$RC_C" -eq 0 ] || { echo "FAIL: the CREATE on the indexed label failed"; exit 1; }
+    [ "$RC_S" -eq 0 ] || { echo "FAIL: the SET on the indexed label failed"; exit 1; }
+    [ "$T_C" -le "$BUDGET_S" ] || { echo "FAIL: one CREATE on an indexed vector property took ${T_C}s (> ${BUDGET_S}s budget; the same write on an unindexed label took ${T_CTL}s) — the write is doing a full index rebuild"; exit 1; }
+    [ "$T_S" -le "$BUDGET_S" ] || { echo "FAIL: one SET of an indexed vector property took ${T_S}s (> ${BUDGET_S}s budget; the same write on an unindexed label took ${T_CTL}s) — the write is doing a full index rebuild"; exit 1; }
+    echo "PASS: single writes into the indexed vector property completed in ${T_C}s / ${T_S}s"
+  timeout_ms: 600000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: single writes into the indexed vector property'
+  tags: [index, liveness, key-assertion]
+
+- name: single-writes-are-searchable
+  description: |
+    The latency assertion is worthless if the fast path skipped the index: both
+    rows written above must be findable through the index.
+  type: bash
+  command: |
+    ADDR="${GEODE_SERVER_ADDRESS:-127.0.0.1:${GEODE_PORT:-3141}}"
+    BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    DIM=256
+    VEC="["
+    SEP=""
+    for d in $(seq 1 $DIM); do
+      VEC="${VEC}${SEP}0.5"
+      SEP=", "
+    done
+    VEC="${VEC}]"
+    OUT=$("$BIN" query "MATCH (n:CIL_Doc) WHERE id(n) IN knn('emb', vectorf32('${VEC}'), 5, 'l2') RETURN n.id AS id" \
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --timeout 300 2>&1)
+    echo "$OUT"
+    echo "$OUT" | grep -q '"id":900002' || { echo "FAIL: the CREATE-written vector is not in the index"; exit 1; }
+    echo "$OUT" | grep -q '"id":900003' || { echo "FAIL: the SET-written vector is not in the index"; exit 1; }
+    echo "PASS: both single-write vectors are searchable"
+  timeout_ms: 300000
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'PASS: both single-write vectors are searchable'
+  tags: [index, liveness]
+
 - name: seeded-rows-untouched
   description: |
     Control — the backfill is a read; it must not have changed the data. A
@@ -176,10 +344,10 @@ tests:
     BIN="${GEODE_BINARY:-./zig-out/bin/geode}"
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
     OUT=$("$BIN" query "MATCH (n:CIL_Doc) RETURN count(n) AS c" \
-      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+      --server "$ADDR" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --timeout 300 2>&1)
     echo "$OUT"
     C=$(echo "$OUT" | grep -o '"c":[0-9]*' | head -1 | cut -d: -f2)
-    [ -n "$C" ] && [ "$C" -ge 1000 ] || { echo "FAIL: rows disappeared (${C:-0})"; exit 1; }
+    [ -n "$C" ] && [ "$C" -ge 3000 ] || { echo "FAIL: rows disappeared (${C:-0})"; exit 1; }
     echo "PASS: ${C} CIL_Doc rows still present after the backfill"
   expect:
     exit_code: 0
