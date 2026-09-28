@@ -1,6 +1,6 @@
 module geodedb.com/geode-loadtest
 
-go 1.27.0
+go 1.27.1
 
 require geodedb.com/geode v0.1.31
 
