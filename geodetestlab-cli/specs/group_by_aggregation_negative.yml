@@ -75,8 +75,8 @@ cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 30000
     cleanup: true
     args:
@@ -115,7 +115,7 @@ tests:
     correctly produce group 1 -> 2 rows and group 2 -> 3 rows, proving the
     baseline GROUP BY/aggregation path works before probing its negative
     edges.
-  query: "MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp"
+  query: MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp
   expected:
     exit_code: 0
     stdout_contains:
@@ -140,7 +140,7 @@ tests:
     function"); this build instead silently accepts it. Do not weaken
     this assertion to expect an error until the underlying validation
     gap is fixed — flip it then.
-  query: "MATCH (n:P20_N) RETURN n.g, n.v, count(*) GROUP BY n.g"
+  query: MATCH (n:P20_N) RETURN n.g, n.v, count(*) GROUP BY n.g
   expected:
     exit_code: 0
     stdout_contains:
@@ -159,7 +159,7 @@ tests:
     operand type and raise a query-time type error for non-numeric input,
     matching the ISO/IEC 39075:2024 contract. Expected real behavior:
     status_class 58000, error "TypeMismatch" — no longer a silent 0.
-  query: "MATCH (n:P20_N) RETURN sum(n.s) AS total"
+  query: MATCH (n:P20_N) RETURN sum(n.s) AS total
   expected:
     exit_code: 0
     stdout_contains:
@@ -179,7 +179,7 @@ tests:
     consistent: both now raise a query-time type error for non-numeric
     operands. Expected real behavior: status_class 58000, error
     "TypeMismatch" — the same rejection sum() now gives.
-  query: "MATCH (n:P20_N) RETURN avg(n.s) AS total"
+  query: MATCH (n:P20_N) RETURN avg(n.s) AS total
   expected:
     exit_code: 0
     stdout_contains:
@@ -199,7 +199,7 @@ tests:
     error. GAP-0926 makes geode reject it. Expected real behavior:
     status_class 42803, error "Aggregate functions cannot be nested" — a
     proper query-time rejection rather than a silently-wrong NULL.
-  query: "MATCH (n:P20_N) RETURN sum(avg(n.v)) AS nested"
+  query: MATCH (n:P20_N) RETURN sum(avg(n.v)) AS nested
   expected:
     exit_code: 0
     stdout_contains:
@@ -216,7 +216,7 @@ tests:
     keep ONLY the group with c=3 (g=2) and exclude the group with c=2
     (g=1). Proves the baseline HAVING path works before probing its
     unknown-identifier edge.
-  query: "MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING c > 2"
+  query: MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING c > 2
   expected:
     exit_code: 0
     stdout_contains:
@@ -228,44 +228,41 @@ tests:
 
 - name: p20-having-unknown-alias
   description: |
-    KEY ASSERTION / LIMITATION-PIN — `HAVING nosuchalias > 2` where
-    nosuchalias is neither a RETURN alias, a GROUP BY key, nor an
-    aggregate. Probed real behavior: no error (status_class 00000) —
-    the documented contract ("unknown identifier in HAVING") is NOT
-    enforced. Instead the result set is silently filtered to ZERO rows.
-    See p20-having-unknown-alias-is-null-differential below for the
-    root-cause proof (nosuchalias resolves to NULL, not an error). Do
-    not weaken this assertion to expect an error until the underlying
-    validation gap is fixed — flip it then.
-  query: "MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING nosuchalias > 2"
+    KEY ASSERTION — `HAVING nosuchalias > 2` where nosuchalias is
+    neither a RETURN alias, a GROUP BY key, nor an aggregate. This was a
+    LIMITATION-PIN (status_class 00000, rows silently filtered to zero).
+    Current geode enforces the documented contract: 42703, "A HAVING
+    ... names something that is no column, binding or parameter". The
+    pin is flipped to assert the rejection.
+  query: MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING nosuchalias > 2
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"42703"'
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"rows":[]'
-  tags: [aggregation, having, negative, key-assertion, limitation-pin, silent-accept]
+  tags: [aggregation, having, negative, key-assertion, key-negative]
 
 - name: p20-having-unknown-alias-is-null-differential
   description: |
-    Root-cause differential for p20-having-unknown-alias — `HAVING
-    nosuchalias IS NULL` over the SAME unresolvable identifier returns
-    BOTH groups (grp=1,c=2 and grp=2,c=3), proving nosuchalias silently
-    resolves to SQL NULL rather than raising "unknown identifier".
-    `NULL > 2` is unknown/false, which is exactly what filters every row
-    out in the `> 2` case above — this is a consistent, deterministic,
-    silent NULL-resolution, not a crash or a raised error.
-  query: "MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING nosuchalias IS NULL"
+    Differential for p20-having-unknown-alias — `HAVING nosuchalias IS
+    NULL` over the SAME unresolvable identifier. It used to return both
+    groups, proving the identifier silently resolved to NULL. geode now
+    rejects the unknown identifier (42703) whatever the predicate, so no
+    group may be returned.
+  query: MATCH (n:P20_N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING nosuchalias IS NULL
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"42703"'
+    stdout_not_contains:
     - '"status_class":"00000"'
     - '"grp":1,"c":2'
-    - '"grp":2,"c":3'
-  tags: [aggregation, having, negative, limitation-pin, silent-accept, differential]
+  tags: [aggregation, having, negative, differential]
 
 - name: p20-cleanup
   description: Clean up all P20 test data.
-  query: "MATCH (n:P20_N) DETACH DELETE n"
+  query: MATCH (n:P20_N) DETACH DELETE n
   expected:
     exit_code: 0
   tags: [cleanup]
