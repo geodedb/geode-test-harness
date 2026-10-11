@@ -297,6 +297,18 @@ tests:
 
     chmod 000 "$WORKDIR/data/audit.jsonl"
     echo "P6_SINK_CHMOD_000_OK"
+    # root ignores file modes (CAP_DAC_OVERRIDE), so under root -- the CI
+    # test-all job runs as root in alpine -- chmod 000 leaves the sink
+    # writable and the server rightly starts. Make the sink unopenable for
+    # root too: a directory in its place cannot be opened for appending
+    # (EISDIR). Same contract: an audit sink the server cannot open.
+    # The seeded log is set aside, and p6_hard_failure_restore_and_chain_verify
+    # puts it back.
+    if [ "$(id -u)" -eq 0 ]; then
+      mv "$WORKDIR/data/audit.jsonl" "$WORKDIR/data/audit.jsonl.p6-root-aside"
+      mkdir "$WORKDIR/data/audit.jsonl"
+      echo "P6_SINK_REPLACED_WITH_DIR_FOR_ROOT"
+    fi
 
     GEODE_AUDIT_ENABLED=1 GEODE_ALLOW_TEST_AUDIT_KEYS=1 GEODE_DISABLE_AUDIT=0 GEODE_ADMIN_PASSWORD="$PW" \
       nohup "$BIN" serve --data-dir "$WORKDIR/data" --log-level warn --listen "127.0.0.1:${PORT}" \
@@ -384,6 +396,12 @@ tests:
     # (no pkill -f here -- see hygiene note in the boot_and_seed test above)
     sleep 0.3
 
+    # Under root the failure probe swapped the sink for a directory and set
+    # the seeded log aside; put it back.
+    if [ -d "$WORKDIR/data/audit.jsonl" ] && [ -f "$WORKDIR/data/audit.jsonl.p6-root-aside" ]; then
+      rmdir "$WORKDIR/data/audit.jsonl"
+      mv "$WORKDIR/data/audit.jsonl.p6-root-aside" "$WORKDIR/data/audit.jsonl"
+    fi
     chmod 644 "$WORKDIR/data/audit.jsonl"
     echo "P6_SINK_RESTORED_644"
 
