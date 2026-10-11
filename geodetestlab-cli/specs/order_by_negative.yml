@@ -71,8 +71,8 @@ cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 30000
     cleanup: true
     args:
@@ -91,7 +91,7 @@ tests:
     Prerequisite (positive) — seed 5 P13_N nodes with integer v values in
     non-sorted insertion order (5, 2, 8, 1, 9), so a subsequent ORDER BY
     has real sorting work to do.
-  query: "CREATE (:P13_N {v:5}), (:P13_N {v:2}), (:P13_N {v:8}), (:P13_N {v:1}), (:P13_N {v:9})"
+  query: CREATE (:P13_N {v:5}), (:P13_N {v:2}), (:P13_N {v:8}), (:P13_N {v:1}), (:P13_N {v:9})
   expected:
     exit_code: 0
     stdout_contains:
@@ -103,7 +103,7 @@ tests:
     Prerequisite (positive) — a normal, valid ORDER BY n.v ASC over the
     seeded ints must sort correctly (1, 2, 5, 8, 9), proving the baseline
     ORDER BY path itself works before we probe its negative edges.
-  query: "MATCH (n:P13_N) RETURN n.v ORDER BY n.v ASC"
+  query: MATCH (n:P13_N) RETURN n.v ORDER BY n.v ASC
   expected:
     exit_code: 0
     stdout_contains:
@@ -126,7 +126,7 @@ tests:
     existing column would produce. Verified deterministic across two
     consecutive identical probes. This is asserted as the real (accepted)
     behavior, not claimed as a rejection.
-  query: "MATCH (n:P13_N) RETURN n.v ORDER BY n.nosuch"
+  query: MATCH (n:P13_N) RETURN n.v ORDER BY n.nosuch
   expected:
     exit_code: 0
     stdout_contains:
@@ -140,14 +140,16 @@ tests:
   description: |
     KEY NEGATIVE — ORDER BY n.v ASCENDING (ASCENDING is not a recognized
     direction keyword; only ASC/DESC are valid) must be rejected as a
-    syntax error. Probed real behavior: status_class 42000, error "parse
-    error" — a genuine parse-time rejection, not a silent-accept.
-  query: "MATCH (n:P13_N) RETURN n.v ORDER BY n.v ASCENDING"
+    syntax error. Probed real behavior: status_class 42000, a genuine
+    parse-time rejection, not a silent-accept. Since geode 381267bd the
+    parser reports the stray keyword as "this clause cannot follow the
+    one before it" instead of "parse error".
+  query: MATCH (n:P13_N) RETURN n.v ORDER BY n.v ASCENDING
   expected:
     exit_code: 0
     stdout_contains:
     - '"status_class":"42000"'
-    - parse error
+    - this clause cannot follow the one before it
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [order-by, negative, invalid-direction, key-assertion]
@@ -175,7 +177,7 @@ tests:
     before ASCII digit characters) — it is a typed total order that
     groups by value type. Verified deterministic across repeated probes.
     Asserted as the real (accepted) behavior, not claimed as a rejection.
-  query: "MATCH (n:P13_MIX) RETURN n.v ORDER BY n.v"
+  query: MATCH (n:P13_MIX) RETURN n.v ORDER BY n.v
   expected:
     exit_code: 0
     stdout_contains:
@@ -204,20 +206,20 @@ tests:
     this spec's description and p13-report.md for the full repro. This
     test is asserted as the real (accepted) behavior for a positive
     out-of-range ordinal, not claimed as a rejection.
-  query: "MATCH (n:P13_N) RETURN n.v ORDER BY 99"
+  query: MATCH (n:P13_N) RETURN n.v ORDER BY 99
   expected:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
     - '"order_keys":["99"]'
-    - 'E:OrdinalSortKey'
+    - E:OrdinalSortKey
     stdout_regex:
     - '"v":8\D+"v":9\D+"v":5\D+"v":2\D+"v":1\D'
   tags: [order-by, negative, ordinal, limitation-pin, silent-accept]
 
 - name: cleanup-test-data
   description: Clean up all P13 test data.
-  query: "MATCH (n) WHERE n:P13_N OR n:P13_MIX DETACH DELETE n"
+  query: MATCH (n) WHERE n:P13_N OR n:P13_MIX DETACH DELETE n
   expected:
     exit_code: 0
   tags: [cleanup]

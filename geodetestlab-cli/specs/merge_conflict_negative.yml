@@ -57,8 +57,8 @@ cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 30000
     cleanup: true
     args:
@@ -113,47 +113,46 @@ tests:
 - name: merge-undefined-var-pattern
   description: |
     KEY NEGATIVE — MERGE (n:P16_Unbound {k: m.v}) references `m`, a
-    variable never bound by any MATCH pattern in this query. Per the
-    unbound-variable limitation-pin in where_clause_negative.yml (an
-    unbound variable referenced in WHERE silently resolves to NULL and
-    filters rows, rather than erroring), probed real behavior:
-    status_class 00000, NOT an error. The property access
-    `m.v` evaluates to NULL and MERGE silently CREATES a node with
-    k=null. Asserted as the real (accepted) behavior — LIMITATION-PIN,
-    not the naming error one might expect.
-  query: "MERGE (n:P16_Unbound {k: m.v}) RETURN n.k AS k"
+    variable never bound by any MATCH pattern in this query. This used to
+    be a LIMITATION-PIN: `m.v` evaluated to NULL and MERGE silently created
+    a node with k=null (status_class 00000). Since geode e5e56535
+    (write-shape allowlist, SONNY-3166/SONNY-3182) the whole statement is
+    refused with 0A000 before anything is written. The limitation-pin
+    flipped once the fix landed: assert the refusal.
+  query: 'MERGE (n:P16_Unbound {k: m.v}) RETURN n.k AS k'
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"0A000"'
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"k":null'
-  tags: [merge, negative, unbound-var, limitation-pin, silent-accept, key-assertion]
+  tags: [merge, negative, unbound-var, key-assertion]
 
 - name: merge-undefined-var-pattern-rerun-dedups
   description: |
-    KEY ASSERTION — re-running the identical unbound-var MERGE must MATCH
-    the already-created null-keyed node, not create a second one. Proves
-    the silent-accept dedups deterministically on NULL keys rather than
-    spawning a duplicate node on every execution.
-  query: "MERGE (n:P16_Unbound {k: m.v}) RETURN n.k AS k"
+    KEY ASSERTION — re-running the identical unbound-var MERGE is refused
+    again (0A000), deterministically, rather than accepted on a second
+    execution.
+  query: 'MERGE (n:P16_Unbound {k: m.v}) RETURN n.k AS k'
   expected:
     exit_code: 0
     stdout_contains:
+    - '"status_class":"0A000"'
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"k":null'
-  tags: [merge, negative, unbound-var, limitation-pin, key-assertion]
+  tags: [merge, negative, unbound-var, key-assertion]
 
 - name: merge-undefined-var-pattern-count
   description: |
-    KEY ASSERTION — count(n) must be exactly 1 after two executions of
-    the unbound-var MERGE. A bug would show count 2 (duplicate node
-    created because the null-keyed MERGE failed to dedup).
+    KEY ASSERTION — count(n) must be exactly 0 after two refused
+    executions of the unbound-var MERGE: the refusal happens before any
+    write, so no null-keyed node may exist.
   query: MATCH (n:P16_Unbound) RETURN count(n) AS c
   expected:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - '"c":1'
+    - '"c":0'
   tags: [merge, negative, unbound-var, key-assertion]
 
 - name: merge-null-key
@@ -163,7 +162,7 @@ tests:
     error. Creates a node with k=null on first execution. Asserted as the
     real (accepted) behavior — LIMITATION-PIN (no rejection of null as a
     merge-key value).
-  query: "MERGE (n:P16_NullKey {k: null}) RETURN n.k AS k"
+  query: 'MERGE (n:P16_NullKey {k: null}) RETURN n.k AS k'
   expected:
     exit_code: 0
     stdout_contains:
@@ -175,7 +174,7 @@ tests:
   description: |
     KEY ASSERTION — re-running the identical null-key MERGE must MATCH
     the existing null-keyed node, not create a second one.
-  query: "MERGE (n:P16_NullKey {k: null}) RETURN n.k AS k"
+  query: 'MERGE (n:P16_NullKey {k: null}) RETURN n.k AS k'
   expected:
     exit_code: 0
     stdout_contains:
