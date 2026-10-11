@@ -155,7 +155,13 @@ tests:
   - role
   - list
 - name: policy-create-rls
-  description: Create row-level security policy
+  description: |
+    Create a row-level security policy. Its USING condition is written in
+    geode's policy predicate grammar (true, current_user()/current_tenant()/
+    current_graph()/resource.label/principal.attributes.<key> = '<literal>',
+    AND/OR), which every policy must compile to since geode b5130bf4. The
+    old condition, user_id = current_user_id(), compares a row property with
+    a function; see policy-create-rls-row-comparison-refused.
   args:
   - policy
   - create
@@ -164,7 +170,7 @@ tests:
   - --table
   - users
   - --using
-  - user_id = current_user_id()
+  - current_user() = 'user_data_owner'
   expect:
     exit_code: 0
     stdout_contains:
@@ -175,6 +181,32 @@ tests:
   - policy
   - rls
   - security
+- name: policy-create-rls-row-comparison-refused
+  description: |
+    A USING condition that compares a row property with a function
+    (user_id = current_user_id()) is outside the policy predicate grammar,
+    and geode refuses it at DDL time with 42000 (b5130bf4). Before that it
+    was stored uncompiled and denied everything at runtime, so this spec's
+    old "created" expectation pinned a policy that never worked.
+  args:
+  - policy
+  - create
+  - user_data_policy_rowcmp
+  - User can only see their own data
+  - --table
+  - users
+  - --using
+  - user_id = current_user_id()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '42000'
+    - Unsupported policy USING expression
+  tags:
+  - policy
+  - rls
+  - security
+  - negative
 - name: audit-log-check
   description: Verify audit logging is working
   setup:
