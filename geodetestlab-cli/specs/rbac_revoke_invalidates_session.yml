@@ -92,6 +92,21 @@ tests:
     stdout_contains: [Granted]
   tags: [rbac, setup, grant]
 
+- name: revoke-bob-can-read-before-revoke
+  description: |
+    POSITIVE — the READ grant lets readonly bob bind rbac_revoke_graph and
+    read it. This also puts bob's bind_graph ALLOW into geode's GPS decision
+    cache, which the post-revoke read below must not be served from.
+  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke-Bob-1234, '-']
+  stdin: |
+    USE GRAPH rbac_revoke_graph;
+    RETURN 1 AS x;
+  expect:
+    exit_code: 0
+    stdout_contains: ['"x":1']
+    stdout_not_contains: [Access denied]
+  tags: [rbac, positive, pre_revoke, grant]
+
 - name: revoke-bob-write-still-denied-before-revoke
   description: |
     NEGATIVE — bob is readonly globally; READ grant does not confer write.
@@ -116,15 +131,36 @@ tests:
 - name: revoke-bob-write-still-denied-after-revoke
   description: |
     NEGATIVE — after the grant revoke, bob's next fresh connection write
-    attempt must still fail with 42501. This confirms the revoke was
-    applied immediately to the enforcement layer (no stale grant cache).
+    attempt must still fail. With the READ grant gone bob may not bind
+    rbac_revoke_graph at all, so the USE GRAPH is refused (exit 3, "Access
+    denied") before the CREATE is reached. This confirms the revoke was
+    applied immediately to the enforcement layer (no stale grant cache);
+    a stale cached bind ALLOW would instead reach the write gate (42501).
   args: [query, -U, rbac_revoke_bob, -P, RbacRevoke-Bob-1234, '-']
   stdin: |
     USE GRAPH rbac_revoke_graph;
     CREATE (n:RbacRevokeBobPost {v: 1}) RETURN n;
   expect:
-    exit_code: 0
-    stdout_contains: ['42501', Permission denied]
+    exit_code: 3
+    stdout_contains: [Access denied, insufficient permissions for graph]
+    stdout_not_contains: [RbacRevokeBobPost]
+  tags: [rbac, negative, post_revoke, gap0290]
+
+- name: revoke-bob-read-denied-after-revoke
+  description: |
+    NEGATIVE — after REVOKE READ ON GRAPH, bob may no longer bind
+    rbac_revoke_graph. geode cached bob's earlier bind_graph ALLOW, and a
+    grant change bumped neither his auth_version nor the policy version,
+    so the revoked grant kept working until restart. A grant change now
+    bumps the policy version and invalidates the cached decision.
+  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke-Bob-1234, '-']
+  stdin: |
+    USE GRAPH rbac_revoke_graph;
+    RETURN 1 AS x;
+  expect:
+    exit_code: 3
+    stdout_contains: [Access denied, insufficient permissions for graph]
+    stdout_not_contains: ['"x":1']
   tags: [rbac, negative, post_revoke, gap0290]
 
 # --- Part B: ALTER USER role downgrade invalidates write ---
