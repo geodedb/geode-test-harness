@@ -121,13 +121,13 @@ tests:
     HOLDER_QUERY="MATCH (a:P21Load),(b:P21Load),(c:P21Load),(d:P21Load),(e:P21Load) RETURN count(*) AS c"
 
     ( geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
-        -U geode -P "${PW}" --timeout 60 "${HOLDER_QUERY}" \
+        -U geode -P "${PW}" --timeout 180 "${HOLDER_QUERY}" \
         > "${P21_DIR}/holder1.out" 2>&1 ) &
     echo $! > "${P21_DIR}/holder1.pid"
     disown
 
     ( geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
-        -U geode -P "${PW}" --timeout 60 "${HOLDER_QUERY}" \
+        -U geode -P "${PW}" --timeout 180 "${HOLDER_QUERY}" \
         > "${P21_DIR}/holder2.out" 2>&1 ) &
     echo $! > "${P21_DIR}/holder2.pid"
     disown
@@ -231,8 +231,11 @@ tests:
     H2=$(cat "${P21_DIR}/holder2.pid" 2>/dev/null || echo "")
 
     # Poll (not `wait` -- these PIDs are not children of this shell)
-    # until both holders have exited, bounded by a generous deadline.
-    DEADLINE=$(( $(date +%s) + 45 ))
+    # until both holders have exited. Each holder carries its own
+    # --timeout 180, so 190 s bounds this even when they never finish.
+    # On a fast host they finish in 15-25 s; four specs in parallel on
+    # two CPUs pushed them past the old 60 s client timeout.
+    DEADLINE=$(( $(date +%s) + 190 ))
     while :; do
       STILL_ALIVE=0
       [ -n "${H1}" ] && kill -0 "${H1}" 2>/dev/null && STILL_ALIVE=1
@@ -254,17 +257,30 @@ tests:
     [ -n "${H1}" ] && kill -9 "${H1}" 2>/dev/null || true
     [ -n "${H2}" ] && kill -9 "${H2}" 2>/dev/null || true
 
-    OUT=$(geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
-          -U geode -P "${PW}" --timeout 15 \
-          "RETURN 'p21_recovered_ok' AS status" 2>&1)
-    EC=$?
+    # A holder that did hit its client timeout exits while the server is
+    # still executing its statement ("the statement may still be executing
+    # on the server"), and the slot frees only when that finishes. So retry
+    # the recovery query until a slot frees, capped at 60 s, instead of one
+    # 15 s attempt.
+    RECOVER_DEADLINE=$(( $(date +%s) + 60 ))
+    ATTEMPT=0
+    while :; do
+      ATTEMPT=$((ATTEMPT + 1))
+      OUT=$(geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
+            -U geode -P "${PW}" --timeout 15 \
+            "RETURN 'p21_recovered_ok' AS status" 2>&1)
+      EC=$?
+      [ "${EC}" -eq 0 ] && break
+      [ "$(date +%s)" -ge "${RECOVER_DEADLINE}" ] && break
+      sleep 1
+    done
     echo "${OUT}"
-    echo "p21_recover_ec=${EC}"
+    echo "p21_recover_ec=${EC} p21_recover_attempts=${ATTEMPT}"
 
     rm -rf "${P21_DIR}"
 
     [ "${EC}" -eq 0 ] && echo "${OUT}" | grep -q "p21_recovered_ok"
-  timeout_ms: 60000
+  timeout_ms: 300000
   expect:
     exit_code: 0
     stdout_contains:
