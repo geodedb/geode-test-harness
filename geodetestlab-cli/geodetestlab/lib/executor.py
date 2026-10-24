@@ -63,6 +63,25 @@ if not SSL_VERIFY:
     )
 
 
+TIMEOUT_EXCERPT_CHARS = 2000
+
+
+def timeout_output_excerpt(exc: subprocess.TimeoutExpired) -> str:
+    """Return the tail of whatever a timed-out command printed, for the error.
+
+    Without it a timeout reports only its duration, which hides where the
+    command stalled (e.g. a ``backup create`` that printed its banner and
+    progress lines before hanging).
+    """
+    parts = []
+    for label, data in (("stdout", exc.stdout), ("stderr", exc.stderr)):
+        if not data:
+            continue
+        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+        parts.append(f"\n--- {label} before timeout (tail) ---\n{text[-TIMEOUT_EXCERPT_CHARS:]}")
+    return "".join(parts)
+
+
 def _as_list(value: object) -> list[str]:
     """Normalize a scalar-or-list expectation field to a list of strings."""
     if value is None:
@@ -767,12 +786,12 @@ def _execute_and_check(
         error = result.stderr
         exit_code = result.returncode
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         return TestResult(
             name=test_case.name,
             passed=False,
             duration_ms=(time.time() - start_time) * 1000,
-            error=f"Test timed out after {effective_timeout_ms}ms",
+            error=f"Test timed out after {effective_timeout_ms}ms" + timeout_output_excerpt(exc),
         )
     except Exception as e:
         return TestResult(
@@ -1143,12 +1162,12 @@ def _run_shell_test(
             error=stderr if not passed else "",
         )
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         return TestResult(
             name=test_case.name,
             passed=False,
             duration_ms=(time.time() - start_time) * 1000,
-            error=f"Shell test timed out after {timeout_s:.0f} seconds",
+            error=f"Shell test timed out after {timeout_s:.0f} seconds" + timeout_output_excerpt(exc),
         )
     except Exception as e:
         return TestResult(
