@@ -3,12 +3,12 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
-GO_VERSION = "1.27.1"
+GO_VERSION = "1.27.3"
 GOLANGCI_LINT_VERSION = "v2.14.0"
 
 
@@ -59,7 +59,11 @@ def main():
     )
     version = (
         subprocess.run(
-            [str(binary), "version"], env=env, capture_output=True, text=True
+            [str(binary), "version"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if binary.is_file()
         else None
@@ -73,7 +77,7 @@ def main():
                 GOBIN=temporary,
                 GOOS=host["GOHOSTOS"],
                 GOARCH=host["GOHOSTARCH"],
-                GOFLAGS="-p=4",
+                GOFLAGS=env.get("GOFLAGS", "-p=4"),
             )
             subprocess.run(
                 [
@@ -103,7 +107,7 @@ def main():
         and not any(a.startswith("--allow-parallel-runners") for a in args)
     ):
         args = [args[0], "--allow-parallel-runners", *args[1:]]
-    return subprocess.run([str(binary), *args], env=env).returncode
+    return subprocess.run([str(binary), *args], env=env, check=False).returncode
 
 
 if __name__ == "__main__":

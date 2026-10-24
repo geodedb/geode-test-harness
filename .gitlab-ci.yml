@@ -4,6 +4,14 @@
 workflow:
   auto_cancel:
     on_new_commit: interruptible
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      auto_cancel:
+        on_new_commit: none
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
 
 default:
   interruptible: true
@@ -38,6 +46,17 @@ variables:
 # Lint Stage: Static analysis and quality gates
 # =============================================================================
 
+# Authenticate dependency fetches without embedding the job credential in
+# cloned repository URLs. Every dependency checkout remains shallow.
+.git-auth:
+  before_script:
+    - |
+      if [ -n "${CI_JOB_TOKEN:-}" ]; then
+        umask 077
+        printf 'machine gitlab.com\nlogin gitlab-ci-token\npassword %s\n' "$CI_JOB_TOKEN" >> ~/.netrc
+        chmod 600 ~/.netrc
+      fi
+
 # Shared setup for Python jobs that need the full dev environment (PERF-006)
 .python-setup:
   # Pin to the lab pool: the Company Cluster (k8s) runners freeze the
@@ -49,14 +68,18 @@ variables:
     - lab
     - linux
   image: python:3.14-slim
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+    PIP_CACHE_POLICY: pull
   cache:
-    # Key includes the interpreter version: a .venv created under an
-    # older python (cached across the 3.13 -> 3.14 image bump) has
-    # dangling interpreter symlinks and stale site-packages, which
-    # produced spurious CLI test failures and hangs.
-    key: pip-py314-${CI_COMMIT_REF_SLUG}
+    # Cache wheels across branches; recreate interpreter-bound environments.
+    # test-unit owns the shared cache upload.
+    key:
+      prefix: pip-python3.14-slim-linux-amd64
+      files: [geodetestlab-cli/pyproject.toml]
     paths:
-      - geodetestlab-cli/.venv/
+      - .cache/pip/
+    policy: $PIP_CACHE_POLICY
   before_script:
     - cd geodetestlab-cli
     - python -m venv .venv
@@ -73,6 +96,10 @@ lint-python:
   rules:
     - changes:
         - "geodetestlab-cli/**/*.py"
+        - "geodetestlab-cli/pyproject.toml"
+        - "scripts/ci-clone.sh"
+        - "scripts/test_ci_clone.py"
+        - ".gitlab-ci.yml"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 lint-mypy:
@@ -85,39 +112,36 @@ lint-mypy:
   rules:
     - changes:
         - "geodetestlab-cli/**/*.py"
+        - "geodetestlab-cli/pyproject.toml"
+        - "scripts/ci-clone.sh"
+        - "scripts/test_ci_clone.py"
+        - ".gitlab-ci.yml"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 test-unit:
   extends: .python-setup
   stage: lint
+  variables:
+    PIP_CACHE_POLICY: pull-push
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git
+    - !reference [.python-setup, before_script]
   # Unit tests run in seconds; anything longer is a hang, not work.
   timeout: 20m
   script:
     - . .venv/bin/activate
-    # --timeout/--timeout-method=thread: an unexplained hang in
-    # TestRunTestsClusterMode only reproduces on CI runners; the thread
-    # method dumps every thread's stack on expiry so the hang is
-    # diagnosable instead of burning the 20m job timeout silently.
-    # -rA prints the short outcome of every test; the explicit rc echo
-    # separates pytest's own exit status from anything the shell adds.
-    # (CI-only mystery: session reports all-green but the job exits 1.)
-    # `|| rc=$?` survives the runner's set -e (a bare `cmd; rc=$?`
-    # aborts the script before the diagnostics can run). If the suite
-    # reports green but pytest exits nonzero (the current CI-only
-    # mystery), re-run once without the coverage plugin to bisect it.
-    - rc=0; python -m pytest geodetestlab/tests/ -v -rA --tb=short --timeout=120 --timeout-method=thread -o faulthandler_timeout=180 || rc=$?
-    - echo "pytest-exit-code=$rc"
-    - |
-      if [ "$rc" -ne 0 ]; then
-        echo "--- bisect: re-run without pytest-cov ---"
-        rc2=0; python -m pytest geodetestlab/tests/ -q -p no:cov --timeout=120 --timeout-method=thread || rc2=$?
-        echo "no-cov-exit-code=$rc2"
-      fi
-    - exit $rc
+    # Preserve coverage, watchdog diagnostics and the native failure status;
+    # do not repeat the complete suite merely to diagnose a failed run.
+    - python -m pytest geodetestlab/tests/ -v -rA --tb=short --timeout=120 --timeout-method=thread -o faulthandler_timeout=180
+    - python ../scripts/test_ci_clone.py
   # Unit tests MUST pass — removed allow_failure (was #57)
   rules:
     - changes:
         - "geodetestlab-cli/**/*.py"
+        - "geodetestlab-cli/pyproject.toml"
+        - "scripts/ci-clone.sh"
+        - "scripts/test_ci_clone.py"
+        - ".gitlab-ci.yml"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 lint-security:
@@ -136,8 +160,8 @@ lint-security:
   #   binary and client runners via subprocess.
   script:
     - mkdir -p reports
-    - bandit -r geodetestlab-cli/geodetestlab/ -s B101,B103,B105,B108,B110,B311,B404,B603,B607 -f json -o reports/bandit.json || true
-    - bandit -r geodetestlab-cli/geodetestlab/ -s B101,B103,B105,B108,B110,B311,B404,B603,B607
+    # One scan produces the report and preserves the same blocking exit code.
+    - bandit -r geodetestlab-cli/geodetestlab/ -s B101,B103,B105,B108,B110,B311,B404,B603,B607 -f json -o reports/bandit.json
   artifacts:
     paths:
       - reports/bandit.json
@@ -146,6 +170,10 @@ lint-security:
   rules:
     - changes:
         - "geodetestlab-cli/**/*.py"
+        - "geodetestlab-cli/pyproject.toml"
+        - "scripts/ci-clone.sh"
+        - "scripts/test_ci_clone.py"
+        - ".gitlab-ci.yml"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 # =============================================================================
@@ -154,9 +182,12 @@ lint-security:
 
 .build-template:
   stage: build
+  dependencies: []
   tags:
     - company
+    - dedicated
     - linux
+    - x86
   allow_failure: true
   artifacts:
     paths:
@@ -168,12 +199,20 @@ lint-security:
 build-zig:
   extends: .build-template
   image: alpine:3.24
+  variables:
+    ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.cache/zig-global"
   cache:
-    key: zig-${ZIG_VERSION}
-    paths:
-      - zig-x86_64-linux-${ZIG_VERSION}/
+    - key: zig-toolchain-${ZIG_VERSION}-linux-amd64
+      paths: ['zig-x86_64-linux-${ZIG_VERSION}/']
+    - key:
+        prefix: zig-runner-${ZIG_VERSION}-alpine3.24-linux-amd64
+        files: [runners/build.zig.zon]
+      paths: [.cache/zig-global/, runners/.zig-cache/]
   before_script:
-    - apk add --no-cache curl xz tar
+    - !reference [.git-auth, before_script]
+    - apk add --no-cache bash curl xz tar git openssl-dev
+    - bash scripts/ci-clone.sh https://gitlab.com/devnw/codepros/geode/geode-client-zig.git ../geode-client-zig
+    - bash scripts/ci-clone.sh https://gitlab.com/devnw/zig/yaml.git ../../../zig/yaml
     - |
       if [ ! -d "zig-x86_64-linux-${ZIG_VERSION}" ]; then
         curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
@@ -188,49 +227,69 @@ build-zig:
     - cd runners
     - zig build -Doptimize=ReleaseFast
     - cp zig-out/bin/zig_runner ./zig_runner
-  # Pass Zig toolchain as artifact so test-all can reuse it (PERF-010)
+  # test-all restores the shared toolchain cache instead of downloading a
+  # second copy of the same compiler as an artifact.
   artifacts:
     paths:
       - runners/zig_runner
-      - zig-x86_64-linux-${ZIG_VERSION}/
     expire_in: 1 hour
   rules:
-    - exists:
-        - runners/build.zig
+    - if: '$CI_COMMIT_TAG || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"'
+    - changes: ['runners/**/*.zig', 'runners/build.zig.zon', '.gitlab-ci.yml', 'scripts/ci-clone.sh']
 
 build-go:
   extends: .build-template
-  image: golang:1.27.1
+  image: golang:1.27.3
   allow_failure: true
+  variables:
+    GOTOOLCHAIN: local
+    GOMAXPROCS: "4"
+    GOFLAGS: "-buildvcs=false -p=2"
+    GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
+    GOCACHE: "$CI_PROJECT_DIR/.go/build"
+    GOLANGCI_LINT_CACHE: "$CI_PROJECT_DIR/.cache/golangci-lint"
+    XDG_CACHE_HOME: "$CI_PROJECT_DIR/.cache"
   cache:
-    key: go-mod-${CI_COMMIT_REF_SLUG}
-    paths:
-      - runners/.go-cache/
+    - key:
+        prefix: go-runner-go1.27.3-linux-amd64
+        files: [runners/go.sum]
+      paths: [.go/pkg/mod/, .go/build/, .cache/golangci-lint/]
+    - key: golangci-v2.14.0-go1.27.3-linux-amd64
+      paths: [.cache/devnw/golangci-lint/]
   before_script:
-    # Clone the Go client repo using CI job token
-    # Note: Requires "Allow access to this project with a CI_JOB_TOKEN" enabled in geode-client-go settings
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git ../geode-client-go
+    - !reference [.git-auth, before_script]
+    - apt-get update -qq && apt-get install -y -qq python3
+    - bash scripts/ci-clone.sh https://gitlab.com/devnw/codepros/geode/geode-client-go.git ../geode-client-go
   script:
-    - export GOMODCACHE=$PWD/runners/.go-cache
     - cd runners
     - go mod edit -replace geodedb.com/geode=../../geode-client-go
-    - GONOSUMCHECK=geodedb.com/geode go vet ./...
+    - GONOSUMCHECK=geodedb.com/geode python3 ../scripts/golangci-lint.py fmt --diff
+    - GONOSUMCHECK=geodedb.com/geode python3 ../scripts/golangci-lint.py run --timeout=5m ./...
     - GONOSUMCHECK=geodedb.com/geode go build -o go_runner go_runner.go
+  artifacts:
+    paths: [runners/go_runner]
+    expire_in: 1 hour
   rules:
-    - exists:
-        - runners/go_runner.go
+    - if: '$CI_COMMIT_TAG || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"'
+    - changes: ['runners/**/*.go', 'runners/go.mod', 'runners/go.sum', '.golangci.yml', '.gitlab-ci.yml', 'scripts/ci-clone.sh', 'scripts/golangci-lint.py']
 
 build-rust:
   extends: .build-template
   image: rust:1.98
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   cache:
-    key: rust-${CI_COMMIT_REF_SLUG}
+    key:
+      prefix: rust1.98-linux-amd64
+      files: [runners/rust_runner/Cargo.toml]
     paths:
+      - .cargo/registry/
+      - .cargo/git/
       - runners/rust_runner/target/
   before_script:
-    # Clone the Rust client repo using CI job token for auth
+    - !reference [.git-auth, before_script]
     - apt-get update -qq && apt-get install -y -qq git
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-rust.git ../geode-client-rust
+    - bash scripts/ci-clone.sh https://gitlab.com/devnw/codepros/geode/geode-client-rust.git ../geode-client-rust
   script:
     - cd runners/rust_runner
     # Override git dependency to use locally cloned repo
@@ -238,9 +297,12 @@ build-rust:
     - printf '[patch."https://gitlab.com/devnw/codepros/geode/geode-client-rust.git"]\ngeode-client = { path = "../../../geode-client-rust" }\n' > .cargo/config.toml
     - cargo clippy -- -D warnings 2>/dev/null || true
     - cargo build --release
+  artifacts:
+    paths: [runners/rust_runner/target/release/rust_runner]
+    expire_in: 1 hour
   rules:
-    - exists:
-        - runners/rust_runner/Cargo.toml
+    - if: '$CI_COMMIT_TAG || $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"'
+    - changes: ['runners/rust_runner/**/*', '.gitlab-ci.yml', 'scripts/ci-clone.sh']
 
 # build-python and build-nodejs removed (PERF-021/QG-023/GAP-0272):
 # Both produced empty artifacts and served no pipeline purpose.
@@ -261,25 +323,35 @@ test-all:
   timeout: 2h
   tags:
     - company
+    - dedicated
     - linux
+    - x86
   image: alpine:3.24
-  # Reuse Zig toolchain from build-zig artifact when available (PERF-010)
+  # Wait for the toolchain cache writer when selected, without downloading
+  # unrelated runner artifacts. The native spec suite uses the Geode CLI.
   needs:
     - job: build-zig
-      artifacts: true
+      artifacts: false
       optional: true
   cache:
-    - key: zig-${ZIG_VERSION}
-      paths:
-        - zig-x86_64-linux-${ZIG_VERSION}/
-    - key: pip-integration-${CI_COMMIT_REF_SLUG}
-      paths:
-        - geodetestlab-cli/.venv/
+    - key: zig-toolchain-${ZIG_VERSION}-linux-amd64
+      paths: ['zig-x86_64-linux-${ZIG_VERSION}/']
+      policy: pull
+    - key: geode-build-zig${ZIG_VERSION}-alpine3.24-linux-amd64
+      paths: [.cache/geode-zig-global/, .cache/geode-zig-local/]
+    - key:
+        prefix: pip-integration-alpine3.24-linux-amd64
+        files: [geodetestlab-cli/pyproject.toml]
+      paths: [.cache/pip/]
   variables:
     GEODE_HOST: "127.0.0.1"
     GEODE_PORT: "3141"
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+    ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.cache/geode-zig-global"
+    ZIG_LOCAL_CACHE_DIR: "$CI_PROJECT_DIR/.cache/geode-zig-local"
   before_script:
-    - apk add --no-cache curl xz tar git openssl python3 py3-pip python3-dev gcc musl-dev linux-headers
+    - !reference [.git-auth, before_script]
+    - apk add --no-cache bash curl xz tar git openssl python3 py3-pip python3-dev gcc musl-dev linux-headers
     # Install Zig (reuses cache from build-zig job)
     - |
       if [ ! -d "zig-x86_64-linux-${ZIG_VERSION}" ]; then
@@ -290,7 +362,7 @@ test-all:
       fi
     - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
     # Clone and build Geode server
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
+    - bash scripts/ci-clone.sh https://gitlab.com/devnw/codepros/geode/geode.git ../geode
     - cd ../geode
     - zig build -Doptimize=ReleaseFast -Denable-openssl=false
     - export GEODE_BINARY="$PWD/zig-out/bin/geode"
@@ -333,8 +405,13 @@ test-all:
     expire_in: 1 week
     when: always
   rules:
+    # MRs must actually execute this required gate instead of waiting forever
+    # for its manual button. Direct main/tag/schedule runs retain qualification.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_TAG'
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: '$CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"'
     - when: manual
+      allow_failure: true
 
 # =============================================================================
 # Triage Stage: Route failures to appropriate repositories
@@ -410,7 +487,9 @@ triage-failures:
         fi
       fi
   rules:
-    - when: always
+    # MR qualification retains reports; only main routes external issues.
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: always
   allow_failure: true
 
 # Individual language triage jobs disabled - triage-failures handles all languages from test-all results
@@ -486,9 +565,6 @@ generate-html-report:
     - company
     - linux
   image: python:3.14-slim
-  dependencies:
-    - test-all
-    - triage-failures
   needs:
     - job: test-all
       artifacts: true
