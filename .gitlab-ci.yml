@@ -251,6 +251,11 @@ test-all:
   # the default 1h job timeout; the run died mid-suite at 1h with most
   # specs passing.
   timeout: 2h
+  # The suite runs as three shards (geodetestlab --shard K/N, round-robin
+  # over the sorted spec list). Unsharded it took ~35 min of specs on the
+  # lab runners but 96 min on the AWS spot overflow runner, which then hit
+  # the 2h timeout during the serial retry pass (pipeline 2936414445).
+  parallel: 3
   # x86: the job downloads the x86_64 zig toolchain. company + linux alone
   # also matches the arm64 lab runner, where that zig cannot execute
   # ("ELF: not found", as build-zig hit in pipeline 2936331961).
@@ -302,7 +307,11 @@ test-all:
       fi
     - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
     # Clone and build Geode server
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
+    # Treeless clone (full commit graph + tags, trees/blobs only for HEAD):
+    # build.zig stamps `geode --version` from `git describe --tags`, which in a
+    # --depth 1 clone of an untagged commit is a bare hash with no version, and
+    # cli_flags_comprehensive.yml checks the version string.
+    - git clone --filter=tree:0 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
     - cd ../geode
     - zig build -Doptimize=ReleaseFast -Denable-openssl=true
     - export GEODE_BINARY="$PWD/zig-out/bin/geode"
@@ -325,7 +334,8 @@ test-all:
     - |
       python -m geodetestlab run \
         --specs specs \
-        --output "$CI_PROJECT_DIR/reports/results.json" \
+        --shard "${CI_NODE_INDEX:-1}/${CI_NODE_TOTAL:-1}" \
+        --output "$CI_PROJECT_DIR/reports/shards/${CI_NODE_INDEX:-1}/results.json" \
         --verbose \
         --parallel 4 \
         --transport quic \
@@ -334,7 +344,7 @@ test-all:
     - |
       python3 -c "
       import json, sys
-      with open('reports/results.json') as f:
+      with open('reports/shards/${CI_NODE_INDEX:-1}/results.json') as f:
           data = json.load(f)
       s = data.get('summary', {})
       print('Results: %d/%d passed, %d failed, %d skipped' % (s.get('passed',0), s.get('total',0), s.get('failed',0), s.get('skipped',0)))
@@ -389,6 +399,7 @@ triage-failures:
     - job: test-all
       artifacts: true
   script:
+    - python3 scripts/merge_shard_results.py reports
     - |
       if [ ! -f reports/results.json ]; then
         echo "No results file found, skipping triage"
@@ -442,6 +453,7 @@ analyze-coverage:
       artifacts: true
       optional: true
   script:
+    - python3 scripts/merge_shard_results.py reports
     - |
       python3 -c "
       import json, os, sys
@@ -507,6 +519,7 @@ generate-html-report:
       artifacts: true
       optional: true
   script:
+    - python3 scripts/merge_shard_results.py reports
     - |
       if [ ! -f reports/results.json ]; then
         echo "No results file, skipping report"

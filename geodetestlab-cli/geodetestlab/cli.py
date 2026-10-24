@@ -93,6 +93,25 @@ def _flush_report(
         pass
 
 
+def parse_shard(value: str) -> tuple[int, int]:
+    """Parse a 'K/N' shard selector into (K, N), 1 <= K <= N."""
+    parts = value.split("/")
+    if len(parts) != 2:
+        raise ValueError(f"--shard must be K/N (e.g. 2/3), got {value!r}")
+    try:
+        index, total = int(parts[0]), int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"--shard must be K/N with integers, got {value!r}") from exc
+    if total < 1 or index < 1 or index > total:
+        raise ValueError(f"--shard needs 1 <= K <= N, got {value!r}")
+    return index, total
+
+
+def select_shard(spec_files: list[Path], index: int, total: int) -> list[Path]:
+    """Return shard ``index`` of ``total`` (1-based), dealt round-robin."""
+    return [f for i, f in enumerate(spec_files) if i % total == index - 1]
+
+
 def track_pid(pid: int) -> None:
     """Register a PID for cleanup on exit."""
     _tracked_pids.add(pid)
@@ -259,6 +278,16 @@ def run(
             "suite against multi-node deployments."
         ),
     ),
+    shard: str | None = typer.Option(
+        None,
+        "--shard",
+        help=(
+            "Run only shard K of N of the spec directory, written 'K/N' "
+            "(1-based, e.g. 2/3). Specs are dealt round-robin over the sorted "
+            "file list, so the N shards together cover every spec exactly "
+            "once. Used by CI's `parallel:` test-all jobs."
+        ),
+    ),
 ) -> None:
     """Execute all tests defined in a specification file or directory.
 
@@ -310,6 +339,16 @@ def run(
         if not spec_files:
             console_err.print(f"Error: No YAML files found in directory: {specs}", style="red")
             raise typer.Exit(code=2)
+
+    if shard is not None:
+        try:
+            shard_index, shard_total = parse_shard(shard)
+        except ValueError as exc:
+            console_err.print(f"Error: {exc}", style="red")
+            raise typer.Exit(code=2) from exc
+        spec_files = select_shard(spec_files, shard_index, shard_total)
+        if not ci and verbose:
+            console.print(f"[dim]Shard {shard_index}/{shard_total}: {len(spec_files)} spec files[/dim]")
 
     # Determine which transports to run
     transports_to_run = ["quic", "grpc"] if transport == "both" else [transport]
