@@ -1,5 +1,5 @@
 # Multi-stage build for geodetestlab with Geode support
-FROM python:3.14-slim AS builder
+FROM python:3.15-slim AS builder
 
 WORKDIR /app
 
@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir --upgrade pip==24.3.1 && \
     pip install --no-cache-dir -e .
 
 # Final runtime image
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 WORKDIR /app
 
