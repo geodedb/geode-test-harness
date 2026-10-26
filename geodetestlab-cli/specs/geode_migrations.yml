@@ -168,7 +168,7 @@ tests:
 - name: add-label-to-nodes
   args:
   - query
-  - "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}) MATCH (p:Person) SET p:Human RETURN labels(p)"
+  - "CREATE (:Person {name: 'Alice'}), (:Person {name: 'Bob'}); MATCH (p:Person) SET p:Human RETURN labels(p)"
   - --format
   - json
   expect:
@@ -259,7 +259,10 @@ tests:
       exit_code: 0
   args:
   - query
-  - MATCH (a)-[old:FOLLOWS]->(b) DELETE old CREATE (b)-[r:FOLLOWED_BY]->(a) RETURN type(r)
+  # geode >= 381267bd ends a statement only at ';' and no longer takes a
+  # CREATE after a DELETE in one statement: create the reversed edge, then
+  # delete the old one, then read it back.
+  - MATCH (a)-[old:FOLLOWS]->(b) CREATE (b)-[r:FOLLOWED_BY]->(a); MATCH ()-[old:FOLLOWS]->() DELETE old; MATCH ()-[r:FOLLOWED_BY]->() RETURN type(r)
   - --format
   - json
   expect:
@@ -288,7 +291,7 @@ tests:
   isolated: true
   args:
   - query
-  - "CREATE (:User {name: 'Alice'}), (:User {name: 'Bob'}), (:User {name: 'Charlie'}) MATCH (u1:User), (u2:User) WHERE u1.name < u2.name CREATE (u1)-[:POTENTIAL_FRIEND]->(u2) RETURN count(*) AS count"
+  - "CREATE (:User {name: 'Alice'}), (:User {name: 'Bob'}), (:User {name: 'Charlie'}); MATCH (u1:User), (u2:User) WHERE u1.name < u2.name CREATE (u1)-[:POTENTIAL_FRIEND]->(u2) RETURN count(*) AS count"
   - --format
   - json
   expect:
@@ -298,7 +301,9 @@ tests:
 - name: batch-delete-orphaned-nodes
   args:
   - query
-  - MATCH (n) WHERE NOT (n)--() DETACH DELETE n RETURN count(*) AS count
+  # geode e5e56535 refuses a pattern predicate in a write (SONNY-3182) and
+  # a RETURN after DELETE; count degree with OPTIONAL MATCH instead.
+  - MATCH (n) OPTIONAL MATCH (n)-[r]-() WITH n, count(r) AS deg WHERE deg = 0 DETACH DELETE n; MATCH (n) RETURN count(*) AS count
   - --format
   - json
   expect:

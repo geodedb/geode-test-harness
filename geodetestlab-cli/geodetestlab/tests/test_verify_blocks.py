@@ -40,6 +40,7 @@ from unittest.mock import patch
 import pytest
 
 from geodetestlab.lib.executor import _build_cli_command, run_cli_test
+from geodetestlab.lib.runner_types import TestResult
 from geodetestlab.lib.spec import TestCase, load_spec
 
 FIXTURE_SPEC = Path(__file__).parent / "fixtures" / "verify_selfcheck.yml"
@@ -129,7 +130,7 @@ class TestVerifyExecutionRuns:
     live server — the harness's verify-execution + expectation-checking logic is
     the real code under test."""
 
-    def _run(self, tc: TestCase) -> tuple[object, list[str]]:
+    def _run(self, tc: TestCase) -> tuple[TestResult, list[str]]:
         executed_queries: list[str] = []
 
         def _side_effect(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]

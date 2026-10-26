@@ -63,6 +63,25 @@ if not SSL_VERIFY:
     )
 
 
+TIMEOUT_EXCERPT_CHARS = 2000
+
+
+def timeout_output_excerpt(exc: subprocess.TimeoutExpired) -> str:
+    """Return the tail of whatever a timed-out command printed, for the error.
+
+    Without it a timeout reports only its duration, which hides where the
+    command stalled (e.g. a ``backup create`` that printed its banner and
+    progress lines before hanging).
+    """
+    parts = []
+    for label, data in (("stdout", exc.stdout), ("stderr", exc.stderr)):
+        if not data:
+            continue
+        text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+        parts.append(f"\n--- {label} before timeout (tail) ---\n{text[-TIMEOUT_EXCERPT_CHARS:]}")
+    return "".join(parts)
+
+
 def _as_list(value: object) -> list[str]:
     """Normalize a scalar-or-list expectation field to a list of strings."""
     if value is None:
@@ -73,8 +92,14 @@ def _as_list(value: object) -> list[str]:
 
 
 def _escape_gql_string(s: str) -> str:
-    """Escape a string for use inside GQL single quotes."""
-    return s.replace("'", "\\'").replace("\\", "\\\\")
+    """Escape a string for use inside GQL single quotes.
+
+    Backslashes are escaped first: escaping the quote first and then every
+    backslash turned ``'`` into ``\\\\'``, an escaped backslash followed by a
+    bare quote that ended the literal early, so a value containing a quote
+    could break out of the string.
+    """
+    return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
 def _extract_capture(step: TestStep, stdout: str) -> tuple[str | None, str | None]:
@@ -284,11 +309,14 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
 
     # --- policy commands ---
     elif subcmd == "policy" and action == "create":
+        # geode.auth.policy_create takes (name, table, condition); a
+        # description positional is accepted for CLI compatibility but the
+        # procedure has no description argument (geode #831). Passing it
+        # shifted table into the condition slot.
         name = positionals[0] if positionals else ""
-        desc = positionals[1] if len(positionals) > 1 else ""
         table = flags.get("--table", "")
         condition = flags.get("--condition", flags.get("--using", ""))
-        return f"CALL geode.auth.policy_create('{esc(name)}', '{esc(desc)}', '{esc(table)}', '{esc(condition)}')"
+        return f"CALL geode.auth.policy_create('{esc(name)}', '{esc(table)}', '{esc(condition)}')"
     elif subcmd == "policy" and action == "list":
         return "CALL geode.auth.policy_list()"
     elif subcmd == "policy" and action == "delete":
@@ -758,12 +786,12 @@ def _execute_and_check(
         error = result.stderr
         exit_code = result.returncode
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         return TestResult(
             name=test_case.name,
             passed=False,
             duration_ms=(time.time() - start_time) * 1000,
-            error=f"Test timed out after {effective_timeout_ms}ms",
+            error=f"Test timed out after {effective_timeout_ms}ms" + timeout_output_excerpt(exc),
         )
     except Exception as e:
         return TestResult(
@@ -1134,12 +1162,12 @@ def _run_shell_test(
             error=stderr if not passed else "",
         )
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         return TestResult(
             name=test_case.name,
             passed=False,
             duration_ms=(time.time() - start_time) * 1000,
-            error=f"Shell test timed out after {timeout_s:.0f} seconds",
+            error=f"Shell test timed out after {timeout_s:.0f} seconds" + timeout_output_excerpt(exc),
         )
     except Exception as e:
         return TestResult(

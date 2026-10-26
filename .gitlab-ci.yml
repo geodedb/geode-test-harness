@@ -36,8 +36,10 @@ variables:
   # pytest process mid-suite (3/3 hangs, even C-level faulthandler
   # watchdogs never fire) — the geode engine's CI notes that pool as
   # broken. Lab/dedicated runners complete the suite in seconds.
+  # No `company` tag: the lab runners (52789722 and the GPU lab runners) no
+  # longer carry it, so [company, lab, linux] matched no runner and the lint
+  # and unit jobs sat pending (pipeline 2984073035).
   tags:
-    - company
     - lab
     - linux
   image: python:3.14-slim
@@ -192,7 +194,7 @@ build-zig:
 
 build-go:
   extends: .build-template
-  image: golang:1.27.1
+  image: golang:1.27.2
   allow_failure: true
   cache:
     key: go-mod-${CI_COMMIT_REF_SLUG}
@@ -214,7 +216,7 @@ build-go:
 
 build-rust:
   extends: .build-template
-  image: rust:1.98
+  image: rust:1.99
   cache:
     key: rust-${CI_COMMIT_REF_SLUG}
     paths:
@@ -251,9 +253,18 @@ test-all:
   # the default 1h job timeout; the run died mid-suite at 1h with most
   # specs passing.
   timeout: 2h
+  # The suite runs as three shards (geodetestlab --shard K/N, round-robin
+  # over the sorted spec list). Unsharded it took ~35 min of specs on the
+  # lab runners but 96 min on the AWS spot overflow runner, which then hit
+  # the 2h timeout during the serial retry pass (pipeline 2936414445).
+  parallel: 3
+  # x86: the job downloads the x86_64 zig toolchain. company + linux alone
+  # also matches the arm64 lab runner, where that zig cannot execute
+  # ("ELF: not found", as build-zig hit in pipeline 2936331961).
   tags:
     - company
     - linux
+    - x86
   image: alpine:3.24
   # Reuse Zig toolchain from build-zig artifact when available (PERF-010)
   needs:
@@ -270,8 +281,24 @@ test-all:
   variables:
     GEODE_HOST: "127.0.0.1"
     GEODE_PORT: "3141"
+    GOTOOLCHAIN: auto
   before_script:
     - apk add --no-cache curl xz tar git openssl python3 py3-pip python3-dev gcc musl-dev linux-headers
+    # Spec commands run under bash and use GNU grep/coreutils flags
+    # (--exclude=, etc.), plus pkill/ss/jq. Alpine ships only BusyBox, so
+    # without these ~530 spec steps fail with "No such file or directory:
+    # 'bash'" or "grep: unrecognized option".
+    - apk add --no-cache bash coreutils findutils grep sed procps-ng iproute2 jq
+    # 2pc_frame_limit.yml builds runners/frame_probe (module runners/go.mod,
+    # which replaces geodedb.com/geode with ../../geode-client-go). Provide Go
+    # (GOTOOLCHAIN=auto fetches the go.mod toolchain) and the client checkout,
+    # the same way build-go does.
+    - apk add --no-cache go
+    # grpc_dual_transport.yml needs the gRPC listener, whose TLS is compiled
+    # out without OpenSSL (`serve --listen-grpc` then refuses to start with
+    # error.TlsRequired). A native build links the image's libssl/libcrypto.
+    - apk add --no-cache openssl-dev
+    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git ../geode-client-go
     # Install Zig (reuses cache from build-zig job)
     - |
       if [ ! -d "zig-x86_64-linux-${ZIG_VERSION}" ]; then
@@ -282,9 +309,13 @@ test-all:
       fi
     - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
     # Clone and build Geode server
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
+    # Treeless clone (full commit graph + tags, trees/blobs only for HEAD):
+    # build.zig stamps `geode --version` from `git describe --tags`, which in a
+    # --depth 1 clone of an untagged commit is a bare hash with no version, and
+    # cli_flags_comprehensive.yml checks the version string.
+    - git clone --filter=tree:0 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
     - cd ../geode
-    - zig build -Doptimize=ReleaseFast -Denable-openssl=false
+    - zig build -Doptimize=ReleaseFast -Denable-openssl=true
     - export GEODE_BINARY="$PWD/zig-out/bin/geode"
     - echo "Geode binary built at $GEODE_BINARY"
     - cd "$CI_PROJECT_DIR"
@@ -305,7 +336,8 @@ test-all:
     - |
       python -m geodetestlab run \
         --specs specs \
-        --output "$CI_PROJECT_DIR/reports/results.json" \
+        --shard "${CI_NODE_INDEX:-1}/${CI_NODE_TOTAL:-1}" \
+        --output "$CI_PROJECT_DIR/reports/shards/${CI_NODE_INDEX:-1}/results.json" \
         --verbose \
         --parallel 4 \
         --transport quic \
@@ -314,7 +346,7 @@ test-all:
     - |
       python3 -c "
       import json, sys
-      with open('reports/results.json') as f:
+      with open('reports/shards/${CI_NODE_INDEX:-1}/results.json') as f:
           data = json.load(f)
       s = data.get('summary', {})
       print('Results: %d/%d passed, %d failed, %d skipped' % (s.get('passed',0), s.get('total',0), s.get('failed',0), s.get('skipped',0)))
@@ -369,6 +401,7 @@ triage-failures:
     - job: test-all
       artifacts: true
   script:
+    - python3 scripts/merge_shard_results.py reports
     - |
       if [ ! -f reports/results.json ]; then
         echo "No results file found, skipping triage"
@@ -422,6 +455,7 @@ analyze-coverage:
       artifacts: true
       optional: true
   script:
+    - python3 scripts/merge_shard_results.py reports
     - |
       python3 -c "
       import json, os, sys
@@ -487,6 +521,7 @@ generate-html-report:
       artifacts: true
       optional: true
   script:
+    - python3 scripts/merge_shard_results.py reports
     - |
       if [ ! -f reports/results.json ]; then
         echo "No results file, skipping report"

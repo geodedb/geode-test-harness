@@ -128,11 +128,11 @@ tests:
     always allowed) and succeeds. If this fails, the enforcement surface
     itself is broken and the negatives below are moot.
   args: [query, -U, geode, -P, '${secret:admin_password}', '-']
-  stdin: "CREATE (n:P26SetupNode {v: 1}) RETURN n"
+  stdin: 'CREATE (n:P26SetupNode {v: 1}) RETURN n'
   expect:
     exit_code: 0
     stdout_contains: [P26SetupNode]
-    stdout_not_contains: ['42501', 'Permission denied']
+    stdout_not_contains: ['42501', Permission denied]
   tags: [p26, setup, positive]
 
 - name: p26-setup-create-graph
@@ -153,7 +153,7 @@ tests:
   expect:
     exit_code: 0
     stdout_contains: [probe]
-    stdout_not_contains: ['Access denied', 'Error:']
+    stdout_not_contains: [Access denied, 'Error:']
   tags: [p26, setup, positive]
 
   # ============================================================================
@@ -174,11 +174,11 @@ tests:
     succeeded); the negative signal is the 42000 status class, NOT a
     non-zero exit.
   args: [query, -U, geode, -P, '${secret:admin_password}', '-']
-  stdin: 'CREATE POLICY ON GRAPH * FOR WRITE USING true'
+  stdin: CREATE POLICY ON GRAPH * FOR WRITE USING true
   expect:
     exit_code: 0
     stdout_contains: ['42000']
-    stdout_not_contains: ['"status_class":"00000"', 'Policy created']
+    stdout_not_contains: ['"status_class":"00000"', Policy created]
   tags: [p26, negative, malformed]
 
 - name: p26-malformed-decide-garbage-statement
@@ -191,7 +191,7 @@ tests:
   stdin: '###totally-garbage-not-gql###'
   expect:
     exit_code: 0
-    stdout_contains: ['42000', 'parse error']
+    stdout_contains: ['42000', parse error]
     stdout_not_contains: ['"status_class":"00000"']
   tags: [p26, negative, malformed]
 
@@ -209,11 +209,11 @@ tests:
     GPS Action set and rejects anything outside it before the statement
     reaches the policy catalog.
   args: [query, -U, geode, -P, '${secret:admin_password}', '-']
-  stdin: "CREATE POLICY p26_unknown_verb_policy ON GRAPH * FOR BOGUSACTION USING true"
+  stdin: CREATE POLICY p26_unknown_verb_policy ON GRAPH * FOR BOGUSACTION USING true
   expect:
     exit_code: 0
-    stdout_contains: ['42000', 'expected one of']
-    stdout_not_contains: ['"status_class":"00000"', 'Policy created']
+    stdout_contains: ['42000', expected one of]
+    stdout_not_contains: ['"status_class":"00000"', Policy created]
   tags: [p26, negative, unknown-verb]
 
   # ============================================================================
@@ -255,19 +255,18 @@ tests:
   description: |
     NEGATIVE — p26_ro (readonly, no grants) issues USE GRAPH against a
     graph name that does not exist ANYWHERE (not created by anyone in
-    this spec). Probed live: exit 3, "Error: Graph does not exist and
-    user lacks permission to create it" on stderr/stdout. This is
-    genuinely different wording from the use-graph-unauthorized case
-    below (existing-but-ungranted graph) — proving the server
-    distinguishes "doesn't exist + can't auto-create" from "exists but
-    access denied".
-  args: [query, -U, p26_ro, -P, 'P26RoAuthzPass!234', '-']
+    this spec). Since geode 8e7ce1e1 (SONNY-2775) every session graph
+    change checks bind permission before existence, so a principal that
+    may not bind the graph gets exit 3 and "Access denied", the same as
+    the use-graph-unauthorized case below, and does not learn whether
+    the graph exists.
+  args: [query, -U, p26_ro, -P, P26RoAuthzPass!234, '-']
   stdin: |
     USE GRAPH p26_nosuch_nonexistent;
     RETURN 1 AS x
   expect:
     exit_code: 3
-    stdout_contains: ['Graph does not exist']
+    stdout_contains: ['Access denied: insufficient permissions for graph']
     stdout_not_contains: ['"x":1', '"status_class":"00000"']
   tags: [p26, negative, use-graph, nonexistent]
 
@@ -288,13 +287,13 @@ tests:
     through would leak "x":1 and this test would fail, giving the
     negative real teeth (same evidentiary pattern as
     security_graph_bind_authorization_861.yml's rg6-readonly-bind-denied).
-  args: [query, -U, p26_ro, -P, 'P26RoAuthzPass!234', '-']
+  args: [query, -U, p26_ro, -P, P26RoAuthzPass!234, '-']
   stdin: |
     USE GRAPH p26_admin_only;
     RETURN 1 AS x
   expect:
     exit_code: 3
-    stdout_contains: ['Access denied', 'insufficient permissions for graph']
+    stdout_contains: [Access denied, insufficient permissions for graph]
     stdout_not_contains: ['"x":1', '"status_class":"00000"']
   tags: [p26, negative, use-graph, unauthorized, bola]
 
@@ -325,11 +324,11 @@ tests:
     "Policy created", policy persisted); it now asserts the verified-correct
     denial. The paired -confirmed-persisted test below verifies the policy
     was NOT written to the catalog.
-  args: [query, -U, p26_ro, -P, 'P26RoAuthzPass!234', CREATE POLICY p26_probe_unauthorized_policy ON GRAPH * FOR WRITE USING true]
+  args: [query, -U, p26_ro, -P, P26RoAuthzPass!234, CREATE POLICY p26_probe_unauthorized_policy ON GRAPH * FOR WRITE USING true]
   expect:
     exit_code: 0
-    stdout_contains: ['42501', 'Permission denied']
-    stdout_not_contains: ['"status_class":"00000"', 'Policy created']
+    stdout_contains: ['42501', Permission denied]
+    stdout_not_contains: ['"status_class":"00000"', Policy created]
   tags: [p26, negative, policy-ddl, limitation, security-gap]
 
 - name: p26-policy-ddl-unauthorized-confirmed-persisted

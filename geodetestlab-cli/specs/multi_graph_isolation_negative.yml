@@ -78,13 +78,13 @@ description: |
 
 cli:
   binary: ./zig-out/bin/geode
-  working_dir: null
+  working_dir:
   env:
     GEODE_LOG_LEVEL: info
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 60000
     cleanup: true
     args:
@@ -236,15 +236,17 @@ tests:
     asserted here because it has no negative teeth (matches
     regression_gap0839_inmemory_graph_tenant_bind.yml's established
     admin-auto-create behavior). The readonly, ungranted principal used
-    here instead exercises the real bind-time "graph does not exist and
-    caller cannot create it" rejection: exit 3, and the query result
-    ("x":1) must never appear.
+    here instead exercises the real bind-time rejection: exit 3, and the
+    query result ("x":1) must never appear. Since geode ef79803a/8e7ce1e1
+    (SONNY-2824, SONNY-2775) the permission check runs before the
+    existence check, so a principal that may not bind the graph gets
+    "Access denied" and does not learn whether it exists.
   query: RETURN 1 AS x
   dsn: quic://p29_ro:P29RoPass1234!@127.0.0.1:${PORT}/p29_b
   expected:
     exit_code: 3
     stdout_contains:
-    - Graph does not exist and user lacks permission to create it
+    - 'Access denied: insufficient permissions for graph'
     stdout_not_contains:
     - '"x":1'
     - '"status_class":"00000"'
@@ -283,8 +285,13 @@ tests:
     Tear down test graphs and the readonly user. Not strictly required
     since cli.server.cleanup gives every run a fresh data_dir, but kept
     for hygiene to match sibling specs.
-  query: |
-    DROP USER IF EXISTS p29_ro; DROP GRAPH IF EXISTS p29_a; DROP GRAPH IF EXISTS p29_b
+  # One graph per data-changing request (geode 0A000), so one statement
+  # per line under --batch.
+  args: [query, --batch, '-']
+  stdin: |
+    DROP USER IF EXISTS p29_ro
+    DROP GRAPH IF EXISTS p29_a
+    DROP GRAPH IF EXISTS p29_b
   expected:
     exit_code: 0
     stdout_contains:

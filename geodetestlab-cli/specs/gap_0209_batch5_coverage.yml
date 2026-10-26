@@ -52,12 +52,28 @@ tests:
     - n
   expected_exit_code: 0
 - name: sum-aggregation
-  description: Test SUM aggregation
+  description: |
+    Test SUM aggregation. SUM is a GQL set function: it aggregates a numeric
+    value over the rows of a binding table, so it is exercised over matched
+    rows. (The old form, sum([1, 2, 3, 4, 5]), passed a single LIST value;
+    see sum-of-list-value-refused.)
+  command: "./zig-out/bin/geode query --server 127.0.0.1:${PORT} --insecure -\n"
+  stdin: "CREATE (:Batch5Sum {v: 1}), (:Batch5Sum {v: 2}), (:Batch5Sum {v: 3}), (:Batch5Sum {v: 4}), (:Batch5Sum {v: 5});\nMATCH (n:Batch5Sum) RETURN sum(n.v) AS total;\n"
+  expected_output:
+    contains:
+    - total
+    - '15'
+  expected_exit_code: 0
+- name: sum-of-list-value-refused
+  description: |
+    SUM over one LIST value is a type error, not a list sum: a set function's
+    argument must be numeric (ISO/IEC 39075 general set functions). geode
+    refuses it with TypeMismatch; summing a list is reduce()/FOR territory.
   command: "./zig-out/bin/geode query --server 127.0.0.1:${PORT} --insecure -\n"
   stdin: "RETURN sum([1, 2, 3, 4, 5]) AS total\n"
   expected_output:
     contains:
-    - total
+    - TypeMismatch
   expected_exit_code: 0
 - name: power-operator
   description: Test power operator
@@ -106,7 +122,7 @@ tests:
 - name: shortest-path
   description: Test shortestPath function
   command: "./zig-out/bin/geode query --server 127.0.0.1:${PORT} --insecure -\n"
-  stdin: "CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'}), (c:Node {name: 'C'})\nCREATE (a)-[:CONNECTS]->(b)-[:CONNECTS]->(c)\nWITH a, c\nRETURN shortestPath((a)-[*]-(c)) AS path\n"
+  stdin: "CREATE (a:Node {name: 'A'}), (b:Node {name: 'B'}), (c:Node {name: 'C'}); MATCH (a:Node {name: 'A'}), (b:Node {name: 'B'}), (c:Node {name: 'C'})\nCREATE (a)-[:CONNECTS]->(b), (b)-[:CONNECTS]->(c);\nMATCH (a:Node {name: 'A'}), (c:Node {name: 'C'})\nRETURN shortestPath((a)-[*]-(c)) AS path\n"
   expected_output:
     contains:
     - path
@@ -174,7 +190,7 @@ tests:
 - name: phantom-read-prevention
   description: Test transaction isolation
   command: "./zig-out/bin/geode query --server 127.0.0.1:${PORT} --insecure -\n"
-  stdin: "BEGIN TRANSACTION\nCREATE (n:IsolationTest {id: 1})\nRETURN n.id\nCOMMIT\n"
+  stdin: "BEGIN TRANSACTION;\nCREATE (n:IsolationTest {id: 1})\nRETURN n.id;\nCOMMIT\n"
   expected_output:
     contains:
     - id
