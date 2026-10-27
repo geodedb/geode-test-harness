@@ -1,6 +1,6 @@
 module gitlab.com/devnw/geode/geode-test-harness/runners
 
-go 1.27.2
+go 1.27.3
 
 require (
 	geodedb.com/geode v1.0.0
