@@ -305,18 +305,17 @@ build-geode-server:
     - rm -rf ../geode
     - git clone --filter=tree:0 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
     - cd ../geode
-    # The build fetches protoc from GitHub releases (geode's protobuf dep),
-    # which intermittently fails with `invalid HTTP response:
-    # HttpConnectionClosing` (!33 shard 2/3 job 17468739675, !39 shard 1/3
-    # job 17471955765). Retry with backoff; zig keeps already-fetched
-    # packages in its global cache, so a retry only refetches what failed.
+    # Retry dependency downloads separately. A compiler failure must exit
+    # this required job immediately so workflow cancellation releases the
+    # other jobs, rather than repeating the complete server build.
     - |
       for attempt in 1 2 3; do
-        zig build -Doptimize=ReleaseFast -Denable-openssl=true && break
+        zig build --fetch -Doptimize=ReleaseFast -Denable-openssl=true && break
         if [ "$attempt" = 3 ]; then exit 1; fi
-        echo "geode build failed (attempt $attempt/3); retrying in $((attempt * 30))s"
+        echo "geode dependency fetch failed (attempt $attempt/3); retrying in $((attempt * 30))s"
         sleep $((attempt * 30))
       done
+    - zig build -j2 -Doptimize=ReleaseFast -Denable-openssl=true
     - export GEODE_BINARY="$PWD/zig-out/bin/geode"
     - echo "Geode binary built at $GEODE_BINARY"
     - cd "$CI_PROJECT_DIR"
