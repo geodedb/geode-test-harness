@@ -1,4 +1,5 @@
 default:
+  interruptible: true
   tags:
     [company, linux, x86]
 stages:
@@ -22,6 +23,8 @@ variables:
   # Zig version — bump here to update all jobs
   ZIG_VERSION: "0.16.0"
   ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+  # Keep runners/go.mod and go.sum aligned with this exact client revision.
+  GEODE_GO_CLIENT_REF: "05006c7167fa4e51638a98b0dd2d4fd62ec98343"
   # glab CLI version
   GLAB_VERSION: "1.36.0"
   GLAB_SHA256: "8dc52304797d3623b6797fd9379e44b5fc565c7a743d598e2490950abd50b304"
@@ -32,23 +35,17 @@ variables:
 
 # Shared setup for Python jobs that need the full dev environment (PERF-006)
 .python-setup:
-  # Pin to the lab pool: the Company Cluster (k8s) runners freeze the
-  # pytest process mid-suite (3/3 hangs, even C-level faulthandler
-  # watchdogs never fire) — the geode engine's CI notes that pool as
-  # broken. Lab/dedicated runners complete the suite in seconds.
-  # No `company` tag: the lab runners (52789722 and the GPU lab runners) no
-  # longer carry it, so [company, lab, linux] matched no runner and the lint
-  # and unit jobs sat pending (pipeline 2984073035).
+  # Run Python validation on the dedicated Linux Docker workers.
+  # The x86 and docker tags keep these container jobs on the matching pool.
   tags:
-    - lab
-    - linux
+    [company, dedicated, linux, x86, docker]
   image: python:3.15-slim
   cache:
     # Key includes the interpreter version: a .venv created under an
     # older python (cached across the 3.13 -> 3.14 image bump) has
     # dangling interpreter symlinks and stale site-packages, which
     # produced spurious CLI test failures and hangs.
-    key: pip-py314-${CI_COMMIT_REF_SLUG}
+    key: pip-py315-${CI_COMMIT_REF_SLUG}
     paths:
       - geodetestlab-cli/.venv/
   before_script:
@@ -162,12 +159,24 @@ lint-security:
 build-zig:
   extends: .build-template
   image: alpine:3.24
+  variables:
+    ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.zig-packages"
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_KEY_0: "url.https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/.insteadOf"
+    GIT_CONFIG_VALUE_0: "https://gitlab.com/"
+    GIT_CONFIG_KEY_1: "url.https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/.insteadOf"
+    GIT_CONFIG_VALUE_1: "git@gitlab.com:"
   cache:
-    key: zig-${ZIG_VERSION}
-    paths:
-      - zig-x86_64-linux-${ZIG_VERSION}/
+    - key: zig-${ZIG_VERSION}
+      paths:
+        - zig-x86_64-linux-${ZIG_VERSION}/
+    - key:
+        files: [runners/build.zig.zon]
+        prefix: harness-zig-packages-${ZIG_VERSION}
+      paths:
+        - .zig-packages/p/
   before_script:
-    - apk add --no-cache curl xz tar
+    - apk add --no-cache curl xz tar git make openssl-dev
     - |
       if [ ! -d "zig-x86_64-linux-${ZIG_VERSION}" ]; then
         curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
@@ -178,10 +187,8 @@ build-zig:
     - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
     - zig version
   script:
-    - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
-    - cd runners
-    - zig build -Doptimize=ReleaseFast
-    - cp zig-out/bin/zig_runner ./zig_runner
+    # Artifacts can move between dedicated and overflow CPUs.
+    - make build-zig ZIG_BUILD_FLAGS="-Doptimize=ReleaseFast -Dcpu=baseline -j2"
   # Pass Zig toolchain as artifact so test-all can reuse it (PERF-010)
   artifacts:
     paths:
@@ -196,11 +203,21 @@ build-go:
   extends: .build-template
   image: golang:1.27.3
   allow_failure: true
+  variables:
+    GOMODCACHE: "$CI_PROJECT_DIR/.go/modules"
+    GOCACHE: "$CI_PROJECT_DIR/.go/build"
+    GOLANGCI_LINT_CACHE: "$CI_PROJECT_DIR/.go/lint"
+    XDG_CACHE_HOME: "$CI_PROJECT_DIR/.go/tools"
+    GONOSUMCHECK: geodedb.com/geode
   cache:
-    key: go-mod-${CI_COMMIT_REF_SLUG}
-    paths:
-      - runners/.go-cache/
+    - key:
+        files: [runners/go.sum]
+        prefix: go-1.27.3-linux-amd64
+      paths: [.go/modules/, .go/build/, .go/lint/]
+    - key: golangci-2.15.0-go-1.27.3-linux-amd64
+      paths: [.go/tools/]
   before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 make
     # Clone the Go client repo using CI job token
     # Note: Requires "Allow access to this project with a CI_JOB_TOKEN" enabled in geode-client-go settings
     # Sibling checkouts live outside the project dir, so a runner that keeps
@@ -208,13 +225,12 @@ build-go:
     # has the previous job's copy and `git clone` fails with "destination path
     # already exists" (!39 job 17475111431). Start from a fresh clone.
     - rm -rf ../geode-client-go
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git ../geode-client-go
+    - git init --quiet ../geode-client-go
+    - git -C ../geode-client-go fetch --quiet --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git "$GEODE_GO_CLIENT_REF"
+    - git -C ../geode-client-go checkout --quiet --detach FETCH_HEAD
+    - test "$(git -C ../geode-client-go rev-parse HEAD)" = "$GEODE_GO_CLIENT_REF"
   script:
-    - export GOMODCACHE=$PWD/runners/.go-cache
-    - cd runners
-    - go mod edit -replace geodedb.com/geode=../../geode-client-go
-    - GONOSUMCHECK=geodedb.com/geode go vet ./...
-    - GONOSUMCHECK=geodedb.com/geode go build -o go_runner go_runner.go
+    - make build-go
   rules:
     - exists:
         - runners/go_runner.go
@@ -249,15 +265,79 @@ build-rust:
 # Integration Stage: Build Geode server + run geodetestlab-cli tests
 # =============================================================================
 #
-# The integration job clones the Geode server repo, builds it with Zig
-# (already cached from build-zig), and runs the geodetestlab-cli test suite.
+# A producer builds the Geode server once with Zig. Integration shards
+# reuse its binary and exact source revision for the geodetestlab-cli suite.
 # This eliminates the need for Docker-in-Docker or private registry access.
+
+# Build the server once per pipeline; every integration shard uses this
+# binary and checks out the recorded source revision for shell/source specs.
+build-geode-server:
+  stage: integration
+  timeout: 90m
+  tags: [company, linux, x86]
+  image: alpine:3.24
+  needs:
+    - job: build-zig
+      artifacts: true
+      optional: true
+  cache:
+    - key: zig-${ZIG_VERSION}
+      paths:
+        - zig-x86_64-linux-${ZIG_VERSION}/
+  before_script:
+    - apk add --no-cache curl xz tar git openssl python3 py3-pip python3-dev gcc musl-dev linux-headers
+    - apk add --no-cache bash coreutils findutils grep sed procps-ng iproute2 jq
+    - apk add --no-cache go openssl-dev
+    # Install Zig (reuses cache from build-zig job)
+    - |
+      if [ ! -d "zig-x86_64-linux-${ZIG_VERSION}" ]; then
+        curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+        echo "${ZIG_SHA256}  zig.tar.xz" | sha256sum -c -
+        tar xJf zig.tar.xz
+        rm zig.tar.xz
+      fi
+    - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
+  script:
+    # Clone and build Geode server
+    # Treeless clone (full commit graph + tags, trees/blobs only for HEAD):
+    # build.zig stamps `geode --version` from `git describe --tags`, which in a
+    # --depth 1 clone of an untagged commit is a bare hash with no version, and
+    # cli_flags_comprehensive.yml checks the version string.
+    - rm -rf ../geode
+    - git clone --filter=tree:0 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
+    - cd ../geode
+    # Use the baseline CPU because dedicated and overflow workers share
+    # this artifact; native CPU instructions may SIGILL on another worker.
+    # Retry dependency downloads separately. A compiler failure must exit
+    # this required job immediately so workflow cancellation releases the
+    # other jobs, rather than repeating the complete server build.
+    - |
+      for attempt in 1 2 3; do
+        zig build --fetch -Doptimize=ReleaseFast -Dcpu=baseline -Denable-openssl=true && break
+        if [ "$attempt" = 3 ]; then exit 1; fi
+        echo "geode dependency fetch failed (attempt $attempt/3); retrying in $((attempt * 30))s"
+        sleep $((attempt * 30))
+      done
+    - zig build -j2 -Doptimize=ReleaseFast -Dcpu=baseline -Denable-openssl=true
+    - export GEODE_BINARY="$PWD/zig-out/bin/geode"
+    - '"$GEODE_BINARY" --version'
+    - echo "Geode binary built at $GEODE_BINARY"
+    - cd "$CI_PROJECT_DIR"
+    - mkdir -p .ci-artifacts
+    - cp "$GEODE_BINARY" .ci-artifacts/geode
+    - git -C ../geode rev-parse HEAD > .ci-artifacts/geode-source.sha
+    - sha256sum .ci-artifacts/geode > .ci-artifacts/geode.sha256
+  artifacts:
+    paths:
+      - .ci-artifacts/
+    expire_in: 1 day
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - when: manual
 
 test-all:
   stage: integration
-  # Building the engine from source (~25m) plus 374 specs does not fit
-  # the default 1h job timeout; the run died mid-suite at 1h with most
-  # specs passing.
+  # Keep the existing suite deadline; server compilation is shared above.
   timeout: 2h
   # The suite runs as three shards (geodetestlab --shard K/N, round-robin
   # over the sorted spec list). Unsharded it took ~35 min of specs on the
@@ -274,6 +354,8 @@ test-all:
   image: alpine:3.24
   # Reuse Zig toolchain from build-zig artifact when available (PERF-010)
   needs:
+    - job: build-geode-server
+      artifacts: true
     - job: build-zig
       artifacts: true
       optional: true
@@ -323,21 +405,20 @@ test-all:
     - rm -rf ../geode
     - git clone --filter=tree:0 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
     - cd ../geode
-    # The build fetches protoc from GitHub releases (geode's protobuf dep),
-    # which intermittently fails with `invalid HTTP response:
-    # HttpConnectionClosing` (!33 shard 2/3 job 17468739675, !39 shard 1/3
-    # job 17471955765). Retry with backoff; zig keeps already-fetched
-    # packages in its global cache, so a retry only refetches what failed.
-    - |
-      for attempt in 1 2 3; do
-        zig build -Doptimize=ReleaseFast -Denable-openssl=true && break
-        if [ "$attempt" = 3 ]; then exit 1; fi
-        echo "geode build failed (attempt $attempt/3); retrying in $((attempt * 30))s"
-        sleep $((attempt * 30))
-      done
+    # Retain the source checkout needed by shell/source-code specs, but do
+    # not compile the server again in each shard.
+    - GEODE_SOURCE_COMMIT="$(cat "$CI_PROJECT_DIR/.ci-artifacts/geode-source.sha")"
+    - git fetch origin "$GEODE_SOURCE_COMMIT"
+    - git checkout --detach "$GEODE_SOURCE_COMMIT"
+    - mkdir -p zig-out/bin
+    - cp "$CI_PROJECT_DIR/.ci-artifacts/geode" zig-out/bin/geode
+    - chmod +x zig-out/bin/geode
     - export GEODE_BINARY="$PWD/zig-out/bin/geode"
-    - echo "Geode binary built at $GEODE_BINARY"
     - cd "$CI_PROJECT_DIR"
+    - sha256sum -c .ci-artifacts/geode.sha256
+    # Fail before installing the harness or running specs if the shared
+    # executable cannot run on this worker.
+    - '"$GEODE_BINARY" --version'
     # Setup geodetestlab-cli
     - cd geodetestlab-cli
     - python3 -m venv .venv
@@ -384,6 +465,8 @@ test-all:
 # =============================================================================
 
 .triage-template:
+  # Preserve issue creation when a newer commit supersedes validation.
+  interruptible: false
   stage: triage
   tags:
     - company
@@ -730,6 +813,7 @@ generate-html-report:
 # =============================================================================
 
 pages:
+  interruptible: false
   stage: pages
   tags:
     - company
@@ -743,3 +827,12 @@ pages:
       - public
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+workflow:
+  auto_cancel:
+    on_job_failure: all
+    on_new_commit: interruptible
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - when: always

@@ -1,67 +1,28 @@
 version: '1.0'
 name: 'GAP-0327: Connection Pool Explicit Rejection'
 description: |
-  CANARY: REQ=REQ-CONN-POOL-REJECTION-001; FEATURE="ConnectionPool"; ASPECT=AdmissionRejection; STATUS=TESTED; TEST=geodetestlab/specs/connection_pool_rejection.yml; OWNER=qa; UPDATED=2026-07-10
+  CANARY: REQ=REQ-CONN-POOL-REJECTION-001; FEATURE="ConnectionPool"; ASPECT=AdmissionRejection; STATUS=TESTED; TEST=geodetestlab/specs/connection_pool_rejection.yml; OWNER=qa; UPDATED=2026-10-28
 
-  Companion to connection_pool_exhaustion.yml and
-  connection_pool_max_connections.yml. Those specs assert *survival* under
-  load (server stays up, eventually admits every connection). Neither one
-  asserts what an over-cap CLIENT actually observes when it tries to
-  connect while every slot is genuinely, continuously held. This spec pins
-  that observable.
+  Hold both slots of a --max-connections 2 server with real authenticated
+  plain-mode shell sessions. Each sends a cheap query every second until
+  explicitly released, so admission pressure is independent of CPU speed.
+  The former 18^5 cross joins timed out on two-CPU CI workers, leaving the
+  server executing queries after their clients exited; that did not test
+  graceful connection release.
 
-  PROBED BEHAVIOUR (single-node scratch server, --max-connections 2):
-    The QUIC accept loop (geode/src/server/main.zig, admission-control
-    block around line 3090) does NOT emit a hard rejection when at
-    capacity. It PARKS: `getConnectionCount() >= max_connections` causes
-    the accept loop to futex-wait on `connection_slot_freed_gen` and
-    `continue`, re-checking every wake. A pending connection attempt is
-    therefore never accepted, never explicitly refused, and never
-    completed while the cap holds — it is left waiting at the QUIC
-    handshake stage.
-
-    From the CLIENT's side this means: an over-cap `geode query` does not
-    hang forever. The client's own `--timeout <secs>` enforces a bounded
-    wall-clock deadline on the whole operation (connect + query); when
-    that deadline elapses the client aborts and exits non-zero with
-    "query timed out after N seconds". That client-side timeout — not a
-    server-emitted POOL_EXHAUSTED/limit error — is the real, honest
-    "explicit rejection" signal an operator gets today. GAP-0327-MAXCONN-002
-    (connection_pool_max_connections.yml) already documents the matching
-    server-side truth: over-cap connections are QUEUED and eventually
-    SERVED once a slot frees, never hard-rejected. This spec is the
-    negative-space companion: it holds the queue open long enough (via
-    two continuously-busy background clients that never free their
-    slots) that the client's bounded timeout — not admission — is what
-    fires, and confirms that firing is clean (bounded, non-zero, no
-    wedge), not a hang.
-
-    LIMITATION (recovery-after-kill, not exercised as a hard assertion
-    here): probing an abrupt client death (SIGKILL of a held connection)
-    showed the slot is NOT reclaimed on the configured `--idle-timeout`
-    schedule. Code inspection confirms why: the per-connection idle reap
-    in geode/src/server/quic_connection_handler.zig
-    (`BufferedProtoReader.proto_reader_idle_reap_deadline_ms`) is a
-    HARDCODED 300_000 ms wall-clock deadline, decoupled from the
-    `--idle-timeout` CLI flag entirely (that flag only feeds the QUIC
-    transport's own `max_idle_timeout_ms` transport parameter). A
-    connection whose peer vanished without a clean close can therefore
-    hold its slot for up to ~300s regardless of how small `--idle-timeout`
-    is configured. This spec's recovery test instead drains the load
-    GRACEFULLY (the background holder queries complete their own work and
-    exit cleanly, closing their connections normally) — the fast, real
-    path an operator gets when clients behave — and documents the
-    kill-path gap here rather than burning ~5 minutes of suite time to
-    assert it directly.
-
+  An over-cap client must time out cleanly within its own deadline while
+  both holders remain connected. After both receive the normal shell quit
+  command and exit successfully, a fresh query must succeed promptly.
+  This covers bounded backpressure and graceful recovery, not abrupt peer
+  loss or long-query cancellation. Holder loops have an independent
+  60-second ceiling so an interrupted spec cannot keep them alive forever.
 single_node_only: true
-
 cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port:
-    data_dir:
+    port: null
+    data_dir: null
     startup_timeout_ms: 30000
     cleanup: true
     args:
@@ -77,101 +38,74 @@ cli:
     timeout_ms: 90000
     tls_verify: false
     format: json
-
 invariants:
 - type: server_running
-
 tests:
 - name: 'P21-SAT-001: saturate a --max-connections 2 server with two continuously-busy holders'
-  description: |
-    Seed a small graph and launch two background `geode query` processes
-    each running a 5-way cross join expensive enough to keep them
-    genuinely busy (continuously sending/receiving, never idle) for
-    roughly 15-25s. With --max-connections 2 these two holders occupy
-    every slot the server has. PIDs are persisted to files so later,
-    independently-executed test steps can check on and drain them.
-    NOTE: the cross join is 5-way (18^5 = 1,889,568 combinations), not
-    4-way — a 4-way join (18^4 = 104,976) completed in <1s on fast
-    multi-core hosts, so holder1 routinely finished before the 1s
-    liveness probe below and the test flaked ("holder1_alive=no"). The
-    5-way join reliably keeps each holder busy well past the 1s SAT check
-    AND the ~8s over-cap probe window in P21-OVERCAP-001, while still
-    draining gracefully inside P21-RECOVER-001's poll deadline.
+  description: Authenticate two real shell sessions and wait for an acknowledged heartbeat from each before probing the occupied pool.
   type: bash
   command: |
     SERVER="${GEODE_SERVER_ADDRESS}"
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
-    TMPDIR="${TMPDIR:-/tmp}"
-    P21_DIR="${TMPDIR}/p21_conn_reject"
-    mkdir -p "${P21_DIR}"
-    rm -f "${P21_DIR}"/holder*.pid "${P21_DIR}"/holder*.out
-
-    geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
-      -U geode -P "${PW}" --timeout 15 \
-      "MATCH (n:P21Load) DETACH DELETE n" >/dev/null 2>&1 || true
-
-    geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
-      -U geode -P "${PW}" --timeout 15 \
-      "CREATE (n01:P21Load {i:1}),(n02:P21Load {i:2}),(n03:P21Load {i:3}),(n04:P21Load {i:4}),
-              (n05:P21Load {i:5}),(n06:P21Load {i:6}),(n07:P21Load {i:7}),(n08:P21Load {i:8}),
-              (n09:P21Load {i:9}),(n10:P21Load {i:10}),(n11:P21Load {i:11}),(n12:P21Load {i:12}),
-              (n13:P21Load {i:13}),(n14:P21Load {i:14}),(n15:P21Load {i:15}),(n16:P21Load {i:16}),
-              (n17:P21Load {i:17}),(n18:P21Load {i:18})" >/dev/null 2>&1
-
-    HOLDER_QUERY="MATCH (a:P21Load),(b:P21Load),(c:P21Load),(d:P21Load),(e:P21Load) RETURN count(*) AS c"
-
-    ( geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
-        -U geode -P "${PW}" --timeout 180 "${HOLDER_QUERY}" \
-        > "${P21_DIR}/holder1.out" 2>&1 ) &
-    echo $! > "${P21_DIR}/holder1.pid"
-    disown
-
-    ( geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
-        -U geode -P "${PW}" --timeout 180 "${HOLDER_QUERY}" \
-        > "${P21_DIR}/holder2.out" 2>&1 ) &
-    echo $! > "${P21_DIR}/holder2.pid"
-    disown
-
-    sleep 1
-
-    H1=$(cat "${P21_DIR}/holder1.pid")
-    H2=$(cat "${P21_DIR}/holder2.pid")
-
-    kill -0 "${H1}" 2>/dev/null && echo "p21_holder1_alive=yes" || echo "p21_holder1_alive=no"
-    kill -0 "${H2}" 2>/dev/null && echo "p21_holder2_alive=yes" || echo "p21_holder2_alive=no"
-
-    kill -0 "${H1}" 2>/dev/null && kill -0 "${H2}" 2>/dev/null
+    P21_STATE="${TMPDIR:-/tmp}/p21_conn_reject_${SERVER##*:}.state"
+    P21_DIR=$(cat "${P21_STATE}" 2>/dev/null || true)
+    if [ -n "${P21_DIR}" ] && [ -d "${P21_DIR}" ]; then touch "${P21_DIR}/release"; fi
+    P21_DIR=$(mktemp -d "${TMPDIR:-/tmp}/p21_conn_reject_${SERVER##*:}.XXXXXX")
+    printf '%s\n' "${P21_DIR}" > "${P21_STATE}"
+    for holder in 1 2; do
+      (
+        # Capture the real client's exit code; no expensive query is used to
+        # hold a slot. The bounded writer also closes clients after an abort.
+        {
+          for tick in $(seq 1 60); do
+            [ -f "${P21_DIR}/release" ] && break
+            printf "RETURN 104729 + %s AS p21_ack;\n" "${holder}"
+            sleep 1
+          done
+          printf '\\q\n'
+        } | geode shell --plain --server "${SERVER}" ${GEODE_CLIENT_TLS} \
+              -U geode -P "${PW}" > "${P21_DIR}/holder${holder}.out" 2>&1
+        client_rc=${PIPESTATUS[1]}
+        printf '%s\n' "${client_rc}" > "${P21_DIR}/holder${holder}.exit"
+      ) </dev/null >/dev/null 2>&1 &
+      echo $! > "${P21_DIR}/holder${holder}.pid"
+      disown
+      # Admit and authenticate one holder before opening the next.
+      DEADLINE=$(( $(date +%s) + 7 ))
+      while ! grep -q "$((104729 + holder))" "${P21_DIR}/holder${holder}.out"; do
+        if [ -f "${P21_DIR}/holder${holder}.exit" ] || [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+          cat "${P21_DIR}/holder${holder}.out"
+          touch "${P21_DIR}/release"
+          exit 1
+        fi
+        sleep 0.2
+      done
+      test ! -f "${P21_DIR}/holder${holder}.exit" || exit 1
+      kill -0 "$(cat "${P21_DIR}/holder${holder}.pid")" || exit 1
+      echo "p21_holder${holder}_alive=yes"
+    done
   timeout_ms: 20000
   expect:
     exit_code: 0
     stdout_contains:
     - p21_holder1_alive=yes
     - p21_holder2_alive=yes
-  tags: [gap-0327, quic, connection-pool, rejection, saturate, p21]
-
+  tags:
+  - gap-0327
+  - quic
+  - connection-pool
+  - rejection
+  - saturate
+  - p21
 - name: 'P21-OVERCAP-001: over-cap query gets a clean bounded failure, not a hang (KEY negative)'
-  description: |
-    While both slots are held by P21-SAT-001's still-busy background
-    holders, fire a 3rd query wrapped in an outer `timeout 15` bash
-    guard, with the client's own `--timeout 8`. Real observed behaviour:
-    the accept loop parks (no free slot), the client's bounded deadline
-    fires first, and `geode query` exits non-zero with a clean
-    "query timed out after 8 seconds" message well inside the outer
-    guard — never triggering the outer `timeout 15` kill. That is the
-    honest "explicit rejection" signal today: a bounded client timeout,
-    not a server POOL_EXHAUSTED error, and NOT a hang.
+  description: The third real client must reach its own eight-second deadline before the fifteen-second outer guard while both authenticated holders stay connected.
   type: bash
   command: |
     SERVER="${GEODE_SERVER_ADDRESS}"
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
-    TMPDIR="${TMPDIR:-/tmp}"
-    P21_DIR="${TMPDIR}/p21_conn_reject"
-
-    H1=$(cat "${P21_DIR}/holder1.pid" 2>/dev/null || echo "")
-    H2=$(cat "${P21_DIR}/holder2.pid" 2>/dev/null || echo "")
-    [ -n "${H1}" ] && kill -0 "${H1}" 2>/dev/null && echo "p21_holder1_still_alive=yes" || echo "p21_holder1_still_alive=no"
-    [ -n "${H2}" ] && kill -0 "${H2}" 2>/dev/null && echo "p21_holder2_still_alive=yes" || echo "p21_holder2_still_alive=no"
-
+    P21_STATE="${TMPDIR:-/tmp}/p21_conn_reject_${SERVER##*:}.state"
+    P21_DIR=$(cat "${P21_STATE}" 2>/dev/null || true)
+    test -n "${P21_DIR}" && test -d "${P21_DIR}" || exit 1
     START=$(date +%s%N)
     OUT=$(timeout 15 geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
           -U geode -P "${PW}" --timeout 8 \
@@ -197,105 +131,99 @@ tests:
       echo "p21_explicit_failure=false"
     fi
 
-    [ "${ELAPSED_MS}" -lt 15000 ] && [ "${EC}" -ne 0 ] && echo "${OUT}" | grep -qi "timed out"
+    [ "${ELAPSED_MS}" -lt 15000 ] && [ "${EC}" -ne 0 ] && echo "${OUT}" | grep -qi "timed out" || exit 1
+
+    for holder in 1 2; do
+      test ! -f "${P21_DIR}/holder${holder}.exit" || exit 1
+      kill -0 "$(cat "${P21_DIR}/holder${holder}.pid")" || exit 1
+      echo "p21_holder${holder}_still_alive=yes"
+    done
   timeout_ms: 20000
   expect:
     exit_code: 0
     stdout_contains:
     - p21_bounded=true
     - p21_explicit_failure=true
-  tags: [gap-0327, quic, connection-pool, rejection, over-cap, negative, p21]
-
+    - p21_holder1_still_alive=yes
+    - p21_holder2_still_alive=yes
+  tags:
+  - gap-0327
+  - quic
+  - connection-pool
+  - rejection
+  - over-cap
+  - negative
+  - p21
 - name: 'P21-RECOVER-001: draining background holders restores capacity for a new query (positive)'
-  description: |
-    Poll for the two background holders (spawned by a PRIOR, separately
-    executed test step) to finish their own work and exit cleanly
-    (graceful drain -- the real, fast path to slot release; see the
-    spec-level LIMITATION note on why an abrupt SIGKILL is not used to
-    drive this assertion). NOTE: `wait $PID` only blocks on a direct
-    child of the CURRENT shell -- since the holders were forked by a
-    different (already-exited) test script's bash process, this step
-    polls their liveness with `kill -0` instead, which works for any PID
-    regardless of parentage. A PID-tracked `kill -9` safety net follows
-    purely for hygiene (normally a no-op by this point). A fresh query
-    must then succeed promptly, proving the cap is a rolling window, not
-    a permanent ceiling once load actually finishes.
+  description: Release both heartbeat writers, require both shell clients to acknowledge normal quit with exit 0, then admit a new real query. No forced kill or server restart satisfies recovery.
   type: bash
   command: |
     SERVER="${GEODE_SERVER_ADDRESS}"
     PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
-    TMPDIR="${TMPDIR:-/tmp}"
-    P21_DIR="${TMPDIR}/p21_conn_reject"
-
-    H1=$(cat "${P21_DIR}/holder1.pid" 2>/dev/null || echo "")
-    H2=$(cat "${P21_DIR}/holder2.pid" 2>/dev/null || echo "")
-
-    # Poll (not `wait` -- these PIDs are not children of this shell)
-    # until both holders have exited. Each holder carries its own
-    # --timeout 180, so 190 s bounds this even when they never finish.
-    # On a fast host they finish in 15-25 s; four specs in parallel on
-    # two CPUs pushed them past the old 60 s client timeout.
-    DEADLINE=$(( $(date +%s) + 190 ))
-    while :; do
-      STILL_ALIVE=0
-      [ -n "${H1}" ] && kill -0 "${H1}" 2>/dev/null && STILL_ALIVE=1
-      [ -n "${H2}" ] && kill -0 "${H2}" 2>/dev/null && STILL_ALIVE=1
-      [ "${STILL_ALIVE}" -eq 0 ] && break
-      if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-        echo "p21_drain_poll_timeout=true"
-        break
-      fi
-      sleep 1
+    P21_STATE="${TMPDIR:-/tmp}/p21_conn_reject_${SERVER##*:}.state"
+    P21_DIR=$(cat "${P21_STATE}" 2>/dev/null || true)
+    test -n "${P21_DIR}" && test -d "${P21_DIR}" || exit 1
+    touch "${P21_DIR}/release"
+    DEADLINE=$(( $(date +%s) + 15 ))
+    for holder in 1 2; do
+      while [ ! -f "${P21_DIR}/holder${holder}.exit" ]; do
+        if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+          echo "p21_holder${holder}_drain_timeout=true"
+          cat "${P21_DIR}/holder${holder}.out"
+          exit 1
+        fi
+        sleep 0.2
+      done
+      client_rc=$(cat "${P21_DIR}/holder${holder}.exit")
+      echo "p21_holder${holder}_exit=${client_rc}"
+      [ "${client_rc}" -eq 0 ] || { cat "${P21_DIR}/holder${holder}.out"; exit 1; }
     done
     echo "p21_drain_polled=true"
-
-    echo "p21_holder1_output=$(tail -c 200 "${P21_DIR}/holder1.out" 2>/dev/null | tr '\n' ' ')"
-    echo "p21_holder2_output=$(tail -c 200 "${P21_DIR}/holder2.out" 2>/dev/null | tr '\n' ' ')"
-
-    # PID-tracked hygiene kill -- a no-op in the normal case since the
-    # holders have already exited per the poll loop above.
-    [ -n "${H1}" ] && kill -9 "${H1}" 2>/dev/null || true
-    [ -n "${H2}" ] && kill -9 "${H2}" 2>/dev/null || true
-
-    # A holder that did hit its client timeout exits while the server is
-    # still executing its statement ("the statement may still be executing
-    # on the server"), and the slot frees only when that finishes. So retry
-    # the recovery query until a slot frees, capped at 60 s, instead of one
-    # 15 s attempt.
-    RECOVER_DEADLINE=$(( $(date +%s) + 60 ))
-    ATTEMPT=0
-    while :; do
-      ATTEMPT=$((ATTEMPT + 1))
-      OUT=$(geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
+    OUT=$(geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
             -U geode -P "${PW}" --timeout 15 \
             "RETURN 'p21_recovered_ok' AS status" 2>&1)
-      EC=$?
-      [ "${EC}" -eq 0 ] && break
-      [ "$(date +%s)" -ge "${RECOVER_DEADLINE}" ] && break
-      sleep 1
-    done
+    EC=$?
     echo "${OUT}"
-    echo "p21_recover_ec=${EC} p21_recover_attempts=${ATTEMPT}"
-
+    echo "p21_recover_ec=${EC}"
+    [ "${EC}" -eq 0 ] && echo "${OUT}" | grep -q p21_recovered_ok || exit 1
     rm -rf "${P21_DIR}"
-
-    [ "${EC}" -eq 0 ] && echo "${OUT}" | grep -q "p21_recovered_ok"
-  timeout_ms: 300000
+    rm -f "${P21_STATE}"
+  timeout_ms: 35000
   expect:
     exit_code: 0
     stdout_contains:
+    - p21_drain_polled=true
+    - p21_holder1_exit=0
+    - p21_holder2_exit=0
     - p21_recovered_ok
-  tags: [gap-0327, quic, connection-pool, rejection, recovery, p21]
-
-- name: 'P21-CLEANUP-001: remove P21Load nodes'
-  description: Delete load test nodes used for connection-pool saturation
-  args:
-  - query
-  - MATCH (n:P21Load) DETACH DELETE n RETURN count(n) AS deleted
+    - p21_recover_ec=0
+  tags:
+  - gap-0327
+  - quic
+  - connection-pool
+  - rejection
+  - recovery
+  - p21
+- name: 'P21-CLEANUP-001: release any remaining holders and confirm server health'
+  description: The explicit release signal is harmless after successful recovery; real query success verifies that the fixture leaves a usable server.
+  type: bash
   expect:
     exit_code: 0
-  tags: [gap-0327, cleanup, p21]
-
+    stdout_contains:
+    - p21_cleanup_ok
+  tags:
+  - gap-0327
+  - cleanup
+  - p21
+  command: |
+    SERVER="${GEODE_SERVER_ADDRESS}"
+    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
+    P21_STATE="${TMPDIR:-/tmp}/p21_conn_reject_${SERVER##*:}.state"
+    P21_DIR=$(cat "${P21_STATE}" 2>/dev/null || true)
+    if [ -d "${P21_DIR}" ]; then touch "${P21_DIR}/release"; fi
+    geode query --server "${SERVER}" ${GEODE_CLIENT_TLS} \
+      -U geode -P "${PW}" --timeout 15 "RETURN 'p21_cleanup_ok' AS status"
+  timeout_ms: 20000
 tags:
 - gap-0327
 - quic

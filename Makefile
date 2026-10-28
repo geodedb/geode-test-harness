@@ -17,6 +17,7 @@
 .PHONY: test-quic test-grpc test-all-transports
 .PHONY: test-cluster-1 test-cluster-3 test-cluster-5 test-cluster-10 test-cluster-matrix
 .PHONY: lint format type-check security-check quality
+.PHONY: lint-go
 .PHONY: loadtest loadtest-go loadtest-python loadtest-cli loadtest-build loadtest-scenario loadtest-scenarios
 
 # Default target: run full test suite with Docker
@@ -52,6 +53,7 @@ GO_CLIENT_PATH := ../geode-client-go
 PYTHON_CLIENT_PATH := ../geode-client-python
 RUST_CLIENT_PATH := ../geode-client-rust
 ZIG_CLIENT_PATH := ../geode-client-zig
+ZIG_BUILD_FLAGS ?= -j2
 NODEJS_CLIENT_PATH := ../geode-client-nodejs
 
 # Check if we're in a venv or nix environment
@@ -258,21 +260,18 @@ build-all: build-zig build-go build-python build-rust build-nodejs
 
 build-zig:
 	@echo "Building Zig runner..."
-	@if [ ! -d "$(ZIG_CLIENT_PATH)" ]; then \
-		echo "Warning: Zig client not found at $(ZIG_CLIENT_PATH)"; \
-		exit 0; \
-	fi
-	@command -v zig >/dev/null 2>&1 || { echo "Zig not found, skipping"; exit 0; }
-	@cd runners && zig build && cp zig-out/bin/zig_runner ./zig_runner 2>/dev/null || echo "Zig build skipped"
+	@command -v zig >/dev/null 2>&1 || { echo "Zig is required to build the runner" >&2; exit 1; }
+	@cd runners && zig build $(ZIG_BUILD_FLAGS)
+	@cp runners/zig-out/bin/zig_runner runners/zig_runner
 
-build-go:
+lint-go:
+	@test -d "$(GO_CLIENT_PATH)" || { echo "Go client not found at $(GO_CLIENT_PATH)" >&2; exit 1; }
+	@cd runners && go list -mod=readonly ./... >/dev/null
+	@cd runners && $(PYTHON) ../scripts/golangci-lint.py run --no-config --default none --enable govet --timeout 5m ./...
+
+build-go: lint-go
 	@echo "Building Go runner..."
-	@if [ ! -d "$(GO_CLIENT_PATH)" ]; then \
-		echo "Warning: Go client not found at $(GO_CLIENT_PATH)"; \
-		exit 0; \
-	fi
-	@command -v go >/dev/null 2>&1 || { echo "Go not found, skipping"; exit 0; }
-	@cd runners && go build -o go_runner go_runner.go 2>/dev/null || echo "Go build skipped"
+	@cd runners && go build -o go_runner go_runner.go
 
 build-python:
 	@echo "Setting up Python runner..."
