@@ -187,7 +187,8 @@ build-zig:
     - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
     - zig version
   script:
-    - make build-zig ZIG_BUILD_FLAGS="-Doptimize=ReleaseFast -j2"
+    # Artifacts can move between dedicated and overflow CPUs.
+    - make build-zig ZIG_BUILD_FLAGS="-Doptimize=ReleaseFast -Dcpu=baseline -j2"
   # Pass Zig toolchain as artifact so test-all can reuse it (PERF-010)
   artifacts:
     paths:
@@ -305,18 +306,21 @@ build-geode-server:
     - rm -rf ../geode
     - git clone --filter=tree:0 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode.git ../geode
     - cd ../geode
+    # Use the baseline CPU because dedicated and overflow workers share
+    # this artifact; native CPU instructions may SIGILL on another worker.
     # Retry dependency downloads separately. A compiler failure must exit
     # this required job immediately so workflow cancellation releases the
     # other jobs, rather than repeating the complete server build.
     - |
       for attempt in 1 2 3; do
-        zig build --fetch -Doptimize=ReleaseFast -Denable-openssl=true && break
+        zig build --fetch -Doptimize=ReleaseFast -Dcpu=baseline -Denable-openssl=true && break
         if [ "$attempt" = 3 ]; then exit 1; fi
         echo "geode dependency fetch failed (attempt $attempt/3); retrying in $((attempt * 30))s"
         sleep $((attempt * 30))
       done
-    - zig build -j2 -Doptimize=ReleaseFast -Denable-openssl=true
+    - zig build -j2 -Doptimize=ReleaseFast -Dcpu=baseline -Denable-openssl=true
     - export GEODE_BINARY="$PWD/zig-out/bin/geode"
+    - '"$GEODE_BINARY" --version'
     - echo "Geode binary built at $GEODE_BINARY"
     - cd "$CI_PROJECT_DIR"
     - mkdir -p .ci-artifacts
@@ -412,6 +416,9 @@ test-all:
     - export GEODE_BINARY="$PWD/zig-out/bin/geode"
     - cd "$CI_PROJECT_DIR"
     - sha256sum -c .ci-artifacts/geode.sha256
+    # Fail before installing the harness or running specs if the shared
+    # executable cannot run on this worker.
+    - '"$GEODE_BINARY" --version'
     # Setup geodetestlab-cli
     - cd geodetestlab-cli
     - python3 -m venv .venv
