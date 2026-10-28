@@ -23,6 +23,8 @@ variables:
   # Zig version — bump here to update all jobs
   ZIG_VERSION: "0.16.0"
   ZIG_SHA256: "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+  # Keep runners/go.mod and go.sum aligned with this exact client revision.
+  GEODE_GO_CLIENT_REF: "05006c7167fa4e51638a98b0dd2d4fd62ec98343"
   # glab CLI version
   GLAB_VERSION: "1.36.0"
   GLAB_SHA256: "8dc52304797d3623b6797fd9379e44b5fc565c7a743d598e2490950abd50b304"
@@ -157,12 +159,24 @@ lint-security:
 build-zig:
   extends: .build-template
   image: alpine:3.24
+  variables:
+    ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.zig-packages"
+    GIT_CONFIG_COUNT: "2"
+    GIT_CONFIG_KEY_0: "url.https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/.insteadOf"
+    GIT_CONFIG_VALUE_0: "https://gitlab.com/"
+    GIT_CONFIG_KEY_1: "url.https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/.insteadOf"
+    GIT_CONFIG_VALUE_1: "git@gitlab.com:"
   cache:
-    key: zig-${ZIG_VERSION}
-    paths:
-      - zig-x86_64-linux-${ZIG_VERSION}/
+    - key: zig-${ZIG_VERSION}
+      paths:
+        - zig-x86_64-linux-${ZIG_VERSION}/
+    - key:
+        files: [runners/build.zig.zon]
+        prefix: harness-zig-packages-${ZIG_VERSION}
+      paths:
+        - .zig-packages/p/
   before_script:
-    - apk add --no-cache curl xz tar
+    - apk add --no-cache curl xz tar git make openssl-dev
     - |
       if [ ! -d "zig-x86_64-linux-${ZIG_VERSION}" ]; then
         curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
@@ -173,10 +187,7 @@ build-zig:
     - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
     - zig version
   script:
-    - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
-    - cd runners
-    - zig build -Doptimize=ReleaseFast
-    - cp zig-out/bin/zig_runner ./zig_runner
+    - make build-zig ZIG_BUILD_FLAGS="-Doptimize=ReleaseFast -j2"
   # Pass Zig toolchain as artifact so test-all can reuse it (PERF-010)
   artifacts:
     paths:
@@ -213,7 +224,10 @@ build-go:
     # has the previous job's copy and `git clone` fails with "destination path
     # already exists" (!39 job 17475111431). Start from a fresh clone.
     - rm -rf ../geode-client-go
-    - git clone --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git ../geode-client-go
+    - git init --quiet ../geode-client-go
+    - git -C ../geode-client-go fetch --quiet --depth 1 https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/devnw/codepros/geode/geode-client-go.git "$GEODE_GO_CLIENT_REF"
+    - git -C ../geode-client-go checkout --quiet --detach FETCH_HEAD
+    - test "$(git -C ../geode-client-go rev-parse HEAD)" = "$GEODE_GO_CLIENT_REF"
   script:
     - make build-go
   rules:
