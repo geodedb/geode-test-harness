@@ -285,12 +285,51 @@ tests:
   tags:
   - storage
   - sonny738
-- name: for-write-staged-return-refused
-  description: 'SONNY-6717: ORDER BY in a writing FOR body RETURN is refused 0A000 (it was applied per element: [2,1])'
+- name: for-write-staged-return-over-whole-table
+  description: 'SONNY-6717: ORDER BY and LIMIT in a writing FOR body RETURN apply over every element (was per element: [2,1] unsorted)'
   args:
   - query
   - '-'
-  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = 99 RETURN o.k AS k ORDER BY k
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = z.k RETURN o.k AS k ORDER BY k DESC LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-staged-return-ascending
+  description: 'SONNY-6717: ascending ORDER BY across the elements'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = z.k RETURN o.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-staged-aggregate
+  description: 'SONNY-6717: an aggregate in a writing FOR body RETURN is one row over all elements'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = z.k RETURN count(*) AS c, sum(o.k) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2,"s":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-staged-buried-aggregate-refused
+  description: An aggregate inside a larger expression is refused 0A000 (not applied per element)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = 99 RETURN count(*) + 1 AS c
   expect:
     exit_code: 1
     stdout_contains:
