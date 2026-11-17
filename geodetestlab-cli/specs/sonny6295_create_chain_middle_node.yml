@@ -1,0 +1,213 @@
+# SONNY-6295: after CREATE (:P {k: K})-[:R]->(:Q {k: K})-[:S]->(:T {k: K}) for K = 0..3,
+# MATCH (b:Q) RETURN count(*) was 8 instead of 4 and
+# MATCH (a:P)-[:R]->(b:Q)-[:S]->(c:T) RETURN count(*) was 0 instead of 4: the unnamed middle
+# node of a chained CREATE pattern was created once per hop, so the two relationships attached
+# to different :Q nodes and the path was not connected.
+# Expected (ISO/IEC 39075:2024 13.2 insert statement: each node pattern of an insert path
+# creates one node): every node pattern in a CREATE path is created exactly once, named or
+# not, and consecutive hops share the middle node.
+
+version: '1.0'
+name: 'SONNY-6295: a CREATE path creates each node pattern once and joins the hops'
+description: A two-hop and three-hop CREATE path with an anonymous or named middle node creates the middle node once and connects the path
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: two-hop-anonymous-middle
+  description: two-hop CREATE with an anonymous middle node, for K = 0..1 (one statement each)
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Cp {k: 0})-[:R]->(:Cq {k: 0})-[:S]->(:Ct {k: 0})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6295
+  - setup
+- name: two-hop-anonymous-middle-second
+  description: second path
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Cp {k: 1})-[:R]->(:Cq {k: 1})-[:S]->(:Ct {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6295
+  - setup
+- name: middle-node-created-once-count
+  description: 'one Q per path: 2, not 4'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (b:Cq) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":2}]'
+  tags:
+  - sonny-6295
+- name: path-is-connected
+  description: P-R->Q-S->T is connected through the SAME middle node for both paths
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:Cp)-[:R]->(b:Cq)-[:S]->(c:Ct) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":2}]'
+  tags:
+  - sonny-6295
+- name: path-joins-matching-keys
+  description: each path joins its own K
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:Cp)-[:R]->(b:Cq)-[:S]->(c:Ct) WHERE a.k = c.k AND b.k = a.k RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":2}]'
+  tags:
+  - sonny-6295
+- name: anonymous-middle-no-labels
+  description: a fully anonymous middle node ()
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Ca {k: 0})-[:R]->()-[:S]->(:Cc {k: 0})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6295
+  - setup
+- name: anonymous-middle-no-labels-connected
+  description: the anonymous node is shared by both hops
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:Ca)-[:R]->(m)-[:S]->(c:Cc) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-6295
+- name: named-middle
+  description: a named middle node with properties and a label
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:Cn1 {k: 0})-[:R]->(b:Cn2 {k: 1})-[:S]->(c:Cn3 {k: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6295
+  - setup
+- name: named-middle-created-once
+  description: one Cn2
+  args:
+  - query
+  - '-'
+  stdin: MATCH (b:Cn2) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-6295
+- name: named-middle-connected
+  description: connected with the properties preserved
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:Cn1)-[:R]->(b:Cn2)-[:S]->(c:Cn3) RETURN a.k AS a, b.k AS b, c.k AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":0,"b":1,"c":2}]'
+  tags:
+  - sonny-6295
+- name: three-hop
+  description: a three-hop path creates two shared middle nodes
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Ch1 {k: 0})-[:R]->(:Ch2 {k: 1})-[:S]->(:Ch3 {k: 2})-[:U]->(:Ch4 {k: 3})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6295
+  - setup
+- name: three-hop-connected
+  description: one connected 4-node path
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:Ch1)-[:R]->(b)-[:S]->(c)-[:U]->(d:Ch4) RETURN a.k AS a, b.k AS b, c.k AS c, d.k AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":0,"b":1,"c":2,"d":3}]'
+  tags:
+  - sonny-6295
+- name: match-create-two-hop
+  description: MATCH ... CREATE (a)-[:R]->(:M)-[:S]->(b) creates the middle node once
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:Ca), (c:Cc) CREATE (a)-[:R2]->(:Cm {k: 9})-[:S2]->(c)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6295
+  - setup
+- name: match-create-middle-once
+  description: one Cm, connected
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:Ca)-[:R2]->(m:Cm)-[:S2]->(c:Cc) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-6295

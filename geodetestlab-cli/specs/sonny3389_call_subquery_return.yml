@@ -1,0 +1,200 @@
+# SONNY-3389: the RETURN after a statement-level CALL { } subquery was ignored; the
+# statement answered the body's rows (CALL { MATCH (n:G) RETURN n.i AS k } RETURN
+# count(*) AS c answered one row per G node instead of one row holding the count).
+# Fixed in call_operations.executeCallSubquery (and SONNY-2680: a SKIP after the
+# RETURN is applied once).
+#
+# SONNY-6343: ISO/IEC 39075:2024 NEXT (linear composition of statements) runs as the
+# same construct as WITH chaining; the inline CALL forms Geode does not run
+# (MATCH ... CALL { }, CALL (x) { }, OPTIONAL CALL, two CALL { } in one statement)
+# are refused with 0A000 (feature not supported) rather than answered wrongly.
+#
+# This spec proves, over a real server and the CLI wire path:
+#   - the RETURN's aggregate, computed items, ORDER BY and SKIP/LIMIT are applied
+#     over the CALL body's rows;
+#   - NEXT composes statements and its second statement sees the first one's names;
+#   - each refused CALL form answers SQLSTATE 0A000 and returns no rows.
+
+version: '1.0'
+name: 'SONNY-3389 / SONNY-6343: statement-level CALL { } and ISO NEXT'
+description: The RETURN after a statement-level CALL { } is applied over the body's rows; ISO NEXT chains statements; unsupported CALL forms are refused with 0A000, never answered wrongly
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed-g-nodes
+  description: five G nodes the CALL body reads
+  args:
+  - query
+  - '-'
+  stdin: 'UNWIND [1, 2, 3, 4, 5] AS i CREATE (:CallG {i: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3389
+  - setup
+- name: call-return-aggregate
+  description: RETURN count(*) after CALL { } is one row holding the count, not the body's rows
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (n:CallG) RETURN n.i AS k } RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":5}]'
+  tags:
+  - sonny-3389
+- name: call-return-computed-item
+  description: a RETURN that computes (k + 1 AS j) is applied over the body's rows
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (n:CallG) RETURN n.i AS k } RETURN k + 1 AS j ORDER BY j
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"j":2},{"j":3},{"j":4},{"j":5},{"j":6}]'
+  tags:
+  - sonny-3389
+- name: call-return-sum
+  description: aggregates other than count run over the body's rows
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (n:CallG) RETURN n.i AS k } RETURN sum(k) AS s, max(k) AS m
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"s":15,"m":5}]'
+  tags:
+  - sonny-3389
+- name: call-return-skip-limit-once
+  description: SKIP and LIMIT after the RETURN are applied exactly once (SONNY-2680)
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (n:CallG) RETURN n.i AS k } RETURN k ORDER BY k SKIP 1 LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":2},{"k":3}]'
+  tags:
+  - sonny-3389
+  - sonny-2680
+- name: call-body-with-where
+  description: a CALL body with its own WITH ... WHERE feeds the outer RETURN
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (n:CallG) WITH n WHERE n.i = 1 RETURN n.i AS gi } RETURN gi
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"gi":1}]'
+  tags:
+  - sonny-3389
+- name: next-composes-statements
+  description: "ISO NEXT: the second statement sees the first RETURN's names (SONNY-6343)"
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:CallG) RETURN n.i AS k ORDER BY k NEXT RETURN k + 1 AS j
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"j":2},{"j":3},{"j":4},{"j":5},{"j":6}]'
+  tags:
+  - sonny-6343
+  - next
+- name: next-then-match-joins-carried-name
+  description: NEXT MATCH ... WHERE m.i = k joins the carried value
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:CallG) RETURN n.i AS k NEXT MATCH (m:CallG) WHERE m.i = k RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":5}]'
+  tags:
+  - sonny-6343
+  - next
+- name: match-then-call-refused
+  description: MATCH ... CALL { } (per-row inline call) is refused 0A000, not answered wrongly
+  args:
+  - query
+  - '-'
+  stdin: MATCH (g:CallG) CALL { MATCH (x:CallG) RETURN count(*) AS c } RETURN g.i AS i, c
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    stdout_not_contains:
+    - '"rows":[{'
+  tags:
+  - sonny-6343
+  - refusal
+- name: call-import-variables-refused
+  description: CALL (g) { } variable import is refused 0A000
+  args:
+  - query
+  - '-'
+  stdin: MATCH (g:CallG) CALL (g) { MATCH (g)-[:R]->(x) RETURN x.i AS xi } RETURN g.i AS i, xi
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - sonny-6343
+  - refusal
+- name: optional-call-refused
+  description: OPTIONAL CALL is refused 0A000
+  args:
+  - query
+  - '-'
+  stdin: OPTIONAL CALL { MATCH (x:CallG) RETURN x.i AS xi } RETURN xi
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - sonny-6343
+  - refusal
+- name: two-call-subqueries-refused
+  description: two CALL { } in one statement are refused 0A000
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (x:CallG) RETURN x.i AS xi } CALL { MATCH (g:CallG) RETURN g.i AS gi } RETURN count(*) AS c
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - sonny-6343
+  - refusal

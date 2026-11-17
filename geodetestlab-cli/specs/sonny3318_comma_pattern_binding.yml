@@ -1,0 +1,180 @@
+# SONNY-3318: in MATCH (g:G)-[:R]->(x:X), (q:Q {i: 2}) SET q.c = 1 the multi-chain
+# executor skipped a later chain of ONE node, so q was null and the SET (and the WHERE,
+# DETACH DELETE and RETURN forms) silently wrote or returned nothing.
+# SONNY-3368: the fix first materialised the whole Cartesian product before WHERE and
+# LIMIT (37 GB / 54 s for LIMIT 1 over 1,500 pairs); the join now streams depth first
+# and stops at SKIP + LIMIT.
+#
+# Assertions: the SET/DELETE reach q, a later relationship chain joins on a variable
+# an earlier chain bound, and LIMIT 1 over a 1,500 x 1,500 product answers inside the
+# test timeout (before the fix it exhausted memory).
+
+version: '1.0'
+name: 'SONNY-3318 / SONNY-3368: comma patterns bind every chain and stream under LIMIT'
+description: MATCH (rel chain), (node chain) binds the node variable; writes through it land; a LIMIT-bounded comma read returns promptly
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed-q
+  description: four Q nodes
+  args:
+  - query
+  - '-'
+  stdin: 'UNWIND [1, 2, 3, 4] AS i CREATE (:CommaQ {i: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3318
+  - setup
+- name: seed-g
+  description: two G nodes with an R edge to an X each
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:CommaG {i: 1})-[:R]->(:CommaX {i: 10}), (:CommaG {i: 2})-[:R]->(:CommaX {i: 11})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3318
+  - setup
+- name: comma-read-binds-node-chain
+  description: "the node chain's variable is bound: q.i is read, not null"
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:CommaG)-[:R]->(x:CommaX), (q:CommaQ {i: 3}) RETURN q.i AS qi, count(*) AS c GROUP BY qi'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"qi":3,"c":2}]'
+  tags:
+  - sonny-3318
+- name: comma-set-writes-through-node-chain
+  description: SET q.c through a later one-node chain writes (it wrote nothing)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:CommaG)-[:R]->(x:CommaX), (q:CommaQ {i: 2}) SET q.c = 1'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3318
+- name: comma-set-landed
+  description: exactly the targeted Q node received the property
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:CommaQ) RETURN q.i AS i, q.c AS c ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1,"c":null},{"i":2,"c":1},{"i":3,"c":null},{"i":4,"c":null}]'
+  tags:
+  - sonny-3318
+- name: comma-detach-delete-through-node-chain
+  description: DETACH DELETE q through the later chain deletes it
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:CommaG)-[:R]->(x:CommaX), (q:CommaQ {i: 4}) DETACH DELETE q'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3318
+- name: comma-delete-landed
+  description: Q4 is gone, the other three remain
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:CommaQ) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":3}]'
+  tags:
+  - sonny-3318
+- name: comma-later-chain-joins-bound-variable
+  description: a later relationship chain joins on variables the earlier chain bound (a = g) and filters by WHERE
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:CommaG)-[:R]->(b:CommaX), (c:CommaG)-[:R]->(d:CommaX) WHERE a.i = 1 AND c.i = 2 RETURN a.i AS a, c.i AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":1,"c":2}]'
+  tags:
+  - sonny-3318
+- name: seed-big-product
+  description: '1,500 pairs: the comma product of two chains is 2.25 million rows'
+  args:
+  - query
+  - '-'
+  stdin: 'UNWIND range(1, 1500) AS i CREATE (:BigA {i: i})-[:E]->(:BigB {i: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  timeout_ms: 60000
+  tags:
+  - sonny-3368
+  - setup
+- name: comma-limit-1-streams
+  description: LIMIT 1 over the whole product answers promptly instead of materialising it (SONNY-3368)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:BigA)-[:E]->(b:BigB), (c:BigA)-[:E]->(d:BigB) RETURN a.i AS ai LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"rows":\[\{"ai":\d+\}\]'
+  timeout_ms: 20000
+  tags:
+  - sonny-3368
+- name: comma-limit-with-where-streams
+  description: a WHERE per binding plus LIMIT stops at the first qualifying row
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:BigA)-[:E]->(b:BigB), (c:BigA)-[:E]->(d:BigB) WHERE a.i = 7 AND c.i = 9 RETURN a.i AS ai, c.i AS ci LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"ai":7,"ci":9}]'
+  timeout_ms: 20000
+  tags:
+  - sonny-3368

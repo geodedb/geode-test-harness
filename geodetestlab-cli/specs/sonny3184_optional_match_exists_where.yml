@@ -1,0 +1,182 @@
+# SONNY-3184: EXISTS { MATCH ... WHERE <inner var> } was always false; an OPTIONAL MATCH
+# chain bound the optional variable as null; an OPTIONAL MATCH's WHERE filtered the WHOLE
+# row instead of only its own match (so rows with no qualifying match disappeared).
+# SONNY-6337: WITH ... OPTIONAL MATCH failed to parse (UnexpectedToken 42601); a part
+# with an OPTIONAL MATCH that names a WITH-bound variable was refused 0A000.
+# ISO/IEC 39075:2024 14.4 <match statement> / 16.? optional match: an OPTIONAL MATCH
+# with no match keeps the incoming record and binds the new variables to null; its
+# WHERE belongs to the optional pattern.
+#
+# Fixture: P0 -R-> Q0 (no j), P1 (no edge), P2 -R-> Q2 (j = 200).
+
+version: '1.0'
+name: 'SONNY-3184 / SONNY-6337: EXISTS inner WHERE, OPTIONAL MATCH chains and WHERE, WITH ... OPTIONAL MATCH'
+description: EXISTS { MATCH ... WHERE inner } sees the inner variable; OPTIONAL MATCH keeps the row with NULLs, its WHERE restricts only its own match, after WITH too
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed
+  description: three P nodes, two with an R edge to a Q node
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:OmP {k: 0})-[:R]->(:OmQ {k: 0}), (:OmP {k: 1}), (:OmP {k: 2})-[:R]->(:OmQ {k: 2, j: 200})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3184
+  - setup
+- name: exists-inner-where
+  description: EXISTS { MATCH (p)-[:R]->(q) WHERE q.j > 100 } uses the inner variable (was always false)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) WHERE EXISTS { MATCH (p)-[:R]->(q:OmQ) WHERE q.j > 100 } RETURN p.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":2}]'
+  tags:
+  - sonny-3184
+  - exists
+- name: exists-inner-where-negated
+  description: NOT EXISTS over the same inner WHERE keeps the other two
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) WHERE NOT EXISTS { MATCH (p)-[:R]->(q:OmQ) WHERE q.j > 100 } RETURN p.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0},{"k":1}]'
+  tags:
+  - sonny-3184
+  - exists
+- name: optional-match-chain-binds-variable
+  description: OPTIONAL MATCH over a chain binds m (was null) and keeps unmatched rows with NULL
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) OPTIONAL MATCH (p)-[:R]->(m:OmQ) RETURN p.k AS k, m.k AS mk ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0,"mk":0},{"k":1,"mk":null},{"k":2,"mk":2}]'
+  tags:
+  - sonny-3184
+  - optional-match
+- name: optional-match-where-restricts-only-its-match
+  description: an OPTIONAL MATCH's WHERE nulls the optional side but keeps EVERY outer row
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) OPTIONAL MATCH (p)-[:R]->(m:OmQ) WHERE m.j > 100 RETURN p.k AS k, m.k AS mk ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0,"mk":null},{"k":1,"mk":null},{"k":2,"mk":2}]'
+  tags:
+  - sonny-3184
+  - optional-match
+- name: optional-match-with-write-refused-not-lost
+  description: a write after OPTIONAL MATCH is refused 0A000 (it used to silently write nothing)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) OPTIONAL MATCH (p)-[:R]->(m:OmQ) WHERE m.j > 100 SET p.x = 1
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - sonny-3184
+  - optional-match
+- name: refused-write-wrote-nothing
+  description: the refused statement left no property behind
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) RETURN count(p.x) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+  tags:
+  - sonny-3184
+- name: with-then-optional-match-parses
+  description: MATCH ... WITH p OPTIONAL MATCH (p)-[:R]->(t) parses and keeps the bound variable (was 42601)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) WITH p OPTIONAL MATCH (p)-[:R]->(t:OmQ) RETURN p.k AS pk, t.k AS tk ORDER BY pk
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"pk":0,"tk":0},{"pk":1,"tk":null},{"pk":2,"tk":2}]'
+  tags:
+  - sonny-6337
+- name: with-where-then-optional-match-where
+  description: 'WITH ... WHERE then OPTIONAL MATCH ... WHERE: the optional WHERE nulls only its own side'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) WITH p WHERE p.k >= 0 OPTIONAL MATCH (p)-[:R]->(t:OmQ) WHERE t.j > 100 RETURN p.k AS pk, t.k AS tk ORDER BY pk
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"pk":0,"tk":null},{"pk":1,"tk":null},{"pk":2,"tk":2}]'
+  tags:
+  - sonny-6337
+- name: where-true-only-keeps-row
+  description: 'a WHERE keeps a row only when it is TRUE: a non-boolean integer is not true (SONNY-3184 / 6425 truthiness)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) WHERE p.k RETURN p.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3184
+  - truthiness
+- name: initial-with-where-integer-not-true
+  description: WITH 1 AS one WHERE one keeps nothing
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:OmP) WITH 1 AS one WHERE one RETURN one
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3184
+  - truthiness

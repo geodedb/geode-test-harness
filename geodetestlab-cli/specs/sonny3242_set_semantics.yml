@@ -1,0 +1,421 @@
+# SONNY-3242: SET semantics depended on whether the statement had a RETURN
+#   (SET q.a = 1, q.b = q.a stored b = 1 with a RETURN and the old a without; a swap
+#   gave (2,1) vs (2,2)); a repeated pattern variable was not enforced
+#   (MATCH (a)-[r:S]->(a) also matched a node whose edge goes elsewhere, on the read
+#   and the write); [r:R|T] wrote only R while the read and DELETE saw both types;
+#   SET a = b wiped all of a's properties.
+# Rule (ISO/IEC 39075:2024 13.3 set statement, SQL UPDATE style): every right-hand
+# side of one SET clause is evaluated against the bindings as they stood BEFORE the
+# clause, then the assignments apply; a later SET clause sees what an earlier one wrote.
+# SONNY-3125: the hop / multi-chain SET read a shared node's stale copy, so
+# SET c.c = c.c + 1 over a node that appears in N matched rows applied once, not N times.
+
+version: '1.0'
+name: 'SONNY-3242 / SONNY-3125: one SET semantics on every path; repeated variables enforced'
+description: SET evaluates a clause's right-hand sides before assigning, with or without RETURN; a repeated pattern variable names one node; R|T matches both types; SET c = c + 1 applies once per matched row
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed-swap
+  description: node with a=1, b=2
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:SetSwap {k: 1, a: 1, b: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3242
+  - setup
+- name: swap-without-return
+  description: SET a = b, b = a swaps (both sides read the pre-clause values) without RETURN
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:SetSwap) SET s.a = s.b, s.b = s.a
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3242
+- name: swap-without-return-landed
+  description: stored result is the swap
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:SetSwap) RETURN s.a AS a, s.b AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":2,"b":1}]'
+  tags:
+  - sonny-3242
+- name: swap-with-return
+  description: the same swap with RETURN stores and shows the same values (was (2,2))
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:SetSwap) SET s.a = s.b, s.b = s.a RETURN s.a AS a, s.b AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":1,"b":2}]'
+  tags:
+  - sonny-3242
+- name: dependent-clause-with-return
+  description: 'SET s.a = 7, s.b = s.a RETURN: b takes the PRE-clause a (1), not the 7 the same clause assigns'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:SetSwap) SET s.a = 7, s.b = s.a RETURN s.a AS a, s.b AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":7,"b":1}]'
+  tags:
+  - sonny-3242
+- name: dependent-clause-without-return
+  description: without RETURN the stored values are identical to the RETURN form
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:SetSwap) SET s.a = 8, s.b = s.a
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3242
+- name: dependent-clause-without-return-landed
+  description: a = 8 and b = the old a (7)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:SetSwap) RETURN s.a AS a, s.b AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":8,"b":7}]'
+  tags:
+  - sonny-3242
+- name: separate-set-clauses-see-earlier-writes
+  description: a LATER SET clause reads what the earlier one wrote
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:SetSwap) SET s.a = 100 SET s.b = s.a
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3242
+- name: separate-set-clauses-landed
+  description: b equals the freshly written a
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:SetSwap) RETURN s.a AS a, s.b AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":100,"b":100}]'
+  tags:
+  - sonny-3242
+- name: seed-loops
+  description: 'S edges: 1 -> 2 and a self-loop on 3'
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:SetLoop {i: 1})-[:S]->(b:SetLoop {i: 2}), (c:SetLoop {i: 3})-[:S]->(c)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3242
+  - setup
+- name: repeated-variable-read
+  description: 'MATCH (a)-[r:S]->(a) names ONE node: only the self-loop matches'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SetLoop)-[r:S]->(a) RETURN a.i AS i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":3}]'
+  tags:
+  - sonny-3242
+  - repeated-variable
+- name: repeated-variable-read-count
+  description: count of the repeated-variable pattern is 1
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SetLoop)-[r:S]->(a) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-3242
+  - repeated-variable
+- name: repeated-variable-write
+  description: SET through the repeated-variable pattern writes only the self-loop node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SetLoop)-[r:S]->(a) SET a.s = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3242
+  - repeated-variable
+- name: repeated-variable-write-landed
+  description: only node 3 got the property
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SetLoop) RETURN a.i AS i, a.s AS s ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1,"s":null},{"i":2,"s":null},{"i":3,"s":1}]'
+  tags:
+  - sonny-3242
+  - repeated-variable
+- name: seed-two-types
+  description: R and T relationships to H2 targets
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:SetH1 {i: 1})-[:R]->(:SetH2 {i: 1}), (:SetH1 {i: 2})-[:T]->(:SetH2 {i: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3242
+  - setup
+- name: alternation-write-sees-both-types
+  description: SET through [r:R|T] updates the target of BOTH relationship types (wrote only R)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:SetH1)-[r:R|T]->(h:SetH2) SET h.w = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3242
+  - alternation
+- name: alternation-write-landed
+  description: both targets carry w = 1
+  args:
+  - query
+  - '-'
+  stdin: MATCH (h:SetH2) RETURN h.i AS i, h.w AS w ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1,"w":1},{"i":2,"w":1}]'
+  tags:
+  - sonny-3242
+  - alternation
+- name: seed-star
+  description: a centre node with a counter
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:SetStar {c: 0})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3125
+  - setup
+- name: seed-star-leaves
+  description: three leaves hang off the centre
+  args:
+  - query
+  - '-'
+  stdin: 'UNWIND [1, 2, 3] AS i MATCH (c:SetStar) CREATE (c)-[:E]->(:SetLeaf {i: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3125
+  - setup
+- name: hop-set-increments-per-row
+  description: SET c.c = c.c + 1 over a hop applies once per matched row (3), not once (stale copy)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (c:SetStar)-[:E]->(l:SetLeaf) SET c.c = c.c + 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3125
+- name: hop-set-landed
+  description: c = 3
+  args:
+  - query
+  - '-'
+  stdin: MATCH (c:SetStar) RETURN c.c AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":3}]'
+  tags:
+  - sonny-3125
+- name: seed-extra
+  description: two more nodes for the multi-chain product
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:SetExtra {i: 1}), (:SetExtra {i: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3125
+  - setup
+- name: multi-chain-set-increments-per-row
+  description: a multi-chain MATCH (3 hop rows x 2 extra) increments once per matched row (6)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (c:SetStar)-[:E]->(l:SetLeaf), (z:SetExtra) SET c.c = c.c + 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3125
+- name: multi-chain-set-landed
+  description: c = 3 + 6 = 9
+  args:
+  - query
+  - '-'
+  stdin: MATCH (c:SetStar) RETURN c.c AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":9}]'
+  tags:
+  - sonny-3125
+- name: seed-set-all
+  description: two nodes for SET a = b
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:SetAll {k: 1, p: 1}), (:SetSrc {k: 2, q: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3242
+  - setup
+- name: set-all-from-map
+  description: SET a = {map} replaces all of a's properties with the map's
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:SetAll) SET a = {q: 5}'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3242
+  - set-all
+- name: set-all-from-map-landed
+  description: only q remains
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SetAll) RETURN a.p AS p, a.q AS q, a.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"p":null,"q":5,"k":null}]'
+  tags:
+  - sonny-3242
+  - set-all
+- name: set-all-from-node-never-wipes
+  description: SET a = b with b a node copies b's properties (it wiped a's); it never answers success and wipes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SetAll), (b:SetSrc) SET a = b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3242
+  - set-all
+- name: set-all-from-node-landed
+  description: a now carries exactly b's properties (k = 2, q = 2) - openCypher SET n = m semantics
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SetAll) RETURN a.k AS k, a.q AS q, a.p AS p
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":2,"q":2,"p":null}]'
+  tags:
+  - sonny-3242
+  - set-all

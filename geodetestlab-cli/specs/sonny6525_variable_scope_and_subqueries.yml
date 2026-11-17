@@ -1,0 +1,223 @@
+# SONNY-6496 item 1: a variable WITH does not project read NULL instead of being refused
+# (MATCH (n) WITH n.k AS k RETURN n.t). ISO/IEC 39075:2024 20.12 SR 8: a reference to an
+# undefined variable is an error (class 42), and after WITH / NEXT only the projected binding
+# variables are in scope. NEXT inherits this.
+# SONNY-6525: (1) a correlated IN subquery read outer variables as NULL on every executor
+# (MATCH (n) WHERE n.k IN (MATCH (m) WHERE m.t = n.t RETURN m.k) returned no rows);
+# (2) a reference to an undefined variable with no projection before it still read NULL
+# (MATCH (n) RETURN m); (3) WITH *, n.k AS k was an unexplained parse error.
+# SONNY-6496 item 3: FOR at the start of an IN subquery or CTE body was a syntax error.
+
+version: '1.0'
+name: 'SONNY-6525 / SONNY-6496: variable scope after WITH, correlated IN subqueries, WITH *, FOR-started subqueries'
+description: An undefined or unprojected variable is a 42000 error, never NULL; a correlated IN subquery sees the outer row; FOR may start a subquery; WITH * , item is explained
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed
+  description: three V nodes
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:ScV {i: 1, s: 'a', t: 'x'}), (:ScV {i: 2, s: 'b', t: 'x'}), (:ScV {i: 3, s: 'c', t: 'y'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6525
+  - setup
+- name: undefined-variable-return-refused
+  description: 'MATCH (n) RETURN m: m is unbound -> 42000, not NULL'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) RETURN m
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+    - not in scope
+    - '20.12'
+    stdout_not_contains:
+    - '"rows":[{'
+  tags:
+  - sonny-6525
+  - scope
+- name: undefined-variable-order-by-refused
+  description: ORDER BY an undefined variable is refused
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) RETURN n.i AS i ORDER BY undefinedvar
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - sonny-6525
+  - scope
+- name: unprojected-variable-after-with-refused
+  description: 'MATCH (n) WITH n.i AS k RETURN n.s: n is not projected -> 42000'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) WITH n.i AS k RETURN n.s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+    - not in scope
+  tags:
+  - sonny-6496
+  - scope
+- name: unprojected-variable-after-next-refused
+  description: NEXT inherits the scope rule
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) RETURN n.i AS k NEXT RETURN n.s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - sonny-6496
+  - scope
+- name: projected-variable-after-with-works
+  description: the projected alias is in scope
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) WITH n.i AS k RETURN k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2},{"k":3}]'
+  tags:
+  - sonny-6496
+  - scope
+- name: correlated-in-subquery-sees-outer-row
+  description: "n.s IN (MATCH (m) WHERE m.t = n.t RETURN m.s): every row's own s is in its group"
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) WHERE n.s IN (MATCH (m:ScV) WHERE m.t = n.t RETURN m.s) RETURN n.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1},{"i":2},{"i":3}]'
+  tags:
+  - sonny-6525
+  - correlated
+- name: correlated-in-subquery-filters-by-outer-row
+  description: "m.i = n.i + 1 selects the NEXT row's s: only a.s='b'... none equals its own"
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) WHERE n.s IN (MATCH (m:ScV) WHERE m.i = n.i + 1 RETURN m.s) RETURN n.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6525
+  - correlated
+- name: correlated-in-subquery-positive-offset
+  description: m.i = n.i - 1 and n.s != m.s still joins the outer row (rows 2 and 3 have a predecessor)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) WHERE n.i IN (MATCH (m:ScV) WHERE m.i = n.i - 1 RETURN m.i + 1) RETURN n.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":2},{"i":3}]'
+  tags:
+  - sonny-6525
+  - correlated
+- name: with-star-then-items-explained
+  description: WITH *, n.k AS k is refused with the ISO 14.11 explanation, not a bare parse error
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) WITH *, n.i AS k RETURN k
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+    - '14.11'
+  tags:
+  - sonny-6525
+- name: for-starts-an-in-subquery
+  description: IN (FOR y IN [1, 2] RETURN y) parses and runs (was a syntax error)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) WHERE n.i IN (FOR y IN [1, 2] RETURN y) RETURN n.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1},{"i":2}]'
+  tags:
+  - sonny-6496
+- name: call-procedure-starts-subquery-refused
+  description: a procedure CALL at the start of an IN subquery is refused 0A000, never answered wrongly
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:ScV) WHERE n.s IN (CALL db.labels() YIELD label RETURN label) RETURN n.i AS i
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - sonny-6496
+  - refusal
+- name: merge-then-create-refused
+  description: MATCH ... MERGE ... CREATE is refused 0A000, not a syntax error
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:ScV) MERGE (v)-[:K]->(w:ScW) CREATE (w)-[:J]->(v)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - sonny-6496
+  - refusal
+- name: refused-merge-create-wrote-nothing
+  description: the refused statement created no ScW
+  args:
+  - query
+  - '-'
+  stdin: MATCH (w:ScW) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+  tags:
+  - sonny-6496

@@ -1,0 +1,191 @@
+# SONNY-3046: MATCH (q:Q) WITH q MATCH (q) RETURN count(*) answered 96 (every node)
+# instead of 4: the chained MATCH ignored the variable WITH bound.
+# SONNY-3376: MATCH ()-[r]->() WITH r MATCH (a)-[r]->(b) did not constrain the
+# second MATCH to r - every row came back.
+# SONNY-3388: a carried variable was only joined as a hop's START node; named alone,
+# with a new label, as a relationship, via WITH *, or as a path it was bound again
+# as if new. Fixed by joining a carried element variable in every pattern position
+# (a part that cannot be joined is refused 0A000, never answered wrongly).
+#
+# Fixture: 4 Q nodes (i = 1..4); 5 G nodes (i = 1..5); G1-[:R]->X10 and G2-[:R]->X11.
+# Every assertion below was a wrong answer before the fix.
+
+version: '1.0'
+name: 'SONNY-3046 / 3376 / 3388: a variable a WITH passes on is joined by the next MATCH'
+description: A node, relationship or path variable carried through WITH constrains the next MATCH wherever the pattern names it
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed-q
+  description: four Q nodes
+  args:
+  - query
+  - '-'
+  stdin: 'UNWIND [1, 2, 3, 4] AS i CREATE (:JoinQ {i: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3046
+  - setup
+- name: seed-g
+  description: five G nodes
+  args:
+  - query
+  - '-'
+  stdin: 'UNWIND [1, 2, 3, 4, 5] AS i CREATE (:JoinG {i: i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3046
+  - setup
+- name: seed-edge-1
+  description: G1 -R-> X10
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:JoinG {i: 1}) CREATE (g)-[:R]->(:JoinX {i: 10})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3046
+  - setup
+- name: seed-edge-2
+  description: G2 -R-> X11
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:JoinG {i: 2}) CREATE (g)-[:R]->(:JoinX {i: 11})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3046
+  - setup
+- name: with-node-then-bare-node-pattern
+  description: MATCH (q:Q) WITH q MATCH (q) RETURN count(*) is 4, not every node (SONNY-3046)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:JoinQ) WITH q MATCH (q) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":4}]'
+  tags:
+  - sonny-3046
+- name: with-node-then-bare-node-single
+  description: a single carried node joined by a bare pattern is 1
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:JoinG {i: 1}) WITH g MATCH (g) RETURN count(*) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-3388
+- name: with-node-then-conflicting-label
+  description: a carried G node re-matched with label X matches nothing
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:JoinG {i: 1}) WITH g MATCH (g:JoinX) RETURN count(*) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+  tags:
+  - sonny-3388
+- name: with-node-then-hop-start
+  description: the always-correct start-node join still works
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:JoinG {i: 1}) WITH g AS h MATCH (h)-[:R]->(x) RETURN count(*) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-3388
+- name: with-relationship-then-same-relationship
+  description: a carried relationship constrains the next MATCH to that edge (SONNY-3376 / 3388)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:JoinG {i: 1})-[r:R]->() WITH r MATCH (a)-[r]->(b) RETURN a.i AS a, b.i AS b'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":1,"b":10}]'
+  tags:
+  - sonny-3376
+  - sonny-3388
+- name: with-any-relationship-then-same-relationship
+  description: MATCH ()-[r]->() WITH r MATCH (a)-[r]->(b) returns each edge once, not edges squared (SONNY-3376)
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[r:R]->() WITH r MATCH (a)-[r]->(b) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":2}]'
+  tags:
+  - sonny-3376
+- name: with-star-then-bare-node
+  description: WITH * keeps the node bound and joined
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (g:JoinG {i: 1})-[r:R]->() WITH * MATCH (g) RETURN count(*) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-3388
+- name: with-path-then-same-path
+  description: a carried path variable is joined, not re-bound
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH p = (g:JoinG {i: 1})-[:R]->() WITH p MATCH p = (a)-[:R]->(b) RETURN count(*) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-3388

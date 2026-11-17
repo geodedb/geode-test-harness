@@ -1,0 +1,154 @@
+# SONNY-6498 item 3: executors swallowed evalExpr errors at ~40 sites, so an expression that
+# failed (division by zero, a type error, a failed cast) was read as NULL / false and the
+# statement succeeded with wrong rows. ISO/IEC 39075:2024 20.? and 22.? (data exceptions:
+# 22012 division by zero, 22G03 invalid value type, 22018 invalid character value for cast)
+# require the exception condition to be raised.
+# SONNY-6525 item 4: an intermediate aggregating WITH built group keys with a lossy
+# formatter, so the integer 1 and the string '1' collided into one group.
+
+version: '1.0'
+name: 'SONNY-6498 / SONNY-6525: expression evaluation errors are raised, group keys are typed'
+description: A WHERE, RETURN, WITH or SET expression that fails raises its SQLSTATE instead of reading as no value; an aggregating WITH groups 1 and '1' separately
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed
+  description: one node with k = 1
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:EvK {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6498
+  - setup
+- name: where-division-by-zero-raises
+  description: WHERE n.k / 0 > 1 raises 22012, it does not read as false
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:EvK) WHERE n.k / 0 > 1 RETURN n.k AS k
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - sonny-6498
+- name: return-division-by-zero-raises
+  description: RETURN n.k / 0 raises 22012
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:EvK) RETURN n.k / 0 AS k
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - sonny-6498
+- name: with-division-by-zero-raises
+  description: WITH n.k / 0 AS z raises 22012
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:EvK) WITH n.k / 0 AS z RETURN z
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - sonny-6498
+- name: set-division-by-zero-raises-and-writes-nothing
+  description: SET n.z = n.k / 0 raises and leaves no property
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:EvK) SET n.z = n.k / 0
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - sonny-6498
+- name: set-failed-wrote-nothing
+  description: no z was written
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:EvK) RETURN count(n.z) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+  tags:
+  - sonny-6498
+- name: arithmetic-type-error-raises
+  description: n.k + 'a' raises 22G03
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:EvK) RETURN n.k + 'a' AS s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - sonny-6498
+- name: failed-cast-raises
+  description: toInteger('zz') raises 22018
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:EvK) RETURN toInteger('zz') AS s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22018"'
+  tags:
+  - sonny-6498
+- name: aggregating-with-groups-by-type
+  description: "WITH x, count(*) groups the integer 1 and the string '1' apart: two groups"
+  args:
+  - query
+  - '-'
+  stdin: UNWIND [1, '1', 1] AS x WITH x, count(*) AS c RETURN count(*) AS groups
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"groups":2}]'
+  tags:
+  - sonny-6525
+- name: aggregating-with-group-counts
+  description: the integer group holds 2, the string group 1
+  args:
+  - query
+  - '-'
+  stdin: UNWIND [1, '1', 1] AS x WITH x, count(*) AS c RETURN x, c ORDER BY c DESC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":1,"c":2},{"x":"1","c":1}]'
+  tags:
+  - sonny-6525
