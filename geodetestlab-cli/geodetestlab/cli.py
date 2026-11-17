@@ -629,14 +629,18 @@ def run(
 
                 try:
                     spec_obj = load_spec(spec_file)
-                except SpecValidationError as exc:
-                    console_err.print(f"SCHEMA_ERROR in {spec_file}", style="red")
+                except Exception as exc:
+                    console_err.print(f"SCHEMA_ERROR in {spec_file}: {exc}", style="red", markup=False, highlight=False)
                     _record_spec_error(str(spec_file), f"SCHEMA_ERROR: {exc}")
                     total_exit_code = max(total_exit_code, 2)
                     continue
-                except Exception as exc:
-                    console_err.print(f"SCHEMA_ERROR in {spec_file}", style="red")
-                    _record_spec_error(str(spec_file), f"SCHEMA_ERROR: {exc}")
+
+                # A spec that yields no tests must never report green (SONNY-6711); a
+                # spec-level `skip:` directive and a dry run contribute zero by design.
+                if not spec_obj.tests and not getattr(spec_obj, "skip", None) and not dry_run:
+                    message = f"spec defines no tests (an empty or missing 'tests' list): {spec_file}"
+                    console_err.print(f"SCHEMA_ERROR: {message}", style="red", markup=False, highlight=False)
+                    _record_spec_error(str(spec_file), f"SCHEMA_ERROR: {message}")
                     total_exit_code = max(total_exit_code, 2)
                     continue
 
