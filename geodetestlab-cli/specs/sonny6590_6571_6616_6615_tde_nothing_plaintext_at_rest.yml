@@ -1,0 +1,143 @@
+version: '1.0'
+name: TDE — nothing written is plaintext under the data directory; a wrong key is refused without touching the store (SONNY-6590, SONNY-6571, SONNY-6616, SONNY-6615)
+description: |
+  SONNY-6590: with TDE on, the label/relationship-type dictionary (labels.dict), the
+  property-key index (props.idx, prop_exact.idx, prop_rev.idx) and the time-series
+  WAL (when GEODE_TDE_KEY alone is set) held names and values in plaintext.
+  SONNY-6616: graph names (registry, dropped-graph list) and topology files, and a
+  wrong key was reported as a misleading NoManifest. SONNY-6571: the Raft log held
+  replicated writes in plaintext (cluster mode; a single node has no Raft log, so
+  here we prove the part observable on one node). SONNY-6615: a time-series WAL
+  opened with the wrong key mode was TRUNCATED to 0 bytes (silent loss of every
+  unflushed point).
+
+  Black-box on a real `geode serve` with GEODE_TDE_KEY: random-per-run label,
+  relationship type, property key, graph names (one dropped), index name, a string
+  value, an integer value and a time-series point are written; every regular file
+  under the data directory is then scanned (python, raw bytes) for each needle in
+  four states: running, after SIGKILL, after a restart on the crashed directory
+  (everything must read back), and after a clean stop.
+
+  Wrong-key phase: restarting on the same directory with a DIFFERENT valid key must
+  refuse to start and must leave every file byte-identical (sha256 of the whole tree
+  unchanged, in particular ts.wal not truncated), and must not report "NoManifest".
+  The correct key then still reads the point back.
+
+  CANARY: REQ=REQ-SONNY-6590-6571-TDE-NOTHING-PLAINTEXT; FEATURE="TDEFileLevelEncryption"; ASPECT=NoPlaintextUnderDataDir; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants: []
+fuzz:
+  enabled: false
+
+tests:
+- name: tde-no-plaintext-names-values-timeseries-and-wrong-key-safe
+  type: bash
+  timeout_ms: 600000
+  command: |
+    set -u
+    export GEODE_ALLOW_INSECURE_TLS=1   # loopback scratch server; the client refuses --insecure-tls-skip-verify on release builds otherwise
+    BIN="$GEODE_BINARY"; PW='Sonny Harness Admin Passphrase 6590'
+    W=$(mktemp -d); trap 'kill $PID 2>/dev/null; rm -rf "$W"' EXIT; PID=0
+    D="$W/data"; mkdir -p "$D"
+    TLSARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "$GEODE_TEST_CA_CERT" ]; then CD=$(dirname "$GEODE_TEST_CA_CERT"); [ -f "$CD/leaf.crt" ] && TLSARGS="--cert $CD/leaf.crt --key $CD/leaf.key"; fi
+    KEY=$(python3 -c 'import os;print(os.urandom(32).hex())')
+    KEY2=$(python3 -c 'import os;print(os.urandom(32).hex())')
+    R=$(python3 -c 'import os;print(os.urandom(5).hex())')
+    LABEL="Lbl${R}Zq"; REL="Rel${R}Zq"; PKEY="pk${R}zq"; VAL="valsentinel-${R}-zq"; NUM=7770000$(python3 -c 'import random;print(random.randint(100000,999999))')
+    G1="grph${R}zq"; G2="gdrp${R}zq"; IDX="idx${R}zq"; TSV=8880000$(python3 -c 'import random;print(random.randint(100000,999999))')
+    cat >"$W/scan.py" <<'PYEOF'
+    import os, struct, sys
+    root = sys.argv[1]
+    needles = sys.argv[2:]
+    bn = []
+    for n in needles:
+        bn.append(n.encode())
+        if n.isdigit():
+            bn.append(struct.pack("<q", int(n)))
+            bn.append(struct.pack(">q", int(n)))
+    hits = []
+    for dp, dn, fn in os.walk(root):
+        for f in fn:
+            p = os.path.join(dp, f)
+            try:
+                with open(p, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                continue
+            for b in bn:
+                if b in data:
+                    hits.append("%s <- %r" % (p, b[:24]))
+    for h in sorted(set(hits)):
+        print("PLAINTEXT " + h)
+    sys.exit(1 if hits else 0)
+    PYEOF
+    scan() { python3 "$W/scan.py" "$D" "$LABEL" "$REL" "$PKEY" "$VAL" "$NUM" "$G1" "$G2" "$IDX" "$TSV"; }
+    tree_hash() { (cd "$D" && find . -type f ! -name '.geode.lock' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-64); }
+    start_srv() { # $1 = key
+      PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+      GEODE_TDE_KEY="$1" GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 nohup "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$D" --log-level warn $TLSARGS >>"$W/server.log" 2>&1 &
+      PID=$!
+      for i in $(seq 1 200); do
+        "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:$PORT" $GEODE_CLIENT_TLS -U geode -P "$PW" >/dev/null 2>&1 && return 0
+        kill -0 $PID 2>/dev/null || return 1
+        sleep 0.3
+      done; return 1
+    }
+    q() { "$BIN" query "$1" --server "127.0.0.1:$PORT" $GEODE_CLIENT_TLS -U geode -P "$PW" 2>&1; }
+    must() { OUT=$(q "$1"); echo "$OUT" | grep -q '"status_class":"00000"' || { echo "FAIL query [$1]: $OUT"; exit 1; }; }
+
+    start_srv "$KEY" || { echo "FAIL first start"; cat "$W/server.log"; exit 1; }
+    must "CREATE (:$LABEL {$PKEY: '$VAL', n6571: $NUM})-[:$REL {$PKEY: '$VAL'}]->(:$LABEL)"
+    must "CREATE INDEX $IDX ON :$LABEL($PKEY)"
+    must "MATCH (n:$LABEL) RETURN n.$PKEY AS v ORDER BY n.$PKEY"
+    must "CALL geode.ts.insert(6590, 'sonny6590', 1000, $TSV)"
+    must "CREATE GRAPH $G1"
+    must "CREATE GRAPH $G2"
+    must "DROP GRAPH $G2"
+    OUT=$(q "MATCH (n:$LABEL) RETURN n.n6571 AS n ORDER BY n.n6571")
+    echo "$OUT" | grep -q "$NUM" || { echo "FAIL read back: $OUT"; exit 1; }
+
+    echo "phase=running"; scan || { echo "FAIL plaintext while running"; exit 1; }
+    kill -9 $PID; wait $PID 2>/dev/null
+    echo "phase=after-sigkill"; scan || { echo "FAIL plaintext after SIGKILL"; exit 1; }
+
+    start_srv "$KEY" || { echo "FAIL restart on crashed dir"; tail -30 "$W/server.log"; exit 1; }
+    OUT=$(q "MATCH (n:$LABEL) RETURN n.$PKEY AS v, n.n6571 AS n ORDER BY n.n6571")
+    echo "$OUT" | grep -q "$VAL" && echo "$OUT" | grep -q "$NUM" || { echo "FAIL graph data lost after crash restart: $OUT"; exit 1; }
+    OUT=$(q "CALL geode.ts.range(6590, 'sonny6590', 1000, 1000) YIELD ts, value RETURN value")
+    echo "$OUT" | grep -q "$TSV" || { echo "FAIL time-series point lost after crash restart: $OUT"; exit 1; }
+    echo "phase=after-restart"; scan || { echo "FAIL plaintext after restart"; exit 1; }
+    kill $PID; wait $PID 2>/dev/null
+    echo "phase=after-clean-stop"; scan || { echo "FAIL plaintext after clean stop"; exit 1; }
+
+    H1=$(tree_hash)
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_TDE_KEY="$KEY2" GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 timeout 60 "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$D" --log-level warn $TLSARGS >"$W/wrong.log" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ]; then echo "FAIL server accepted a wrong TDE key rc=$RC"; cat "$W/wrong.log"; exit 1; fi
+    if grep -q "NoManifest" "$W/wrong.log"; then echo "FAIL wrong key reported as the misleading NoManifest"; cat "$W/wrong.log"; exit 1; fi
+    H2=$(tree_hash)
+    [ "$H1" = "$H2" ] || { echo "FAIL a wrong-key start modified the data directory (ts.wal truncated?)"; exit 1; }
+    echo "wrong_key_refused_store_untouched rc=$RC"
+
+    start_srv "$KEY" || { echo "FAIL restart with the right key"; tail -30 "$W/server.log"; exit 1; }
+    OUT=$(q "CALL geode.ts.range(6590, 'sonny6590', 1000, 1000) YIELD ts, value RETURN value")
+    echo "$OUT" | grep -q "$TSV" || { echo "FAIL time-series point lost after the wrong-key attempt: $OUT"; exit 1; }
+    echo "tde_nothing_plaintext_ok"
+  expect:
+    exit_code: 0
+    stdout_contains: [phase=running, phase=after-sigkill, phase=after-restart, phase=after-clean-stop, wrong_key_refused_store_untouched, tde_nothing_plaintext_ok]
+  tags: [tde, at-rest, timeseries, sonny-6590, sonny-6571, sonny-6616, sonny-6615, critical]
+
+tags: [tde, security, sonny-738, critical]

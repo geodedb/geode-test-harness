@@ -1,0 +1,214 @@
+version: '1.0'
+name: Key variables and unknown options fail closed at startup (SONNY-6386, SONNY-6422, SONNY-6442)
+description: |
+  SONNY-6386 (1): a malformed GEODE_TDE_KEY was swallowed (`tde.loadKey catch null`)
+  and `geode serve` opened the store with NO page encryption while the operator
+  believed TDE was on. SONNY-6422 (1, 2): a half-configured GEODE_AUDIT_PUB /
+  GEODE_AUDIT_SEC pair silently fell back to file keys and any-length
+  GEODE_MASTER_KEY was hashed into a working FLE key; GEODE_WAL_KEY alone left the
+  WAL plaintext. SONNY-6442 (4): `geode serve` silently ignored unknown options
+  (`--data-dri` started a server on the defaults). SONNY-6386 (2): `geode fle
+  rotate-key` printed a completed rotation without rotating anything.
+
+  This spec drives the real binary (GEODE_BINARY) as a child process, black-box:
+  a key variable that is set but unusable must make `geode serve` exit non-zero
+  BEFORE it listens, name the variable, and never echo the value; an unknown option
+  exits 2 naming the option; FLE rotation is refused as unsupported.
+
+  Each negative has a control (a well-formed key starts the server) so a refusal
+  caused by something unrelated (port, TLS, data-dir) cannot pass the spec.
+
+  CANARY: REQ=REQ-SONNY-6386-6422-6442-KEY-REFUSAL-BLACKBOX; FEATURE="Key configuration"; ASPECT=SetButUnusableKeyRefuses; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants: []
+fuzz:
+  enabled: false
+
+tests:
+- name: control-wellformed-tde-key-starts
+  description: control — a 64-hex GEODE_TDE_KEY lets the server reach the listening state
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6386' GEODE_LSP_PORT=0 \
+      GEODE_TDE_KEY=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+      timeout 25 "$GEODE_BINARY" serve --listen "127.0.0.1:$PORT" --data-dir "$D/data" --log-level info >"$D/out" 2>&1
+    if grep -q "QUIC transport listening" "$D/out"; then echo "control=started"; else echo "control=FAIL"; cat "$D/out"; exit 1; fi
+  expect:
+    exit_code: 0
+    stdout_contains: [control=started]
+  tags: [tde, key, control]
+
+- name: malformed-tde-key-refuses-startup
+  description: a GEODE_TDE_KEY that is set but not 64 hex chars refuses startup, names the variable, never echoes the value
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    BAD='not-a-hex-key-SENTINELTDEVALUE'
+    GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6386' GEODE_LSP_PORT=0 GEODE_TDE_KEY="$BAD" \
+      timeout 25 "$GEODE_BINARY" serve --listen "127.0.0.1:$PORT" --data-dir "$D/data" --log-level info >"$D/out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ]; then echo "FAIL rc=$RC (server ran with a malformed TDE key)"; cat "$D/out"; exit 1; fi
+    if grep -q "QUIC transport listening" "$D/out"; then echo "FAIL server reached listening"; exit 1; fi
+    grep -q "GEODE_TDE_KEY" "$D/out" || { echo "FAIL output does not name GEODE_TDE_KEY"; cat "$D/out"; exit 1; }
+    if grep -q "SENTINELTDEVALUE" "$D/out"; then echo "FAIL output echoes the key value"; exit 1; fi
+    echo "tde_key_refused rc=$RC"
+  expect:
+    exit_code: 0
+    stdout_contains: [tde_key_refused]
+  tags: [tde, key, fail-closed, sonny-6386]
+
+- name: half-configured-audit-key-pair-refuses-startup
+  description: GEODE_AUDIT_PUB without GEODE_AUDIT_SEC (and the reverse) refuses startup instead of falling back to file keys
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    HEX=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+    for VAR in GEODE_AUDIT_PUB GEODE_AUDIT_SEC; do
+      PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+      env "$VAR=$HEX" GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6422' GEODE_LSP_PORT=0 \
+        timeout 25 "$GEODE_BINARY" serve --listen "127.0.0.1:$PORT" --data-dir "$D/data-$VAR" --log-level info >"$D/out-$VAR" 2>&1
+      RC=$?
+      if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ] || grep -q "QUIC transport listening" "$D/out-$VAR"; then
+        echo "FAIL $VAR alone did not refuse startup rc=$RC"; cat "$D/out-$VAR"; exit 1
+      fi
+      grep -q "GEODE_AUDIT" "$D/out-$VAR" || { echo "FAIL $VAR refusal does not name GEODE_AUDIT_*"; cat "$D/out-$VAR"; exit 1; }
+      echo "audit_pair_refused $VAR rc=$RC"
+    done
+  expect:
+    exit_code: 0
+    stdout_contains: [audit_pair_refused GEODE_AUDIT_PUB, audit_pair_refused GEODE_AUDIT_SEC]
+  tags: [audit, key, fail-closed, sonny-6422]
+
+- name: short-master-key-refuses-startup
+  description: a GEODE_MASTER_KEY that is not a usable length is refused, not hashed into a weak FLE master key
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6422' GEODE_LSP_PORT=0 GEODE_MASTER_KEY=abc \
+      timeout 25 "$GEODE_BINARY" serve --listen "127.0.0.1:$PORT" --data-dir "$D/data" --log-level info >"$D/out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ] || grep -q "QUIC transport listening" "$D/out"; then
+      echo "FAIL short GEODE_MASTER_KEY accepted rc=$RC"; cat "$D/out"; exit 1
+    fi
+    grep -q "GEODE_MASTER_KEY" "$D/out" || { echo "FAIL refusal does not name GEODE_MASTER_KEY"; cat "$D/out"; exit 1; }
+    echo "master_key_refused rc=$RC"
+  expect:
+    exit_code: 0
+    stdout_contains: [master_key_refused]
+  tags: [fle, key, fail-closed, sonny-6422]
+
+- name: wal-key-alone-refuses-startup
+  description: GEODE_WAL_KEY alone (nothing reads it) must refuse, not leave the WAL plaintext
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6422' GEODE_LSP_PORT=0 \
+      GEODE_WAL_KEY=cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe \
+      timeout 25 "$GEODE_BINARY" serve --listen "127.0.0.1:$PORT" --data-dir "$D/data" --log-level info >"$D/out" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ] || grep -q "QUIC transport listening" "$D/out"; then
+      echo "FAIL GEODE_WAL_KEY alone accepted rc=$RC"; cat "$D/out"; exit 1
+    fi
+    grep -q "GEODE_WAL_KEY" "$D/out" || { echo "FAIL refusal does not name GEODE_WAL_KEY"; cat "$D/out"; exit 1; }
+    echo "wal_key_refused rc=$RC"
+  expect:
+    exit_code: 0
+    stdout_contains: [wal_key_refused]
+  tags: [wal, key, fail-closed, sonny-6422]
+
+- name: symbolic-kms-url-refuses-startup-without-claiming-a-kms
+  description: SONNY-6348 (1) — GEODE_KMS_URL=aws/azure/gcp/hashicorp/local used to log "KMS configured" after a local round trip with a random key, contacting nothing
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    for URL in aws azure gcp hashicorp local; do
+      PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+      GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6348' GEODE_LSP_PORT=0 GEODE_KMS_URL="$URL" \
+        timeout 25 "$GEODE_BINARY" serve --listen "127.0.0.1:$PORT" --data-dir "$D/data-$URL" --log-level info >"$D/out-$URL" 2>&1
+      RC=$?
+      if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ] || grep -q "QUIC transport listening" "$D/out-$URL"; then echo "FAIL GEODE_KMS_URL=$URL started rc=$RC"; cat "$D/out-$URL"; exit 1; fi
+      if grep -q "KMS configured" "$D/out-$URL"; then echo "FAIL GEODE_KMS_URL=$URL claimed KMS configured"; exit 1; fi
+      echo "symbolic_kms_refused $URL rc=$RC"
+    done
+  expect:
+    exit_code: 0
+    stdout_contains: [symbolic_kms_refused aws, symbolic_kms_refused local]
+  tags: [kms, tde, fail-closed, sonny-6348]
+
+- name: serve-unknown-option-refused
+  description: an unknown serve option exits 2, names the option, never starts listening
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6442' GEODE_LSP_PORT=0 \
+      timeout 25 "$GEODE_BINARY" serve --listen "127.0.0.1:$PORT" --data-dir "$D/data" --data-dri /srv/typo --log-level info >"$D/out" 2>&1
+    RC=$?
+    [ "$RC" -eq 2 ] || { echo "FAIL expected exit 2 got $RC"; cat "$D/out"; exit 1; }
+    grep -q -- "--data-dri" "$D/out" || { echo "FAIL output does not name --data-dri"; cat "$D/out"; exit 1; }
+    if grep -q "QUIC transport listening" "$D/out"; then echo "FAIL listened"; exit 1; fi
+    echo "unknown_option_refused rc=$RC"
+  expect:
+    exit_code: 0
+    stdout_contains: [unknown_option_refused]
+  tags: [cli, sonny-6442]
+
+- name: fle-rotate-key-refused-as-unsupported
+  description: geode fle rotate-key exits non-zero, says unsupported, and never claims a rotation
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    for SCOPE in "default fek Person ssn" "default sk Person" "default trk"; do
+      # shellcheck disable=SC2086
+      OUT=$(cd "$D" && GEODE_MASTER_KEY=sonny6386-fle-master-key-0123456789abcdef GEODE_LSP_PORT=0 \
+        timeout 30 "$GEODE_BINARY" fle rotate-key $SCOPE 2>&1); RC=$?
+      [ "$RC" -ne 0 ] || { echo "FAIL rotate-key $SCOPE exited 0"; echo "$OUT"; exit 1; }
+      echo "$OUT" | grep -q "not supported" || { echo "FAIL no 'not supported' for $SCOPE"; echo "$OUT"; exit 1; }
+      if echo "$OUT" | grep -q -E "Rotated|Rewrapped|rotation complete|New key version active"; then
+        echo "FAIL claimed a rotation for $SCOPE"; echo "$OUT"; exit 1
+      fi
+    done
+    echo "fle_rotate_refused"
+  expect:
+    exit_code: 0
+    stdout_contains: [fle_rotate_refused]
+  tags: [fle, rotation, sonny-6386]
+
+tags:
+- tde
+- fle
+- key-management
+- fail-closed
+- security
+- sonny-738

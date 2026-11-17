@@ -1,0 +1,204 @@
+version: '1.0'
+name: Durable auth state at startup — resolved data dir, offline user hashing, HMAC key, tenant registry (SONNY-6339, SONNY-6358, SONNY-6322, SONNY-6346)
+description: |
+  Four startup/auth-persistence bugs, all driven black-box against the real binary:
+
+  SONNY-6339 (SECURITY): a server whose data directory came from GEODE_DATA_DIR
+  (no --data-dir flag) passed NO directory to the HMAC key lookup, so the key file
+  was neither read nor created and the HMAC-chained auth graph was silently
+  disabled: CREATE USER reported success and everything vanished on restart.
+  Proof here: GEODE_DATA_DIR only -> create a user, restart, the user is still
+  there, `.geode_hmac_key` exists and `geode auth verify` reports integrity OK.
+
+  SONNY-6358: offline `geode user create` / `user update --password` wrote the
+  supplied password into password_hash unhashed and did not reseal the chain.
+  Proof: after offline create/update the plaintext password is nowhere in the data
+  dir, `geode auth verify` passes, and the server logs the user in with it.
+
+  SONNY-6322 (2): startup invented a fresh random .geode_hmac_key when auth
+  records existed and the key was missing, then exited AuthChainTampered leaving
+  the junk key. Proof: records on disk + key deleted -> refuses ("HMAC key
+  required"), exits non-zero, and does NOT recreate the key file.
+
+  SONNY-6346 (1): the tenant registry silently fell back to memory when
+  <data-dir>/tenants could not be created (every tenant lost at restart). Proof:
+  `tenants` planted as a regular file -> startup refuses naming the problem.
+
+  CANARY: REQ=REQ-SONNY-6339-6358-6322-6346-BLACKBOX; FEATURE="AuthState"; ASPECT=DurableStartup; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants: []
+fuzz:
+  enabled: false
+
+tests:
+- name: env-resolved-data-dir-keeps-auth-state
+  description: GEODE_DATA_DIR only (no --data-dir) — user and HMAC key survive a restart, chain verifies
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    export GEODE_ALLOW_INSECURE_TLS=1   # loopback scratch server; the client refuses --insecure-tls-skip-verify on release builds otherwise
+    BIN="$GEODE_BINARY"; PW='Sonny Harness Admin Passphrase 6339'
+    W=$(mktemp -d); trap 'kill $PID 2>/dev/null; rm -rf "$W"' EXIT; PID=0
+    TLSARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "$GEODE_TEST_CA_CERT" ]; then CD=$(dirname "$GEODE_TEST_CA_CERT"); [ -f "$CD/leaf.crt" ] && TLSARGS="--cert $CD/leaf.crt --key $CD/leaf.key"; fi
+    start_srv() {
+      PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+      GEODE_DATA_DIR="$W/data" GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 nohup "$BIN" serve --listen "127.0.0.1:$PORT" --log-level warn $TLSARGS >>"$W/server.log" 2>&1 &
+      PID=$!
+      for i in $(seq 1 200); do
+        "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:$PORT" $GEODE_CLIENT_TLS -U geode -P "$PW" >/dev/null 2>&1 && return 0
+        kill -0 $PID 2>/dev/null || return 1
+        sleep 0.3
+      done; return 1
+    }
+    stop_srv() { kill $PID 2>/dev/null; wait $PID 2>/dev/null; }
+    q() { "$BIN" query "$1" --server "127.0.0.1:$PORT" $GEODE_CLIENT_TLS -U geode -P "$PW" 2>&1; }
+    mkdir -p "$W/data"
+    start_srv || { echo "FAIL first start"; cat "$W/server.log"; exit 1; }
+    [ -f "$W/data/.geode_hmac_key" ] || { echo "FAIL .geode_hmac_key not created under GEODE_DATA_DIR"; ls -la "$W/data"; exit 1; }
+    OUT=$(q "CREATE USER env_dir_user SET PASSWORD 'Env Dir User Passphrase 6339' ROLE readonly")
+    echo "$OUT" | grep -q '"status_class":"00000"' || { echo "FAIL create user: $OUT"; exit 1; }
+    stop_srv
+    start_srv || { echo "FAIL restart"; cat "$W/server.log"; exit 1; }
+    OUT=$(q "SHOW USERS")
+    echo "$OUT" | grep -q "env_dir_user" || { echo "FAIL user lost after restart: $OUT"; exit 1; }
+    stop_srv
+    V=$("$BIN" auth verify --data-dir "$W/data" 2>&1)
+    echo "$V" | grep -q "integrity OK" || { echo "FAIL chain verify: $V"; exit 1; }
+    echo "env_data_dir_durable"
+  expect:
+    exit_code: 0
+    stdout_contains: [env_data_dir_durable]
+  tags: [auth, sonny-6339, restart, critical]
+
+- name: offline-user-create-hashes-password-and-reseals
+  description: geode user create / update --password store an Argon2id hash, chain verifies, server accepts the login
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    export GEODE_ALLOW_INSECURE_TLS=1   # loopback scratch server; the client refuses --insecure-tls-skip-verify on release builds otherwise
+    BIN="$GEODE_BINARY"
+    W=$(mktemp -d); trap 'kill $PID 2>/dev/null; rm -rf "$W"' EXIT; PID=0
+    TLSARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "$GEODE_TEST_CA_CERT" ]; then CD=$(dirname "$GEODE_TEST_CA_CERT"); [ -f "$CD/leaf.crt" ] && TLSARGS="--cert $CD/leaf.crt --key $CD/leaf.key"; fi
+    D="$W/data"; mkdir -p "$D"
+    P1='Bob First Offline Passphrase 6358'; P2='Bob Second Offline Passphrase 6358'; PC='Carol Offline Passphrase Value 6358'
+    "$BIN" user create bob bob@example.com --password "$P1" --data-dir "$D" >"$W/c1.log" 2>&1 || { echo "FAIL create"; cat "$W/c1.log"; exit 1; }
+    "$BIN" user update bob --password "$P2" --data-dir "$D" >"$W/c2.log" 2>&1 || { echo "FAIL update"; cat "$W/c2.log"; exit 1; }
+    "$BIN" user update carol --password "$PC" --email carol@example.com --data-dir "$D" >"$W/c3.log" 2>&1 || { echo "FAIL update-new"; cat "$W/c3.log"; exit 1; }
+    for P in "$P1" "$P2" "$PC"; do
+      if grep -r -a -q -F "$P" "$D"; then echo "FAIL plaintext password at rest: $P"; grep -r -a -l -F "$P" "$D"; exit 1; fi
+    done
+    V=$("$BIN" auth verify --data-dir "$D" 2>&1)
+    echo "$V" | grep -q "integrity OK" || { echo "FAIL chain not sealed: $V"; exit 1; }
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6358' GEODE_LSP_PORT=0 nohup "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$D" --log-level warn $TLSARGS >"$W/server.log" 2>&1 &
+    PID=$!
+    OK=0
+    for i in $(seq 1 200); do
+      OUT=$("$BIN" query "RETURN 7 AS x" --server "127.0.0.1:$PORT" $GEODE_CLIENT_TLS -U bob -P "$P2" 2>&1)
+      if echo "$OUT" | grep -q '"x":7\|"x": 7'; then OK=1; break; fi
+      kill -0 $PID 2>/dev/null || break
+      sleep 0.3
+    done
+    [ "$OK" -eq 1 ] || { echo "FAIL server did not accept bob with the updated password"; echo "$OUT"; cat "$W/server.log"; exit 1; }
+    OLD=$("$BIN" query "RETURN 7 AS x" --server "127.0.0.1:$PORT" $GEODE_CLIENT_TLS -U bob -P "$P1" 2>&1)
+    if echo "$OLD" | grep -q '"x":7\|"x": 7'; then echo "FAIL the superseded password still works"; exit 1; fi
+    echo "offline_user_hashed_and_sealed"
+  expect:
+    exit_code: 0
+    stdout_contains: [offline_user_hashed_and_sealed]
+  tags: [auth, sonny-6358, offline, critical]
+
+- name: missing-hmac-key-with-auth-records-refuses-and-writes-nothing
+  description: SONNY-6322 (2) — auth records on disk and no HMAC key -> HMAC key required, exit non-zero, no junk key written
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    export GEODE_ALLOW_INSECURE_TLS=1   # loopback scratch server; the client refuses --insecure-tls-skip-verify on release builds otherwise
+    BIN="$GEODE_BINARY"; PW='Sonny Harness Admin Passphrase 6322'
+    W=$(mktemp -d); trap 'kill $PID 2>/dev/null; rm -rf "$W"' EXIT; PID=0
+    TLSARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "$GEODE_TEST_CA_CERT" ]; then CD=$(dirname "$GEODE_TEST_CA_CERT"); [ -f "$CD/leaf.crt" ] && TLSARGS="--cert $CD/leaf.crt --key $CD/leaf.key"; fi
+    D="$W/data"; mkdir -p "$D"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 nohup "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$D" --log-level warn $TLSARGS >"$W/s1.log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 200); do
+      "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:$PORT" $GEODE_CLIENT_TLS -U geode -P "$PW" >/dev/null 2>&1 && break
+      sleep 0.3
+    done
+    "$BIN" query "CREATE USER keyless SET PASSWORD 'Keyless User Passphrase Value 6322' ROLE readonly" --server "127.0.0.1:$PORT" $GEODE_CLIENT_TLS -U geode -P "$PW" >/dev/null 2>&1
+    kill $PID; wait $PID 2>/dev/null
+    [ -f "$D/.geode_hmac_key" ] || { echo "FAIL precondition: no key file"; exit 1; }
+    rm -f "$D/.geode_hmac_key"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 timeout 60 "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$D" --log-level warn $TLSARGS >"$W/s2.log" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ]; then echo "FAIL started without the HMAC key rc=$RC"; cat "$W/s2.log"; exit 1; fi
+    grep -q "HMAC key required" "$W/s2.log" || { echo "FAIL no 'HMAC key required' message"; cat "$W/s2.log"; exit 1; }
+    if [ -e "$D/.geode_hmac_key" ]; then echo "FAIL a junk HMAC key was written over existing auth records"; exit 1; fi
+    echo "hmac_key_required_nothing_written rc=$RC"
+  expect:
+    exit_code: 0
+    stdout_contains: [hmac_key_required_nothing_written]
+  tags: [auth, sonny-6322, fail-closed, critical]
+
+- name: unusable-tenant-registry-refuses-startup
+  description: SONNY-6346 (1) — <data>/tenants cannot be created (a file is planted) -> startup refuses instead of an in-memory registry
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    export GEODE_ALLOW_INSECURE_TLS=1   # loopback scratch server; the client refuses --insecure-tls-skip-verify on release builds otherwise
+    BIN="$GEODE_BINARY"
+    W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+    TLSARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "$GEODE_TEST_CA_CERT" ]; then CD=$(dirname "$GEODE_TEST_CA_CERT"); [ -f "$CD/leaf.crt" ] && TLSARGS="--cert $CD/leaf.crt --key $CD/leaf.key"; fi
+    D="$W/data"; mkdir -p "$D"; echo "not a directory" > "$D/tenants"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6346' GEODE_LSP_PORT=0 timeout 60 "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$D" --log-level warn $TLSARGS >"$W/s.log" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ]; then echo "FAIL started with an unusable tenant registry rc=$RC"; cat "$W/s.log"; exit 1; fi
+    grep -qi "tenant" "$W/s.log" || { echo "FAIL refusal does not mention the tenant registry"; cat "$W/s.log"; exit 1; }
+    echo "tenant_registry_refused rc=$RC"
+  expect:
+    exit_code: 0
+    stdout_contains: [tenant_registry_refused]
+  tags: [tenancy, sonny-6346, fail-closed]
+
+- name: corrupt-tenant-registry-line-refuses-startup
+  description: SONNY-6348 (2) — a registry.jsonl line that cannot become a tenant fails startup (TenantRegistryCorrupt), the tenant is not silently lost
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="$GEODE_BINARY"
+    W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+    D="$W/data"; mkdir -p "$D/tenants"; printf 'this is not json\n' > "$D/tenants/registry.jsonl"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD='Sonny Harness Admin Passphrase 6348' GEODE_LSP_PORT=0 timeout 60 "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$D" --log-level warn >"$W/s.log" 2>&1
+    RC=$?
+    if [ "$RC" -eq 0 ] || [ "$RC" -eq 124 ]; then echo "FAIL started over a corrupt tenant registry rc=$RC"; cat "$W/s.log"; exit 1; fi
+    grep -qi "tenant" "$W/s.log" || { echo "FAIL refusal does not mention the tenant registry"; cat "$W/s.log"; exit 1; }
+    echo "corrupt_registry_refused rc=$RC"
+  expect:
+    exit_code: 0
+    stdout_contains: [corrupt_registry_refused]
+  tags: [tenancy, sonny-6348, fail-closed]
+
+tags: [auth, startup, security, sonny-738]

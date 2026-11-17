@@ -1,0 +1,352 @@
+version: '1.0'
+name: FLE migration of existing plaintext leaves no plaintext on disk; storage.scrub clears dead space (SONNY-6688, SONNY-6692, SONNY-6700)
+description: |
+  SONNY-6688: `geode fle migrate-encrypt` printed "Migration Complete" and exited 0 without
+  encrypting anything (no storage backend), so existing plaintext of a field that was newly
+  configured as encrypted could not be migrated. Now `CALL geode.fle.migrateEncrypt(type, field
+  [, batch_size [, tenant [, graph]]])` (and the CLI) rewrite every stored value sealed through
+  the real storage adapter: columns encrypted / already / batches / complete; idempotent; the
+  permitted role reads plaintext, others [REDACTED].
+
+  SONNY-6692: the first implementation removed each plaintext value but the old bytes stayed in
+  props.store pages and the WAL until the next checkpoint, in freed var-store pages (values larger
+  than a property page spill there) and in a tombstoned slab slot of a record that an earlier UPDATE
+  relocated. After migrateEncrypt returns, NO plaintext of the field (small, large, or superseded)
+  may remain in ANY file of the data directory, with the server still running.
+
+  SONNY-6700: an operator procedure `CALL geode.storage.scrub()` (Admin only, 42501 otherwise)
+  overwrites the dead space of every graph: a value superseded by an update or a DELETE no longer
+  survives in any data-dir file; live data reads back.
+
+  Black-box: a real server, a recursive raw-byte grep of the whole data directory (every file,
+  including the WAL), control-first (the plaintext IS on disk before the migration).
+
+  CANARY: REQ=REQ-SONNY-6688-6692-6700-MIGRATE-SCRUB-BLACKBOX; FEATURE="FLE"; ASPECT=MigrationScrub; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+    Execution note: the server is a private scratch server started by the first step (own port and
+    data dir under /tmp/sonny738-crypto-*, outside the harness-managed lifecycle), so these steps are not
+    affected by concurrent harness runs on a shared machine.
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+invariants: []
+tests:
+- name: scratch-server-start
+  description: Starts a private geode server (own data dir and port, outside the harness-managed lifecycle) for the steps below.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    ST="/tmp/sonny738-crypto-6688"
+    rm -rf "$ST"; mkdir -p "$ST"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    cat > "$ST/env.sh" <<'ENVEOF'
+    export GEODE_ALLOW_INSECURE_TLS=1
+    export ST="/tmp/sonny738-crypto-6688"
+    export D="$ST/data"
+    export GEODE_DATA_DIR="$D"
+    export GEODE_CLIENT_TLS="--insecure-tls-skip-verify"
+    export ADMINPW="Sonny Harness Admin Passphrase 738"
+    SRV_ENV=(
+      'GEODE_ADMIN_PASSWORD=Sonny Harness Admin Passphrase 738'
+      GEODE_ALLOW_TEST_AUDIT_KEYS=1
+      GEODE_LSP_PORT=0
+      GEODE_MASTER_KEY=sonny6688-fle-master-key-0123456789abcdef
+    )
+    SRV_ARGS=()
+    gq_as() { local u="$1" p="$2"; shift 2; "$GEODE_BINARY" query -U "$u" -P "$p" "$@" --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS; }
+    gq() { gq_as geode "$ADMINPW" "$@"; }
+    start_srv() {
+      env "${SRV_ENV[@]}" setsid nohup "$GEODE_BINARY" serve --listen "$GEODE_SERVER_ADDRESS" --data-dir "$D" --log-level warn "${SRV_ARGS[@]}" </dev/null >>"$ST/server.log" 2>&1 &
+      echo $! > "$ST/pid"
+      local i
+      for i in $(seq 1 400); do
+        gq "RETURN 1 AS x" >/dev/null 2>&1 && return 0
+        kill -0 "$(cat "$ST/pid")" 2>/dev/null || { echo "SERVER_EXITED"; tail -20 "$ST/server.log"; return 1; }
+        sleep 0.5
+      done
+      echo "SERVER_NOT_READY"; tail -20 "$ST/server.log"; return 1
+    }
+    stop_srv() {
+      [ -f "$ST/pid" ] || return 0
+      local p; p=$(cat "$ST/pid")
+      kill "$p" 2>/dev/null
+      local i; for i in $(seq 1 200); do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+      kill -9 "$p" 2>/dev/null; rm -f "$ST/pid"
+    }
+    restart_srv() { stop_srv; start_srv; }
+    ENVEOF
+    echo "export GEODE_SERVER_ADDRESS=127.0.0.1:$PORT" >> "$ST/env.sh"
+    . "$ST/env.sh"
+    mkdir -p "$D"
+    start_srv && echo "SCRATCH_SERVER_READY"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+  tags:
+  - setup
+- name: seed-plaintext-small-large-and-superseded-values
+  description: three small values, one value larger than a property page (spills to the var store), one value updated before the migration (old bytes relocated)
+  type: bash
+  timeout_ms: 180000
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    set -u
+    PW="Sonny Harness Admin Passphrase 738"
+    F=$(mktemp); trap 'rm -f "$F"' EXIT
+    python3 - "$F" <<'PYEOF'
+    import sys
+    big = "MIG-6688-BIG-" + ("x" * 30000)
+    lines = [
+      "CREATE (:P6688 {k: 1, ssn: 'MIG-6688-AAAA-1111'});",
+      "CREATE (:P6688 {k: 2, ssn: 'MIG-6688-BBBB-2222'});",
+      "CREATE (:P6688 {k: 3, ssn: 'MIG-6688-CCCC-3333'});",
+      "CREATE (:P6688 {k: 4, ssn: '%s'});" % big,
+      "CREATE (:P6688 {k: 5, ssn: 'MIG-6688-OLDV-5555'});",
+      "MATCH (n:P6688 {k: 5}) SET n.ssn = 'MIG-6688-NEWV-5555';",
+    ]
+    open(sys.argv[1], "w").write("\n".join(lines))
+    PYEOF
+    OUT=$("$GEODE_BINARY" query -f "$F" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1) || { echo "SEED_FAIL: $OUT" | tail -5; exit 1; }
+    echo "SEED_DONE"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SEED_DONE
+  tags:
+  - fle
+  - migration
+  - setup
+- name: control-plaintext-is-on-disk-before-migration
+  description: CONTROL — the markers are findable in the data dir before the migration (the later "absent" is meaningful)
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    set -u
+    D="${GEODE_DATA_DIR:?}"
+    for M in MIG-6688-AAAA-1111 MIG-6688-BBBB-2222 MIG-6688-CCCC-3333 MIG-6688-BIG- MIG-6688-NEWV-5555; do
+      grep -r -a -q -F "$M" "$D" || { echo "CONTROL_FAIL marker $M not on disk before migration"; exit 1; }
+    done
+    echo "CONTROL_PLAINTEXT_PRESENT"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CONTROL_PLAINTEXT_PRESENT
+  tags:
+  - fle
+  - migration
+  - control
+  timeout_ms: 300000
+- name: configure-field-and-grant-role
+  type: bash
+  timeout_ms: 60000
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    set -u
+    PW="Sonny Harness Admin Passphrase 738"
+    q() { "$GEODE_BINARY" query "$1" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1; }
+    q "CALL geode.fle.configureField('P6688', 'ssn', { algorithm: 'AES-256-GCM', visibility: ['pii'] })" | grep -q '"status_class":"00000"' || { echo FAIL configure; exit 1; }
+    q "CALL geode.fle.grantRole('geode', 'pii')" | grep -q '"status_class":"00000"' || { echo FAIL grant; exit 1; }
+    echo CONFIGURED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CONFIGURED
+  tags:
+  - fle
+  - migration
+  - setup
+- name: migrate-encrypt-encrypts-every-stored-value
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].encrypted
+      equals: 5
+    - expression: results[0].already
+      equals: 0
+    - expression: results[0].complete
+      equals: true
+  tags:
+  - fle
+  - migration
+  - sonny-6688
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.migrateEncrypt('"'"'P6688'"'"', '"'"'ssn'"'"', 2)'
+  timeout_ms: 300000
+- name: no-plaintext-anywhere-in-data-dir-after-migration
+  description: SONNY-6692 — small, large (var-store) and superseded values are in NO file, WAL included, with the server running
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    set -u
+    D="${GEODE_DATA_DIR:?}"
+    BAD=0
+    for M in MIG-6688-AAAA-1111 MIG-6688-BBBB-2222 MIG-6688-CCCC-3333 MIG-6688-BIG- MIG-6688-OLDV-5555 MIG-6688-NEWV-5555; do
+      if grep -r -a -l -F "$M" "$D" >/dev/null 2>&1; then echo "LEAK $M in: $(grep -r -a -l -F "$M" "$D" | tr '\n' ' ')"; BAD=1; fi
+    done
+    [ "$BAD" -eq 0 ] && echo "NO_PLAINTEXT_AFTER_MIGRATION" || exit 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - NO_PLAINTEXT_AFTER_MIGRATION
+  tags:
+  - fle
+  - migration
+  - sonny-6692
+  - critical
+  timeout_ms: 300000
+- name: permitted-role-reads-migrated-plaintext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - MIG-6688-AAAA-1111
+    - MIG-6688-BBBB-2222
+    - MIG-6688-CCCC-3333
+    - MIG-6688-NEWV-5555
+    stdout_not_contains:
+    - MIG-6688-OLDV-5555
+    - '[REDACTED]'
+  tags:
+  - fle
+  - migration
+  - sonny-6688
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role pii 'MATCH (n:P6688) WHERE n.k <= 3 OR n.k = 5 RETURN n.k AS k, n.ssn AS ssn ORDER BY k'
+  timeout_ms: 300000
+- name: other-roles-read-redacted
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '[REDACTED]'
+    stdout_not_contains:
+    - MIG-6688-AAAA-1111
+  tags:
+  - fle
+  - migration
+  - sonny-6688
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:P6688) WHERE n.k <= 3 RETURN n.ssn AS ssn'
+  timeout_ms: 300000
+- name: migrate-encrypt-is-idempotent
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].encrypted
+      equals: 0
+    - expression: results[0].already
+      equals: 5
+  tags:
+  - fle
+  - migration
+  - sonny-6688
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.migrateEncrypt('"'"'P6688'"'"', '"'"'ssn'"'"')'
+  timeout_ms: 300000
+- name: setup-readwrite-user-and-dead-values
+  description: a readwrite user, plus values that become dead space (superseded by SET, removed by DELETE)
+  type: bash
+  timeout_ms: 120000
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    set -u
+    PW="Sonny Harness Admin Passphrase 738"
+    q() { "$GEODE_BINARY" query "$1" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1; }
+    q "CREATE USER rw6700 SET PASSWORD 'Rw Six Seven Zero Zero Passphrase' ROLE readwrite" | grep -q '"status_class":"00000"' || { echo FAIL user; exit 1; }
+    q "CREATE (:D6700 {k: 1, v: 'SCRUB-6700-OLDVAL-0001'})" >/dev/null
+    q "CREATE (:D6700 {k: 2, v: 'SCRUB-6700-DELVAL-0002'})" >/dev/null
+    q "MATCH (n:D6700 {k: 1}) SET n.v = 'SCRUB-6700-NEWVAL-0001'" >/dev/null
+    q "MATCH (n:D6700 {k: 2}) DETACH DELETE n" >/dev/null
+    echo DEAD_VALUES_CREATED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - DEAD_VALUES_CREATED
+  tags:
+  - storage
+  - scrub
+  - setup
+- name: scrub-requires-admin
+  description: SONNY-6700 — a readwrite user is refused (42501)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42501'
+  tags:
+  - storage
+  - scrub
+  - authz
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    gq_as rw6700 'Rw Six Seven Zero Zero Passphrase' 'CALL geode.storage.scrub()'
+  timeout_ms: 300000
+- name: admin-scrub-runs
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - scrub
+  - sonny-6700
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.storage.scrub()'
+  timeout_ms: 300000
+- name: scrubbed-dead-values-gone-live-value-reads-back
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    set -u
+    D="${GEODE_DATA_DIR:?}"
+    PW="Sonny Harness Admin Passphrase 738"
+    for M in SCRUB-6700-OLDVAL-0001 SCRUB-6700-DELVAL-0002; do
+      if grep -r -a -l -F "$M" "$D" >/dev/null 2>&1; then echo "DEAD_VALUE_SURVIVES $M in: $(grep -r -a -l -F "$M" "$D" | tr '\n' ' ')"; exit 1; fi
+    done
+    OUT=$("$GEODE_BINARY" query "MATCH (n:D6700) RETURN n.v AS v" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+    echo "$OUT" | grep -q "SCRUB-6700-NEWVAL-0001" || { echo "LIVE_VALUE_LOST: $OUT"; exit 1; }
+    echo "SCRUB_CLEARED_DEAD_SPACE"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRUB_CLEARED_DEAD_SPACE
+  tags:
+  - storage
+  - scrub
+  - sonny-6700
+  - critical
+  timeout_ms: 300000
+- name: scratch-server-stop
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6688/env.sh"
+    stop_srv; rm -rf "$ST"; echo SCRATCH_SERVER_STOPPED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags:
+  - teardown
+tags:
+- fle
+- storage
+- security
+- sonny-738

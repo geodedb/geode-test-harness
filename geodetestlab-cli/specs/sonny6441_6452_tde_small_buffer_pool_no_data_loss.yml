@@ -1,0 +1,245 @@
+version: '1.0'
+name: TDE with a buffer pool smaller than the store — no committed node, edge or delete is lost (SONNY-6441, SONNY-6452)
+description: |
+  SONNY-6441: with page encryption on and a buffer pool smaller than the store
+  (GEODE_BUFFER_POOL_PAGES below the store size, GEODE_BUFFER_POOL_AUTO_SIZE=0)
+  committed nodes read back as MISSING (4 of 2000 reads) — silent data loss under
+  TDE. Root cause (graph-storage <= 0.4.11, fixed in 0.4.12, SONNY-6452): the
+  encryption tag was written over the last 16 bytes of every page, so the node in
+  slot 169 of an 8 KiB node page lost label_count/flags/txn_stamp (a DELETED
+  slot-169 node reappeared) and the last incoming-edge heads of each adjacency
+  directory page read as "no head" (incoming edges invisible).
+
+  This spec makes the engine evict constantly (128-page pool; the store below is several times larger) under TDE and checks, for
+  1200 nodes (slot 169 of the first pages included): every node reads back with its
+  property, deleted nodes stay deleted (slot-169 ids among them), and every node of
+  a chain has its incoming edge, before AND after a restart.
+
+  CANARY: REQ=REQ-SONNY-6441-TDE-SMALL-POOL; FEATURE="TDE"; ASPECT=EvictionReloadNoLoss; STATUS=TESTED; TEST=self; OWNER=storage; UPDATED=2026-11-17
+
+    Execution note: the server is a private scratch server started by the first step (own port and
+    data dir under /tmp/sonny738-crypto-*, outside the harness-managed lifecycle), so these steps are not
+    affected by concurrent harness runs on a shared machine.
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+invariants: []
+tests:
+- name: scratch-server-start
+  description: Starts a private geode server (own data dir and port, outside the harness-managed lifecycle) for the steps below.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    ST="/tmp/sonny738-crypto-6441"
+    rm -rf "$ST"; mkdir -p "$ST"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    cat > "$ST/env.sh" <<'ENVEOF'
+    export GEODE_ALLOW_INSECURE_TLS=1
+    export ST="/tmp/sonny738-crypto-6441"
+    export D="$ST/data"
+    export GEODE_DATA_DIR="$D"
+    export GEODE_CLIENT_TLS="--insecure-tls-skip-verify"
+    export ADMINPW="Sonny Harness Admin Passphrase 738"
+    SRV_ENV=(
+      'GEODE_ADMIN_PASSWORD=Sonny Harness Admin Passphrase 738'
+      GEODE_ALLOW_TEST_AUDIT_KEYS=1
+      GEODE_BUFFER_POOL_AUTO_SIZE=0
+      GEODE_BUFFER_POOL_PAGES=128
+      GEODE_LSP_PORT=0
+      GEODE_TDE_KEY=5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
+    )
+    SRV_ARGS=()
+    gq_as() { local u="$1" p="$2"; shift 2; "$GEODE_BINARY" query -U "$u" -P "$p" "$@" --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS; }
+    gq() { gq_as geode "$ADMINPW" "$@"; }
+    start_srv() {
+      env "${SRV_ENV[@]}" setsid nohup "$GEODE_BINARY" serve --listen "$GEODE_SERVER_ADDRESS" --data-dir "$D" --log-level warn "${SRV_ARGS[@]}" </dev/null >>"$ST/server.log" 2>&1 &
+      echo $! > "$ST/pid"
+      local i
+      for i in $(seq 1 400); do
+        gq "RETURN 1 AS x" >/dev/null 2>&1 && return 0
+        kill -0 "$(cat "$ST/pid")" 2>/dev/null || { echo "SERVER_EXITED"; tail -20 "$ST/server.log"; return 1; }
+        sleep 0.5
+      done
+      echo "SERVER_NOT_READY"; tail -20 "$ST/server.log"; return 1
+    }
+    stop_srv() {
+      [ -f "$ST/pid" ] || return 0
+      local p; p=$(cat "$ST/pid")
+      kill "$p" 2>/dev/null
+      local i; for i in $(seq 1 200); do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+      kill -9 "$p" 2>/dev/null; rm -f "$ST/pid"
+    }
+    restart_srv() { stop_srv; start_srv; }
+    ENVEOF
+    echo "export GEODE_SERVER_ADDRESS=127.0.0.1:$PORT" >> "$ST/env.sh"
+    . "$ST/env.sh"
+    mkdir -p "$D"
+    start_srv && echo "SCRATCH_SERVER_READY"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+  tags:
+  - setup
+- name: seed-1200-nodes-in-600-chained-pairs-and-delete-every-seventh
+  type: bash
+  timeout_ms: 900000
+  command: |
+    . "/tmp/sonny738-crypto-6441/env.sh"
+    set -u
+    F=$(mktemp); trap 'rm -f "$F"' EXIT
+    for B in 0 1 2 3 4 5; do
+    python3 - "$F" "$B" <<'PYEOF'
+    import sys
+    b = int(sys.argv[2]); pad = "p" * 1000
+    lines = ["CREATE (:S6441 {i: %d, tag: 'tde-pool-%d', pad: '%s'})-[:NEXT]->(:S6441 {i: %d, tag: 'tde-pool-%d', pad: '%s'});" % (2*k-1, 2*k-1, pad, 2*k, 2*k, pad) for k in range(b*100+1, b*100+101)]
+    open(sys.argv[1], "w").write("\n".join(lines))
+    PYEOF
+    OUT=$("$GEODE_BINARY" query -f "$F" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$ADMINPW" 2>&1)
+    echo "$OUT" | grep -q "Statements executed: 100" && ! echo "$OUT" | grep -q "Errors: [1-9]" || { echo "SEED_FAIL batch $B: $(echo "$OUT" | tail -3)"; exit 1; }
+    sleep 5
+    done
+    for A in 0 100 200 300 400 500 600 700 800 900 1000 1100; do
+      gq "MATCH (n:S6441) WHERE n.i > $A AND n.i <= $((A+100)) AND n.i % 7 = 0 DETACH DELETE n" | grep -q '"status_class":"00000"' || { echo "DELETE_FAIL range $A"; exit 1; }
+      sleep 3
+    done
+    echo "SEED_DONE"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SEED_DONE
+  tags:
+  - tde
+  - small-pool
+  - setup
+  description: 1200 padded nodes (about 2.4 MB, over twice the 128-page pool) created in 6 batches of 100 (odd)-[:NEXT]->(even) pairs with a checkpoint pause between batches, then every multiple of 7 deleted
+- name: live-count-and-values
+  description: 1200 created, 171 deleted (multiples of 7) -> 1029 live, none resurrected
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].live
+      equals: 1029
+    - expression: results[0].d
+      equals: 1029
+    - expression: results[0].resurrected
+      equals: 0
+  tags:
+  - tde
+  - small-pool
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6441/env.sh"
+    gq 'MATCH (n:S6441) RETURN count(n) AS live, count(DISTINCT n.i) AS d, sum(CASE WHEN n.i % 7 = 0 THEN 1 ELSE 0 END) AS resurrected'
+  timeout_ms: 300000
+- name: every-live-node-and-its-property-reads-back
+  description: "cold-reads every live node's property in 12 ranges: the count per range is exactly the non-multiples of 7 and each node's 1000-byte pad is intact"
+  type: bash
+  timeout_ms: 900000
+  command: |
+    . "/tmp/sonny738-crypto-6441/env.sh"
+    set -u
+    for A in 0 100 200 300 400 500 600 700 800 900 1000 1100; do
+      WANT=$(python3 -c "print(len([i for i in range($A+1,$A+101) if i % 7]))")
+      OUT=$(gq "MATCH (n:S6441) WHERE n.i > $A AND n.i <= $((A+100)) RETURN count(n) AS c, sum(size(n.pad)) AS padsum")
+      echo "$OUT" | grep -q "\"c\":$WANT," && echo "$OUT" | grep -q "\"padsum\":$((WANT*1000))" || { echo "RANGE_MISMATCH $A want $WANT: $OUT"; exit 1; }
+    done
+    echo "ALL_NODES_READ_BACK"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ALL_NODES_READ_BACK
+  tags:
+  - tde
+  - small-pool
+  - critical
+- name: incoming-edges-visible
+  description: every live node whose predecessor is live has its incoming NEXT edge visible
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].edges
+      equals: 429
+    - expression: results[0].targets
+      equals: 429
+  tags:
+  - tde
+  - small-pool
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6441/env.sh"
+    gq 'MATCH (a:S6441)-[:NEXT]->(b:S6441) RETURN count(*) AS edges, count(DISTINCT b) AS targets'
+  timeout_ms: 300000
+- name: restart-server
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6441/env.sh"
+    echo restarting
+    restart_srv && echo restarted
+  expect:
+    exit_code: 0
+  tags:
+  - tde
+  - restart
+  timeout_ms: 300000
+- name: after-restart-count-and-deletes
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].live
+      equals: 1029
+    - expression: results[0].resurrected
+      equals: 0
+  tags:
+  - tde
+  - small-pool
+  - restart
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6441/env.sh"
+    gq 'MATCH (n:S6441) RETURN count(n) AS live, sum(CASE WHEN n.i % 7 = 0 THEN 1 ELSE 0 END) AS resurrected'
+  timeout_ms: 300000
+- name: after-restart-incoming-edges
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].edges
+      equals: 429
+    - expression: results[0].targets
+      equals: 429
+  tags:
+  - tde
+  - small-pool
+  - restart
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6441/env.sh"
+    gq 'MATCH (a:S6441)-[:NEXT]->(b:S6441) RETURN count(*) AS edges, count(DISTINCT b) AS targets'
+  timeout_ms: 300000
+- name: scratch-server-stop
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6441/env.sh"
+    stop_srv; rm -rf "$ST"; echo SCRATCH_SERVER_STOPPED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags:
+  - teardown
+tags:
+- tde
+- storage
+- sonny-738
+- critical

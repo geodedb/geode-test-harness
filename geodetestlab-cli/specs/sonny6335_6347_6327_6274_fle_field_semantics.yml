@@ -1,0 +1,528 @@
+version: '1.0'
+name: FLE field semantics — indexes refused, inline maps agree with WHERE, MERGE refused, edge reads decrypt, catalog lives in the data dir (SONNY-6335, SONNY-6347, SONNY-6327, SONNY-6362, SONNY-6274)
+description: |
+  Black-box proofs for the FLE correctness/leak bugs of the SONNY-738 sweep.
+
+  SONNY-6335 (2): the fulltext/exact/ordered/vector indexes and the MERGE property index stored
+  CIPHERTEXT for encrypted fields (an FTS over an encrypted field indexed noise). Now: CREATE INDEX
+  of every kind and CREATE CONSTRAINT UNIQUE on an encrypted field are refused (0A000), NOT NULL is
+  allowed, an index on a plain field is unaffected, and configureField on a field that already has an
+  index/UNIQUE constraint is refused (0A000, the field stays unencrypted).
+  SONNY-6335 (3): inline property maps `(n:L {secret: 'x'})` compared against the stored envelope and
+  never matched while `WHERE n.secret = 'x'` did; both must agree for each role.
+  SONNY-6347 (1) / SONNY-6362 (4): MERGE on an encrypted key compared the envelope with the plaintext
+  and created a duplicate on every run; it is refused (0A000).
+  SONNY-6327 (1): an encrypted EDGE property was returned with no decryption and no role check.
+  SONNY-6274: the FLE catalog fell back to a shared /tmp/geode_fle_catalog.dat; with a data directory it
+  lives there (0600) and /tmp is never written.
+
+  Real server (FLE via GEODE_MASTER_KEY), real roles (`--role`), the Admin holds FLE role 'pii' through
+  geode.fle.grantRole (SONNY-6341).
+
+  CANARY: REQ=REQ-SONNY-6335-6347-6327-FLE-SEMANTICS-BLACKBOX; FEATURE="FLE"; ASPECT=IdentityIndexesMerge; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+    Execution note: the server is a private scratch server started by the first step (own port and
+    data dir under /tmp/sonny738-crypto-*, outside the harness-managed lifecycle), so these steps are not
+    affected by concurrent harness runs on a shared machine.
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+invariants: []
+tests:
+- name: scratch-server-start
+  description: Starts a private geode server (own data dir and port, outside the harness-managed lifecycle) for the steps below.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    ST="/tmp/sonny738-crypto-6335"
+    rm -rf "$ST"; mkdir -p "$ST"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    cat > "$ST/env.sh" <<'ENVEOF'
+    export GEODE_ALLOW_INSECURE_TLS=1
+    export ST="/tmp/sonny738-crypto-6335"
+    export D="$ST/data"
+    export GEODE_DATA_DIR="$D"
+    export GEODE_CLIENT_TLS="--insecure-tls-skip-verify"
+    export ADMINPW="Sonny Harness Admin Passphrase 738"
+    SRV_ENV=(
+      'GEODE_ADMIN_PASSWORD=Sonny Harness Admin Passphrase 738'
+      GEODE_ALLOW_TEST_AUDIT_KEYS=1
+      GEODE_LSP_PORT=0
+      GEODE_MASTER_KEY=sonny6335-fle-master-key-0123456789abcdef
+    )
+    SRV_ARGS=()
+    gq_as() { local u="$1" p="$2"; shift 2; "$GEODE_BINARY" query -U "$u" -P "$p" "$@" --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS; }
+    gq() { gq_as geode "$ADMINPW" "$@"; }
+    start_srv() {
+      env "${SRV_ENV[@]}" setsid nohup "$GEODE_BINARY" serve --listen "$GEODE_SERVER_ADDRESS" --data-dir "$D" --log-level warn "${SRV_ARGS[@]}" </dev/null >>"$ST/server.log" 2>&1 &
+      echo $! > "$ST/pid"
+      local i
+      for i in $(seq 1 400); do
+        gq "RETURN 1 AS x" >/dev/null 2>&1 && return 0
+        kill -0 "$(cat "$ST/pid")" 2>/dev/null || { echo "SERVER_EXITED"; tail -20 "$ST/server.log"; return 1; }
+        sleep 0.5
+      done
+      echo "SERVER_NOT_READY"; tail -20 "$ST/server.log"; return 1
+    }
+    stop_srv() {
+      [ -f "$ST/pid" ] || return 0
+      local p; p=$(cat "$ST/pid")
+      kill "$p" 2>/dev/null
+      local i; for i in $(seq 1 200); do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+      kill -9 "$p" 2>/dev/null; rm -f "$ST/pid"
+    }
+    restart_srv() { stop_srv; start_srv; }
+    ENVEOF
+    echo "export GEODE_SERVER_ADDRESS=127.0.0.1:$PORT" >> "$ST/env.sh"
+    . "$ST/env.sh"
+    mkdir -p "$D"
+    start_srv && echo "SCRATCH_SERVER_READY"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+  tags:
+  - setup
+- name: setup-encrypt-fields
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ok
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.configureField('"'"'M6335'"'"', '"'"'ssn'"'"', { algorithm: '"'"'AES-256-GCM'"'"', visibility: ['"'"'pii'"'"'] }) RETURN '"'"'ok'"'"' AS s'
+  timeout_ms: 300000
+- name: setup-encrypt-edge-field
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ok
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.configureField('"'"'Q6335'"'"', '"'"'p'"'"', { algorithm: '"'"'AES-256-GCM'"'"', visibility: ['"'"'pii'"'"'] }) RETURN '"'"'ok'"'"' AS s'
+  timeout_ms: 300000
+- name: setup-grant-role
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ok
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.grantRole('"'"'geode'"'"', '"'"'pii'"'"') RETURN '"'"'ok'"'"' AS s'
+  timeout_ms: 300000
+- name: setup-seed
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:M6335 {k: 1, ssn: '"'"'SSN-6335-SECRET-ABC'"'"'})-[:Q6335 {k: 10, p: '"'"'SSN-6335-SECRET-ABC'"'"'}]->(:M6335 {k: 2, ssn: '"'"'other'"'"'}), (:M6335 {k: 3, ssn: '"'"'SSN-6335-SECRET-ABC'"'"'}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: index-on-encrypted-field-refused-plain
+  description: 'SONNY-6335 (2): plain on an encrypted field is refused'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE INDEX i6335a FOR (n:M6335) ON (n.ssn)'
+  timeout_ms: 300000
+- name: index-on-encrypted-field-refused-composite
+  description: 'SONNY-6335 (2): composite on an encrypted field is refused'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE INDEX i6335b FOR (n:M6335) ON (n.k, n.ssn)'
+  timeout_ms: 300000
+- name: index-on-encrypted-field-refused-fulltext
+  description: 'SONNY-6335 (2): fulltext on an encrypted field is refused'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE INDEX i6335c FOR (n:M6335) ON (n.ssn) USING fulltext'
+  timeout_ms: 300000
+- name: index-on-encrypted-field-refused-hash
+  description: 'SONNY-6335 (2): hash on an encrypted field is refused'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE INDEX i6335d FOR (n:M6335) ON (n.ssn) USING hash'
+  timeout_ms: 300000
+- name: index-on-encrypted-field-refused-unique-constraint
+  description: 'SONNY-6335 (2): unique-constraint on an encrypted field is refused'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE CONSTRAINT c6335a FOR (n:M6335) REQUIRE n.ssn IS UNIQUE'
+  timeout_ms: 300000
+- name: not-null-constraint-allowed-on-encrypted-field
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE CONSTRAINT c6335n FOR (n:M6335) REQUIRE n.ssn IS NOT NULL'
+  timeout_ms: 300000
+- name: index-on-plain-field-allowed
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE INDEX i6335k FOR (n:M6335) ON (n.k)'
+  timeout_ms: 300000
+- name: configure-field-over-existing-index-refused-setup
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE INDEX i6335x FOR (n:U6335) ON (n.ssn)'
+  timeout_ms: 300000
+- name: configure-field-over-existing-index-refused
+  description: a field that already has an index cannot become encrypted
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.configureField('"'"'U6335'"'"', '"'"'ssn'"'"', {visibility: ['"'"'pii'"'"']})'
+  timeout_ms: 300000
+- name: configure-field-over-unique-constraint-setup
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE CONSTRAINT c6335u FOR (n:V6335) REQUIRE n.ssn IS UNIQUE'
+  timeout_ms: 300000
+- name: configure-field-over-unique-constraint-refused
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.configureField('"'"'V6335'"'"', '"'"'ssn'"'"', {visibility: ['"'"'pii'"'"']})'
+  timeout_ms: 300000
+- name: inline-map-matches-like-where-plaintext-role
+  description: 'SONNY-6335 (3): the plaintext role matches by inline map exactly as by WHERE'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"k":1'
+    - '"k":3'
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role pii 'MATCH (n:M6335 {ssn: '"'"'SSN-6335-SECRET-ABC'"'"'}) RETURN n.k AS k ORDER BY k'
+  timeout_ms: 300000
+- name: where-equality-plaintext-role
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"k":1'
+    - '"k":3'
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role pii 'MATCH (n:M6335) WHERE n.ssn = '"'"'SSN-6335-SECRET-ABC'"'"' RETURN n.k AS k ORDER BY k'
+  timeout_ms: 300000
+- name: inline-map-count-plaintext-role
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role pii 'MATCH (n:M6335 {ssn: '"'"'SSN-6335-SECRET-ABC'"'"'}) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: inline-map-edge-plaintext-role
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"k":10'
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role pii 'MATCH ()-[r:Q6335 {p: '"'"'SSN-6335-SECRET-ABC'"'"'}]->() RETURN r.k AS k'
+  timeout_ms: 300000
+- name: inline-map-no-role-matches-nothing
+  description: 'a session without the FLE role reads [REDACTED]: the inline map does not match (and does not reveal) the value'
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 0
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:M6335 {ssn: '"'"'SSN-6335-SECRET-ABC'"'"'}) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: where-no-role-matches-nothing
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 0
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:M6335) WHERE n.ssn = '"'"'SSN-6335-SECRET-ABC'"'"' RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: merge-on-encrypted-key-refused
+  description: 'SONNY-6347 (1) / SONNY-6362 (4): MERGE on an encrypted key never matched and created a duplicate each run'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (n:M6335 {ssn: '"'"'merge-6335-x'"'"'})'
+  timeout_ms: 300000
+- name: merge-on-encrypted-key-created-nothing
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 3
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:M6335) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: edge-property-plaintext-role
+  description: 'SONNY-6327 (1): the plaintext role reads the decrypted edge property'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SSN-6335-SECRET-ABC
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role pii 'MATCH ()-[r:Q6335]->() RETURN r.p AS p'
+  timeout_ms: 300000
+- name: edge-property-no-role-redacted
+  description: 'SONNY-6327 (1): an encrypted edge property is no longer returned as stored'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '[REDACTED]'
+    stdout_not_contains:
+    - SSN-6335-SECRET-ABC
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH ()-[r:Q6335]->() RETURN r.p AS p'
+  timeout_ms: 300000
+- name: whole-edge-no-role-redacted
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - SSN-6335-SECRET-ABC
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH ()-[r:Q6335]->() RETURN r'
+  timeout_ms: 300000
+- name: whole-node-no-role-redacted
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - SSN-6335-SECRET-ABC
+  tags:
+  - fle
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:M6335 {k: 1}) RETURN n'
+  timeout_ms: 300000
+- name: searchable-true-is-refused-not-silently-dropped
+  description: SONNY-6348 (6) / SONNY-6342 (2) — configureField searchable:true used to be silently dropped (the field was not searchable); it is refused
+  expect:
+    exit_code: 1
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fle
+  - sonny-6348
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.configureField('"'"'S6348'"'"', '"'"'ssn'"'"', { algorithm: '"'"'AES-256-GCM'"'"', visibility: ['"'"'pii'"'"'], searchable: true })'
+  timeout_ms: 300000
+- name: secret-never-at-rest-in-plaintext
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    grep -r -a -l '--exclude=*.jsonl' --exclude-dir=timeseries --exclude-dir=fts --exclude-dir=wal SSN-6335-SECRET-ABC "$D"
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - scan
+  - critical
+  type: bash
+  timeout_ms: 300000
+- name: fle-catalog-lives-in-data-dir-not-tmp
+  description: SONNY-6274 — the catalog is a 0600 file in the data directory; nothing is written to the shared /tmp path by this server
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    set -u
+    D="${GEODE_DATA_DIR:?}"
+    F=$(find "$D" -maxdepth 2 -name 'geode_fle_catalog.dat' | head -1)
+    [ -n "$F" ] || { echo "FAIL no FLE catalog file under the data dir"; ls -la "$D"; exit 1; }
+    MODE=$(stat -c %a "$F")
+    [ "$MODE" = "600" ] || { echo "FAIL catalog mode $MODE (want 600)"; exit 1; }
+    if [ -e /tmp/geode_fle_catalog.dat ]; then
+      # another process/run may have left it; this server must not have touched it in the last 10 minutes
+      if find /tmp/geode_fle_catalog.dat -mmin -10 | grep -q .; then echo "FAIL /tmp/geode_fle_catalog.dat was written recently"; exit 1; fi
+    fi
+    echo "fle_catalog_in_data_dir mode=$MODE"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - fle_catalog_in_data_dir
+  tags:
+  - fle
+  - sonny-6274
+  timeout_ms: 300000
+- name: scratch-server-stop
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6335/env.sh"
+    stop_srv; rm -rf "$ST"; echo SCRATCH_SERVER_STOPPED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags:
+  - teardown
+tags:
+- fle
+- security
+- sonny-738
