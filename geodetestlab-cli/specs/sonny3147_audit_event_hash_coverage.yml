@@ -1,0 +1,130 @@
+version: '1.0'
+name: SONNY-3147 audit event_hash covers every field; `geode audit verify` recomputes it for every record
+description: |
+  Ticket: SONNY-3147.
+  Bug: an audit record's event_hash covered only prev_hash, event type,
+  resource.id and action, so the timestamp, actor, result, details, ... of a record
+  could be edited without breaking the chain, and `geode audit verify` never
+  recomputed event_hash for an ordinary record.
+  Spec proves against a real server's audit log: records carry "hash_v":2 and the
+  untouched log verifies ("OK chain", exit 0, record_hashes=verified); editing ANY
+  single field of a record in a copy (timestamp, actor, result, details,
+  resource.id, action, event_type, session) makes `geode audit verify` exit
+  non-zero with a FAILED verdict and NO "OK chain" line, a deleted record and a
+  swapped pair of records are refused, and replacing only the stored event_hash of
+  a record (nothing else changed) is refused.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny3147-field-tamper-detected
+  type: bash
+  command: |
+    export GEODE_AUDIT_ENABLED=1 GEODE_DISABLE_AUDIT=0 GEODE_ALLOW_TEST_AUDIT_KEYS=1
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+     GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+     start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+     for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+     echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+     ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+     O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+     SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+     [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+
+    AUDIT="$SD/audit.jsonl"
+    W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+    ok "u1" "$(q "CREATE USER a3147 SET PASSWORD 'Correct Horse Battery Staple 3147'")"
+    ok "u2" "$(q "CREATE USER b3147 SET PASSWORD 'Correct Horse Battery Staple 3148'")"
+    ok "u3" "$(q "CREATE USER c3147 SET PASSWORD 'Correct Horse Battery Staple 3149'")"
+    sleep 3
+    cp "$AUDIT" "$W/clean.jsonl"
+    N=$(grep -c . "$W/clean.jsonl"); [ "$N" -ge 4 ] || { echo "FAIL only $N audit records"; exit 1; }
+    grep -q '"hash_v":2' "$W/clean.jsonl" || { echo "FAIL records carry no hash_v:2"; head -2 "$W/clean.jsonl"; exit 1; }
+    OUT=$("$BIN" audit verify --file "$W/clean.jsonl" 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && echo "$OUT" | grep -q "OK chain" && echo "$OUT" | grep -q "record_hashes=verified" || { echo "FAIL clean log did not verify rc=$RC"; echo "$OUT"; exit 1; }
+    tamper() { # name python-expression-on-lines  ; writes $W/t.jsonl
+      python3 - "$W/clean.jsonl" "$W/t.jsonl" "$1" <<'PY'
+    import sys, json, re
+    src, dst, mode = sys.argv[1:4]
+    lines = open(src).read().split("\n")
+    lines = [l for l in lines if l]
+    # target: the second record (an ordinary, non-DIGEST record)
+    i = 1
+    l = lines[i]
+    if mode == "timestamp":   l = re.sub(r'"timestamp":"2026-', '"timestamp":"2025-', l, count=1)
+    elif mode == "actor":     l = re.sub(r'"actor":"user:(\d+)"', '"actor":"user:99"', l, count=1)
+    elif mode == "result":    l = l.replace('"result":"success"', '"result":"failure"', 1)
+    elif mode == "details":   l = re.sub(r'"details":\{"username":"([a-z0-9]+)"', r'"details":{"username":"x\1"', l, count=1)
+    elif mode == "resource_id": l = l.replace('"id":"__geode_security"', '"id":"__geode_securitx"', 1)
+    elif mode == "action":    l = l.replace('"action":"ASSIGN_ROLE"', '"action":"REVOKE_ROLE"', 1)
+    elif mode == "event_type": l = l.replace('"event_type":"configuration_change"', '"event_type":"authentication"', 1)
+    elif mode == "session":   l = l.replace('"session":""', '"session":"forged"', 1)
+    elif mode == "event_hash":
+        m = re.search(r'"event_hash":"([0-9a-f]{64})"', l)
+        h = m.group(1); l = l.replace(h, ("0" if h[0] != "0" else "1") + h[1:], 1)
+    elif mode == "delete":    del lines[i]; l = None
+    elif mode == "swap":      lines[1], lines[2] = lines[2], lines[1]; l = None
+    if l is not None: lines[i] = l
+    assert mode in ("delete", "swap") or lines[i] != open(src).read().split("\n")[i], "tamper %s changed nothing" % mode
+    open(dst, "w").write("\n".join(lines) + "\n")
+    PY
+    }
+    for mode in timestamp actor result details resource_id action event_type session event_hash delete swap; do
+      tamper "$mode" || { echo "FAIL could not build tampered copy for $mode"; exit 1; }
+      OUT=$("$BIN" audit verify --file "$W/t.jsonl" 2>&1); RC=$?
+      if [ "$RC" -eq 0 ] || echo "$OUT" | grep -q "OK chain"; then echo "FAIL tamper '$mode' not detected (rc=$RC)"; echo "$OUT"; exit 1; fi
+      echo "$OUT" | grep -q "FAILED" || { echo "FAIL tamper '$mode': no FAILED verdict"; echo "$OUT"; exit 1; }
+    done
+    echo "AUDIT_COVERAGE_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [AUDIT_COVERAGE_OK]
+  tags: [audit, sonny3147]

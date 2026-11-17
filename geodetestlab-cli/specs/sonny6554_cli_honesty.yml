@@ -1,0 +1,233 @@
+version: '1.0'
+name: SONNY-6554 CLI session/auth/apikey commands do not claim what did not happen
+description: |
+  Ticket: SONNY-6554 (CLI part; the geode-client-zig DSN parsing part lives in
+  the client repo and is covered by the DSN specs of SONNY-6569/6550/6544).
+  Bug: `geode session invalidate-all` printed "have been invalidated", `session
+  rotate` printed "rotated successfully" and invented a token, `auth validate`
+  accepted any string ("Session token valid"), `authn config/test-access/
+  stepup-*` and `apikey create/list/revoke/...` reported success without any
+  server doing anything, `query --token` was silently dropped, and a DSN
+  `insecure=true` was ignored.
+  Spec proves on the real binary: each such command exits 1 with "not
+  supported by this server", never prints its old success line, and writes no
+  local state file; `query --token` exits 2 naming --token; the help marks them
+  unsupported; `apikey validate` says it checked the format only; a DSN
+  `insecure=true` is honoured like --insecure-tls-skip-verify (with the
+  "TLS certificate verification DISABLED" warning) and refused in production
+  posture unless GEODE_ALLOW_INSECURE_TLS=1.
+
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6554-unsupported-commands-refused
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    fails=0
+    while IFS='|' read -r claim args; do
+      [ -z "$claim" ] && continue
+      H=$(mktemp -d)
+      OUT=$(HOME="$H" "$BIN" $args </dev/null 2>&1); RC=$?
+      bad=""
+      [ "$RC" -eq 1 ] || bad="rc=$RC(want 1) "
+      echo "$OUT" | grep -q "not supported by this server" || bad="${bad}no-refusal "
+      echo "$OUT" | grep -qF "$claim" && bad="${bad}claims-'$claim' "
+      echo "$OUT" | grep -q "panic" && bad="${bad}panic "
+      for f in geode_authn_state.db geode_apikey_state.db geode_session_state.db; do
+        [ -e "$H/.local/state/geode/$f" ] && bad="${bad}wrote-$f "
+      done
+      if [ -n "$bad" ]; then echo "FAIL [$args]: $bad"; echo "$OUT"; fails=$((fails+1)); fi
+      rm -rf "$H"
+    done <<'LIST'
+    have been invalidated|session invalidate-all --user alice
+    rotated successfully|session rotate
+    Session is valid|session validate --token 0123456789abcdef0123456789abcdef
+    Session is active|session check-idle
+    Session token valid|auth validate --token garbage
+    Session token valid|auth validate garbage
+    anonymous access allowed|authn config --allow-anonymous-path /health
+    mfa required for path|authn config --require-mfa-path /admin/*
+    Access allowed|authn test-access --path /health
+    No step-up required|authn stepup-check --action read:data
+    Session elevated|authn stepup-mark
+    API key created|apikey create --user geode --name ci --scope query:execute
+    API keys for user|apikey list --user geode
+    API key 'ci' revoked|apikey revoke --user geode --name ci
+    Revoked |apikey revoke-all --user geode --yes
+    scope granted|apikey check-scope --user geode --name ci --scope query:execute
+    LIST
+    [ "$fails" -eq 0 ] || exit 1
+    echo "REFUSALS_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [REFUSALS_OK]
+  tags: [cli, sonny6554]
+
+- name: sonny6554-help-marks-unsupported
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    H=$(mktemp -d); trap 'rm -rf "$H"' EXIT
+    for c in session authn apikey; do
+      OUT=$(HOME="$H" "$BIN" $c --help 2>&1); RC=$?
+      [ "$RC" -eq 0 ] && echo "$OUT" | grep -q "not supported" || { echo "FAIL $c --help"; echo "$OUT"; exit 1; }
+    done
+    OUT=$(HOME="$H" "$BIN" auth --help 2>&1)
+    echo "$OUT" | grep -q "do not accept session tokens" || { echo "FAIL auth --help"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "Use --save-session to persist credentials" && { echo "FAIL auth --help stale save-session text"; exit 1; }
+    OUT=$(HOME="$H" "$BIN" apikey validate gk1.0123456789abcdef.0123456789abcdef0123456789abcdef 2>&1)
+    echo "$OUT" | grep -q "format" && echo "$OUT" | grep -q "no geode server accepts API keys" || { echo "FAIL apikey validate"; echo "$OUT"; exit 1; }
+    echo "HELP_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [HELP_OK]
+  tags: [cli, sonny6554]
+
+- name: sonny6554-saved-session-and-token-honesty
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    OUT=$(HOME="$H" "$BIN" auth login --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" --save-session 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && echo "$OUT" | grep -q "Successfully authenticated" && echo "$OUT" | grep -q "do not accept session tokens" && ! echo "$OUT" | grep -q "Session token saved" || { echo "FAIL login --save-session rc=$RC"; echo "$OUT"; exit 1; }
+    BEFORE=$(cat "$H/.geode/credentials.json")
+    OUT=$(HOME="$H" "$BIN" session rotate 2>&1); RC=$?
+    [ "$RC" -eq 1 ] && echo "$OUT" | grep -q "not supported by this server" && ! echo "$OUT" | grep -q "rotated successfully" || { echo "FAIL rotate rc=$RC"; echo "$OUT"; exit 1; }
+    AFTER=$(cat "$H/.geode/credentials.json")
+    [ "$BEFORE" = "$AFTER" ] || { echo "FAIL rotate changed the saved credentials"; exit 1; }
+    for s in validate check-idle; do
+      OUT=$(HOME="$H" "$BIN" session $s 2>&1); RC=$?
+      [ "$RC" -eq 1 ] && echo "$OUT" | grep -q "not supported by this server" || { echo "FAIL session $s rc=$RC"; echo "$OUT"; exit 1; }
+    done
+    OUT=$(HOME="$H" "$BIN" session info 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && echo "$OUT" | grep -q "local file" && echo "$OUT" | grep -q "do not accept" || { echo "FAIL session info rc=$RC"; echo "$OUT"; exit 1; }
+    OUT=$(HOME="$H" "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" --token abc --timeout 10 "RETURN 6554 AS x" 2>&1); RC=$?
+    [ "$RC" -eq 2 ] && echo "$OUT" | grep -q -- "--token" && echo "$OUT" | grep -q "not supported by this server" && ! echo "$OUT" | grep -q "6554" || { echo "FAIL query --token rc=$RC"; echo "$OUT"; exit 1; }
+    echo "SESSION_HONESTY_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [SESSION_HONESTY_OK]
+  tags: [cli, sonny6554]
+
+- name: sonny6554-dsn-insecure-honoured
+  description: DSN insecure=true (and aliases) skips TLS verification like the flag; production posture refuses it unless overridden
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    PWE=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$PW")
+    q() { HOME="$H" "$@" "$BIN" query --dsn "$DSN" --no-saved-session --timeout 10 "RETURN 6554 * 7 AS x" 2>&1; }
+    for flag in insecure=true insecure_tls_skip_verify=1 skip_verify=yes; do
+      DSN="$ADDR?$flag&user=geode&pass=$PWE"
+      OUT=$(GEODE_ALLOW_INSECURE_TLS=1 HOME="$H" "$BIN" query --dsn "$DSN" --no-saved-session --timeout 10 "RETURN 6554 * 7 AS x" 2>&1); RC=$?
+      [ "$RC" -eq 0 ] && echo "$OUT" | grep -q 45878 && echo "$OUT" | grep -q "TLS certificate verification DISABLED" || { echo "FAIL $flag rc=$RC"; echo "$OUT"; exit 1; }
+    done
+    DSN="$ADDR?insecure=true&user=geode&pass=$PWE"
+    OUT=$(env -u GEODE_ALLOW_INSECURE_TLS GEODE_ENV=production HOME="$H" "$BIN" query --dsn "$DSN" --no-saved-session --timeout 10 "RETURN 6554 * 7 AS x" 2>&1); RC=$?
+    [ "$RC" -eq 1 ] && echo "$OUT" | grep -q "SECURITY: refusing --insecure-tls-skip-verify" && ! echo "$OUT" | grep -q 45878 || { echo "FAIL production refusal rc=$RC"; echo "$OUT"; exit 1; }
+    OUT=$(GEODE_ENV=production GEODE_ALLOW_INSECURE_TLS=1 HOME="$H" "$BIN" query --dsn "$DSN" --no-saved-session --timeout 10 "RETURN 6554 * 7 AS x" 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && echo "$OUT" | grep -q 45878 || { echo "FAIL production override rc=$RC"; echo "$OUT"; exit 1; }
+    # a DSN ca= bundle is honoured: a nonexistent bundle must fail the connection
+    DSN="$ADDR?ca=/nonexistent/sonny6554-ca.pem&user=geode&pass=$PWE"
+    OUT=$(HOME="$H" "$BIN" query --dsn "$DSN" --no-saved-session --timeout 10 "RETURN 6554 * 7 AS x" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && ! echo "$OUT" | grep -q 45878 || { echo "FAIL ca= ignored rc=$RC"; echo "$OUT"; exit 1; }
+    echo "DSN_INSECURE_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [DSN_INSECURE_OK]
+  tags: [cli, dsn, sonny6554]

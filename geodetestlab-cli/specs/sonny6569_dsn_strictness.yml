@@ -1,0 +1,193 @@
+version: '1.0'
+name: SONNY-6569 geode CLI DSN / --server strictness (credentials in host, unknown params)
+description: |
+  Ticket: SONNY-6569 (the geode-client-zig library part is in the client repo;
+  this spec covers geode's own CLI paths, which apply the same rules).
+  Bug: `--server pw@host` was accepted (an '@' in a host name: part of the
+  password dialled / printed); DSN query parameters were read leniently (unknown
+  names ignored, `timeout=` read as milliseconds, fragment reported as generic
+  InvalidDSN).
+  Spec proves on the real binary: `query`, `shell`, `auth login`, `backup
+  create` and `restore` refuse a --server host that carries a credential
+  (exit nonzero, "Invalid Geode endpoint DSN: an @ follows the host" or "the host
+  must be"), and never print the secret; `geode query --dsn` refuses unknown or
+  malformed DSN parameters with exit 2, "Invalid Geode endpoint DSN" and the
+  parameter named, without echoing the password, and still runs a valid DSN.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6569-server-host-with-credentials-refused
+  type: bash
+  command: |
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    fails=0
+    for addr in "s3cretpw@127.0.0.1:3141" "admin:s3cretpw@localhost:3141" "s3cretpw host:3141"; do
+      case "$addr" in *"@"*) want="Invalid Geode endpoint DSN: an @ follows the host";; *) want="Invalid Geode endpoint DSN: the host must be";; esac
+      for cmd in \
+        "query --server ADDR $GEODE_CLIENT_TLS --no-saved-session -U u -P p --timeout 5 RETURN-1" \
+        "shell --server ADDR $GEODE_CLIENT_TLS -U u -P p" \
+        "auth login --server ADDR $GEODE_CLIENT_TLS -U u -P p" \
+        "backup create --output OUT --server ADDR $GEODE_CLIENT_TLS -U u -P p --timeout 5" \
+        "restore --server ADDR --yes $GEODE_CLIENT_TLS -U u -P p --timeout 5"; do
+        H=$(mktemp -d)
+        args=()
+        for w in $cmd; do case "$w" in ADDR) args+=("$addr");; OUT) args+=("$H/b.backup");; RETURN-1) args+=("RETURN 1 AS x");; *) args+=("$w");; esac; done
+        OUT=$(HOME="$H" "$BIN" "${args[@]}" </dev/null 2>&1); RC=$?
+        if [ "$RC" -eq 0 ] || ! echo "$OUT" | grep -qF "$want" || echo "$OUT" | grep -q "s3cretpw"; then
+          echo "FAIL [$cmd] addr=[$addr] rc=$RC want='$want'"; echo "$OUT"; fails=$((fails+1))
+        fi
+        rm -rf "$H"
+      done
+    done
+    [ "$fails" -eq 0 ] || exit 1
+    echo "HOST_CREDS_REFUSED_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [HOST_CREDS_REFUSED_OK]
+  tags: [cli, dsn, sonny6569]
+
+- name: sonny6569-bad-dsn-parameters-refused
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    PWE=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$PW")
+    fails=0
+    while IFS='|' read -r qs expect; do
+      [ -z "$qs" ] && continue
+      DSN="$ADDR?$qs&insecure=true&user=geode&pass=$PWE"
+      OUT=$(HOME="$H" "$BIN" query --dsn "$DSN" --no-saved-session --timeout 10 "RETURN 6554 * 7 AS x" 2>&1); RC=$?
+      if [ "$RC" -ne 2 ] || echo "$OUT" | grep -q 45878 || ! echo "$OUT" | grep -q "Invalid Geode endpoint DSN" || ! echo "$OUT" | grep -q "$expect" || echo "$OUT" | grep -qF "$PW"; then
+        echo "FAIL [$qs] rc=$RC want '$expect'"; echo "$OUT"; fails=$((fails+1))
+      fi
+    done <<'LIST'
+    bogus=1|unknown query parameter
+    insecure|name=value
+    page_size=50%|page_size
+    page_size=0|page_size
+    page_size=abc|page_size
+    insecure=maybe|boolean
+    tls=sometimes|boolean
+    connect_timeout=999999|timeout
+    connect_timeout=0|timeout
+    timeout_ms=x|timeout
+    LIST
+    [ "$fails" -eq 0 ] || exit 1
+    echo "BAD_PARAMS_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [BAD_PARAMS_OK]
+  tags: [cli, dsn, sonny6569]
+
+- name: sonny6569-unsupported-dsn-params-named
+  description: parameters geode query cannot honour are refused; a no-effect one is named; a valid DSN still works
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    PWE=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$PW")
+    for p in tenant=acme server_name=db.example.com tls=false; do
+      OUT=$(HOME="$H" "$BIN" query --dsn "$ADDR?$p&insecure=true&user=geode&pass=$PWE" --no-saved-session --timeout 10 "RETURN 6554 * 7 AS x" 2>&1); RC=$?
+      [ "$RC" -eq 2 ] && ! echo "$OUT" | grep -q 45878 && echo "$OUT" | grep -q "is not supported by geode query" || { echo "FAIL $p rc=$RC"; echo "$OUT"; exit 1; }
+    done
+    OUT=$(HOME="$H" "$BIN" query --dsn "$ADDR?hello_name=my-app&insecure=true&user=geode&pass=$PWE" --no-saved-session --timeout 10 "RETURN 6554 * 7 AS x" 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && echo "$OUT" | grep -q 45878 && echo "$OUT" | grep -q "'hello_name' has no effect" || { echo "FAIL hello_name rc=$RC"; echo "$OUT"; exit 1; }
+    echo "UNSUPPORTED_PARAMS_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [UNSUPPORTED_PARAMS_OK]
+  tags: [cli, dsn, sonny6569]

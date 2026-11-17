@@ -1,0 +1,94 @@
+version: '1.0'
+name: SONNY-6602 MFA CLI says MFA is not enforced at login
+description: |
+  Ticket: SONNY-6602.
+  Bug: `geode user mfa-setup` printed a TOTP secret and recovery codes ("Store
+  these recovery codes securely. Each can only be used once.") and `geode user
+  mfa enable` printed "MFA enabled for <user>", although MFA is not enforced at
+  login (HELLO never asks for a code, SONNY-6604) and nothing redeems recovery
+  codes.
+  Spec proves on the real offline CLI: `user mfa-setup --help`, `user mfa
+  --help`, the output of `mfa-setup --show-recovery` and of `mfa enable` all say
+  MFA is "not enforced at login" and name SONNY-6604, the advertised "Each can
+  only be used once" claim is gone, and `mfa enable --code <valid TOTP>` still
+  enables ("MFA enabled for <user>"). Online `geode.auth.mfa_setup` / `mfa_enable`
+  carry the same warning.
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 420000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ENABLE_MFA: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+
+tests:
+
+- name: sonny6602-offline-cli-warns
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    GEODE_ADMIN_PASSWORD='Offline Mfa Admin Passphrase' "$BIN" auth init --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+    enrol() { # user -> sets SECRET and SETUP_OUT
+     "$BIN" user create "$1" "$1@example.com" --password "Correct Horse Battery Staple 6619" --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL create $1"; exit 1; }
+     SETUP_OUT=$("$BIN" user mfa-setup "$1" --data-dir "$D" 2>&1) || { echo "FAIL mfa-setup $1"; echo "$SETUP_OUT"; exit 1; }
+     SECRET=$(echo "$SETUP_OUT" | sed -n 's/^MFA secret: //p' | head -1)
+     [ -n "$SECRET" ] || { echo "FAIL no secret printed"; echo "$SETUP_OUT"; exit 1; }
+    }
+
+    w() { echo "$2" | grep -q "not enforced at login" && echo "$2" | grep -q "SONNY-6604" || { echo "FAIL $1 lacks not-enforced warning"; echo "$2"; exit 1; }; }
+    w "user mfa-setup --help" "$("$BIN" user mfa-setup --help 2>&1)"
+    w "user mfa --help" "$("$BIN" user mfa --help 2>&1)"
+    "$BIN" user create cli6602 cli6602@example.com --password "Correct Horse Battery Staple 6602" --data-dir "$D" >/dev/null 2>&1 || exit 1
+    OUT=$("$BIN" user mfa-setup cli6602 --show-recovery --data-dir "$D" 2>&1) || { echo "FAIL setup"; echo "$OUT"; exit 1; }
+    w "mfa-setup" "$OUT"
+    echo "$OUT" | grep -q "Each can only be used once" && { echo "FAIL still advertises single-use recovery codes"; echo "$OUT"; exit 1; }
+    SECRET=$(echo "$OUT" | sed -n 's/^MFA secret: //p' | head -1)
+    OUT=$("$BIN" user mfa enable cli6602 --code "$(totp "$SECRET")" --data-dir "$D" 2>&1) || { echo "FAIL enable"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "MFA enabled for cli6602" || { echo "FAIL enable text"; echo "$OUT"; exit 1; }
+    w "mfa enable" "$OUT"
+    echo "NOT_ENFORCED_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [NOT_ENFORCED_OK]
+  tags: [mfa, sonny6602]

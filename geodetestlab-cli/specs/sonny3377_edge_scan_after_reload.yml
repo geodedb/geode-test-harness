@@ -1,0 +1,162 @@
+# SONNY-3377: an unlabeled relationship scan with a property filter answers after a reload
+#
+# Bug: `MATCH ()-[e]->() WHERE e.zz = 1 RETURN count(e)` failed with
+# EdgeSlotMappingMissing in a persisted session after the store was reloaded
+# (the storage-native read materialized each relationship through the graph's
+# IdMap, which a reload had not filled for edges yet). Also failed at a clean
+# restart and after a crash-style teardown that skips the IdMap snapshot.
+#
+# Fixed behaviour: the unfiltered, filtered, typed and count(*) forms all answer
+# the same counts after a reload.
+#
+# What this spec proves: a real persisted server node is loaded with 40
+# relationships (zz alternating 0/1), the four query forms are asserted before,
+# after a clean restart of the node, and after a SIGKILL (no shutdown, no IdMap
+# snapshot) + restart on the same data directory. The harness's single-node
+# independent cluster mode is used only because it provides the signal /
+# restart_node steps; nodes are independent standalone servers.
+
+version: '1.0'
+name: SONNY-3377 unlabeled edge scan after reload
+description: An unlabeled relationship scan with a property filter answers after a clean restart and after a SIGKILL restart (SONNY-3377)
+cluster:
+  nodes: 2
+  independent: true
+  target_node: '0'
+  startup_timeout_ms: 90000
+  shared_args:
+  - --log-level
+  - warn
+  shared_env:
+    GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+cli:
+  binary: ./zig-out/bin/geode
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s3377-unlabeled-edge-scan-after-reload
+  description: Four edge-scan forms answer identically before, after a clean restart, and after SIGKILL + restart
+  type: sequential
+  steps:
+  - type: gql
+    query: 'FOR i IN range(0, 40) CREATE (:A {i: i})-[:R {zz: i % 2}]->(:B {i: i})'
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+  - type: gql
+    query: MATCH ()-[e]->() WHERE e.zz = 1 RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  - type: gql
+    query: MATCH ()-[e]->() RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":40'
+  - type: gql
+    query: MATCH (a)-[e]->(b) WHERE e.zz = 1 RETURN count(*) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  - type: gql
+    query: MATCH ()-[e:R]->() WHERE e.zz = 1 RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  - type: restart_node
+    target: node:0
+  - type: wait
+    wait_ms: 2000
+  - type: gql
+    query: MATCH ()-[e]->() WHERE e.zz = 1 RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  - type: gql
+    query: MATCH ()-[e]->() RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":40'
+  - type: gql
+    query: MATCH (a)-[e]->(b) WHERE e.zz = 1 RETURN count(*) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  - type: gql
+    query: MATCH ()-[e:R]->() WHERE e.zz = 1 RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  - type: signal
+    target: node:0
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 1500
+  - type: restart_node
+    target: node:0
+  - type: wait
+    wait_ms: 2000
+  - type: gql
+    query: MATCH ()-[e]->() WHERE e.zz = 1 RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  - type: gql
+    query: MATCH ()-[e]->() RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":40'
+  - type: gql
+    query: MATCH (a)-[e]->(b) WHERE e.zz = 1 RETURN count(*) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  - type: gql
+    query: MATCH ()-[e:R]->() WHERE e.zz = 1 RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":20'
+  tags:
+  - storage
+  - reload
+  - edges
+  - sonny3377

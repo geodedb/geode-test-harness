@@ -1,0 +1,323 @@
+version: '1.0'
+name: 'SONNY-2686 / SONNY-2728 / SONNY-2817: MERGE under row-level security refuses hidden matches and rate-limits the oracle'
+description: |
+  Tickets: SONNY-2686, SONNY-2728, SONNY-2817.
+  SONNY-2686 (security): MERGE found existing nodes without the row-level-security
+  visibility filter, so a session could read a hidden row (MERGE (x:Hidden {s: 'leak'})
+  RETURN x.secret), rewrite it (ON MATCH SET), or attach a relationship to it. Fixed:
+  a MERGE whose only match is a row RLS hides from the session is refused with
+  SQLSTATE 42501 (MergeMatchNotVisible) before anything is written; MERGE on visible
+  rows, and a MERGE that matches nothing (it creates), are unchanged.
+  SONNY-2728: that refusal is an equality oracle over hidden property values; it is
+  kept (as PostgreSQL's ON CONFLICT under RLS) and documented as a covert channel.
+  SONNY-2817: the oracle is rate-limited per session and label: after 5 refusals on one
+  label within 60 s the session is refused 53400 on EVERY MERGE naming that label for
+  a cooldown, whatever the pattern would have matched (hidden, visible or absent), so
+  the cooldown answers nothing; other labels and other sessions are unaffected.
+  Proves: fourteen refused MERGE shapes (node, relationship either direction, ON
+  MATCH/ON CREATE/SET, label-less, MATCH ... MERGE, aggregating) each answer 42501 in a
+  session of their own and leave no write behind (hidden row unchanged, no endpoint
+  created, no edge attached); allowed MERGEs still match, create and update; one
+  session's sixth hidden-label MERGE gets 53400 (also for an absent key and a second
+  pattern) while another label of the same session still works.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s2686-create-user-bob
+  description: 'bob: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER bob SET PASSWORD 'Bob Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created bob]
+  tags: [s2686, setup]
+
+- name: s2686-seed
+  description: Seed one hidden row and one visible row as the admin.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:Hidden {s: 'leak', secret: 's3cr3t', cls: 'secret'});
+    CREATE (:Doc {s: 'pub', cls: 'public'})
+  expect:
+    exit_code: 0
+  tags: [s2686, setup]
+
+- name: s2686-deny
+  description: Deny bob the label Hidden.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('default', 'Hidden', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [deny policy added]
+  tags: [s2686, setup]
+
+- name: s2686-control-admin-merge
+  description: 'Control (no policy for the admin): MERGE on the hidden label matches and reads the row.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MERGE (x:Hidden {s: 'leak'}) RETURN x.secret AS secret"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"secret":"s3cr3t"}]']
+  tags: [s2686]
+
+- name: s2686-refused-01
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (x:Hidden {s: 'leak'}) RETURN x.secret AS secret"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Hidden {s: 'leak'}) RETURN x.secret AS secret"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-02
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (x:Hidden {s: 'leak'})"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Hidden {s: 'leak'})"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-03
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (x:Hidden {s: 'leak'}) ON MATCH SET x.cls = 'public' RETURN x.s AS s"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Hidden {s: 'leak'}) ON MATCH SET x.cls = 'public' RETURN x.s AS s"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-04
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (x:Hidden {s: 'leak'}) ON CREATE SET x.cls = 'public' RETURN x.s AS s"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Hidden {s: 'leak'}) ON CREATE SET x.cls = 'public' RETURN x.s AS s"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-05
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (x:Hidden {s: 'leak'}) SET x.cls = 'public'"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Hidden {s: 'leak'}) SET x.cls = 'public'"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-06
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (x:Hidden {s: 'leak', cls: 'secret'}) RETURN x.secret AS secret"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Hidden {s: 'leak', cls: 'secret'}) RETURN x.secret AS secret"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-07
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (x {s: 'leak'}) RETURN x.secret AS secret"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x {s: 'leak'}) RETURN x.secret AS secret"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-08
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (a:Doc {s: 'pub'})-[:R]->(b:Hidden {s: 'leak'})"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (a:Doc {s: 'pub'})-[:R]->(b:Hidden {s: 'leak'})"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-09
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (a:Hidden {s: 'leak'})-[:R]->(b:Doc {s: 'pub'})"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (a:Hidden {s: 'leak'})-[:R]->(b:Doc {s: 'pub'})"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-10
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (a:Doc {s: 'pub'})-[r:R]->(b:Hidden {s: 'leak'}) ON CREATE SET r.w = 1"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (a:Doc {s: 'pub'})-[r:R]->(b:Hidden {s: 'leak'}) ON CREATE SET r.w = 1"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-11
+  description: "SONNY-2686 bob (own session): refused, 42501: MATCH (a:Doc {s: 'pub'}) MERGE (a)-[:R]->(b:Hidden {s: 'leak'})"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (a:Doc {s: 'pub'}) MERGE (a)-[:R]->(b:Hidden {s: 'leak'})"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-12
+  description: "SONNY-2686 bob (own session): refused, 42501: MATCH (a:Doc {s: 'pub'}) MERGE (x:Hidden {s: 'leak'}) RETURN count(*) AS c"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (a:Doc {s: 'pub'}) MERGE (x:Hidden {s: 'leak'}) RETURN count(*) AS c"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-13
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (a:Doc {s: 'fresh'})-[:R]->(b:Hidden {s: 'leak'})"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (a:Doc {s: 'fresh'})-[:R]->(b:Hidden {s: 'leak'})"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-refused-14
+  description: "SONNY-2686 bob (own session): refused, 42501: MERGE (n:Doc {s: 'fresh'}) MERGE (x:Hidden {s: 'leak'}) RETURN x.secret AS secret"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (n:Doc {s: 'fresh'}) MERGE (x:Hidden {s: 'leak'}) RETURN x.secret AS secret"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [s3cr3t]
+  tags: [s2686, refused]
+
+- name: s2686-after-refusals-hidden-row-intact
+  description: 'admin: no refused MERGE wrote anything (hidden-row-intact).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (x:Hidden {s: 'leak'}) RETURN x.cls AS cls"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"cls":"secret"}]']
+  tags: [s2686, refused]
+
+- name: s2686-after-refusals-no-endpoint-created
+  description: 'admin: no refused MERGE wrote anything (no-endpoint-created).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (d:Doc {s: 'fresh'}) RETURN count(d) AS c"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":0}]']
+  tags: [s2686, refused]
+
+- name: s2686-after-refusals-no-edge-attached
+  description: 'admin: no refused MERGE wrote anything (no-edge-attached).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (:Doc {s: 'pub'})-[r]-() RETURN count(r) AS c"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":0}]']
+  tags: [s2686, refused]
+
+- name: s2686-after-refusals-no-edge-on-hidden
+  description: 'admin: no refused MERGE wrote anything (no-edge-on-hidden).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (:Hidden)-[r]-() RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":0}]']
+  tags: [s2686, refused]
+
+- name: s2686-after-refusals-total-nodes
+  description: 'admin: no refused MERGE wrote anything (total-nodes).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n) RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":2}]']
+  tags: [s2686, refused]
+
+- name: s2686-allowed-match-update
+  description: 'bob: MERGE on a visible row still matches and updates it.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Doc {s: 'pub'}) ON MATCH SET x.seen = 1 RETURN x.s AS s, x.seen AS seen"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"pub","seen":1}]']
+  tags: [s2686, allowed]
+
+- name: s2686-allowed-create
+  description: 'bob: MERGE that matches nothing creates.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Doc {s: 'new', cls: 'public'}) ON CREATE SET x.fresh = true RETURN x.s AS s, x.fresh AS fresh"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"new","fresh":true}]']
+  tags: [s2686, allowed]
+
+- name: s2686-allowed-relationship
+  description: 'bob: relationship MERGE between visible endpoints creates the edge.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (a:Doc {s: 'pub'})-[r:R]->(b:Doc {s: 'pub2', cls: 'public'}) ON CREATE SET r.w = 1"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s2686, allowed]
+
+- name: s2686-allowed-relationship-verify
+  description: 'admin: the edge and its property exist.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (a:Doc {s: 'pub'})-[r:R]->(b) RETURN b.s AS b, r.w AS w"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"b":"pub2","w":1}]']
+  tags: [s2686, allowed]
+
+- name: s2686-allowed-absent-hidden-label
+  description: 'bob: MERGE on the hidden label with a key no row carries creates (the hidden row is not the match).'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Hidden {s: 'mine'}) RETURN x.s AS s"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"mine"}]']
+  tags: [s2686, allowed]
+
+- name: s2686-rate-limit-one-session
+  description: 'SONNY-2817 bob, ONE session: five hidden-match refusals (42501), then every MERGE naming the label is 53400 (hidden match with a second property, an absent key, a relationship MERGE), while label Doc on the same session still works.'
+  args: [query, --batch, -U, bob, -P, Bob Query Passphrase For Testing, '-']
+  stdin: |
+    MERGE (x:Hidden {s: 'leak'}) RETURN x.s AS s
+    MERGE (x:Hidden {s: 'leak'}) RETURN x.s AS s
+    MERGE (x:Hidden {s: 'leak'}) RETURN x.s AS s
+    MERGE (x:Hidden {s: 'leak'}) RETURN x.s AS s
+    MERGE (x:Hidden {s: 'leak'}) RETURN x.s AS s
+    MERGE (x:Hidden {s: 'leak', salary: 250000}) RETURN x.s AS s
+    MERGE (x:Hidden {s: 'absent2817'}) RETURN x.s AS s
+    MERGE (a:Doc {s: 'pub'})-[:R2]->(b:Hidden {s: 'absent2817b'})
+    MERGE (x:Doc {s: 'pub'}) RETURN x.s AS s
+    MERGE (x:Doc {s: 'new2817'}) RETURN x.s AS s
+  expect:
+    exit_code: 1
+    stdout_regex: ['(?s)("status_class":"42501".*?){5}("status_class":"53400".*?){3}"rows":\[\{"s":"pub"\}\].*"rows":\[\{"s":"new2817"\}\]']
+  tags: [s2686, ratelimit]
+
+- name: s2686-rate-limit-no-oracle-write
+  description: 'admin: the rate-limited MERGEs created nothing.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n) WHERE n.s = 'absent2817' OR n.s = 'absent2817b' RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":0}]']
+  tags: [s2686, ratelimit]
+
+- name: s2686-rate-limit-new-session
+  description: 'SONNY-2817 a NEW session of bob is not limited: the hidden-match refusal is 42501 again.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MERGE (x:Hidden {s: 'leak'}) RETURN x.s AS s"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+  tags: [s2686, ratelimit]

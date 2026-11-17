@@ -1,0 +1,176 @@
+version: '1.0'
+name: SONNY-6472 DROP GRAPH then CREATE GRAPH of the same name starts empty
+description: |
+  SONNY-6472 item 1 (found by test-sonny3033-batch-graph-gate failing on the
+  sweep branch): after `DROP GRAPH g` and `CREATE GRAPH g` the new graph
+  showed the OLD nodes. The sweep's failure-atomic deleteNodeNoSave /
+  deleteEdgeNoSave read a node's incident edges and an edge's body through
+  the hydrating, checked readers, which go to the storage engine;
+  GraphStore.dropGraph runs clearNodesForGraph AFTER the adapter has dropped
+  that engine, so every delete failed with GraphNotFound ("node delete
+  failed; the node is unchanged") and the graph's resident nodes, label
+  counts and postings stayed, keyed by the graph name - and a re-created graph
+  of the same name inherited them. Fixed: clearNodesForGraph removes the
+  graph's resident edges, then nodes, directly in memory.
+
+  Black-box proof over the wire (each statement its own session bound with
+  -g to the graph):
+    - a graph holding labelled nodes AND edges is dropped and re-created
+      under the same name: it has 0 nodes, 0 edges, no old label and no
+      old property value, whether counted by label, unlabeled, or by edge;
+    - the new graph is fully writable and counts only the new data;
+    - the drop and re-create is durable: after a server restart the graph
+      still holds only the new data (the old nodes do not come back);
+    - another graph is untouched by the drop.
+
+  Item 2 (a write racing a DROP GRAPH must fail with GraphNotFound and never
+  re-create the graph) needs a session held open across a drop by another
+  session; it is in sonny3122_dropped_graph_not_recreated.yml. Item 3
+  (REMOVE/DELETE joining the session engine transaction) is a crash-atomicity
+  property only observable by killing the process mid-request and item 4 is a
+  concurrent-scan race: both are covered in-process
+  (test-sonny6472-dropped-graph-writes, test-sonny6472-scan-live-count-race,
+  test-sonny3033-batch-graph-gate).
+
+  Engine regression: test-sonny3033-batch-graph-gate.
+
+  CANARY: REQ=REQ-SONNY-6472-DROP-RECREATE-GRAPH; FEATURE="DROP GRAPH"; ASPECT=RecreateStartsEmpty; STATUS=TESTED; TEST=self; OWNER=storage; UPDATED=2026-11-17
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [storage, graph, drop-graph, sonny-6472]
+tests:
+
+- name: s6472_create_graphs
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE GRAPH g6472
+    CREATE GRAPH keep6472
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42', '"status_class":"58']
+
+- name: s6472_populate_old_graph
+  description: Nodes with a label and a distinctive property, joined by edges.
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (a:Old6472 {k: 'old-one'})-[:LINKS6472 {w: 1}]->(b:Old6472 {k: 'old-two'});
+    CREATE (c:Old6472 {k: 'old-three'})
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6472_populate_other_graph
+  args: [query, -g, keep6472, -U, geode, -P, '${secret:admin_password}', "CREATE (n:Keep6472 {k: 'keep-me'})"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6472_old_graph_has_three_nodes
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', MATCH (n) RETURN count(*) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":3']
+
+- name: s6472_drop_graph
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP GRAPH g6472]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6472_recreate_same_name
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH g6472]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6472_recreated_graph_has_no_nodes
+  description: KEY ASSERTION - the re-created graph is empty (it showed the old 3 nodes).
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', MATCH (n) RETURN count(*) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"c":0']
+    stdout_not_contains: ['"c":3', '"c":2', '"c":1']
+
+- name: s6472_recreated_graph_no_old_label
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', MATCH (n:Old6472) RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: [old-one, old-two, old-three]
+
+- name: s6472_recreated_graph_no_old_edges
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', 'MATCH ()-[r]->() RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"c":0']
+
+- name: s6472_recreated_graph_no_old_property_value
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', MATCH (n) WHERE n.k = 'old-one' RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: [old-one]
+
+- name: s6472_recreated_graph_is_writable
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', "CREATE (n:New6472 {k: 'new-one'})"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6472_recreated_graph_counts_only_new
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', MATCH (n) RETURN count(*) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":1']
+    stdout_not_contains: ['"c":4']
+
+- name: s6472_other_graph_untouched
+  args: [query, -g, keep6472, -U, geode, -P, '${secret:admin_password}', MATCH (n:Keep6472) RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"k":"keep-me"']
+
+- name: s6472_restart_server
+  description: Real restart against the same data directory.
+  command: echo 'restart checkpoint'
+  restart_server: true
+  expect:
+    exit_code: 0
+
+- name: s6472_after_restart_recreated_graph_has_only_new
+  args: [query, -g, g6472, -U, geode, -P, '${secret:admin_password}', MATCH (n) RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', new-one]
+    stdout_not_contains: [old-one, old-two, old-three]
+
+- name: s6472_after_restart_other_graph_intact
+  args: [query, -g, keep6472, -U, geode, -P, '${secret:admin_password}', MATCH (n:Keep6472) RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"k":"keep-me"']

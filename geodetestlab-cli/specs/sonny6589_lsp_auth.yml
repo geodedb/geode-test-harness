@@ -1,0 +1,152 @@
+version: '1.0'
+name: SONNY-6589 embedded LSP authenticates with the HELLO credentials and filters completions per user
+description: |
+  Ticket: SONNY-6589 (item 3; item 2, the MCP endpoint timeout, is in
+  sonny6589_mcp_timeout_applied.yml; the client-library initFromConfig item and
+  the REPL refused-connect text are library/in-process).
+  Bug: the LSP listener `geode serve` co-hosts (TCP, GEODE_LSP_PORT) started with an
+  empty AuthProvider that nothing populated, so every `initialize` was refused with
+  JSON-RPC -32002 and schema-aware completion over TCP could never work.
+  Spec proves against a real `geode serve` and a real LSP client (Content-Length
+  framed JSON-RPC over TCP): `initialize` with initializationOptions.geode
+  {username,password,graph} succeeds for the admin and for a read-only user;
+  a wrong password, missing password, missing credentials and an unissued token
+  are refused with -32002 and never echo the password; completion after `MATCH (n:`
+  lists the session graph's label and NOT another graph's label; the read-only user
+  with READ granted on graph A only gets graph A's label and, asking for graph B,
+  gets no label of B.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6589-lsp-password-auth-and-per-user-schema
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+     GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+     start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+     for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+     echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+     ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+     O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+     SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+     [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+
+    LSPPORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    export GEODE_LSP_PORT=$LSPPORT
+    privstart
+    for s in "CREATE GRAPH ga6589" "CREATE GRAPH gb6589"; do ok "$s" "$(q "$s")"; done
+    ok "seed a" "$("$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" --graph ga6589 "CREATE (:Visible6589 {visible_prop6589: 1})" 2>&1)"
+    ok "seed b" "$("$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" --graph gb6589 "CREATE (:Secret6589 {secret_ssn6589: 'x'})" 2>&1)"
+    ok "alice" "$(q "CREATE USER alice6589 SET PASSWORD 'Alice Lsp Sonny Passphrase 6589' ROLE readonly")"
+    ok "grant" "$(q "GRANT READ ON GRAPH ga6589 TO alice6589")"
+    python3 - "$LSPPORT" <<'PY'
+    import socket, json, sys, time
+    port = int(sys.argv[1])
+    class Lsp:
+        def __init__(self):
+            for _ in range(100):
+                try:
+                    self.s = socket.create_connection(("127.0.0.1", port), timeout=30); break
+                except OSError: time.sleep(0.2)
+            else: raise SystemExit("LSP port never opened")
+            self.buf = b""
+        def send(self, obj):
+            b = json.dumps(obj).encode(); self.s.sendall(b"Content-Length: %d\r\n\r\n" % len(b) + b)
+        def frame(self):
+            while True:
+                i = self.buf.find(b"\r\n\r\n")
+                if i >= 0:
+                    n = int([l for l in self.buf[:i].split(b"\r\n") if l.lower().startswith(b"content-length")][0].split(b":")[1])
+                    if len(self.buf) >= i + 4 + n:
+                        body = self.buf[i+4:i+4+n]; self.buf = self.buf[i+4+n:]; return json.loads(body)
+                d = self.s.recv(8192)
+                if not d: return None
+                self.buf += d
+        def resp(self, id):
+            while True:
+                m = self.frame()
+                if m is None: raise SystemExit("LSP closed before response %s" % id)
+                if m.get("id") == id and "method" not in m: return m
+        def init(self, opts):
+            self.send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":None,"rootUri":None,"capabilities":{},"initializationOptions":{"geode":opts}}})
+            return self.resp(1)
+        def complete(self, id, text):
+            uri = "file:///s6589-%d.gql" % id
+            self.send({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"gql","version":1,"text":text}}})
+            self.send({"jsonrpc":"2.0","id":id,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":0,"character":len(text)}}})
+            return json.dumps(self.resp(id))
+    def session(user, pw, graph):
+        l = Lsp(); r = l.init({"username": user, "password": pw, "graph": graph})
+        assert "capabilities" in json.dumps(r) and "error" not in r, "initialize as %s on %s refused: %s" % (user, graph, r)
+        l.send({"jsonrpc":"2.0","method":"initialized","params":{}}); return l
+    ADMIN = ("geode", "Geode Test Admin Passphrase"); ALICE = ("alice6589", "Alice Lsp Sonny Passphrase 6589")
+    doc = "MATCH (n:"
+    l = session(*ADMIN, "ga6589"); c = l.complete(2, doc)
+    assert "Visible6589" in c and "Secret6589" not in c, "admin on ga6589: %s" % c
+    l = session(*ALICE, "ga6589"); c = l.complete(2, doc)
+    assert "Visible6589" in c and "Secret6589" not in c, "alice on ga6589: %s" % c
+    l = Lsp(); r = l.init({"username": ALICE[0], "password": ALICE[1], "graph": "gb6589"})
+    if "capabilities" in json.dumps(r):
+        l.send({"jsonrpc":"2.0","method":"initialized","params":{}}); c = l.complete(2, doc)
+        assert "Secret6589" not in c, "alice learned graph B's schema: %s" % c
+    for opts in ({"username": ALICE[0], "password": "not her password", "graph": "ga6589"}, {"username": ALICE[0], "graph": "ga6589"},
+                 {"graph": "ga6589"}, {"authToken": "sonny6589-not-an-issued-token", "graph": "ga6589"}):
+        l = Lsp(); r = l.init(opts); t = json.dumps(r)
+        assert "-32002" in t and "capabilities" not in t, "unauthenticated initialize %s was not refused: %s" % (opts, t)
+        assert "not her password" not in t, "refusal echoes the password"
+        c = l.complete(2, doc)
+        assert "-32002" in c and "Visible6589" not in c, "completion after a refused initialize: %s" % c
+    print("LSP_AUTH_OK")
+    PY
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [LSP_AUTH_OK]
+  tags: [lsp, sonny6589]

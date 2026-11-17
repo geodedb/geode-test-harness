@@ -1,0 +1,74 @@
+version: '1.0'
+name: SONNY-6644 `geode mcp --port` serves Streamable HTTP sessions until SIGTERM
+description: |
+  Ticket: SONNY-6644 (the mcp library's HTTP session / parallel-batch fixes; geode
+  pinned mcp v0.1.26 and fixed `geode mcp --port`).
+  Bug: server-to-client requests only worked over stdio (the HTTP transport created
+  no Session) and `geode mcp --port N` printed its port and exited at once, serving
+  nothing.
+  Spec proves on the real binary: `geode mcp --token <t> --port 0` (--no-auth is debug-only for HTTP) prints "MCP server
+  listening on port N" and keeps running; an HTTP POST /mcp `initialize` answers 200
+  with an Mcp-Session-Id header and a serverInfo body; a call without the session
+  header is 400, with an unknown session 404; notifications/initialized is 202;
+  tools/list in the session is 200 and lists "query"; a second `initialize` opens a
+  second, different session; SIGTERM makes the process exit 0 within 15 s.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6644-mcp-port-serves-http-sessions
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    H=$(mktemp -d); trap '[ -n "$P" ] && kill -9 $P 2>/dev/null; rm -rf "$H"' EXIT
+    P=""
+    HOME="$H" GEODE_LSP_PORT=0 "$BIN" mcp --token tok6644tok6644tok6644tok --port 0 >"$H/out" 2>"$H/err" </dev/null & P=$!
+    PORT=""
+    for i in $(seq 1 120); do PORT=$(sed -n 's/.*MCP server listening on port \([0-9]*\).*/\1/p' "$H/err" | head -1); [ -n "$PORT" ] && break; sleep 0.25; done
+    [ -n "$PORT" ] || { echo "FAIL geode mcp printed no port"; cat "$H/err"; exit 1; }
+    sleep 1; kill -0 $P 2>/dev/null || { echo "FAIL geode mcp --port exited right after printing its port"; cat "$H/err"; exit 1; }
+    post() { # session body -> sets CODE, SID, BODY
+      local hdr=(-H 'Authorization: Bearer tok6644tok6644tok6644tok' -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
+      [ -n "$1" ] && hdr+=(-H "Mcp-Session-Id: $1")
+      RESP=$(curl -s -m 15 -D "$H/h" -o "$H/b" -w '%{http_code}' "${hdr[@]}" -d "$2" "http://127.0.0.1:$PORT/mcp"); CODE="$RESP"
+      SID=$(grep -i '^mcp-session-id:' "$H/h" | head -1 | cut -d: -f2 | tr -d ' \r\n'); BODY=$(cat "$H/b")
+    }
+    INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"sonny6644","version":"1.0"}}}'
+    post "" "$INIT"
+    [ "$CODE" = 200 ] && [ -n "$SID" ] && echo "$BODY" | grep -q '"serverInfo"' || { echo "FAIL initialize code=$CODE sid='$SID'"; echo "$BODY"; exit 1; }
+    S1="$SID"
+    post "" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; [ "$CODE" = 400 ] || { echo "FAIL tools/list w/o session code=$CODE (want 400)"; exit 1; }
+    post "no-such-session-6644" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; [ "$CODE" = 404 ] || { echo "FAIL tools/list unknown session code=$CODE (want 404)"; exit 1; }
+    post "$S1" '{"jsonrpc":"2.0","method":"notifications/initialized"}'; [ "$CODE" = 202 ] || { echo "FAIL initialized code=$CODE (want 202)"; exit 1; }
+    post "$S1" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+    [ "$CODE" = 200 ] && echo "$BODY" | grep -q '"query"' && [ "$SID" = "$S1" ] || { echo "FAIL tools/list in session code=$CODE sid=$SID"; echo "$BODY"; exit 1; }
+    post "" "$INIT"; [ "$CODE" = 200 ] && [ -n "$SID" ] && [ "$SID" != "$S1" ] || { echo "FAIL second session code=$CODE sid=$SID s1=$S1"; exit 1; }
+    kill -TERM $P
+    for i in $(seq 1 60); do kill -0 $P 2>/dev/null || break; sleep 0.25; done
+    kill -0 $P 2>/dev/null && { echo "FAIL geode mcp did not exit within 15 s of SIGTERM"; exit 1; }
+    wait $P; RC=$?; P=""
+    [ "$RC" -eq 0 ] || { echo "FAIL geode mcp exit status $RC after SIGTERM"; exit 1; }
+    echo "MCP_HTTP_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [MCP_HTTP_OK]
+  tags: [mcp, sonny6644]

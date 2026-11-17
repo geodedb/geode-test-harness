@@ -1,0 +1,341 @@
+version: '1.0'
+name: 'SONNY-2742: property-map MATCH with WHERE, ORDER BY and LIMIT returns every matching row'
+description: |
+  Ticket: SONNY-2742 (wrong results).
+  A query of the shape MATCH (n:L {tag: $t}) WHERE n.id > $x AND n.sub = $s RETURN n.id
+  ORDER BY n.id LIMIT 10 was answered from only the NEWEST node matching the property map,
+  before WHERE was applied: [] or a single row instead of every matching row in order.
+  ThreadID's PAM listing used this shape and saw one access request per tenant. The
+  ticket was verified already fixed on the sweep branch (cause not bisected); this spec
+  pins it from outside.
+  Fixture: Req nodes a1/A, b1/B, a2/A and a0/A (another tag), the same tag on three.
+  Proves, on a persisted admin session, after a server restart, and on a row-level-
+  security session (bob, denied an unrelated label): the property-map + WHERE + ORDER BY
+  + LIMIT shape returns every matching row in order; ORDER BY DESC, LIMIT 1, no ORDER BY
+  and the tag-in-WHERE form agree.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s2742-create-user-bob
+  description: 'bob: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER bob SET PASSWORD 'Bob Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created bob]
+  tags: [s2742, setup]
+
+- name: s2742-seed
+  description: Seed the Req nodes.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:Req {tag: 't', id: 'a1', sub: 'A'});
+    CREATE (:Req {tag: 't', id: 'b1', sub: 'B'});
+    CREATE (:Req {tag: 't', id: 'a2', sub: 'A'});
+    CREATE (:Req {tag: 'u', id: 'a0', sub: 'A'})
+  expect:
+    exit_code: 0
+  tags: [s2742, setup]
+
+- name: s2742-deny
+  description: Deny bob an unrelated label so his session is a row-level-security session.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('default', 'Hidden', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [deny policy added]
+  tags: [s2742, setup]
+
+- name: s2742-pre-and-where-admin
+  description: "SONNY-2742 [admin, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-pre-and-where-bob
+  description: "SONNY-2742 [bob RLS session, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-pre-gt-admin
+  description: "SONNY-2742 [admin, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > 'a1' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.id > 'a1' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-pre-gt-bob
+  description: "SONNY-2742 [bob RLS session, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > 'a1' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.id > 'a1' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-pre-sub-b-admin
+  description: "SONNY-2742 [admin, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'B' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'B' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"b1"}]']
+  tags: [s2742]
+
+- name: s2742-pre-sub-b-bob
+  description: "SONNY-2742 [bob RLS session, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'B' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'B' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"b1"}]']
+  tags: [s2742]
+
+- name: s2742-pre-desc-admin
+  description: "SONNY-2742 [admin, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id DESC LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id DESC LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a2"},{"id":"a1"}]']
+  tags: [s2742]
+
+- name: s2742-pre-desc-bob
+  description: "SONNY-2742 [bob RLS session, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id DESC LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id DESC LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a2"},{"id":"a1"}]']
+  tags: [s2742]
+
+- name: s2742-pre-no-where-admin
+  description: "SONNY-2742 [admin, pre restart]: MATCH (n:Req {tag: 't'}) RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"},{"id":"b1"}]']
+  tags: [s2742]
+
+- name: s2742-pre-no-where-bob
+  description: "SONNY-2742 [bob RLS session, pre restart]: MATCH (n:Req {tag: 't'}) RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"},{"id":"b1"}]']
+  tags: [s2742]
+
+- name: s2742-pre-limit1-admin
+  description: "SONNY-2742 [admin, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 1"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 1"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"}]']
+  tags: [s2742]
+
+- name: s2742-pre-limit1-bob
+  description: "SONNY-2742 [bob RLS session, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 1"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 1"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"}]']
+  tags: [s2742]
+
+- name: s2742-pre-tag-in-where-admin
+  description: "SONNY-2742 [admin, pre restart]: MATCH (n:Req) WHERE n.tag = 't' AND n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:Req) WHERE n.tag = 't' AND n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-pre-tag-in-where-bob
+  description: "SONNY-2742 [bob RLS session, pre restart]: MATCH (n:Req) WHERE n.tag = 't' AND n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:Req) WHERE n.tag = 't' AND n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-pre-no-order-admin
+  description: "SONNY-2742 [admin, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-pre-no-order-bob
+  description: "SONNY-2742 [bob RLS session, pre restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-restart
+  description: 'Restart the server: the same answers after reopen.'
+  type: bash
+  command: echo "restart checkpoint"
+  restart_server: true
+  expect: {exit_code: 0}
+  tags: [s2742, restart]
+
+- name: s2742-post-and-where-admin
+  description: "SONNY-2742 [admin, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-post-and-where-bob
+  description: "SONNY-2742 [bob RLS session, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-post-gt-admin
+  description: "SONNY-2742 [admin, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > 'a1' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.id > 'a1' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-post-gt-bob
+  description: "SONNY-2742 [bob RLS session, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > 'a1' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.id > 'a1' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-post-sub-b-admin
+  description: "SONNY-2742 [admin, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'B' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'B' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"b1"}]']
+  tags: [s2742]
+
+- name: s2742-post-sub-b-bob
+  description: "SONNY-2742 [bob RLS session, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'B' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'B' RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"b1"}]']
+  tags: [s2742]
+
+- name: s2742-post-desc-admin
+  description: "SONNY-2742 [admin, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id DESC LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id DESC LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a2"},{"id":"a1"}]']
+  tags: [s2742]
+
+- name: s2742-post-desc-bob
+  description: "SONNY-2742 [bob RLS session, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id DESC LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id DESC LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a2"},{"id":"a1"}]']
+  tags: [s2742]
+
+- name: s2742-post-no-where-admin
+  description: "SONNY-2742 [admin, post restart]: MATCH (n:Req {tag: 't'}) RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"},{"id":"b1"}]']
+  tags: [s2742]
+
+- name: s2742-post-no-where-bob
+  description: "SONNY-2742 [bob RLS session, post restart]: MATCH (n:Req {tag: 't'}) RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) RETURN n.id AS id ORDER BY id LIMIT 10"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"},{"id":"b1"}]']
+  tags: [s2742]
+
+- name: s2742-post-limit1-admin
+  description: "SONNY-2742 [admin, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 1"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 1"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"}]']
+  tags: [s2742]
+
+- name: s2742-post-limit1-bob
+  description: "SONNY-2742 [bob RLS session, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 1"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 1"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"}]']
+  tags: [s2742]
+
+- name: s2742-post-tag-in-where-admin
+  description: "SONNY-2742 [admin, post restart]: MATCH (n:Req) WHERE n.tag = 't' AND n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:Req) WHERE n.tag = 't' AND n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-post-tag-in-where-bob
+  description: "SONNY-2742 [bob RLS session, post restart]: MATCH (n:Req) WHERE n.tag = 't' AND n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:Req) WHERE n.tag = 't' AND n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id LIMIT 10]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-post-no-order-admin
+  description: "SONNY-2742 [admin, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-post-no-order-bob
+  description: "SONNY-2742 [bob RLS session, post restart]: MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (n:Req {tag: 't'}) WHERE n.id > '' AND n.sub = 'A' RETURN n.id AS id ORDER BY id"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]
+
+- name: s2742-param
+  description: "The ticket's parameterised form: tag, id and sub as query parameters."
+  args: [query, -U, geode, -P, '${secret:admin_password}', --param, t, '"t"', --param, x, '""', --param, s, '"A"', 'MATCH (n:Req {tag: $t}) WHERE n.id > $x AND n.sub = $s RETURN n.id AS id ORDER BY id LIMIT 10']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"id":"a1"},{"id":"a2"}]']
+  tags: [s2742]

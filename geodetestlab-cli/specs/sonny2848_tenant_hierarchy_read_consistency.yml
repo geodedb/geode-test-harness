@@ -1,0 +1,1163 @@
+version: '1.0'
+name: 'SONNY-2848 / SONNY-2820 / SONNY-2693 / SONNY-1326: tenant-hierarchy reads agree with MATCH on every path'
+description: |
+  Tickets: SONNY-2848, SONNY-2820, SONNY-2693, SONNY-1326.
+  A tenant-scoped session sees the rows tagged with its tenant and, when the tenant is registered
+  in the hierarchy, those of its descendants (a child does not see its parent's rows, siblings
+  and unrelated tenants see nothing of each other). Every read must obey that one rule.
+  SONNY-2848: COUNT {}, EXISTS {}, IN (subquery), comprehensions and aggregates after WITH
+  saw none of the session's own nodes (or returned 0) on a tenant session.
+  SONNY-1326: shortestPath(), COUNT {}, EXISTS {} and pattern comprehensions read across
+  tenants.
+  SONNY-2820: knn() compared tenant tags exactly, so a parent missed its children's rows; and a
+  property no visible row carries raised UnknownProperty instead of an empty list.
+  SONNY-2693: one rule for edges on every path: an edge is visible only when its OWN tenant tag
+  (hierarchy-aware) and both endpoints are visible (an edge a parent wrote between its child's
+  nodes is invisible to the child on every path, single hop, undirected, variable length,
+  COUNT {}, EXISTS {}, comprehensions).
+  How the sessions are made: the geode CLI sends no tenant, so each statement batch goes through
+  `geode mcp --stdio` whose backend endpoint carries tenant=<id> in its HELLO, against the real
+  server (GEODE_PERMISSIVE_TENANCY=1 only so the managed server accepts the admin's tenant-less
+  setup calls). Tenants: P with children C1 and C2, and an unrelated root U.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_PERMISSIVE_TENANCY: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s6338-tenant-t6338_p
+  description: Register tenant t6338_p.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CALL geode.tenant.create('t6338_p')]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"created":true']
+  tags: [tenant, setup]
+
+- name: s6338-tenant-t6338_c1
+  description: Register tenant t6338_c1 under t6338_p.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.tenant.create('t6338_c1', 't6338_p')"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"created":true']
+  tags: [tenant, setup]
+
+- name: s6338-tenant-t6338_c2
+  description: Register tenant t6338_c2 under t6338_p.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.tenant.create('t6338_c2', 't6338_p')"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"created":true']
+  tags: [tenant, setup]
+
+- name: s6338-tenant-t6338_u
+  description: Register tenant t6338_u.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CALL geode.tenant.create('t6338_u')]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"created":true']
+  tags: [tenant, setup]
+
+- name: s6338-seed-c1
+  description: C1 writes s1 -T-> s2.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c1 'CREATE (a:S {who: '\''s1'\'', k: 1})-[:T]->(b:S {who: '\''s2'\'', k: 2})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-c2
+  description: C2 writes s3 -T-> s4.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c2 'CREATE (a:S {who: '\''s3'\'', k: 3})-[:T]->(b:S {who: '\''s4'\'', k: 4})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-u
+  description: U writes s5 -T-> s6.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_u 'CREATE (a:S {who: '\''s5'\'', k: 5})-[:T]->(b:S {who: '\''s6'\'', k: 6})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-p
+  description: P writes s7.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_p 'CREATE (:S {who: '\''s7'\'', k: 7})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-subqueries-t6338_c1
+  description: "SONNY-2848/1326: every subquery / expression-path / aggregate form returns what the session's own MATCH sees (tenant t6338_c1: 2 nodes, 1 sources; s1 visible: True)."
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c1 'MATCH (n:S) RETURN count(n) AS c' 'MATCH (a:S)-[:T]->(b:S) RETURN count(a) AS c' 'RETURN COUNT { (n:S) } AS c' 'MATCH (a:S) WHERE EXISTS { (a)-[:T]->(b) } RETURN count(a) AS c' 'MATCH (a:S) WHERE COUNT { (n:S) } > 0 RETURN count(a) AS c' 'RETURN size([(a:S)-[:T]->(b:S) | b.who]) AS c' 'MATCH (x:S) WHERE x.k IN (MATCH (y:S) RETURN y.k) RETURN count(x) AS c' 'MATCH (a:S)-[:T]->(b:S) RETURN count(shortestPath((a)-[*]-(b))) AS c' 'MATCH (a:S) WITH count(a) AS c RETURN c' 'MATCH (a:S) WHERE EXISTS { (a)-[:T]->() } RETURN count(*) AS c' 'MATCH (a:S)-[:T]->(b:S) WHERE b.k IN (MATCH (y:S) RETURN y.k) RETURN count(a) AS c' 'MATCH (a:S) WITH a, COUNT { (a)-[:T]->() } AS d WHERE d > 0 RETURN count(a) AS c' 'MATCH (a:S) WITH a WHERE EXISTS { (a)-[:T]->() } RETURN count(a) AS c' 'MATCH (a:S) WITH a, size([(a)-[:T]->(x) | x.k]) AS d WHERE d > 0 RETURN count(a) AS c' 'MATCH (a:S) RETURN sum(COUNT { (a)-[:T]->() }) AS c' 'MATCH (a:S) WITH a RETURN count(a) AS c' 'RETURN shortestPath((a:S {who: '\''s1'\''})-[*]-(b:S {who: '\''s2'\''})) IS NULL AS np' 'RETURN COUNT { (a:S {who: '\''s1'\''}) } AS c' 'RETURN EXISTS { (a:S {who: '\''s1'\''}) } AS e'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"c":2}]', 'Q02 OK [{"c":1}]', 'Q03 OK [{"c":2}]', 'Q04 OK [{"c":1}]', 'Q05 OK [{"c":2}]', 'Q06 OK [{"c":1}]', 'Q07 OK [{"c":2}]', 'Q08 OK [{"c":1}]', 'Q09 OK [{"c":2}]', 'Q10 OK [{"c":1}]', 'Q11 OK [{"c":1}]', 'Q12 OK [{"c":1}]', 'Q13 OK [{"c":1}]', 'Q14 OK [{"c":1}]', 'Q15 OK [{"c":1}]', 'Q16 OK [{"c":2}]', 'Q17 OK [{"np":false}]', 'Q18 OK [{"c":1}]', 'Q19 OK [{"e":true}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-subqueries-t6338_u
+  description: "SONNY-2848/1326: every subquery / expression-path / aggregate form returns what the session's own MATCH sees (tenant t6338_u: 2 nodes, 1 sources; s1 visible: False)."
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_u 'MATCH (n:S) RETURN count(n) AS c' 'MATCH (a:S)-[:T]->(b:S) RETURN count(a) AS c' 'RETURN COUNT { (n:S) } AS c' 'MATCH (a:S) WHERE EXISTS { (a)-[:T]->(b) } RETURN count(a) AS c' 'MATCH (a:S) WHERE COUNT { (n:S) } > 0 RETURN count(a) AS c' 'RETURN size([(a:S)-[:T]->(b:S) | b.who]) AS c' 'MATCH (x:S) WHERE x.k IN (MATCH (y:S) RETURN y.k) RETURN count(x) AS c' 'MATCH (a:S)-[:T]->(b:S) RETURN count(shortestPath((a)-[*]-(b))) AS c' 'MATCH (a:S) WITH count(a) AS c RETURN c' 'MATCH (a:S) WHERE EXISTS { (a)-[:T]->() } RETURN count(*) AS c' 'MATCH (a:S)-[:T]->(b:S) WHERE b.k IN (MATCH (y:S) RETURN y.k) RETURN count(a) AS c' 'MATCH (a:S) WITH a, COUNT { (a)-[:T]->() } AS d WHERE d > 0 RETURN count(a) AS c' 'MATCH (a:S) WITH a WHERE EXISTS { (a)-[:T]->() } RETURN count(a) AS c' 'MATCH (a:S) WITH a, size([(a)-[:T]->(x) | x.k]) AS d WHERE d > 0 RETURN count(a) AS c' 'MATCH (a:S) RETURN sum(COUNT { (a)-[:T]->() }) AS c' 'MATCH (a:S) WITH a RETURN count(a) AS c' 'RETURN shortestPath((a:S {who: '\''s1'\''})-[*]-(b:S {who: '\''s2'\''})) IS NULL AS np' 'RETURN COUNT { (a:S {who: '\''s1'\''}) } AS c' 'RETURN EXISTS { (a:S {who: '\''s1'\''}) } AS e'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"c":2}]', 'Q02 OK [{"c":1}]', 'Q03 OK [{"c":2}]', 'Q04 OK [{"c":1}]', 'Q05 OK [{"c":2}]', 'Q06 OK [{"c":1}]', 'Q07 OK [{"c":2}]', 'Q08 OK [{"c":1}]', 'Q09 OK [{"c":2}]', 'Q10 OK [{"c":1}]', 'Q11 OK [{"c":1}]', 'Q12 OK [{"c":1}]', 'Q13 OK [{"c":1}]', 'Q14 OK [{"c":1}]', 'Q15 OK [{"c":1}]', 'Q16 OK [{"c":2}]', 'Q17 OK [{"np":true}]', 'Q18 OK [{"c":0}]', 'Q19 OK [{"e":false}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-subqueries-t6338_p
+  description: "SONNY-2848/1326: every subquery / expression-path / aggregate form returns what the session's own MATCH sees (tenant t6338_p: 5 nodes, 2 sources; s1 visible: True)."
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_p 'MATCH (n:S) RETURN count(n) AS c' 'MATCH (a:S)-[:T]->(b:S) RETURN count(a) AS c' 'RETURN COUNT { (n:S) } AS c' 'MATCH (a:S) WHERE EXISTS { (a)-[:T]->(b) } RETURN count(a) AS c' 'MATCH (a:S) WHERE COUNT { (n:S) } > 0 RETURN count(a) AS c' 'RETURN size([(a:S)-[:T]->(b:S) | b.who]) AS c' 'MATCH (x:S) WHERE x.k IN (MATCH (y:S) RETURN y.k) RETURN count(x) AS c' 'MATCH (a:S)-[:T]->(b:S) RETURN count(shortestPath((a)-[*]-(b))) AS c' 'MATCH (a:S) WITH count(a) AS c RETURN c' 'MATCH (a:S) WHERE EXISTS { (a)-[:T]->() } RETURN count(*) AS c' 'MATCH (a:S)-[:T]->(b:S) WHERE b.k IN (MATCH (y:S) RETURN y.k) RETURN count(a) AS c' 'MATCH (a:S) WITH a, COUNT { (a)-[:T]->() } AS d WHERE d > 0 RETURN count(a) AS c' 'MATCH (a:S) WITH a WHERE EXISTS { (a)-[:T]->() } RETURN count(a) AS c' 'MATCH (a:S) WITH a, size([(a)-[:T]->(x) | x.k]) AS d WHERE d > 0 RETURN count(a) AS c' 'MATCH (a:S) RETURN sum(COUNT { (a)-[:T]->() }) AS c' 'MATCH (a:S) WITH a RETURN count(a) AS c' 'RETURN shortestPath((a:S {who: '\''s1'\''})-[*]-(b:S {who: '\''s2'\''})) IS NULL AS np' 'RETURN COUNT { (a:S {who: '\''s1'\''}) } AS c' 'RETURN EXISTS { (a:S {who: '\''s1'\''}) } AS e'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"c":5}]', 'Q02 OK [{"c":2}]', 'Q03 OK [{"c":5}]', 'Q04 OK [{"c":2}]', 'Q05 OK [{"c":5}]', 'Q06 OK [{"c":2}]', 'Q07 OK [{"c":5}]', 'Q08 OK [{"c":2}]', 'Q09 OK [{"c":5}]', 'Q10 OK [{"c":2}]', 'Q11 OK [{"c":2}]', 'Q12 OK [{"c":2}]', 'Q13 OK [{"c":2}]', 'Q14 OK [{"c":2}]', 'Q15 OK [{"c":2}]', 'Q16 OK [{"c":5}]', 'Q17 OK [{"np":false}]', 'Q18 OK [{"c":1}]', 'Q19 OK [{"e":true}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-subqueries-t6338_c2
+  description: "SONNY-2848/1326: every subquery / expression-path / aggregate form returns what the session's own MATCH sees (tenant t6338_c2: 2 nodes, 1 sources; s1 visible: False)."
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c2 'MATCH (n:S) RETURN count(n) AS c' 'MATCH (a:S)-[:T]->(b:S) RETURN count(a) AS c' 'RETURN COUNT { (n:S) } AS c' 'MATCH (a:S) WHERE EXISTS { (a)-[:T]->(b) } RETURN count(a) AS c' 'MATCH (a:S) WHERE COUNT { (n:S) } > 0 RETURN count(a) AS c' 'RETURN size([(a:S)-[:T]->(b:S) | b.who]) AS c' 'MATCH (x:S) WHERE x.k IN (MATCH (y:S) RETURN y.k) RETURN count(x) AS c' 'MATCH (a:S)-[:T]->(b:S) RETURN count(shortestPath((a)-[*]-(b))) AS c' 'MATCH (a:S) WITH count(a) AS c RETURN c' 'MATCH (a:S) WHERE EXISTS { (a)-[:T]->() } RETURN count(*) AS c' 'MATCH (a:S)-[:T]->(b:S) WHERE b.k IN (MATCH (y:S) RETURN y.k) RETURN count(a) AS c' 'MATCH (a:S) WITH a, COUNT { (a)-[:T]->() } AS d WHERE d > 0 RETURN count(a) AS c' 'MATCH (a:S) WITH a WHERE EXISTS { (a)-[:T]->() } RETURN count(a) AS c' 'MATCH (a:S) WITH a, size([(a)-[:T]->(x) | x.k]) AS d WHERE d > 0 RETURN count(a) AS c' 'MATCH (a:S) RETURN sum(COUNT { (a)-[:T]->() }) AS c' 'MATCH (a:S) WITH a RETURN count(a) AS c' 'RETURN shortestPath((a:S {who: '\''s1'\''})-[*]-(b:S {who: '\''s2'\''})) IS NULL AS np' 'RETURN COUNT { (a:S {who: '\''s1'\''}) } AS c' 'RETURN EXISTS { (a:S {who: '\''s1'\''}) } AS e'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"c":2}]', 'Q02 OK [{"c":1}]', 'Q03 OK [{"c":2}]', 'Q04 OK [{"c":1}]', 'Q05 OK [{"c":2}]', 'Q06 OK [{"c":1}]', 'Q07 OK [{"c":2}]', 'Q08 OK [{"c":1}]', 'Q09 OK [{"c":2}]', 'Q10 OK [{"c":1}]', 'Q11 OK [{"c":1}]', 'Q12 OK [{"c":1}]', 'Q13 OK [{"c":1}]', 'Q14 OK [{"c":1}]', 'Q15 OK [{"c":1}]', 'Q16 OK [{"c":2}]', 'Q17 OK [{"np":true}]', 'Q18 OK [{"c":0}]', 'Q19 OK [{"e":false}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-knn-u
+  description: U writes a V row with emb and a U-only vector property.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_u 'CREATE (:V {who: '\''u'\'', emb: vectorf32([0.0, 1.0]), uonly: vectorf32([1.0, 1.0])})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-knn-p
+  description: P writes a V row.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_p 'CREATE (:V {who: '\''p'\'', emb: vectorf32([0.0, 1.2])})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-knn-c1
+  description: C1 writes two V rows.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c1 'CREATE (:V {who: '\''c1'\'', emb: vectorf32([0.0, 1.4])})' 'CREATE (:V {who: '\''c1b'\'', emb: vectorf32([0.0, 2.0])})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []', 'Q02 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-knn-c2
+  description: C2 writes a V row.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c2 'CREATE (:V {who: '\''c2'\'', emb: vectorf32([0.0, 1.6])})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-knn-scan-t6338_p
+  description: SONNY-2820 [scan path] knn() ranks the rows tenant t6338_p's MATCH sees (parent includes children, nearest-k cut after the tenant filter); a property no visible row carries is an empty list, not UnknownProperty.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_p 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 10, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 2, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 1, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''uonly'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'RETURN size(knn('\''uonly'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'')) AS n'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"who":"c1"},{"who":"c1b"},{"who":"c2"},{"who":"p"}]', 'Q02 OK [{"who":"c1"},{"who":"p"}]', 'Q03 OK [{"who":"p"}]', 'Q04 OK []', 'Q05 OK [{"n":0}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-knn-scan-t6338_c1
+  description: SONNY-2820 [scan path] knn() ranks the rows tenant t6338_c1's MATCH sees (parent includes children, nearest-k cut after the tenant filter); a property no visible row carries is an empty list, not UnknownProperty.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c1 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 10, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 1, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''uonly'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'RETURN size(knn('\''nosuch'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'')) AS n'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"who":"c1"},{"who":"c1b"}]', 'Q02 OK [{"who":"c1"}]', 'Q03 OK []', 'Q04 OK [{"n":0}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-knn-scan-t6338_c2
+  description: SONNY-2820 [scan path] knn() ranks the rows tenant t6338_c2's MATCH sees (parent includes children, nearest-k cut after the tenant filter); a property no visible row carries is an empty list, not UnknownProperty.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c2 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 10, '\''l2'\'') RETURN n.who AS who ORDER BY who'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"who":"c2"}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-knn-scan-t6338_u
+  description: SONNY-2820 [scan path] knn() ranks the rows tenant t6338_u's MATCH sees (parent includes children, nearest-k cut after the tenant filter); a property no visible row carries is an empty list, not UnknownProperty.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_u 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 10, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''uonly'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'') RETURN n.who AS who ORDER BY who'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"who":"u"}]', 'Q02 OK [{"who":"u"}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-knn-index
+  description: Create a vector index on V.emb (the index path of knn).
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE INDEX v_emb ON V (emb) USING vector]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [tenant, setup]
+
+- name: s6338-knn-index-t6338_p
+  description: SONNY-2820 [index path] knn() ranks the rows tenant t6338_p's MATCH sees (parent includes children, nearest-k cut after the tenant filter); a property no visible row carries is an empty list, not UnknownProperty.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_p 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 10, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 2, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 1, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''uonly'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'RETURN size(knn('\''uonly'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'')) AS n'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"who":"c1"},{"who":"c1b"},{"who":"c2"},{"who":"p"}]', 'Q02 OK [{"who":"c1"},{"who":"p"}]', 'Q03 OK [{"who":"p"}]', 'Q04 OK []', 'Q05 OK [{"n":0}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-knn-index-t6338_c1
+  description: SONNY-2820 [index path] knn() ranks the rows tenant t6338_c1's MATCH sees (parent includes children, nearest-k cut after the tenant filter); a property no visible row carries is an empty list, not UnknownProperty.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c1 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 10, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 1, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''uonly'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'RETURN size(knn('\''nosuch'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'')) AS n'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"who":"c1"},{"who":"c1b"}]', 'Q02 OK [{"who":"c1"}]', 'Q03 OK []', 'Q04 OK [{"n":0}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-knn-index-t6338_c2
+  description: SONNY-2820 [index path] knn() ranks the rows tenant t6338_c2's MATCH sees (parent includes children, nearest-k cut after the tenant filter); a property no visible row carries is an empty list, not UnknownProperty.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c2 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 10, '\''l2'\'') RETURN n.who AS who ORDER BY who'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"who":"c2"}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-knn-index-t6338_u
+  description: SONNY-2820 [index path] knn() ranks the rows tenant t6338_u's MATCH sees (parent includes children, nearest-k cut after the tenant filter); a property no visible row carries is an empty list, not UnknownProperty.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_u 'MATCH (n:V) WHERE id(n) IN knn('\''emb'\'', vectorf32([0.0, 1.0]), 10, '\''l2'\'') RETURN n.who AS who ORDER BY who' 'MATCH (n:V) WHERE id(n) IN knn('\''uonly'\'', vectorf32([1.0, 1.0]), 5, '\''l2'\'') RETURN n.who AS who ORDER BY who'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"who":"u"}]', 'Q02 OK [{"who":"u"}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-e-c1
+  description: C1 writes two E nodes.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c1 'CREATE (:E {k: 1})' 'CREATE (:E {k: 2})'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK []', 'Q02 OK []']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-seed-e-edge
+  description: "P (the parent) writes a W edge between C1's two nodes: the edge is tagged P."
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_p 'MATCH (a:E {k: 1}), (b:E {k: 2}) CREATE (a)-[:W {w: 1}]->(b)'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"nodes_created":0,"relationships_created":1}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-edge-rule-t6338_p
+  description: 'SONNY-2693 tenant t6338_p: the edge P wrote is visible on every path (single hop, COUNT {}, comprehension, EXISTS {}, undirected, variable length).'
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_p 'MATCH (a:E)-[r:W]->(b:E) RETURN count(r) AS c' 'MATCH (a:E) WHERE COUNT { (a)-[:W]->(b) } > 0 RETURN count(a) AS c' 'MATCH (a:E) WHERE size([(a)-[:W]->(b) | b.k]) > 0 RETURN count(a) AS c' 'MATCH (a:E) WHERE EXISTS { (a)-[:W]->() } RETURN count(a) AS c' 'MATCH (a:E)-[r:W]-(b:E) RETURN count(r) AS c' 'MATCH (a:E)-[r:W*1..2]->(b) RETURN count(b) AS c' 'RETURN COUNT { (:E)-[:W]->(:E) } AS c' 'MATCH (a:E) WHERE a.k = 1 AND COUNT { (a)-[r:W]->() WHERE r.w = 1 } > 0 RETURN count(a) AS c'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"c":1}]', 'Q02 OK [{"c":1}]', 'Q03 OK [{"c":1}]', 'Q04 OK [{"c":1}]', 'Q05 OK [{"c":2}]', 'Q06 OK [{"c":1}]', 'Q07 OK [{"c":1}]', 'Q08 OK [{"c":1}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-edge-rule-t6338_c1
+  description: 'SONNY-2693 tenant t6338_c1: the edge P wrote is invisible on every path (single hop, COUNT {}, comprehension, EXISTS {}, undirected, variable length).'
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_c1 'MATCH (a:E)-[r:W]->(b:E) RETURN count(r) AS c' 'MATCH (a:E) WHERE COUNT { (a)-[:W]->(b) } > 0 RETURN count(a) AS c' 'MATCH (a:E) WHERE size([(a)-[:W]->(b) | b.k]) > 0 RETURN count(a) AS c' 'MATCH (a:E) WHERE EXISTS { (a)-[:W]->() } RETURN count(a) AS c' 'MATCH (a:E)-[r:W]-(b:E) RETURN count(r) AS c' 'MATCH (a:E)-[r:W*1..2]->(b) RETURN count(b) AS c' 'RETURN COUNT { (:E)-[:W]->(:E) } AS c' 'MATCH (a:E) WHERE a.k = 1 AND COUNT { (a)-[r:W]->() WHERE r.w = 1 } > 0 RETURN count(a) AS c'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"c":0}]', 'Q02 OK [{"c":0}]', 'Q03 OK [{"c":0}]', 'Q04 OK [{"c":0}]', 'Q05 OK [{"c":0}]', 'Q06 OK [{"c":0}]', 'Q07 OK [{"c":0}]', 'Q08 OK [{"c":0}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
+
+- name: s6338-edge-rule-t6338_u
+  description: 'SONNY-2693 tenant t6338_u: the edge P wrote is invisible on every path (single hop, COUNT {}, comprehension, EXISTS {}, undirected, variable length).'
+  type: bash
+  timeout_ms: 120000
+  command: |
+    H=$(mktemp --suffix=.py)
+    cat > "$H" <<'PYEOF'
+    import json, os, subprocess, sys, urllib.parse
+    tenant, stmts = sys.argv[1], sys.argv[2:]
+    addr = os.environ["GEODE_SERVER_ADDRESS"]
+    pw = urllib.parse.quote(os.environ.get("GEODE_ADMIN_PASSWORD", "GeodeTestPassword123!"))
+    dsn = "quic://%s?insecure=true&user=geode&pass=%s&tenant=%s" % (addr, pw, tenant)
+    msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "harness", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}]
+    for i, s in enumerate(stmts):
+        msgs.append({"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": "query", "arguments": {"query": s}}})
+    env = dict(os.environ); env["GEODE_ALLOW_INSECURE_TLS"] = "1"
+    r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "mcp", "--stdio", "--no-auth", "--endpoint", dsn], input="\n".join(json.dumps(m) for m in msgs) + "\n", capture_output=True, text=True, timeout=120, env=env)
+    by_id = {}
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try: m = json.loads(line)
+            except Exception: continue
+            if "id" in m: by_id[m["id"]] = m
+    for i, s in enumerate(stmts):
+        tag = "Q%02d" % (i + 1)
+        m = by_id.get(10 + i)
+        if m is None: print(tag, "ERR no response"); continue
+        if "error" in m: print(tag, "ERR", json.dumps(m["error"])[:300]); continue
+        res = m["result"]; text = "".join(c.get("text", "") for c in res.get("content", []))
+        if res.get("isError"): print(tag, "ERR", text[:300]); continue
+        try: print(tag, "OK", json.dumps(json.loads(text).get("rows"), separators=(",", ":")))
+        except Exception: print(tag, "OK", text[:300])
+    PYEOF
+    python3 "$H" t6338_u 'MATCH (a:E)-[r:W]->(b:E) RETURN count(r) AS c' 'MATCH (a:E) WHERE COUNT { (a)-[:W]->(b) } > 0 RETURN count(a) AS c' 'MATCH (a:E) WHERE size([(a)-[:W]->(b) | b.k]) > 0 RETURN count(a) AS c' 'MATCH (a:E) WHERE EXISTS { (a)-[:W]->() } RETURN count(a) AS c' 'MATCH (a:E)-[r:W]-(b:E) RETURN count(r) AS c' 'MATCH (a:E)-[r:W*1..2]->(b) RETURN count(b) AS c' 'RETURN COUNT { (:E)-[:W]->(:E) } AS c' 'MATCH (a:E) WHERE a.k = 1 AND COUNT { (a)-[r:W]->() WHERE r.w = 1 } > 0 RETURN count(a) AS c'
+    rm -f "$H"
+  expect:
+    exit_code: 0
+    stdout_contains: ['Q01 OK [{"c":0}]', 'Q02 OK [{"c":0}]', 'Q03 OK [{"c":0}]', 'Q04 OK [{"c":0}]', 'Q05 OK [{"c":0}]', 'Q06 OK [{"c":0}]', 'Q07 OK [{"c":0}]', 'Q08 OK [{"c":0}]']
+    stdout_not_contains: [ERR]
+  tags: [tenant]
