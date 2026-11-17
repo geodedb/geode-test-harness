@@ -1,14 +1,16 @@
-# SONNY-1223 (GEO-UP-009) / SONNY-1319: the HNSW vector index behind `USING HNSW` is one process-wide object per
-# index NAME, so a second graph's same-named index would have shared it (and a same-named vector property
-# in another graph revoked its authority). The index catalog is now graph-scoped (SONNY-1319), and the CREATE of a
-# same-named advanced index in another graph is refused with 42P07 (IF NOT EXISTS included) instead of a silent
-# no-op; DROP / SHOW in the other graph do not see it. The index keeps validating the query metric
-# (42704) for a property no other graph carries.
-# KNOWN RESIDUAL (SONNY-6703): knn() still falls back to an unvalidated scan when another graph carries a
-# same-named vector property; this spec does not assert that shape.
+# SONNY-1223 (GEO-UP-009): knn() silently downgraded to an O(n) scan, losing the metric check, when another
+# graph used the same property name. SONNY-1319 only refused a same-named index in a second graph; SONNY-6703
+# makes the vector index the graph's own: the runtime structure is keyed by graph and name, so each graph
+# builds, validates and uses its own index, two graphs can use one index name with different metrics and
+# dimensions, a carrier of the property in another graph (or on another label of the same graph) does not matter,
+# and a scan that answers in place of an index still checks the metric (42704). The other advanced index
+# types (here network_cidr) remain one process-wide structure per name: a same-named one in another graph is
+# 42P07, IF NOT EXISTS included.
+# Graphs: g1 (l2 index vec_a on V.emb, dimension 2, two nodes), g2 (cosine index vec_a on V.emb, dimension 3,
+# one node), g3 (V.emb carriers and no index).
 version: '1.0'
-name: 'SONNY-1223 a vector index name is process-wide: a second graph cannot twin it'
-description: cross-graph vector index name scope
+name: SONNY-1223/6703 vector indexes are per graph and knn always validates the metric
+description: per-graph vector indexes; knn validates the metric on every path
 cli:
   binary: ./zig-out/bin/geode
   server:
@@ -35,6 +37,7 @@ tests:
   stdin: |
     CREATE GRAPH IF NOT EXISTS g1
     CREATE GRAPH IF NOT EXISTS g2
+    CREATE GRAPH IF NOT EXISTS g3
   expect:
     exit_code: 0
     stdout_contains:
@@ -46,14 +49,14 @@ tests:
   tags:
   - setup
 - name: g1-create-index
-  description: create an HNSW index in g1
+  description: create an l2 HNSW index in g1
   args:
   - query
   - -g
   - g1
   - '-'
   stdin: |
-    CREATE INDEX vec_a ON V1 (uniqprop) USING HNSW WITH (metric = 'l2')
+    CREATE INDEX vec_a ON V (emb) USING HNSW WITH (metric = 'l2')
   expect:
     exit_code: 0
     stdout_contains:
@@ -61,14 +64,14 @@ tests:
   tags:
   - regression
 - name: g1-node-1
-  description: insert a vector node in g1
+  description: insert a dim-2 vector in g1
   args:
   - query
   - -g
   - g1
   - '-'
   stdin: |
-    CREATE (n:V1 {id: 1, uniqprop: vectorf32('[1.0, 0.0]')})
+    CREATE (n:V {id: 1, emb: vectorf32('[1.0, 0.0]')})
   expect:
     exit_code: 0
     stdout_contains:
@@ -76,29 +79,108 @@ tests:
   tags:
   - regression
 - name: g1-node-2
-  description: insert a second vector node in g1
+  description: insert a second dim-2 vector in g1
   args:
   - query
   - -g
   - g1
   - '-'
   stdin: |
-    CREATE (n:V1 {id: 2, uniqprop: vectorf32('[0.0, 1.0]')})
+    CREATE (n:V {id: 2, emb: vectorf32('[0.0, 1.0]')})
   expect:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
   tags:
   - regression
-- name: g1-knn-matching-metric
-  description: knn with the index metric answers two ids
+- name: g2-same-name-allowed
+  description: the same index name in g2, with another metric, is its own index
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE INDEX vec_a ON V (emb) USING HNSW WITH (metric = 'cosine')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g2-other-dimension
+  description: 'g2 pins its own dimension: a dim-3 vector is fine there'
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE (n:V {id: 7, emb: vectorf32('[1.0, 0.0, 0.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g2-dim-guard
+  description: and g2 refuses a dim-2 vector under its own pin
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE (n:V {id: 8, emb: vectorf32('[1.0, 0.0]')})
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-dim-guard
+  description: g1 keeps its dimension 2 independently of g2
   args:
   - query
   - -g
   - g1
   - '-'
   stdin: |
-    RETURN size(knn('uniqprop', vectorf32('[1.0, 0.0]'), 2, 'l2')) AS n
+    CREATE (n:V {id: 3, emb: vectorf32('[1.0, 0.0, 0.0]')})
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g3-carrier-1
+  description: g3 carries a same-named vector property with no index
+  args:
+  - query
+  - -g
+  - g3
+  - '-'
+  stdin: |
+    CREATE (n:V {id: 9, emb: vectorf32('[1.0, 0.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-knn-own-metric
+  description: g1 answers from its index (its own two rows only)
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0]'), 10, 'l2')) AS n
   expect:
     exit_code: 0
     stdout_contains:
@@ -107,14 +189,14 @@ tests:
   tags:
   - regression
 - name: g1-knn-metric-mismatch
-  description: knn with another metric is 42704
+  description: g1 knn with another metric is 42704 although g3 carries the property
   args:
   - query
   - -g
   - g1
   - '-'
   stdin: |
-    RETURN knn('uniqprop', vectorf32('[1.0, 0.0]'), 2, 'cosine') AS ids
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0]'), 10, 'cosine')) AS n
   expect:
     exit_code: 1
     stdout_contains:
@@ -123,93 +205,105 @@ tests:
     - '"status_class":"00000"'
   tags:
   - regression
-- name: g2-same-name-refused
-  description: the same index name in g2 is refused 42P07
+- name: g2-knn-own-metric
+  description: g2 answers with its cosine index (its one row)
   args:
   - query
   - -g
   - g2
   - '-'
   stdin: |
-    CREATE INDEX vec_a ON V1 (otherprop) USING HNSW WITH (metric = 'l2')
-  expect:
-    exit_code: 1
-    stdout_contains:
-    - '"status_class":"42P07"'
-    stdout_not_contains:
-    - '"status_class":"00000"'
-  tags:
-  - regression
-- name: g2-if-not-exists-refused
-  description: IF NOT EXISTS does not swallow it
-  args:
-  - query
-  - -g
-  - g2
-  - '-'
-  stdin: |
-    CREATE INDEX IF NOT EXISTS vec_a ON V1 (otherprop) USING HNSW WITH (metric = 'l2')
-  expect:
-    exit_code: 1
-    stdout_contains:
-    - '"status_class":"42P07"'
-    stdout_not_contains:
-    - '"status_class":"00000"'
-  tags:
-  - regression
-- name: g2-btree-same-name-refused
-  description: a btree of that name in g2 is refused too
-  args:
-  - query
-  - -g
-  - g2
-  - '-'
-  stdin: |
-    CREATE INDEX vec_a FOR (n:Item) ON (n.k)
-  expect:
-    exit_code: 1
-    stdout_contains:
-    - '"status_class":"42P07"'
-    stdout_not_contains:
-    - '"status_class":"00000"'
-  tags:
-  - regression
-- name: g2-drop-not-found
-  description: g2 cannot drop g1 index (42002)
-  args:
-  - query
-  - -g
-  - g2
-  - '-'
-  stdin: |
-    DROP INDEX vec_a
-  expect:
-    exit_code: 1
-    stdout_contains:
-    - '"status_class":"42002"'
-    stdout_not_contains:
-    - '"status_class":"00000"'
-  tags:
-  - regression
-- name: g2-show-no-vec
-  description: SHOW INDEXES in g2 does not list vec_a
-  args:
-  - query
-  - -g
-  - g2
-  - '-'
-  stdin: |
-    SHOW INDEXES
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0, 0.0]'), 10, 'cosine')) AS n
   expect:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    stdout_not_contains:
-    - vec_a
+    - '"rows":[{"n":1}]'
   tags:
   - regression
-- name: g1-show-has-vec
-  description: SHOW INDEXES in g1 lists vec_a
+- name: g2-knn-metric-mismatch
+  description: 'g2 knn with l2 is 42704: its index is cosine, whatever g1 holds'
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0, 0.0]'), 10, 'l2')) AS n
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42704"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g3-knn-any-metric
+  description: 'g3 has no index: any metric scans'
+  args:
+  - query
+  - -g
+  - g3
+  - '-'
+  stdin: |
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0]'), 10, 'cosine')) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"n":1}]'
+  tags:
+  - regression
+- name: g1-second-label
+  description: a second label of g1 carries the property
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    CREATE (n:W {id: 5, emb: vectorf32('[1.0, 1.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-second-label-scan-validates
+  description: the scan that now answers still checks the index metric
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0]'), 10, 'cosine')) AS n
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42704"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-second-label-scan-rows
+  description: and answers every carrier with the right metric
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0]'), 10, 'l2')) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"n":3}]'
+  tags:
+  - regression
+- name: g1-show
+  description: SHOW INDEXES in g1 lists vec_a as a vector index
   args:
   - query
   - -g
@@ -224,27 +318,12 @@ tests:
     - '"name":"vec_a","type":"vector"'
   tags:
   - regression
-- name: g2-other-name-ok
-  description: a differently named vector index in g2 is fine
+- name: g2-show
+  description: SHOW INDEXES in g2 lists its own vec_a
   args:
   - query
   - -g
   - g2
-  - '-'
-  stdin: |
-    CREATE INDEX vec_b ON V2 (prop2) USING HNSW WITH (metric = 'cosine')
-  expect:
-    exit_code: 0
-    stdout_contains:
-    - '"status_class":"00000"'
-  tags:
-  - regression
-- name: g1-still-there
-  description: g1 index survives the refused attempts
-  args:
-  - query
-  - -g
-  - g1
   - '-'
   stdin: |
     SHOW INDEXES
@@ -252,6 +331,136 @@ tests:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - '"name":"vec_a"'
+    - '"name":"vec_a","type":"vector"'
+  tags:
+  - regression
+- name: g3-show
+  description: g3 lists no vec_a
+  args:
+  - query
+  - -g
+  - g3
+  - '-'
+  stdin: |
+    SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - vec_a
+  tags:
+  - regression
+- name: g1-drop
+  description: DROP INDEX in g1 drops g1 own index
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    DROP INDEX vec_a
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-after-drop-scan
+  description: 'g1 has no index now: cosine is a plain scan'
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0]'), 10, 'cosine')) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"n":3}]'
+  tags:
+  - regression
+- name: g2-after-drop-still-validated
+  description: g2 index is untouched by the g1 DROP
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    RETURN size(knn('emb', vectorf32('[1.0, 0.0, 0.0]'), 10, 'l2')) AS n
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42704"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g2-still-listed
+  description: g2 still lists vec_a
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"vec_a","type":"vector"'
+  tags:
+  - regression
+- name: g3-g1-name-network
+  description: a network_cidr index (a process-wide structure per name) in g1
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    CREATE INDEX net_a ON N (addr) USING network_cidr
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g3-network-twin-refused
+  description: the same name in g2 is 42P07
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE INDEX net_a ON N (addr) USING network_cidr
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42P07"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g3-network-twin-if-not-exists
+  description: IF NOT EXISTS does not swallow it
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE INDEX IF NOT EXISTS net_a ON N (addr) USING network_cidr
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42P07"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
   tags:
   - regression
