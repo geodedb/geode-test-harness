@@ -12,6 +12,7 @@ import re
 import shlex
 import signal as _signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -1112,6 +1113,10 @@ def _run_shell_test(
     # a CA was provisioned (release-safe), else "--insecure-tls-skip-verify".
     # Specs reference $GEODE_CLIENT_TLS instead of hardcoding the insecure flag.
     test_env.setdefault("GEODE_CLIENT_TLS", " ".join(client_tls_args(test_env)))
+    # The interpreter running the harness (its venv carries grpcio/protobuf), so
+    # bash steps that speak a wire protocol directly (raw gRPC probes) need not
+    # guess which python3 has the libraries. Specs fall back to python3.
+    test_env.setdefault("GEODETESTLAB_PYTHON", sys.executable)
     test_env.update(test_case.env)
 
     # Honor per-test timeout_ms if it exceeds the default shell timeout. Long-
