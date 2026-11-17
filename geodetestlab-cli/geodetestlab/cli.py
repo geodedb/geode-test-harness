@@ -128,7 +128,6 @@ def _kill_geode_processes() -> None:
     Uses tracked PIDs when available, falling back to pattern-based
     pkill only for processes matching our temp-dir naming convention.
     """
-    import subprocess
 
     # First, kill any PIDs we explicitly tracked
     for pid in list(_tracked_pids):
@@ -138,15 +137,11 @@ def _kill_geode_processes() -> None:
             pass
         _tracked_pids.discard(pid)
 
-    # Fallback: pattern-based cleanup scoped to our test temp dirs
-    try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "geode serve.*geode-test-"],
-            capture_output=True,
-            timeout=5,
-        )
-    except Exception:
-        pass
+    # Fallback: servers in our test temp dirs whose owning run is gone. Never
+    # a machine-wide pkill: that killed the servers of other live runs.
+    from lib.server import kill_orphaned_test_servers
+
+    kill_orphaned_test_servers(signal.SIGKILL)
 
 
 def _kill_child_processes() -> None:
