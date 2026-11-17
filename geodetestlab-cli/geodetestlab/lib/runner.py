@@ -206,6 +206,10 @@ class ServerState:
     process: subprocess.Popen[str] | None
     port: int
     grpc_port: int | None
+    # The argv the server was started with, including the provisioned
+    # ``--cert``/``--key``. A restart must reuse it: without them the server
+    # presents a fresh self-signed certificate the client's CA does not trust.
+    server_args: list[str] | None = None
 
 
 def _run_pre_server_commands(pre_server: list[str] | None, dry_run: bool, verbose: bool) -> None:
@@ -403,7 +407,7 @@ def _check_and_restart_crashed_server(
                 port=server_state.port,
                 grpc_port=server_state.grpc_port,
                 env=env,
-                server_args=spec.server_args,
+                server_args=server_state.server_args if server_state.server_args is not None else spec.server_args,
                 server_timeout_ms=server_timeout_ms,
                 verbose=verbose,
                 server_port=server_port,
@@ -494,7 +498,7 @@ def _recover_hung_server(
                     port=server_state.port,
                     grpc_port=server_state.grpc_port,
                     env=env,
-                    server_args=spec.server_args,
+                    server_args=server_state.server_args if server_state.server_args is not None else spec.server_args,
                     server_timeout_ms=server_timeout_ms,
                     verbose=verbose,
                     server_port=server_port,
@@ -549,7 +553,9 @@ def _recover_hung_server(
                         port=server_state.port,
                         grpc_port=server_state.grpc_port,
                         env=env,
-                        server_args=spec.server_args,
+                        server_args=server_state.server_args
+                        if server_state.server_args is not None
+                        else spec.server_args,
                         server_timeout_ms=server_timeout_ms,
                         verbose=verbose,
                         server_port=server_port,
@@ -660,7 +666,7 @@ def _execute_one_test(
                 port=server_state.port,
                 grpc_port=server_state.grpc_port,
                 env=env,
-                server_args=spec.server_args,
+                server_args=server_state.server_args if server_state.server_args is not None else spec.server_args,
                 server_timeout_ms=server_timeout_ms,
                 verbose=verbose,
                 server_port=server_port,
@@ -932,6 +938,7 @@ def run_tests(
                 dry_run,
                 server_args=server_args,
             )
+            server_state.server_args = server_args
         except RunnerError as exc:
             # No server means no test can run. Record the infrastructure
             # failure and return a summary that says so, rather than

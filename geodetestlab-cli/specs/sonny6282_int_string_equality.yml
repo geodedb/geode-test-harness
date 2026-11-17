@@ -1,0 +1,210 @@
+# SONNY-6282: `WHERE n.id = 1` also matched a node whose id was the string '1' (an inline `{id: 1}` did
+# not), and `WHERE n.id = '1'` raised an error. ISO/IEC 39075:2024 19.3 (comparison predicate): values of
+# different type classes are not equal. One equality at every site: WHERE, inline map, parameters.
+version: '1.0'
+name: SONNY-6282 an integer and a string are never equal
+description: integer 1 and string "1" are distinct in WHERE, inline maps and parameters
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-p
+  description: 'Setup: setup-p'
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:P {id: 1, tag: 'int'}), (:P {id: '1', tag: 'str'})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: where-int
+  description: WHERE n.id = 1 matches only the integer
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:P) WHERE n.id = 1 RETURN n.tag AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"t":"int"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: inline-int
+  description: '{id: 1} matches only the integer'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:P {id: 1}) RETURN n.tag AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"t":"int"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: where-str
+  description: WHERE n.id = '1' matches only the string (no error)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:P) WHERE n.id = '1' RETURN n.tag AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"t":"str"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: inline-str
+  description: "{id: '1'} matches only the string"
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:P {id: '1'}) RETURN n.tag AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"t":"str"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: where-neq
+  description: n.id <> 1 selects the string node
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:P) WHERE n.id <> 1 RETURN n.tag AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"t":"str"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: where-reversed
+  description: 1 = n.id
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:P) WHERE 1 = n.id RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: param-int
+  description: parameter integer
+  args:
+  - query
+  - --param
+  - p
+  - '1'
+  - '-'
+  stdin: |
+    MATCH (n:P) WHERE n.id = $p RETURN n.tag AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"t":"int"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: param-str
+  description: parameter string
+  args:
+  - query
+  - --param
+  - p
+  - '"1"'
+  - '-'
+  stdin: |
+    MATCH (n:P) WHERE n.id = $p RETURN n.tag AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"t":"str"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: param-inline-str
+  description: inline map with a string parameter
+  args:
+  - query
+  - --param
+  - p
+  - '"1"'
+  - '-'
+  stdin: |
+    MATCH (n:P {id: $p}) RETURN n.tag AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"t":"str"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: literals
+  description: literal comparison
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN 1 = '1' AS a, '1' <> 1 AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"a":false,"b":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression

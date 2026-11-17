@@ -1,0 +1,1050 @@
+# SONNY-2707: `SET` through a variable-length pattern was silently ignored; `COUNT { }` over an unbound relationship
+# counted left nodes; a variable-length `COUNT { }` followed outgoing edges only. SONNY-1562: COUNT{} / EXISTS{} scanned
+# resident-only nodes, so a COLD store (after a restart) answered 0 / false. ISO/IEC 39075:2024 16.7 / 19.4.
+# The cold-store half restarts the server on the same data directory so nothing is resident.
+# Fixture: four :Q {k, f?}, four :X {k}, four :Y {k}, eight :Z {k, g, r}:
+#   (Yk)-[:R]->(Qk)-[:R {w: k}]->(Xk); (Q0)-[:S]->(Q1) and a self loop (Q3)-[:S]->(Q3).
+# V chain (SET targets): :V k=0..3 with (V0)-[:R]->(V1)-[:R]->(V2)-[:R]->(V3), plus an isolated V4.
+version: '1.0'
+name: SONNY-2707/1562 COUNT{}/EXISTS{} direction and cold store; SET through a variable-length pattern
+description: subquery directions, multi-hop counts, variable-length SET, cold-store subqueries
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-fixture
+  description: Create the Q/X/Y/Z fixture graph
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0})
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1})
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2})
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3})
+    CREATE (:Z {k: 0, g: 0, r: 7})
+    CREATE (:Z {k: 1, g: 0, r: 6})
+    CREATE (:Z {k: 2, g: 0, r: 5})
+    CREATE (:Z {k: 3, g: 0, r: 4})
+    CREATE (:Z {k: 4, g: 1, r: 3})
+    CREATE (:Z {k: 5, g: 1, r: 2})
+    CREATE (:Z {k: 6, g: 1, r: 1})
+    CREATE (:Z {k: 7, g: 1, r: 0})
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b)
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: setup-v
+  description: 'Setup: setup-v'
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:V {k: 0}), (:V {k: 1}), (:V {k: 2}), (:V {k: 3}), (:V {k: 4})
+    MATCH (a:V {k: 0}), (b:V {k: 1}) CREATE (a)-[:R]->(b)
+    MATCH (a:V {k: 1}), (b:V {k: 2}) CREATE (a)-[:R]->(b)
+    MATCH (a:V {k: 2}), (b:V {k: 3}) CREATE (a)-[:R]->(b)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: warm-count-in-S
+  description: COUNT over incoming :S edges of Q counts the targets, not the left nodes
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q)<-[:S]-(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-out-S
+  description: COUNT over outgoing :S edges of Q
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q)-[:S]->(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-in-R-from-Y
+  description: COUNT over incoming :R edges from Y
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q)<-[:R]-(b:Y) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-per-q-in-S
+  description: per-node COUNT of incoming :S
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) RETURN q.k AS k, COUNT { (q)<-[:S]-() } AS c ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0,"c":0},{"k":1,"c":1},{"k":2,"c":0},{"k":3,"c":1}]'
+  tags:
+  - regression
+- name: warm-count-edge-prop
+  description: COUNT with a relationship property map
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a)<-[{w: 2}]-(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-two-hop
+  description: COUNT of a two-hop chain
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (y:Y)-[:R]->(q)-[:R]->(x) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-varlen-out
+  description: variable-length COUNT outgoing
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (y:Y {k: 0})-[:R*1..2]->(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-varlen-in
+  description: variable-length COUNT incoming
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (x:X {k: 0})<-[:R*1..2]-(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-exists-in
+  description: EXISTS over an incoming edge
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (a:Q)<-[:S]-(b:Q) } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-exists-none
+  description: EXISTS over an absent edge
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (a:X)-[:S]->() } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":false}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-node
+  description: COUNT of a node pattern
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-any-node
+  description: COUNT of every node
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (n) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":25}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-exists-node-prop
+  description: EXISTS of a node pattern with a property
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (b:X {k: 3}) } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-exists-node-absent
+  description: EXISTS of an absent node
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (b:X {k: 100000}) } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":false}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-exists-hop-prop
+  description: EXISTS of a hop to a property
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (a:Q)-[:R]->(:X {k: 3}) } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-count-where
+  description: COUNT { MATCH ... WHERE }
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { MATCH (a:Q)-[:R]->(b:X) WHERE a.k < 2 } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-comprehension-hop
+  description: pattern comprehension over a hop
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN size([(a:Q)-[:R]->(b:X) | b.k]) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"n":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: warm-comprehension-node
+  description: pattern comprehension over nodes
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN size([(b:X) | b.k]) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"n":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-out-1-2
+  description: Clear the written marker before out-1-2
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-out-1-2
+  description: 'MATCH (a:V {k: 0})-[*1..2]->(b) SET b.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V {k: 0})-[*1..2]->(b) SET b.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-out-1-2
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - regression
+- name: reset-out-typed-1-3
+  description: Clear the written marker before out-typed-1-3
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-out-typed-1-3
+  description: 'MATCH (a:V {k: 0})-[:R*1..3]->(b) SET b.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V {k: 0})-[:R*1..3]->(b) SET b.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-out-typed-1-3
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2},{"k":3}]'
+  tags:
+  - regression
+- name: reset-exact-2
+  description: Clear the written marker before exact-2
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-exact-2
+  description: 'MATCH (a:V {k: 0})-[*2..2]->(b) SET b.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V {k: 0})-[*2..2]->(b) SET b.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-exact-2
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":2}]'
+  tags:
+  - regression
+- name: reset-in-1-2
+  description: Clear the written marker before in-1-2
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-in-1-2
+  description: 'MATCH (a:V {k: 2})<-[*1..2]-(b) SET b.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V {k: 2})<-[*1..2]-(b) SET b.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-in-1-2
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0},{"k":1}]'
+  tags:
+  - regression
+- name: reset-both-1-2
+  description: Clear the written marker before both-1-2
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-both-1-2
+  description: 'MATCH (a:V {k: 1})-[*1..2]-(b) SET b.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V {k: 1})-[*1..2]-(b) SET b.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-both-1-2
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0},{"k":2},{"k":3}]'
+  tags:
+  - regression
+- name: reset-end-labelled
+  description: Clear the written marker before end-labelled
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-end-labelled
+  description: 'MATCH (a:V)-[*1..2]->(b:V {k: 2}) SET a.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V)-[*1..2]->(b:V {k: 2}) SET a.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-end-labelled
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0},{"k":1}]'
+  tags:
+  - regression
+- name: reset-where-end
+  description: Clear the written marker before where-end
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-where-end
+  description: 'MATCH (a:V {k: 0})-[*1..3]->(b) WHERE b.k >= 3 SET b.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V {k: 0})-[*1..3]->(b) WHERE b.k >= 3 SET b.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-where-end
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":3}]'
+  tags:
+  - regression
+- name: reset-with-where-end
+  description: Clear the written marker before with-where-end
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-with-where-end
+  description: 'MATCH (a:V {k: 0})-[*1..3]->(b) WITH b WHERE b.k >= 3 SET b.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V {k: 0})-[*1..3]->(b) WITH b WHERE b.k >= 3 SET b.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-with-where-end
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":3}]'
+  tags:
+  - regression
+- name: reset-return-count
+  description: Clear the written marker before return-count
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (n:V) REMOVE n.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-return-count
+  description: 'MATCH (a:V {k: 0})-[*1..2]->(b) SET b.x = 1 RETURN count(*) AS c'
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:V {k: 0})-[*1..2]->(b) SET b.x = 1 RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-return-count
+  description: exactly these :V nodes got x = 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:V) WHERE n.x = 1 RETURN n.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - regression
+  restart_server: true
+- name: cold-count-in-S
+  description: COUNT over incoming :S edges of Q counts the targets, not the left nodes
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q)<-[:S]-(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-out-S
+  description: COUNT over outgoing :S edges of Q
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q)-[:S]->(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-in-R-from-Y
+  description: COUNT over incoming :R edges from Y
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q)<-[:R]-(b:Y) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-per-q-in-S
+  description: per-node COUNT of incoming :S
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) RETURN q.k AS k, COUNT { (q)<-[:S]-() } AS c ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0,"c":0},{"k":1,"c":1},{"k":2,"c":0},{"k":3,"c":1}]'
+  tags:
+  - regression
+- name: cold-count-edge-prop
+  description: COUNT with a relationship property map
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a)<-[{w: 2}]-(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-two-hop
+  description: COUNT of a two-hop chain
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (y:Y)-[:R]->(q)-[:R]->(x) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-varlen-out
+  description: variable-length COUNT outgoing
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (y:Y {k: 0})-[:R*1..2]->(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-varlen-in
+  description: variable-length COUNT incoming
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (x:X {k: 0})<-[:R*1..2]-(b) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-exists-in
+  description: EXISTS over an incoming edge
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (a:Q)<-[:S]-(b:Q) } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-exists-none
+  description: EXISTS over an absent edge
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (a:X)-[:S]->() } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":false}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-node
+  description: COUNT of a node pattern
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-any-node
+  description: COUNT of every node
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (n) } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":25}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-exists-node-prop
+  description: EXISTS of a node pattern with a property
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (b:X {k: 3}) } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-exists-node-absent
+  description: EXISTS of an absent node
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (b:X {k: 100000}) } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":false}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-exists-hop-prop
+  description: EXISTS of a hop to a property
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN EXISTS { (a:Q)-[:R]->(:X {k: 3}) } AS e
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"e":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-count-where
+  description: COUNT { MATCH ... WHERE }
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { MATCH (a:Q)-[:R]->(b:X) WHERE a.k < 2 } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-comprehension-hop
+  description: pattern comprehension over a hop
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN size([(a:Q)-[:R]->(b:X) | b.k]) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"n":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: cold-comprehension-node
+  description: pattern comprehension over nodes
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN size([(b:X) | b.k]) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"n":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression

@@ -1,0 +1,257 @@
+# SONNY-1223 (GEO-UP-009) / SONNY-1319: the HNSW vector index behind `USING HNSW` is one process-wide object per
+# index NAME, so a second graph's same-named index would have shared it (and a same-named vector property
+# in another graph revoked its authority). The index catalog is now graph-scoped (SONNY-1319), and the CREATE of a
+# same-named advanced index in another graph is refused with 42P07 (IF NOT EXISTS included) instead of a silent
+# no-op; DROP / SHOW in the other graph do not see it. The index keeps validating the query metric
+# (42704) for a property no other graph carries.
+# KNOWN RESIDUAL (SONNY-6703): knn() still falls back to an unvalidated scan when another graph carries a
+# same-named vector property; this spec does not assert that shape.
+version: '1.0'
+name: 'SONNY-1223 a vector index name is process-wide: a second graph cannot twin it'
+description: cross-graph vector index name scope
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-graphs
+  description: 'Setup: setup-graphs'
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE GRAPH IF NOT EXISTS g1
+    CREATE GRAPH IF NOT EXISTS g2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: g1-create-index
+  description: create an HNSW index in g1
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    CREATE INDEX vec_a ON V1 (uniqprop) USING HNSW WITH (metric = 'l2')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-node-1
+  description: insert a vector node in g1
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    CREATE (n:V1 {id: 1, uniqprop: vectorf32('[1.0, 0.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-node-2
+  description: insert a second vector node in g1
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    CREATE (n:V1 {id: 2, uniqprop: vectorf32('[0.0, 1.0]')})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-knn-matching-metric
+  description: knn with the index metric answers two ids
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    RETURN size(knn('uniqprop', vectorf32('[1.0, 0.0]'), 2, 'l2')) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"n":2}]'
+  tags:
+  - regression
+- name: g1-knn-metric-mismatch
+  description: knn with another metric is 42704
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    RETURN knn('uniqprop', vectorf32('[1.0, 0.0]'), 2, 'cosine') AS ids
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42704"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g2-same-name-refused
+  description: the same index name in g2 is refused 42P07
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE INDEX vec_a ON V1 (otherprop) USING HNSW WITH (metric = 'l2')
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42P07"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g2-if-not-exists-refused
+  description: IF NOT EXISTS does not swallow it
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE INDEX IF NOT EXISTS vec_a ON V1 (otherprop) USING HNSW WITH (metric = 'l2')
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42P07"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g2-btree-same-name-refused
+  description: a btree of that name in g2 is refused too
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE INDEX vec_a FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42P07"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g2-drop-not-found
+  description: g2 cannot drop g1 index (42002)
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    DROP INDEX vec_a
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42002"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g2-show-no-vec
+  description: SHOW INDEXES in g2 does not list vec_a
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - vec_a
+  tags:
+  - regression
+- name: g1-show-has-vec
+  description: SHOW INDEXES in g1 lists vec_a
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"vec_a","type":"vector"'
+  tags:
+  - regression
+- name: g2-other-name-ok
+  description: a differently named vector index in g2 is fine
+  args:
+  - query
+  - -g
+  - g2
+  - '-'
+  stdin: |
+    CREATE INDEX vec_b ON V2 (prop2) USING HNSW WITH (metric = 'cosine')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: g1-still-there
+  description: g1 index survives the refused attempts
+  args:
+  - query
+  - -g
+  - g1
+  - '-'
+  stdin: |
+    SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"name":"vec_a"'
+  tags:
+  - regression

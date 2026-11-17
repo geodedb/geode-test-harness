@@ -1,0 +1,279 @@
+# SONNY-6702 (found by the query-a harness lane while covering SONNY-2680): `LIMIT 0` on an unfiltered
+# `MATCH (z:Z)` node scan returned one row (the engine-direct scan appended a slot and only then compared
+# the collected count to the cap of 0), and an ungrouped `count(*)` ignored OFFSET and LIMIT (`LIMIT 0` and
+# `SKIP 1` still returned the count row). ISO/IEC 39075:2024 14.10: LIMIT 0 yields no rows; the one aggregate
+# row is windowed like any other row.
+# Fixture: four :Q {k, f?}, four :X {k}, four :Y {k}, eight :Z {k, g, r}:
+#   (Yk)-[:R]->(Qk)-[:R {w: k}]->(Xk); Q0 and Q1 also have f: 1; Zk has g = k/4 and r = 7-k;
+#   (Q0)-[:S]->(Q1) and a self loop (Q3)-[:S]->(Q3).
+version: '1.0'
+name: SONNY-6702 LIMIT 0 and a count row window on an unfiltered node scan
+description: LIMIT 0 returns no rows; a count row can be windowed out
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-fixture
+  description: Create the Q/X/Y/Z fixture graph
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0})
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1})
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2})
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3})
+    CREATE (:Z {k: 0, g: 0, r: 7})
+    CREATE (:Z {k: 1, g: 0, r: 6})
+    CREATE (:Z {k: 2, g: 0, r: 5})
+    CREATE (:Z {k: 3, g: 0, r: 4})
+    CREATE (:Z {k: 4, g: 1, r: 3})
+    CREATE (:Z {k: 5, g: 1, r: 2})
+    CREATE (:Z {k: 6, g: 1, r: 1})
+    CREATE (:Z {k: 7, g: 1, r: 0})
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b)
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: limit-zero-projection
+  description: LIMIT 0 of a projection
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: limit-zero-param
+  description: LIMIT $l with l = 0
+  args:
+  - query
+  - --param
+  - l
+  - '0'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: limit-zero-node
+  description: LIMIT 0 of the bare node
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: limit-zero-offset
+  description: OFFSET 0 LIMIT 0
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k OFFSET 0 LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: limit-zero-inline-map
+  description: LIMIT 0 with an inline map
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 2}) RETURN z.k AS k LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: limit-zero-where
+  description: LIMIT 0 behind a WHERE
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k > 0 RETURN z.k AS k LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: count-limit-zero
+  description: count(*) LIMIT 0 returns no row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN count(*) AS c LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: count-skip-one
+  description: count(*) SKIP 1 returns no row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN count(*) AS c SKIP 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: count-offset-one
+  description: count(*) OFFSET 1 returns no row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN count(*) AS c OFFSET 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: count-where-limit-zero
+  description: count(*) behind a WHERE with LIMIT 0
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k > 0 RETURN count(*) AS c LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: count-inline-offset
+  description: count(*) with an inline map and OFFSET 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 1}) RETURN count(*) AS c OFFSET 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: limit-one
+  description: LIMIT 1 still returns exactly one row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"rows":\[\{"k":[0-7]\}\]'
+  tags:
+  - regression
+- name: count-limit-one
+  description: count(*) LIMIT 1 returns the count
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN count(*) AS c LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":8}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-plain
+  description: count(*) alone
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":8}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-offset-zero
+  description: count(*) OFFSET 0
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN count(*) AS c OFFSET 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":8}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
