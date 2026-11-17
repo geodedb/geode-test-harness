@@ -1,0 +1,113 @@
+version: '1.0'
+name: SONNY-6478 completed QUIC streams are retired; latency stays flat on a long-lived connection
+description: |
+  SONNY-6478 (and SONNY-6475): on a long-lived QUIC connection the server resent
+  STREAM data of already-completed request streams forever and never retired their
+  state, so per-request latency grew with every request (median 37-45 ms ->
+  130-153 ms over 64 KMS unwraps; a 1,100-exchange loopback test went 13.8 ms ->
+  494.7 ms and completed only 261) and an idle connection kept sending ~370
+  datagrams per second. Three defects in quic v0.1.49 (fixed in v0.1.51, pinned
+  by the integration branch): ACKs answered with ACKs forever (ECN-marked ACK-only
+  datagrams owed an ACK, RFC 9000 13.2.1); stale PTO probes sent with everything
+  acknowledged (RFC 9002 6.2.1); stream state never retired and MAX_STREAMS credit
+  never returned (RFC 9000 3, 4.6).
+
+  Black-box: a real QUIC client (aioquic, ALPN geode/1) logs in once (HELLO) and
+  then sends 1,100 `RETURN 1` ExecuteRequests, each on a NEW stream of the SAME
+  connection, as a multiplexing client does. It requires every request to be
+  answered, the median latency of the last 100 requests to stay within
+  max(8 x, +40 ms) of the first 100's, and the connection - now idle - to receive
+  fewer than 60 datagrams in the next 3 seconds (the bug: thousands). On the
+  pre-fix server the 1,100-request loop stalls and the step times out.
+
+  CANARY: REQ=REQ-SONNY-6478-QUIC-STREAM-RETIREMENT; FEATURE="QuicTransport"; ASPECT=FlatLatencyAndQuietIdle; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6478_quic_long_connection_flat.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+tests:
+
+- name: thousand-requests-on-one-connection-keep-latency-flat-and-idle-quiet
+  description: 1,100 requests, one new stream each, one connection; flat median latency and a quiet idle connection afterwards
+  type: bash
+  timeout_ms: 300000
+  command: |
+    PY="${GEODETESTLAB_PYTHON:-python3}"
+    "$PY" - <<'PYEOF'
+    import asyncio, os, ssl, statistics, struct, sys, time
+    from aioquic.asyncio import connect
+    from aioquic.asyncio.protocol import QuicConnectionProtocol
+    from aioquic.quic.configuration import QuicConfiguration
+    from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
+
+    def varint(n):
+        out = b""
+        while True:
+            b = n & 0x7F; n >>= 7
+            if n: out += bytes([b | 0x80])
+            else: return out + bytes([b])
+    def ld(field, data):
+        if isinstance(data, str): data = data.encode()
+        return varint(field << 3 | 2) + varint(len(data)) + data
+    def frame(field, payload):
+        body = ld(field, payload); return struct.pack(">I", len(body)) + body
+
+    class P(QuicConnectionProtocol):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k); self.streams = {}; self.waiters = {}; self.dgrams = 0
+        def datagram_received(self, data, addr):
+            self.dgrams += 1
+            super().datagram_received(data, addr)
+        def quic_event_received(self, ev):
+            if isinstance(ev, StreamDataReceived):
+                b = self.streams.get(ev.stream_id, b"") + ev.data; self.streams[ev.stream_id] = b
+                w = self.waiters.get(ev.stream_id)
+                if w and not w.done() and len(b) >= 4 and len(b) >= 4 + struct.unpack(">I", b[:4])[0]:
+                    w.set_result(b)
+
+    async def main(port, n):
+        cfg = QuicConfiguration(is_client=True, alpn_protocols=["geode/1"]); cfg.verify_mode = ssl.CERT_NONE
+        async with connect("127.0.0.1", port, configuration=cfg, create_protocol=P) as c:
+            loop = asyncio.get_event_loop()
+            async def call(field, payload, end=False):
+                sid = c._quic.get_next_available_stream_id()
+                c.waiters[sid] = loop.create_future()
+                c._quic.send_stream_data(sid, frame(field, payload), end_stream=end); c.transmit()
+                r = await asyncio.wait_for(c.waiters[sid], 30)
+                del c.waiters[sid]; c.streams.pop(sid, None)
+                return r
+            h = await call(1, ld(1, 'geode') + ld(2, os.environ.get('GEODE_ADMIN_PASSWORD','Geode Test Admin Passphrase')) + ld(4, 'flat') + ld(5, '1') + ld(6, 'min'))
+            sess = h[h.index(b'sess_'):h.index(b'sess_')+37].decode(); print('session', sess)
+            lat = []
+            for i in range(n):
+                t0 = time.perf_counter(); r = await call(2, ld(1, sess) + ld(2, 'RETURN 1 AS x'), True); lat.append((time.perf_counter() - t0) * 1000)
+            first = statistics.median(lat[:100]); last = statistics.median(lat[-100:])
+            print("REQUESTS=%d first100_median_ms=%.2f last100_median_ms=%.2f" % (n, first, last))
+            print("LATENCY_FLAT=%s" % ("yes" if last <= max(8 * first, first + 40) else "no"))
+            d0 = c.dgrams; await asyncio.sleep(3); idle = c.dgrams - d0
+            print("IDLE_DATAGRAMS_3S=%d" % idle)
+            print("IDLE_QUIET=%s" % ("yes" if idle < 60 else "no"))
+    asyncio.run(main(int(os.environ['GEODE_SERVER_ADDRESS'].rsplit(':', 1)[1]), 1100))
+    PYEOF
+  expect:
+    exit_code: 0
+    stdout_contains: [REQUESTS=1100, LATENCY_FLAT=yes, IDLE_QUIET=yes]
+    stdout_not_contains: [LATENCY_FLAT=no, IDLE_QUIET=no, Traceback]
+  tags: [quic, streams, latency, sonny-6478, sonny-6475, regression]

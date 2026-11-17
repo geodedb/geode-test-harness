@@ -1,0 +1,125 @@
+version: '1.0'
+name: SONNY-3390 a client that disconnects stops the read it left running
+description: |
+  SONNY-3390: a QUIC client that disconnects did not cancel the read executing
+  for it; the server kept a core busy until the 60 s per-connection stall
+  watchdog. A read's cancel source is the connection-level shutdown flag, and
+  nothing set it for a handler already executing on a connection whose peer had
+  closed.
+
+  Fixed behaviour (d143eb020, extended by SONNY-6466 68126c5f5 to the case where
+  the connection's first stream already ended and a SIBLING stream runs the
+  read): after the client's CONNECTION_CLOSE the server goes idle within seconds
+  (2.1 s measured), well inside the 60 s watchdog.
+
+  Black-box: seed 400 nodes, start (`geode query --timeout 3`) a comma join no
+  binding of which survives its WHERE (400^3 = 64M bindings: minutes of work),
+  let the client give up and leave on its own timeout (a normal client exit
+  closes the QUIC connection), then watch the real server process's per-thread
+  CPU in /proc: no thread may stay busy past 20 s. The server runs with the
+  default 60 s watchdog, so passing means the close was seen, not that the
+  watchdog fired. A fresh connection must still be answered afterwards.
+
+  A client that vanishes WITHOUT a close is SONNY-6466 (sonny6466_quic_abandoned_read.yml).
+
+  CANARY: REQ=REQ-SONNY-3390-QUIC-DISCONNECT-CANCEL; FEATURE="QuicTransport"; ASPECT=DisconnectCancelsRead; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny3390_quic_disconnect_cancels_read.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: client-close-stops-the-running-read-within-seconds
+  description: after the client leaves, the server's busiest thread goes idle inside 20 s (watchdog is 60 s)
+  type: bash
+  timeout_ms: 240000
+  command: |
+    GP="${GEODETESTLAB_PYTHON:-python3}"
+    "$GP" - <<'PY'
+    import glob, os, sys, time, subprocess
+    port = os.environ["GEODE_SERVER_ADDRESS"].rsplit(":", 1)[1]
+    def server_pid():
+        for p in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                a = open(p, "rb").read().split(b"\0")
+            except OSError:
+                continue
+            a = [x.decode(errors="replace") for x in a]
+            if "serve" in a and any(x == "127.0.0.1:" + port for x in a):
+                return int(p.split("/")[2])
+        return None
+    def ticks(pid):
+        out = {}
+        for t in glob.glob("/proc/%d/task/*/stat" % pid):
+            try:
+                s = open(t).read()
+            except OSError:
+                continue
+            f = s[s.rindex(")") + 2:].split()
+            out[t.split("/")[4]] = int(f[11]) + int(f[12])
+        return out
+    def busiest(pid, secs=1.0):
+        a = ticks(pid); time.sleep(secs); b = ticks(pid)
+        return max([b[t] - a[t] for t in b if t in a] or [0])
+    pw = os.environ.get("GEODE_ADMIN_PASSWORD", "Geode Test Admin Passphrase")
+    base = [os.environ.get("GEODE_BINARY", "geode"), "query", "--server", os.environ["GEODE_SERVER_ADDRESS"]] + os.environ.get("GEODE_CLIENT_TLS", "").split() + ["-U", "geode", "-P", pw, "--format", "json"]
+    def q(stmt, timeout=60, extra=()):
+        return subprocess.run(base + ["--timeout", str(timeout)] + list(extra) + [stmt], capture_output=True, text=True, timeout=timeout + 30)
+    pid = server_pid()
+    assert pid, "no server pid"
+    r = q("FOR i IN range(0, 400) CREATE (:Spin {i: i})", 120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    r = q("MATCH (n:Spin) RETURN count(n) AS c")
+    assert '400' in r.stdout, r.stdout
+    SPIN = "MATCH (a:Spin), (b:Spin), (c:Spin) WHERE a.i + b.i + c.i < 0 RETURN count(*) AS c"
+
+    spin = subprocess.Popen(base + ["--timeout", "3", SPIN], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(1.5)
+    b = busiest(pid)
+    print("busy_before_close=%s (busiest thread %d ticks/s)" % ("yes" if b >= 50 else "no", b))
+    spin.wait(timeout=30)
+    print("client_exit=%d" % spin.returncode)
+    t0 = time.time(); idle_at = None
+    while time.time() - t0 < 45:
+        if busiest(pid) < 30:
+            idle_at = time.time() - t0
+            break
+    print("idle_after_s=%s" % ("never" if idle_at is None else "%.1f" % idle_at))
+    print("stopped_inside_20s=%s" % ("yes" if idle_at is not None and idle_at <= 20 else "no"))
+    r = q("RETURN 8080 AS alive", 30)
+    print("server_answers_new_connection=%s" % ("yes" if "8080" in r.stdout else "no"))
+    PY
+  expect:
+    exit_code: 0
+    stdout_contains: [busy_before_close=yes, stopped_inside_20s=yes, server_answers_new_connection=yes]
+    stdout_not_contains: [Traceback]
+  tags: [quic, cancel, disconnect, sonny-3390, regression]

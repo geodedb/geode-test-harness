@@ -1,0 +1,142 @@
+version: '1.0'
+name: SONNY-6562 wire result metadata describes the result it sends
+description: |
+  SONNY-6562 (SONNY-6548 reproductions): the metadata Geode sent with a result
+  contradicted the result.
+
+    1. Declared column types. An exact numeric literal (`1.25`) is declared an
+       exact numeric (ISO/IEC 39075:2024 21.2) - DECIMAL - not FLOAT. A column's
+       declared type is the combination of the types of ALL its values (14.2 SR;
+       22.18/22.19): every UNION operand and every row, not the first non-null
+       value among the first 10 rows; values of different primary base types
+       combine to the open dynamic union ANY (18.9); NULL adds nothing.
+    2. `ordered` / `order_keys` are set exactly when the statement ends in an
+       ORDER BY, including `FOR ... RETURN ... ORDER BY` (it reported
+       ordered:false while sending 3,2,1).
+    3. PROFILE reports no spill when nothing spilled: with
+       GEODE_SPILL_THRESHOLD_BYTES set the version-1 payload said
+       `spill_reason:"threshold"` beside spill counters of 0 (the executor never
+       spills).
+
+  Fixed (8bfcf8599 test, 39de599c8 fix). Black-box: the real client prints the
+  schema frame's declared `columns[].type`, `ordered`, `order_keys` and the PROFILE
+  payload exactly as the server sent them. The managed server runs with a spill
+  threshold of 1 byte so every PROFILE would have reported a spill before.
+
+  CANARY: REQ=REQ-SONNY-6562-WIRE-METADATA; FEATURE="ResultMetadata"; ASPECT=DeclaredTypesOrderAndSpill; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6562_wire_result_metadata.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_SPILL_THRESHOLD_BYTES: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+tests:
+
+- name: decimal-literal-is-declared-decimal-not-float
+  description: RETURN 1.25 declares DECIMAL; a float literal stays DOUBLE and an integer INTEGER
+  args: [query, '-']
+  stdin: RETURN 1.25 AS d, 1.5e0 AS f, 7 AS i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"columns":[{"name":"d","type":"DECIMAL"},{"name":"f","type":"DOUBLE"},{"name":"i","type":"INTEGER"}]'
+    stdout_not_contains: ['"type":"FLOAT"']
+  tags: [wire-metadata, types, sonny-6562, regression]
+
+- name: union-column-type-is-the-combination-of-both-operands
+  description: INTEGER UNION DECIMAL declares DECIMAL (it declared INTEGER for a column holding 1.25)
+  args: [query, '-']
+  stdin: RETURN 2 AS a UNION RETURN 1.25 AS a
+  expect:
+    exit_code: 0
+    stdout_contains: ['"columns":[{"name":"a","type":"DECIMAL"}]', '"1.25"']
+    stdout_not_contains: ['"type":"INTEGER"']
+  tags: [wire-metadata, types, union, sonny-6562, regression]
+
+- name: union-of-different-base-types-is-any
+  description: INTEGER UNION STRING declares the open dynamic union ANY
+  args: [query, '-']
+  stdin: RETURN 1 AS a UNION RETURN 'x' AS a
+  expect:
+    exit_code: 0
+    stdout_contains: ['"columns":[{"name":"a","type":"ANY"}]']
+  tags: [wire-metadata, types, union, sonny-6562, regression]
+
+- name: column-type-sees-every-row-not-the-first-ten
+  description: eleven integers then a string - the type comes from all rows (ANY); eleven integers then a decimal is DECIMAL
+  type: bash
+  timeout_ms: 60000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    q() { "${GEODE_BINARY:-geode}" query "$1" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --format json 2>&1; }
+    q "FOR x IN [1,1,1,1,1,1,1,1,1,1,1,'late'] RETURN x" | grep -o '"columns":\[[^]]*\]' | sed 's/^/LATE_STRING=/'
+    q "FOR x IN [1,1,1,1,1,1,1,1,1,1,1,2.5] RETURN x" | grep -o '"columns":\[[^]]*\]' | sed 's/^/LATE_DECIMAL=/'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - LATE_STRING="columns":[{"name":"x","type":"ANY"}]
+    - LATE_DECIMAL="columns":[{"name":"x","type":"DECIMAL"}]
+  tags: [wire-metadata, types, sonny-6562, regression]
+
+- name: for-order-by-reports-ordered-true
+  description: FOR ... RETURN ... ORDER BY a DESC sends 3,2,1 with ordered:true and order_keys [a]
+  args: [query, '-']
+  stdin: FOR a IN [2,1,3] RETURN a ORDER BY a DESC
+  expect:
+    exit_code: 0
+    stdout_contains: ['"ordered":true', '"order_keys":["a"]', '"rows":[{"a":3},{"a":2},{"a":1}]']
+  tags: [wire-metadata, ordering, sonny-6562, regression]
+
+- name: result-without-order-by-reports-unordered
+  description: a FOR with no ORDER BY, and a plain RETURN, stay ordered:false with no keys
+  args: [query, '-']
+  stdin: FOR a IN [2,1,3] RETURN a
+  expect:
+    exit_code: 0
+    stdout_contains: ['"ordered":false', '"order_keys":[]']
+  tags: [wire-metadata, ordering, sonny-6562, regression]
+
+- name: profile-reports-no-spill-under-a-spill-threshold
+  description: with GEODE_SPILL_THRESHOLD_BYTES=1, PROFILE of a sort/union/data change carries no spill_reason and zero counters
+  type: bash
+  timeout_ms: 90000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    q() { "${GEODE_BINARY:-geode}" query "$1" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --format json 2>&1; }
+    q "CREATE (:S6562Spill {k: 1})" > /dev/null
+    FAIL=0
+    for STMT in \
+      "PROFILE CREATE (:S6562Spill {k: 2})" \
+      "PROFILE MATCH (n:S6562Spill) RETURN n.k AS k ORDER BY k" \
+      "PROFILE RETURN 1 AS x UNION RETURN 2 AS x" \
+      "PROFILE RETURN DISTINCT 1 AS x, 1 AS y ORDER BY x LIMIT 5"; do
+      OUT=$(q "$STMT")
+      if echo "$OUT" | grep -q '"profile"' && ! echo "$OUT" | grep -q 'spill_reason' && ! echo "$OUT" | grep -Eq '"(sort|distinct|union|hashagg)_spills":[1-9]'; then
+        echo "PROFILE_OK $STMT"
+      else
+        echo "PROFILE_BAD $STMT"; echo "$OUT" | head -c 600; FAIL=1
+      fi
+    done
+    exit $FAIL
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - PROFILE_OK PROFILE CREATE
+    - PROFILE_OK PROFILE MATCH
+    - PROFILE_OK PROFILE RETURN 1 AS x UNION
+    stdout_not_contains: [PROFILE_BAD]
+  tags: [wire-metadata, profile, spill, sonny-6562, regression]

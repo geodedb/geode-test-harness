@@ -1,0 +1,214 @@
+version: '1.0'
+name: SONNY-6561 CDC diagnostics and control over QUIC see the running CDC engine
+description: |
+  SONNY-6561: the QUIC CDC_DIAGNOSTICS and CDC_CONTROL frames read
+  `ServerState.cdc_engine`, a field nothing ever assigned. CDC runs in the
+  process-global engine `CALL cdc.enable()` starts (and the gRPC handler read), so
+  over QUIC, with CDC running, CDC_CONTROL answered NO_ENGINE, the documented
+  RESET_GUARDRAILS action was unreachable, an unknown action was not answered
+  UNSUPPORTED, and CDC_DIAGNOSTICS reported CDC disabled.
+
+  Fixed (c4c5696d4 test, 1581e5122 fix): both transports answer through one
+  function; refusals are SQLSTATE errors (28000 for an unauthenticated caller,
+  42501 for a non-admin).
+
+  Black-box: the geode CLI has no CDC frame command, so the spec speaks the QUIC
+  protocol itself with a real QUIC client (aioquic, ALPN geode/1; frames are a
+  4-byte big-endian length plus a protobuf QuicClientMessage, per src/proto/
+  geode.proto), against the managed server, with CDC toggled by `CALL
+  cdc.enable()` / `cdc.disable()` through the real CLI. It checks every state
+  (never enabled, enabled, disabled again) and every caller (admin, readonly
+  user, unauthenticated), the epoch increment RESET_GUARDRAILS causes, and the
+  UNSUPPORTED answer for an unknown or empty action.
+
+  CANARY: REQ=REQ-SONNY-6561-QUIC-CDC-ENGINE; FEATURE="CDCControl"; ASPECT=QuicSeesRunningEngine; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6561_quic_cdc_control.yml; OWNER=cdc; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+tests:
+
+- name: quic-cdc-frames-answer-from-the-running-engine
+  description: CDC_DIAGNOSTICS / CDC_CONTROL over QUIC across never-enabled, enabled and disabled states and admin / readonly / unauthenticated callers
+  type: bash
+  timeout_ms: 240000
+  command: |
+    PY="${GEODETESTLAB_PYTHON:-python3}"
+    "$PY" - <<'PYEOF'
+    import asyncio, ssl, struct, sys, time, os
+    from aioquic.asyncio import connect
+    from aioquic.asyncio.protocol import QuicConnectionProtocol
+    from aioquic.quic.configuration import QuicConfiguration
+    from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
+
+    def varint(n):
+        out = b""
+        while True:
+            b = n & 0x7F; n >>= 7
+            if n: out += bytes([b | 0x80])
+            else: return out + bytes([b])
+    def ld(field, data):
+        if isinstance(data, str): data = data.encode()
+        return varint(field << 3 | 2) + varint(len(data)) + data
+    def parse(buf):
+        out = {}; i = 0
+        while i < len(buf):
+            key = 0; shift = 0
+            while True:
+                b = buf[i]; i += 1; key |= (b & 0x7F) << shift; shift += 7
+                if not b & 0x80: break
+            f, wt = key >> 3, key & 7
+            if wt == 0:
+                v = 0; shift = 0
+                while True:
+                    b = buf[i]; i += 1; v |= (b & 0x7F) << shift; shift += 7
+                    if not b & 0x80: break
+            elif wt == 2:
+                n = 0; shift = 0
+                while True:
+                    b = buf[i]; i += 1; n |= (b & 0x7F) << shift; shift += 7
+                    if not b & 0x80: break
+                v = buf[i:i+n]; i += n
+            elif wt == 1: v = buf[i:i+8]; i += 8
+            elif wt == 5: v = buf[i:i+4]; i += 4
+            else: raise ValueError("wt %d" % wt)
+            out.setdefault(f, []).append(v)
+        return out
+    def packet(qmsg_field, payload):
+        body = ld(qmsg_field, payload)
+        return struct.pack(">I", len(body)) + body
+
+    class P(QuicConnectionProtocol):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k); self.buf = b""; self.waiter = None
+        def quic_event_received(self, ev):
+            if isinstance(ev, StreamDataReceived):
+                self.buf += ev.data
+                if self.waiter and not self.waiter.done() and self._have():
+                    self.waiter.set_result(True)
+            if isinstance(ev, ConnectionTerminated) and self.waiter and not self.waiter.done():
+                self.waiter.set_exception(ConnectionError("closed %s" % hex(ev.error_code)))
+        def _have(self):
+            return len(self.buf) >= 4 and len(self.buf) >= 4 + struct.unpack(">I", self.buf[:4])[0]
+        async def frame(self, t=90):
+            while not self._have():
+                self.waiter = asyncio.get_event_loop().create_future()
+                await asyncio.wait_for(self.waiter, t)
+            n = struct.unpack(">I", self.buf[:4])[0]; body = self.buf[4:4+n]; self.buf = self.buf[4+n:]
+            return parse(body)
+
+
+    async def session(port, user, pw, hello=True):
+        cfg = QuicConfiguration(is_client=True, alpn_protocols=["geode/1"]); cfg.verify_mode = ssl.CERT_NONE
+        return connect("127.0.0.1", port, configuration=cfg, create_protocol=P)
+
+    def diag_view(resp):
+        if 5 not in resp: return None
+        d = parse(resp[5][0]); cfgm = parse(d[11][0]) if 11 in d else {}; eng = parse(d[12][0]) if 12 in d else {}
+        return (bool(cfgm.get(1, [0])[0]), bool(eng.get(1, [0])[0]), d.get(8, [0])[0])
+    def ctrl_view(resp):
+        if 6 not in resp: return None
+        c_ = parse(resp[6][0]); return (bool(c_.get(1, [0])[0]), c_.get(2, [b""])[0].decode(), c_.get(3, [0])[0])
+
+    async def talk(port, user, pw, steps):
+        """steps: list of ('diag',) / ('ctrl', action); returns the decoded answers. user None = no HELLO."""
+        out = []
+        cfg = QuicConfiguration(is_client=True, alpn_protocols=["geode/1"]); cfg.verify_mode = ssl.CERT_NONE
+        async with connect("127.0.0.1", port, configuration=cfg, create_protocol=P) as c:
+            sid = c._quic.get_next_available_stream_id()
+            async def rpc(field, payload):
+                c._quic.send_stream_data(sid, packet(field, payload)); c.transmit()
+                return await c.frame()
+            session_id = ""
+            if user is not None:
+                h = parse((await rpc(1, ld(1, user) + ld(2, pw) + ld(4, "cdc-probe") + ld(5, "1") + ld(6, "min")))[1][0])
+                if not h.get(1, [0])[0]: return ["HELLO_FAILED"]
+                session_id = h[2][0].decode()
+            for st in steps:
+                r = await rpc(5, ld(1, session_id)) if st[0] == "diag" else await rpc(6, ld(1, st[1]) + ld(2, session_id))
+                out.append((diag_view(r) if st[0] == "diag" else ctrl_view(r)) or ("ERRORFRAME", r.get(2, [b""])[0]))
+        return out
+
+    def cli(stmt):
+        import subprocess
+        env = dict(os.environ, GEODE_ALLOW_INSECURE_TLS="1")
+        pw = os.environ.get("GEODE_ADMIN_PASSWORD", "Geode Test Admin Passphrase")
+        r = subprocess.run([os.environ.get("GEODE_BINARY", "geode"), "query", stmt, "--server", os.environ["GEODE_SERVER_ADDRESS"],
+                            "--insecure-tls-skip-verify", "-U", "geode", "-P", pw, "--format", "json", "--timeout", "30"],
+                           capture_output=True, text=True, env=env)
+        return r.stdout + r.stderr
+
+    PORT = int(os.environ["GEODE_SERVER_ADDRESS"].rsplit(":", 1)[1])
+    ADMIN = ("geode", os.environ.get("GEODE_ADMIN_PASSWORD", "Geode Test Admin Passphrase"))
+    fails = 0
+    def check(name, ok, detail=""):
+        global fails
+        print(("CHECK_OK " if ok else "CHECK_BAD ") + name + ("" if ok else "  " + str(detail)[:300])); fails += (not ok)
+
+    async def main():
+        # never enabled
+        d, c = await talk(PORT, *ADMIN, [("diag",), ("ctrl", "RESET_GUARDRAILS")])
+        check("never enabled: CDC_DIAGNOSTICS reports disabled and not running", d[:2] == (False, False), d)
+        check("never enabled: CDC_CONTROL answers NO_ENGINE", c[1] == "NO_ENGINE" and c[0] is False, c)
+        # enabled by CALL cdc.enable() over a different connection: the engine is process-global
+        check("CALL cdc.enable() succeeds", '"status_class":"00000"' in cli("CALL cdc.enable()"))
+        d1, c1, c2, c3, d2 = await talk(PORT, *ADMIN, [("diag",), ("ctrl", "RESET_GUARDRAILS"), ("ctrl", "UNKNOWN_ACTION"), ("ctrl", ""), ("diag",)])
+        check("CDC running: CDC_DIAGNOSTICS over QUIC sees the running engine (it answered 'CDC disabled')", d1[:2] == (True, True), d1)
+        check("CDC running: RESET_GUARDRAILS answers OK (it answered NO_ENGINE)", c1[0] is True and c1[1] == "OK", c1)
+        check("RESET_GUARDRAILS advanced the guardrail epoch by one", d2[2] == d1[2] + 1, (d1, d2))
+        check("CDC running: an unknown action answers UNSUPPORTED", c2[0] is False and c2[1] == "UNSUPPORTED", c2)
+        check("CDC running: an empty action answers UNSUPPORTED", c3[0] is False and c3[1] == "UNSUPPORTED", c3)
+        # disabled again
+        check("CALL cdc.disable() succeeds", '"status_class":"00000"' in cli("CALL cdc.disable()"))
+        d3, c4 = await talk(PORT, *ADMIN, [("diag",), ("ctrl", "RESET_GUARDRAILS")])
+        check("disabled again: diagnostics report not running", d3[:2] == (False, False), d3)
+        check("disabled again: CDC_CONTROL answers NO_ENGINE", c4[1] == "NO_ENGINE", c4)
+        # refusals are SQLSTATE error frames
+        cli("CALL cdc.enable()")
+        cli("CREATE USER s6561_ro SET PASSWORD 'Readonly Passphrase 6561 Phrase' ROLE readonly")
+        ro = await talk(PORT, "s6561_ro", "Readonly Passphrase 6561 Phrase", [("diag",), ("ctrl", "RESET_GUARDRAILS")])
+        check("a readonly user is refused CDC_DIAGNOSTICS with 42501", ro[0][0] == "ERRORFRAME" and b"42501" in ro[0][1], ro[0])
+        check("a readonly user is refused CDC_CONTROL with 42501", ro[1][0] == "ERRORFRAME" and b"42501" in ro[1][1], ro[1])
+        anon = await talk(PORT, None, None, [("diag",), ("ctrl", "RESET_GUARDRAILS")])
+        check("an unauthenticated caller is refused CDC_DIAGNOSTICS with 28000", anon[0][0] == "ERRORFRAME" and b"28000" in anon[0][1], anon[0])
+        check("an unauthenticated caller is refused CDC_CONTROL with 28000", anon[1][0] == "ERRORFRAME" and b"28000" in anon[1][1], anon[1])
+        cli("CALL cdc.disable()")
+
+    try:
+        asyncio.run(main())
+    except Exception as exc:
+        check("the CDC probe ran to completion", False, "%s: %s" % (type(exc).__name__, exc))
+    print("FAILS=%d" % fails)
+    sys.exit(1 if fails else 0)
+    PYEOF
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'CHECK_OK never enabled: CDC_DIAGNOSTICS reports disabled and not running'
+    - 'CHECK_OK CDC running: CDC_DIAGNOSTICS over QUIC sees the running engine'
+    - 'CHECK_OK CDC running: RESET_GUARDRAILS answers OK'
+    - CHECK_OK RESET_GUARDRAILS advanced the guardrail epoch by one
+    - 'CHECK_OK CDC running: an unknown action answers UNSUPPORTED'
+    - 'CHECK_OK CDC running: an empty action answers UNSUPPORTED'
+    - CHECK_OK a readonly user is refused CDC_DIAGNOSTICS with 42501
+    - CHECK_OK an unauthenticated caller is refused CDC_CONTROL with 28000
+    - FAILS=0
+    stdout_not_contains: [CHECK_BAD, Traceback]
+  tags: [cdc, quic, sonny-6561, regression]

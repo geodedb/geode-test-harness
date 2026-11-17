@@ -1,0 +1,110 @@
+version: '1.0'
+name: SONNY-6593 the gRPC server serves exactly the RPCs geode.proto declares
+description: |
+  SONNY-6593 item 2: geode's gRPC server served RPCs the published contract
+  (src/proto/geode.proto `service GeodeService`, which every client ships and
+  generates its stubs from) does not declare - Savepoint, RollbackTo, Backup,
+  Restore and UploadBackup - and two undeclared CDC aliases, CdcDiag and CdcCtrl.
+  A client generated from the .proto could not call the first five, and nothing
+  documented the last two.
+
+  Fixed (8720d9596): the RPCs `geode serve --listen-grpc` answers are exactly the
+  RPCs the proto declares. A declared RPC is routed (it never answers grpc-status
+  12 UNIMPLEMENTED); any other name under /geode.GeodeService/ answers
+  UNIMPLEMENTED, including the removed CdcDiag / CdcCtrl aliases.
+
+  Black-box: the spec starts a real `geode serve --listen-grpc`, dials its TLS
+  gRPC port with the real grpcio client (generic channel, no stubs, empty
+  request, no HELLO - the handler is reached and refuses or answers it, only an
+  unrouted path is UNIMPLEMENTED) and reads the real grpc-status of each call.
+  The declared list below is `service GeodeService` of src/proto/geode.proto.
+  Needs grpcio (the harness venv has it); the step reports a skip-free failure
+  if the interpreter lacks it, never a silent pass.
+
+  CANARY: REQ=REQ-SONNY-6593-GRPC-CONTRACT; FEATURE="GrpcTransport"; ASPECT=ServedEqualsDeclared; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6593_grpc_service_contract.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+tests:
+
+- name: served-rpcs-equal-declared-rpcs
+  description: every declared RPC is routed; undeclared names (CdcDiag, CdcCtrl, Pull, Cancel, an unknown one) answer UNIMPLEMENTED
+  type: bash
+  timeout_ms: 180000
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+    PY="${GEODETESTLAB_PYTHON:-python3}"
+    D=$(mktemp -d); trap 'kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -rf "$D"' EXIT
+    read QP GP < <(python3 -c "import socket
+    u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));q=u.getsockname()[1]
+    t=socket.socket();t.bind(('127.0.0.1',0));g=t.getsockname()[1];print(q,g)")
+    export GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}" GEODE_LSP_PORT=0 GEODE_DISABLE_AUDIT=1
+    "$BIN" serve --data-dir "$D/data" --log-level warn --listen 127.0.0.1:$QP --listen-grpc 127.0.0.1:$GP > "$D/log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 120); do
+      python3 -c "import socket;s=socket.socket();s.settimeout(1);s.connect(('127.0.0.1',$GP))" 2>/dev/null && break
+      kill -0 $PID 2>/dev/null || { echo "server_died"; cat "$D/log"; exit 1; }
+      sleep 0.5
+    done
+    "$PY" - "$GP" <<'PYEOF'
+    import ssl, sys
+    try:
+        import grpc
+    except ImportError:
+        print("GRPCIO_MISSING"); sys.exit(1)
+    gp = int(sys.argv[1])
+    DECLARED = ["Handshake", "Execute", "Ping", "Begin", "Commit", "Rollback",
+                "GetCdcDiagnostics", "ControlCdc", "Savepoint", "RollbackTo",
+                "Backup", "Restore", "UploadBackup"]
+    UNDECLARED = ["CdcDiag", "CdcCtrl", "Pull", "Cancel", "NoSuchMethod6593"]
+    STREAMING = {"Execute"}
+    pem = ssl.get_server_certificate(("127.0.0.1", gp)).encode()
+    ch = grpc.secure_channel("127.0.0.1:%d" % gp, grpc.ssl_channel_credentials(root_certificates=pem),
+                             options=[("grpc.ssl_target_name_override", "localhost")])
+    ident = lambda x: x
+    def status(name):
+        path = "/geode.GeodeService/" + name
+        try:
+            if name in STREAMING:
+                list(ch.unary_stream(path, request_serializer=ident, response_deserializer=ident)(b"", timeout=15))
+            else:
+                ch.unary_unary(path, request_serializer=ident, response_deserializer=ident)(b"", timeout=15)
+            return "OK"
+        except grpc.RpcError as e:
+            return e.code().name
+    bad = 0
+    for n in DECLARED:
+        s = status(n)
+        ok = s != "UNIMPLEMENTED"
+        print("%s declared=%s %s" % ("SERVED_OK" if ok else "SERVED_BAD", n, s)); bad += (not ok)
+    for n in UNDECLARED:
+        s = status(n)
+        ok = s == "UNIMPLEMENTED"
+        print("%s undeclared=%s %s" % ("REFUSED_OK" if ok else "REFUSED_BAD", n, s)); bad += (not ok)
+    sys.exit(1 if bad else 0)
+    PYEOF
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SERVED_OK declared=Savepoint
+    - SERVED_OK declared=RollbackTo
+    - SERVED_OK declared=Backup
+    - SERVED_OK declared=Restore
+    - SERVED_OK declared=UploadBackup
+    - REFUSED_OK undeclared=CdcDiag
+    - REFUSED_OK undeclared=CdcCtrl
+    - REFUSED_OK undeclared=NoSuchMethod6593
+    stdout_not_contains: [SERVED_BAD, REFUSED_BAD, GRPCIO_MISSING, server_died]
+  tags: [grpc, contract, sonny-6593, regression]
