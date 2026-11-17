@@ -1,0 +1,128 @@
+version: '1.0'
+name: A damaged graph is quarantined and refuses reads with 58000 (SONNY-6541, SONNY-6528, SONNY-6547)
+description: |
+  SONNY-6541 item 3 / SONNY-6528 items 4-5 / SONNY-6547 (2, listing errors):
+  a graph whose stored pages are damaged and that has not been hydrated yet
+  answered reads from zeroed pages - a filtered count, an ORDER BY or max()
+  came back as a plausible empty/zero result instead of an error; in-process
+  callers and the schema listings (SHOW TABLES) answered for the damaged graph;
+  and a corruption error carried no message.
+
+  Black-box proof on a hand-rolled scratch server: create graph `gq`, load 60
+  nodes, wait for a checkpoint (every shard WAL empty), SIGKILL, zero every
+  written page of the user graph's node stores and remove the hydration
+  snapshots and label index, restart. Then, over QUIC:
+    * a count, a filtered count, max(), an ORDER BY and SHOW TABLES on `gq` are
+      all refused with SQLSTATE 58000 and an explanatory DataCorruption
+      message ("the graph's stored data is damaged ...") - never an answer
+      built from zeroed pages, never rows;
+    * the damage stays confined: the default graph still answers (count 0), a
+      session may switch off the damaged graph within a program, and SHOW GRAPHS
+      still lists both graphs.
+  (The gRPC node-scan half of SONNY-6547 cannot be driven from the CLI, whose
+  gRPC client is plaintext only; it is covered in-process, see
+  cluster-coverage.md.)
+
+  CANARY: REQ=REQ-SONNY-6541-QUARANTINE-READS; FEATURE="StorageIntegrity"; ASPECT=QuarantinedGraphRefusesReads; STATUS=TESTED; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: damaged_graph_refuses_every_read_with_58000
+  type: bash
+  timeout_ms: 900000
+  command: |
+    unset GEODE_DATA_DIR
+    D=/tmp/s6541.$$.$RANDOM; mkdir -p "${D}"
+    PID=""
+    cleanup() { [ -n "${PID}" ] && kill -9 "${PID}" 2>/dev/null; rm -rf "${D}"; }
+    trap cleanup EXIT
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/ca.key" 2>/dev/null
+    openssl req -x509 -new -sha256 -key "${D}/ca.key" -days 1 -subj "/CN=ca" -addext basicConstraints=critical,CA:TRUE -out "${D}/ca.crt" 2>/dev/null
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/leaf.key" 2>/dev/null
+    openssl req -new -sha256 -key "${D}/leaf.key" -subj "/CN=geode" -out "${D}/leaf.csr" 2>/dev/null
+    printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth,clientAuth\n' > "${D}/leaf.ext"
+    openssl x509 -req -sha256 -in "${D}/leaf.csr" -CA "${D}/ca.crt" -CAkey "${D}/ca.key" -CAcreateserial -days 1 -extfile "${D}/leaf.ext" -out "${D}/leaf.crt" 2>/dev/null
+    PORT=$(python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    mkdir -p "${D}/data"
+    q() { "${GEODE_BINARY}" query --server "127.0.0.1:${PORT}" --ca-cert "${D}/ca.crt" -U geode -P "${GEODE_ADMIN_PASSWORD}" --timeout 30 "$1" 2>&1; }
+    start() {
+      "${GEODE_BINARY}" serve --listen "127.0.0.1:${PORT}" --data-dir "${D}/data" --persist-interval 500 \
+        --cert "${D}/leaf.crt" --key "${D}/leaf.key" --log-level warn >> "${D}/server.log" 2>&1 &
+      PID=$!
+      for i in $(seq 1 90); do q "RETURN 1 AS x" | grep -q '"x":1' && return 0; kill -0 "${PID}" 2>/dev/null || { echo "died: $(tail -5 ${D}/server.log)"; return 1; }; sleep 1; done; return 1
+    }
+    start || exit 1
+    q "CREATE GRAPH gq" | grep -q '"status_class":"00000"' || exit 1
+    for i in $(seq 1 60); do q "USE GRAPH gq; CREATE (:Q {i: ${i}})" >/dev/null; done
+    q "USE GRAPH gq; MATCH (n:Q) RETURN count(n) AS c" | grep -q '"c":60' || { echo "seed failed"; exit 1; }
+    wait_ckpt() { for i in $(seq 1 120); do [ -z "$(find "${D}/data" -name graph.wal -size +0 | head -1)" ] && return 0; sleep 1; done; return 1; }
+    wait_ckpt || { echo "no checkpoint observed"; exit 1; }
+    kill -9 "${PID}"; wait "${PID}" 2>/dev/null; PID=""
+    python3 - "${D}/data" <<'PY'
+    import os, sys
+    PAGE, HDR = 8192, 32
+    zeroed = 0
+    for root, dirs, files in os.walk(sys.argv[1]):
+        top = os.path.relpath(root, sys.argv[1]).split(os.sep)[0]
+        if os.path.exists(os.path.join(sys.argv[1], top, "audit.jsonl")):
+            continue
+        for f in files:
+            p = os.path.join(root, f)
+            if f == "labels.idx":
+                open(p, "r+b").truncate(0)
+            elif f == "nodes.store":
+                with open(p, "r+b") as fh:
+                    n = os.path.getsize(p) // PAGE
+                    for i in range(n):
+                        fh.seek(i * PAGE); h = fh.read(HDR)
+                        if h.strip(b"\0"):
+                            fh.seek(i * PAGE); fh.write(b"\0" * PAGE); zeroed += 1
+            elif f.startswith("hydration_") and f.endswith(".snap"):
+                os.remove(p)
+    print("zeroed_pages", zeroed)
+    PY
+    start || exit 1
+    # helper: run, require the status class and substrings
+    expect() { # status needle... <- query as $1
+      local query="$1" status="$2"; shift 2
+      local out; out=$(q "${query}")
+      echo "${out}" | grep -q "\"status_class\":\"${status}\"" || { echo "'${query}' did not answer ${status}: ${out:0:300}"; return 1; }
+      local n; for n in "$@"; do echo "${out}" | grep -q -- "${n}" || { echo "'${query}': answer lacks ${n}: ${out:0:300}"; return 1; }; done
+      echo "${out}" | grep -q '"rows":\[{' && [ "${status}" != 00000 ] && { echo "'${query}' returned rows from a damaged graph: ${out:0:300}"; return 1; }
+      return 0
+    }
+    expect "USE GRAPH gq; MATCH (n:Q) RETURN count(n) AS c" 58000 DataCorruption "stored data is damaged" || exit 1
+    expect "USE GRAPH gq; MATCH (n:Q) WHERE n.i > 10 RETURN count(n) AS c" 58000 DataCorruption || exit 1
+    expect "USE GRAPH gq; MATCH (n:Q) RETURN max(n.i) AS m" 58000 DataCorruption || exit 1
+    expect "USE GRAPH gq; MATCH (n:Q) RETURN n.i AS i ORDER BY i" 58000 DataCorruption || exit 1
+    expect "USE GRAPH gq; SHOW TABLES" 58000 DataCorruption || exit 1
+    # the damage does not leak to other graphs or to the catalog
+    expect "MATCH (n) RETURN count(n) AS c" 00000 '"c":0' || exit 1
+    expect "USE GRAPH gq; USE GRAPH default; MATCH (n) RETURN count(n) AS c" 00000 '"c":0' || exit 1
+    expect "SHOW GRAPHS" 00000 '"name":"gq"' '"name":"default"' || exit 1
+    echo quarantine_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - quarantine_ok
+  tags: [storage, quarantine, corruption, sonny-6541, sonny-6528, sonny-6547]

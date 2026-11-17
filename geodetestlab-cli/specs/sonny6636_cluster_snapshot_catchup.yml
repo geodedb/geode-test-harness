@@ -1,0 +1,215 @@
+version: '1.0'
+name: Raft snapshot catch-up across geode serve processes (SONNY-6636, SONNY-6633, SONNY-6665, SONNY-6631, SONNY-6667, SONNY-2810)
+description: |
+  A node that is down while the cluster compacts its Raft log past everything
+  it has can only catch up from the leader's snapshot. The bugs this pins:
+
+    SONNY-6636  server-side Raft snapshots did not exist (the log grew forever,
+                a leader had no snapshot to send) and the old GRS2 snapshot was
+                lossy for ExtValues (SONNY-2810's Float, too).
+    SONNY-6633  InstallSnapshot over QUIC dropped the data, checksum and config,
+                so a follower could never install a leader snapshot, and the
+                durable store could not be restored from one.
+    SONNY-6665  the wire also lost the resume fields; the follower must resume
+                an interrupted transfer rather than restart or wedge.
+    SONNY-6631  hydrating the restored graph under inner_mutex stalled the Raft
+                node past the election timeout (flaky elections after restore).
+    SONNY-6667  the restore worker raced apply / shutdown on the idempotency
+                table (panic: incorrect alignment).
+    SONNY-2810  the snapshot serializer printed a Float into a 32 byte buffer
+                with `catch unreachable`: 1e40 (41 characters) crashed it.
+
+  Scenario (3 real `geode serve` processes, verified peer TLS, every node with
+  GEODE_RAFT_SNAPSHOT_ENTRIES=25 so every node snapshots and compacts its log
+  every 25 applied entries; a fresh cluster already logs entries of its
+  own bootstrap):
+    1. write rows through the current leader, including Floats of extreme
+       magnitude (1e40, 1.5e-300, -2.5e+200);
+    2. SIGKILL node 0 (leader or follower, either is a valid victim);
+    3. while it is down write 60 more rows one statement at a time, far past the
+       compaction threshold, so the victim's missing entries no longer exist in
+       any log: it can only be caught up with a snapshot;
+    4. restart node 0 on its data directory and require it to converge: same
+       row count, every id exactly once, and every extreme Float read back as
+       DOUBLE with the identical value, equal on all three nodes;
+    5. SIGKILL and restart it a second time and require the same again (no lost
+       and no duplicated row after a restart on top of an installed snapshot);
+    6. all three processes are still alive and one leader is elected throughout.
+
+  NOTE: floats are written in scientific notation (`3.5e0`): a plain `3.5` is an
+  exact numeric (DECIMAL) literal, which a replicated write refuses by design
+  (ClusterWriteNotReplicable, fail-closed) because the Raft payload carries no
+  Decimal; an approximate numeric is replicated.
+
+  CANARY: REQ=REQ-SONNY-6636-CLUSTER-SNAPSHOT; FEATURE="Raft Snapshot Persistence"; ASPECT=BlackBoxCatchUp; STATUS=TESTED; OWNER=distributed; UPDATED=2026-11-17
+
+cluster:
+  nodes: 3
+  target_node: leader
+  startup_timeout_ms: 120000
+  shared_env:
+    GEODE_RAFT_SNAPSHOT_ENTRIES: '25'
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: follower_down_past_log_compaction_catches_up_from_snapshot
+  type: sequential
+  timeout_ms: 3000000
+  steps:
+  - type: bash
+    timeout_ms: 900000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 120 "$2" 2>&1
+      }
+      w() {
+        local deadline=$(( $(date +%s) + 400 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 1
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      w "CREATE (:Snap {id: 0, v: 1e40})" || exit 1
+      w "CREATE (:Snap {id: 1, v: 1.5e-300})" || exit 1
+      w "CREATE (:Snap {id: 2, v: -2.5e+200})" || exit 1
+      for i in $(seq 3 4); do w "CREATE (:Snap {id: ${i}, v: ${i}.5e0})" || exit 1; done
+      echo phase1_written=5
+  - type: signal
+    target: node:0
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 2000
+  - type: bash
+    timeout_ms: 1500000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 120 "$2" 2>&1
+      }
+      # Node 0 is dead: only its two peers can serve and elect.
+      w() {
+        local deadline=$(( $(date +%s) + 400 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[1]}" "${PORTS[2]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 1
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      for i in $(seq 5 64); do w "CREATE (:Snap {id: ${i}, v: ${i}.25e0})" || exit 1; done
+      echo phase2_written=60
+  - type: restart_node
+    target: node:0
+  - type: bash
+    timeout_ms: 900000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 120 "$2" 2>&1
+      }
+      Q="MATCH (n:Snap) RETURN n.id AS id, n.v AS v ORDER BY id"
+      deadline=$(( $(date +%s) + 400 ))
+      ok=0
+      while [ "$(date +%s)" -lt "${deadline}" ]; do
+        out=$(q "${PORTS[0]}" "${Q}")
+        n=$(echo "${out}" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["rows"]))' 2>/dev/null || echo -1)
+        if [ "${n}" = "65" ]; then ok=1; break; fi
+        sleep 1
+      done
+      [ "${ok}" = 1 ] || { echo "restarted node never reached 65 rows (last n=${n}): ${out:0:400}"; exit 1; }
+      for P in "${PORTS[@]}"; do q "${P}" "${Q}" > "/tmp/s6636.$$.${P}"; done
+      python3 - "/tmp/s6636.$$" "${PORTS[@]}" <<'PY'
+      import json, sys
+      base, ports = sys.argv[1], sys.argv[2:]
+      views = []
+      for p in ports:
+          d = json.load(open(f"{base}.{p}"))
+          assert d["status_class"] == "00000", d
+          cols = {c["name"]: c["type"] for c in d["columns"]}
+          assert cols["v"] == "DOUBLE", f"Float column came back as {cols['v']} on :{p}"
+          ids = [r["id"] for r in d["rows"]]
+          assert ids == list(range(65)), f"ids on :{p} are not 0..64 exactly once: {ids}"
+          vals = {r["id"]: r["v"] for r in d["rows"]}
+          assert float(vals[0]) == 1e40, vals[0]  # printed in full digits, parsed as int by json
+          assert float(vals[1]) == 1.5e-300, vals[1]
+          assert float(vals[2]) == -2.5e+200, vals[2]
+          assert float(vals[20]) == 20.25, vals[20]
+          views.append(d["rows"])
+      assert views[0] == views[1] == views[2], "the three nodes disagree"
+      print("catchup_ok rows=65")
+      PY
+      rc=$?
+      rm -f /tmp/s6636.$$.*
+      exit ${rc}
+    expect: {}
+  - type: signal
+    target: node:0
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 2000
+  - type: restart_node
+    target: node:0
+  - type: bash
+    timeout_ms: 900000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 120 "$2" 2>&1
+      }
+      w() {
+        local deadline=$(( $(date +%s) + 400 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 1
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      # The cluster still takes writes after a second restart on top of an
+      # installed snapshot, and the node converges on them too.
+      for i in $(seq 65 69); do w "CREATE (:Snap {id: ${i}, v: ${i}.75e0})" || exit 1; done
+      Q="MATCH (n:Snap) RETURN count(n) AS c, count(DISTINCT n.id) AS d"
+      deadline=$(( $(date +%s) + 400 ))
+      while [ "$(date +%s)" -lt "${deadline}" ]; do
+        out=$(q "${PORTS[0]}" "${Q}")
+        if echo "${out}" | grep -q '"c":70' && echo "${out}" | grep -q '"d":70'; then echo "second_restart_ok c=70 d=70"; exit 0; fi
+        sleep 1
+      done
+      echo "node 0 never converged to 70 distinct rows: ${out:0:400}"; exit 1
+    expect: {}
+  tags: [cluster, raft, snapshot, sonny-6636, sonny-6633, sonny-6665, sonny-2810]

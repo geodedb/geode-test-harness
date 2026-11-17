@@ -1,0 +1,93 @@
+version: '1.0'
+name: Many new labels are durable and distinct across restarts (SONNY-6524, SONNY-6527)
+description: |
+  SONNY-6524 / SONNY-6527 (graph-storage label dictionary): a new label name
+  cost one fsync per shard (32 serial fsyncs on a 16-shard store, 1.9x slower
+  than 0.4.13), an in-memory label assignment was not undone when the durable
+  write failed, the label dictionary kept 16 per-shard copies that could split
+  (a graph with split dictionaries is refused by name) and `getOrAssign`
+  overflowed at u32 max. What a client can observe of all of that is that a
+  large number of new labels, created in one go and again after a restart, are
+  assigned distinct ids, survive a SIGKILL-free restart and a SIGKILL restart,
+  and label every node correctly afterwards - the dictionary is whole.
+
+  Proven on a hand-rolled scratch server (the harness's own restart_server step
+  does not reconnect to a restarted server in this configuration, so the spec
+  controls the restarts itself): one statement creates 150 nodes with 150 brand-new
+  labels, the server is stopped with SIGTERM and restarted, every label still resolves to its
+  one node (first, middle, last), `CALL db.labels()` lists all 150; a second
+  batch of 30 new labels is added and the server restarted again; the total is
+  then 180 labels and no label has absorbed another's nodes.
+
+  The cost (fsync count), the dictionary-split refusal message and the u32
+  overflow are not observable from outside (see cluster-coverage.md).
+
+  CANARY: REQ=REQ-SONNY-6524-LABEL-DICT; FEATURE="Label dictionary"; ASPECT=ManyLabelsDurable; STATUS=TESTED; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: many_new_labels_survive_restarts_distinct_and_whole
+  type: bash
+  timeout_ms: 900000
+  command: |
+    unset GEODE_DATA_DIR
+    D=/tmp/s6524.$$.$RANDOM; mkdir -p "${D}"
+    PID=""
+    cleanup() { [ -n "${PID}" ] && kill -9 "${PID}" 2>/dev/null; rm -rf "${D}"; }
+    trap cleanup EXIT
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/k" 2>/dev/null
+    openssl req -x509 -new -sha256 -key "${D}/k" -days 1 -subj /CN=geode -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" -out "${D}/c" 2>/dev/null
+    PORT=$(python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    mkdir -p "${D}/data"
+    q() { "${GEODE_BINARY}" query --server "127.0.0.1:${PORT}" --ca-cert "${D}/c" -U geode -P "${GEODE_ADMIN_PASSWORD}" --timeout 120 "$1" 2>&1; }
+    start() {
+      "${GEODE_BINARY}" serve --listen "127.0.0.1:${PORT}" --data-dir "${D}/data" --cert "${D}/c" --key "${D}/k" --log-level warn >> "${D}/server.log" 2>&1 &
+      PID=$!
+      for i in $(seq 1 120); do q "RETURN 1 AS x" | grep -q '"x":1' && return 0; kill -0 "${PID}" 2>/dev/null || { echo "died: $(tail -5 ${D}/server.log)"; return 1; }; sleep 1; done; return 1
+    }
+    stop() { kill -TERM "${PID}"; for i in $(seq 1 90); do kill -0 "${PID}" 2>/dev/null || break; sleep 1; done; kill -0 "${PID}" 2>/dev/null && return 1; PID=""; return 0; }
+    want() { # query needle
+      out=$(q "$1"); echo "${out}" | grep -q -- "$2" || { echo "'$1' lacks $2: ${out:0:300}"; return 1; }
+    }
+    start || exit 1
+    out=$(q "CREATE (:S6524L1 {k: 1}), (:S6524L2 {k: 2}), (:S6524L3 {k: 3}), (:S6524L4 {k: 4}), (:S6524L5 {k: 5}), (:S6524L6 {k: 6}), (:S6524L7 {k: 7}), (:S6524L8 {k: 8}), (:S6524L9 {k: 9}), (:S6524L10 {k: 10}), (:S6524L11 {k: 11}), (:S6524L12 {k: 12}), (:S6524L13 {k: 13}), (:S6524L14 {k: 14}), (:S6524L15 {k: 15}), (:S6524L16 {k: 16}), (:S6524L17 {k: 17}), (:S6524L18 {k: 18}), (:S6524L19 {k: 19}), (:S6524L20 {k: 20}), (:S6524L21 {k: 21}), (:S6524L22 {k: 22}), (:S6524L23 {k: 23}), (:S6524L24 {k: 24}), (:S6524L25 {k: 25}), (:S6524L26 {k: 26}), (:S6524L27 {k: 27}), (:S6524L28 {k: 28}), (:S6524L29 {k: 29}), (:S6524L30 {k: 30}), (:S6524L31 {k: 31}), (:S6524L32 {k: 32}), (:S6524L33 {k: 33}), (:S6524L34 {k: 34}), (:S6524L35 {k: 35}), (:S6524L36 {k: 36}), (:S6524L37 {k: 37}), (:S6524L38 {k: 38}), (:S6524L39 {k: 39}), (:S6524L40 {k: 40}), (:S6524L41 {k: 41}), (:S6524L42 {k: 42}), (:S6524L43 {k: 43}), (:S6524L44 {k: 44}), (:S6524L45 {k: 45}), (:S6524L46 {k: 46}), (:S6524L47 {k: 47}), (:S6524L48 {k: 48}), (:S6524L49 {k: 49}), (:S6524L50 {k: 50}), (:S6524L51 {k: 51}), (:S6524L52 {k: 52}), (:S6524L53 {k: 53}), (:S6524L54 {k: 54}), (:S6524L55 {k: 55}), (:S6524L56 {k: 56}), (:S6524L57 {k: 57}), (:S6524L58 {k: 58}), (:S6524L59 {k: 59}), (:S6524L60 {k: 60}), (:S6524L61 {k: 61}), (:S6524L62 {k: 62}), (:S6524L63 {k: 63}), (:S6524L64 {k: 64}), (:S6524L65 {k: 65}), (:S6524L66 {k: 66}), (:S6524L67 {k: 67}), (:S6524L68 {k: 68}), (:S6524L69 {k: 69}), (:S6524L70 {k: 70}), (:S6524L71 {k: 71}), (:S6524L72 {k: 72}), (:S6524L73 {k: 73}), (:S6524L74 {k: 74}), (:S6524L75 {k: 75}), (:S6524L76 {k: 76}), (:S6524L77 {k: 77}), (:S6524L78 {k: 78}), (:S6524L79 {k: 79}), (:S6524L80 {k: 80}), (:S6524L81 {k: 81}), (:S6524L82 {k: 82}), (:S6524L83 {k: 83}), (:S6524L84 {k: 84}), (:S6524L85 {k: 85}), (:S6524L86 {k: 86}), (:S6524L87 {k: 87}), (:S6524L88 {k: 88}), (:S6524L89 {k: 89}), (:S6524L90 {k: 90}), (:S6524L91 {k: 91}), (:S6524L92 {k: 92}), (:S6524L93 {k: 93}), (:S6524L94 {k: 94}), (:S6524L95 {k: 95}), (:S6524L96 {k: 96}), (:S6524L97 {k: 97}), (:S6524L98 {k: 98}), (:S6524L99 {k: 99}), (:S6524L100 {k: 100}), (:S6524L101 {k: 101}), (:S6524L102 {k: 102}), (:S6524L103 {k: 103}), (:S6524L104 {k: 104}), (:S6524L105 {k: 105}), (:S6524L106 {k: 106}), (:S6524L107 {k: 107}), (:S6524L108 {k: 108}), (:S6524L109 {k: 109}), (:S6524L110 {k: 110}), (:S6524L111 {k: 111}), (:S6524L112 {k: 112}), (:S6524L113 {k: 113}), (:S6524L114 {k: 114}), (:S6524L115 {k: 115}), (:S6524L116 {k: 116}), (:S6524L117 {k: 117}), (:S6524L118 {k: 118}), (:S6524L119 {k: 119}), (:S6524L120 {k: 120}), (:S6524L121 {k: 121}), (:S6524L122 {k: 122}), (:S6524L123 {k: 123}), (:S6524L124 {k: 124}), (:S6524L125 {k: 125}), (:S6524L126 {k: 126}), (:S6524L127 {k: 127}), (:S6524L128 {k: 128}), (:S6524L129 {k: 129}), (:S6524L130 {k: 130}), (:S6524L131 {k: 131}), (:S6524L132 {k: 132}), (:S6524L133 {k: 133}), (:S6524L134 {k: 134}), (:S6524L135 {k: 135}), (:S6524L136 {k: 136}), (:S6524L137 {k: 137}), (:S6524L138 {k: 138}), (:S6524L139 {k: 139}), (:S6524L140 {k: 140}), (:S6524L141 {k: 141}), (:S6524L142 {k: 142}), (:S6524L143 {k: 143}), (:S6524L144 {k: 144}), (:S6524L145 {k: 145}), (:S6524L146 {k: 146}), (:S6524L147 {k: 147}), (:S6524L148 {k: 148}), (:S6524L149 {k: 149}), (:S6524L150 {k: 150})"); echo "${out}" | grep -q '"status_class":"00000"' || { echo "create failed: ${out:0:300}"; exit 1; }
+    stop || { echo "no clean stop"; exit 1; }
+    start || exit 1
+    want "MATCH (n:S6524L1) RETURN n.k AS k" '"rows":\[{"k":1}\]' || exit 1
+    want "MATCH (n:S6524L77) RETURN n.k AS k" '"rows":\[{"k":77}\]' || exit 1
+    want "MATCH (n:S6524L150) RETURN n.k AS k" '"rows":\[{"k":150}\]' || exit 1
+    want "MATCH (n) RETURN count(n) AS c" '"rows":\[{"c":150}\]' || exit 1
+    want "CALL db.labels() YIELD label RETURN count(label) AS c" '"rows":\[{"c":150}\]' || exit 1
+    out=$(q "CREATE (:S6524M1 {k: 1}), (:S6524M2 {k: 2}), (:S6524M3 {k: 3}), (:S6524M4 {k: 4}), (:S6524M5 {k: 5}), (:S6524M6 {k: 6}), (:S6524M7 {k: 7}), (:S6524M8 {k: 8}), (:S6524M9 {k: 9}), (:S6524M10 {k: 10}), (:S6524M11 {k: 11}), (:S6524M12 {k: 12}), (:S6524M13 {k: 13}), (:S6524M14 {k: 14}), (:S6524M15 {k: 15}), (:S6524M16 {k: 16}), (:S6524M17 {k: 17}), (:S6524M18 {k: 18}), (:S6524M19 {k: 19}), (:S6524M20 {k: 20}), (:S6524M21 {k: 21}), (:S6524M22 {k: 22}), (:S6524M23 {k: 23}), (:S6524M24 {k: 24}), (:S6524M25 {k: 25}), (:S6524M26 {k: 26}), (:S6524M27 {k: 27}), (:S6524M28 {k: 28}), (:S6524M29 {k: 29}), (:S6524M30 {k: 30})"); echo "${out}" | grep -q '"status_class":"00000"' || { echo "second create failed: ${out:0:300}"; exit 1; }
+    kill -9 "${PID}"; wait "${PID}" 2>/dev/null; PID=""
+    start || exit 1
+    want "MATCH (n:S6524M30) RETURN n.k AS k" '"rows":\[{"k":30}\]' || exit 1
+    want "MATCH (n:S6524L75) RETURN n.k AS k" '"rows":\[{"k":75}\]' || exit 1
+    want "CALL db.labels() YIELD label RETURN count(label) AS c" '"rows":\[{"c":180}\]' || exit 1
+    want "MATCH (n) RETURN count(n) AS c" '"rows":\[{"c":180}\]' || exit 1
+    echo labels_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - labels_ok
+  tags: [storage, labels, restart, sonny-6524, sonny-6527]

@@ -1,0 +1,106 @@
+version: '1.0'
+name: Cluster liveness signal in SHOW CLUSTER STATUS (SONNY-6456, SONNY-6459, SONNY-6463)
+description: |
+  SONNY-6456 / SONNY-6459: the cluster's per-peer liveness signal was never
+  refreshed from Raft traffic. NodeInfo.last_heartbeat and Peer.last_contact
+  were stamped only when a peer entry was created, so (a) the health monitor
+  marked every peer failed 5 s after start and (b) SHOW CLUSTER STATUS
+  `last_contact_ms` simply grew from process start instead of measuring the
+  time since the peer was last heard from.
+  SONNY-6463 item 4 additionally made a peer that was never heard from report
+  NULL instead of a start-up number. That NULL is timing dependent from the
+  outside (a follower may or may not have seen the other follower during the
+  election), so it is asserted only in-process (see cluster-coverage.md).
+
+  What this spec proves, against a real 3-process cluster (verified peer TLS,
+  real QUIC Raft transport), sampled three times over more than 4 s and well
+  past the old 5 s failure deadline:
+    1. On the LEADER every follower row has a non-NULL last_contact_ms below
+       4 s (refreshed by heartbeat replies; the old value only ever grew).
+    2. On each FOLLOWER the leader row is non-NULL and below 4 s.
+    3. Throughout, every node still reports 3 members, exactly one leader and
+       one agreed leader_id (nobody was marked failed and dropped).
+
+  CANARY: REQ=REQ-SONNY-6456-CLUSTER-LIVENESS; FEATURE="Cluster peer liveness"; ASPECT=LastContact; STATUS=TESTED; OWNER=distributed; UPDATED=2026-11-17
+
+cluster:
+  nodes: 3
+  target_node: leader
+  startup_timeout_ms: 90000
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 90000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: leader_and_follower_last_contact_is_refreshed_by_raft_traffic
+  type: bash
+  timeout_ms: 120000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD}"
+    PORTS=$(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' ')
+    status() {
+      "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+        -U geode -P "${PW}" --timeout 10 "SHOW CLUSTER STATUS" 2>/dev/null
+    }
+    # Let the cluster live well past the old 5 s "every peer failed" deadline.
+    sleep 9
+    DIR=$(mktemp -d)
+    for round in 1 2 3; do
+      for P in ${PORTS}; do
+        status "${P}" > "${DIR}/${round}.${P}.json"
+      done
+      sleep 2
+    done
+    python3 - "${DIR}" ${PORTS} <<'PY'
+    import json, sys
+    base, ports = sys.argv[1], sys.argv[2:]
+    LIMIT = 4000
+    leader_views = 0
+    for rnd in (1, 2, 3):
+        for idx, p in enumerate(ports):
+            me = idx + 1   # raft node id = position in the cluster (1-based)
+            rows = json.load(open(f"{base}/{rnd}.{p}.json"))["rows"]
+            assert len(rows) == 3, f"expected 3 members on :{p}: {rows}"
+            leaders = [r for r in rows if r["role"] == "leader"]
+            assert len(leaders) == 1, f"expected exactly one leader on :{p}: {rows}"
+            lid = leaders[0]["node_id"]
+            assert {r["leader_id"] for r in rows} == {lid}, f"leader_id disagreement on :{p}: {rows}"
+            if me == lid:
+                leader_views += 1
+                for r in rows:
+                    if r["node_id"] == me:
+                        continue
+                    v = r["last_contact_ms"]
+                    assert v is not None, f"leader never heard from follower {r['node_id']}: {rows}"
+                    assert v < LIMIT, f"leader's last_contact_ms for follower {r['node_id']} is {v} ms (stale): {rows}"
+            else:
+                v = leaders[0]["last_contact_ms"]
+                assert v is not None, f"follower {me} never heard from the leader: {rows}"
+                assert v < LIMIT, f"follower {me}: last_contact_ms for the leader is {v} ms (stale): {rows}"
+    assert leader_views == 3, f"expected one leader view per round, got {leader_views}"
+    print(f"liveness_ok leader_views={leader_views}")
+    PY
+    rc=$?
+    rm -rf "${DIR}"
+    exit ${rc}
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - liveness_ok
+  tags: [cluster, liveness, sonny-6456, sonny-6459, sonny-6463]

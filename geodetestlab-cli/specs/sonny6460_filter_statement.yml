@@ -1,0 +1,147 @@
+version: '1.0'
+name: ISO FILTER statement after CALL ... YIELD and repeated after MATCH (SONNY-6460)
+description: |
+  SONNY-6460 item 2: ISO/IEC 39075:2024 14.6 <filter statement> ::=
+  FILTER { <where clause> | <search condition> } (SR 2: `FILTER SC` is
+  `FILTER WHERE SC`). Before the fix `CALL ... YIELD ... FILTER` was a syntax
+  error (a WHERE after YIELD was the only form accepted, which the standard
+  does not define) and a MATCH took only one FILTER.
+
+  Proven here over the wire on a real server: FILTER (with or without WHERE)
+  after CALL ... YIELD, on a yield alias, repeated, as the final statement,
+  followed by ORDER BY / LIMIT, after MATCH, and after MATCH ... CALL ... YIELD
+  where it sees both the MATCH variable and the yielded column. A condition
+  evaluating to Unknown drops the row (19.1 GR 2), `Unknown OR True` keeps it.
+  A WHERE directly after YIELD stays refused with 42000 and the message names
+  the FILTER form.
+
+  Data: nodes with labels A, B, C and D (D has no `v`). CALL db.labels() lists
+  the four labels and the `v` values are 1, 2, 3.
+
+  CANARY: REQ=REQ-SONNY-6460-FILTER-STATEMENT; FEATURE="FilterStatement"; ASPECT=WireRegression; STATUS=TESTED; OWNER=parser; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: seed_nodes
+  query: 'CREATE (:A {v: 1}), (:B {v: 2}), (:C {v: 3}), (:D)'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+
+- name: filter_after_call_yield_search_condition
+  query: CALL db.labels() YIELD label FILTER label <> 'B' RETURN label ORDER BY label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"A"},{"label":"C"},{"label":"D"}]'
+- name: filter_where_form
+  query: CALL db.labels() YIELD label FILTER WHERE label = 'C' RETURN label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"C"}]'
+- name: filter_on_yield_alias
+  query: CALL db.labels() YIELD label AS l FILTER l = 'D' RETURN l
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"l":"D"}]'
+- name: filter_repeated_after_yield
+  query: CALL db.labels() YIELD label FILTER label <> 'A' FILTER WHERE label <> 'D' RETURN label ORDER BY label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"B"},{"label":"C"}]'
+- name: filter_as_final_statement_auto_projects
+  query: CALL db.labels() YIELD label FILTER label = 'A'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"A"}]'
+- name: filter_then_order_and_limit
+  query: CALL db.labels() YIELD label FILTER label <> 'A' RETURN label ORDER BY label DESC LIMIT 2
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"D"},{"label":"C"}]'
+- name: filter_unknown_drops_rows_null_literal
+  query: CALL db.labels() YIELD label FILTER NULL RETURN label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+- name: filter_unknown_drops_rows_eq_null
+  query: CALL db.labels() YIELD label FILTER label = NULL RETURN label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+- name: filter_or_with_unknown_keeps_true_branch
+  query: CALL db.labels() YIELD label FILTER label = NULL OR label = 'B' RETURN label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"B"}]'
+- name: filter_after_match
+  query: MATCH (n) FILTER n.v > 1 RETURN n.v ORDER BY n.v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"v":2},{"v":3}]'
+- name: filter_after_match_where_then_filter
+  query: MATCH (n) WHERE n.v IS NOT NULL FILTER n.v < 3 RETURN n.v ORDER BY n.v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"v":1},{"v":2}]'
+- name: filter_repeated_after_match
+  query: MATCH (n) FILTER n.v IS NOT NULL FILTER n.v <> 2 RETURN n.v ORDER BY n.v
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"v":1},{"v":3}]'
+- name: filter_sees_match_variable_and_yield_column
+  query: MATCH (n) CALL db.labels() YIELD label FILTER n.v = 2 AND label = 'C' RETURN n.v, label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"v":2,"label":"C"}]'
+- name: where_after_yield_is_still_refused_and_names_filter
+  query: CALL db.labels() YIELD label WHERE label = 'A' RETURN label
+  expected:
+    exit_code: [1, 2, 3, 4]
+    stdout_contains:
+    - '"status_class":"42000"'
+    - FILTER
