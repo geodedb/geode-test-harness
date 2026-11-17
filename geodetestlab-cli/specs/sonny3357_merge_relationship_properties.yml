@@ -1,0 +1,186 @@
+# SONNY-3357: a relationship MERGE ignored the relationship's properties when matching (a MERGE
+# of ()-[:T {w: 2}]->() matched an existing ()-[:T {w: 1}]->()).
+#
+# This spec drives a real server: relationship MERGEs with different properties create distinct
+# relationships, a repeat matches, a property-less MERGE matches, MATCH ... MERGE runs ON MATCH
+# only on the matching relationship, and an extra property makes a new relationship.
+
+version: '1.0'
+name: SONNY-3357 relationship MERGE matches on relationship properties
+description: Relationship MERGE property matching
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: merge-rel-w1
+  description: 'Relationship MERGE with {w: 1} creates the pattern'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:A3357 {k: 1})-[:T3357 {w: 1}]->(b:B3357 {k: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-rel-w2
+  description: 'A different property value is a different relationship: created'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:A3357 {k: 1})-[:T3357 {w: 2}]->(b:B3357 {k: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: two-relationships
+  description: Two relationships now exist
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:A3357)-[r:T3357]->(:B3357) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: w2-one
+  description: Exactly one carries w = 2
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (:A3357)-[r:T3357 {w: 2}]->(:B3357) RETURN count(r) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-rel-w1-again
+  description: 'Repeating {w: 1} matches and creates nothing'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:A3357 {k: 1})-[:T3357 {w: 1}]->(b:B3357 {k: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: still-two
+  description: Still two relationships
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:A3357)-[r:T3357]->(:B3357) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-rel-no-props
+  description: A MERGE without properties matches an existing relationship
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:A3357 {k: 1})-[:T3357]->(b:B3357 {k: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: still-two-b
+  description: Still two relationships, and the two endpoints are not duplicated
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) WHERE n:A3357 OR n:B3357 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: match-merge-on-match
+  description: MATCH ... MERGE on a bound pair with ON CREATE / ON MATCH acts on the matching relationship only
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:A3357 {k: 1}), (b:B3357 {k: 2}) MERGE (a)-[r:T3357 {w: 1}]->(b) ON CREATE SET r.c = 3 ON MATCH SET r.m = 3'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: on-match-applied-to-w1-only
+  description: ON MATCH landed on w=1, not on w=2; ON CREATE did not run
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:A3357)-[r:T3357]->(:B3357) RETURN r.w AS w, r.c AS c, r.m AS m ORDER BY w
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"w":1,"c":null,"m":3},{"w":2,"c":null,"m":null}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-rel-extra-prop-creates
+  description: A MERGE with an extra property is a new relationship
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:A3357 {k: 1}), (b:B3357 {k: 2}) MERGE (a)-[r:T3357 {w: 1, x: 9}]->(b)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: three
+  description: Three relationships
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:A3357)-[r:T3357]->(:B3357) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738

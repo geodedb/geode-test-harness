@@ -1,0 +1,183 @@
+version: '1.0'
+name: SONNY-6642 a graph whose WAL is damaged mid-log is refused as WalCorrupted
+description: |
+  SONNY-6642: graph-storage refuses to open a graph whose shard WAL has a
+  damaged record followed by VALID records (that is not a torn tail, so the
+  log is kept as it is and the graph is not opened: WalCorrupted). geode did
+  not list the error, so every statement on the graph answered the generic
+  58000 GraphQuarantined ("the graph's indexes could not be loaded") with no
+  hint at the cause or the remedy. The fix answers 58000 with its own
+  "WalCorrupted: ..." operator message (the log is damaged mid-way, the graph
+  is not opened, other graphs are unaffected, restore from a backup or DROP
+  GRAPH), on every statement against the graph.
+
+  Black-box scenario: seed a second graph (control) and a target graph with
+  several committed batches, SIGKILL the server (no checkpoint, so the target
+  graph's shard WALs hold every record; --persist-interval is huge), flip one
+  payload byte of the MIDDLE record of the longest shard WAL on disk (the
+  target graph's: the record framing is [lsn u64][len u32][payload][crc u32]),
+  restart, and assert:
+    * the control graph still serves its data,
+    * the damaged graph answers 58000 starting "WalCorrupted: " and naming the
+      remedy, not GraphQuarantined,
+    * the damaged WAL file was left exactly as damaged (the open does not
+      truncate a log it cannot read), and
+    * the server stays up and the control graph keeps answering.
+
+  CANARY: REQ=REQ-SONNY-6642-WAL-CORRUPTED-QUARANTINE; FEATURE="StorageIntegrity"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny6642_wal_corrupted_quarantine.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+  client:
+    timeout_ms: 120000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+default_timeout_ms: 120000
+
+tests:
+- name: create-control-graph
+  query: CREATE GRAPH other6642
+  expected:
+    exit_code: 0
+
+- name: seed-control-graph
+  query: 'USE GRAPH other6642; CREATE (:O6642 {i: 1})'
+  expected:
+    exit_code: 0
+
+- name: create-target-graph
+  query: CREATE GRAPH w6642
+  expected:
+    exit_code: 0
+
+- name: seed-target-batch-1
+  query: "USE GRAPH w6642; UNWIND range(1, 49) AS i CREATE (:W6642 {i: i, s: 'payload-6642'})"
+  expected:
+    exit_code: 0
+
+- name: seed-target-batch-2
+  query: "USE GRAPH w6642; UNWIND range(1, 49) AS i CREATE (:W6642 {i: i, s: 'payload-6642'})"
+  expected:
+    exit_code: 0
+
+- name: seed-target-batch-3
+  query: "USE GRAPH w6642; UNWIND range(1, 49) AS i CREATE (:W6642 {i: i, s: 'payload-6642'})"
+  expected:
+    exit_code: 0
+
+- name: seed-target-batch-4
+  query: "USE GRAPH w6642; UNWIND range(1, 49) AS i CREATE (:W6642 {i: i, s: 'payload-6642'})"
+  expected:
+    exit_code: 0
+
+- name: target-graph-serves-before-damage
+  query: USE GRAPH w6642; MATCH (n:W6642) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":192'
+
+- name: sigkill-damage-middle-record-restart
+  description: SIGKILL, then flip one payload byte of the middle record of the longest graph.wal under the data dir, then restart on it.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    python3 - <<'PY'
+    import os, struct, sys, glob
+    d = os.environ["GEODE_DATA_DIR"]
+    best, best_recs = None, []
+    for path in glob.glob(os.path.join(d, "**", "wal", "graph.wal"), recursive=True):
+        data = open(path, "rb").read()
+        recs, off = [], 0
+        while off + 16 <= len(data):
+            lsn = struct.unpack_from("<Q", data, off)[0]
+            n = struct.unpack_from("<I", data, off + 8)[0]
+            if (lsn == 0 and n == 0) or off + 16 + n > len(data):
+                break
+            recs.append((off, n))
+            off += 16 + n
+        if len(recs) > len(best_recs):
+            best, best_recs = path, recs
+    if best is None or len(best_recs) < 3:
+        sys.exit("no graph.wal with >= 3 records: %r" % (best,))
+    off, n = best_recs[len(best_recs) // 2]
+    if n == 0:
+        sys.exit("empty middle record")
+    data = bytearray(open(best, "rb").read())
+    data[off + 12 + n // 2] ^= 0xFF
+    open(best, "wb").write(bytes(data))
+    open(os.path.join(d, ".damaged_wal_path"), "w").write(best)
+    open(os.path.join(d, ".damaged_wal_sum"), "w").write(__import__("hashlib").sha256(bytes(data)).hexdigest())
+    print("DAMAGED_%d_OF_%d_RECORDS" % (len(best_recs) // 2, len(best_recs)))
+    PY
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - DAMAGED_
+
+- name: control-graph-still-serves
+  query: USE GRAPH other6642; MATCH (n:O6642) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+
+- name: damaged-graph-refused-as-wal-corrupted
+  query: USE GRAPH w6642; MATCH (n:W6642) RETURN count(n) AS c
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    - 'WalCorrupted: '
+    - Restore the graph
+    stdout_not_contains:
+    - GraphQuarantined
+
+- name: damaged-graph-refuses-writes-too
+  query: 'USE GRAPH w6642; CREATE (:W6642 {i: 999})'
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    - 'WalCorrupted: '
+
+- name: damaged-wal-left-untouched
+  description: The refusal must not rewrite or truncate the log it cannot read.
+  type: bash
+  command: |
+    set -e
+    p=$(cat "${GEODE_DATA_DIR}/.damaged_wal_path")
+    want=$(cat "${GEODE_DATA_DIR}/.damaged_wal_sum")
+    got=$(sha256sum "$p" | cut -d' ' -f1)
+    [ "$want" = "$got" ] && echo WAL_UNTOUCHED || { echo "WAL_CHANGED $want $got"; exit 1; }
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - WAL_UNTOUCHED
+
+- name: control-graph-still-serves-after-refusals
+  query: USE GRAPH other6642; MATCH (n:O6642) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'

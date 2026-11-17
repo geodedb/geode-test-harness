@@ -1,0 +1,360 @@
+version: '1.0'
+name: SONNY-6659 6529 aborted and still-open transactions never become durable
+description: |
+  SONNY-6659, SONNY-6657, SONNY-6648, SONNY-6529: an aborted or still-open
+  transaction must never become durable.
+
+  graph-storage logs full-page after-images, so a transaction that stayed open
+  while another committed a write to the same page had its bytes carried into
+  the committed transaction's image and replayed after a crash (SONNY-6659);
+  TxnManager.abort discarded only the WAL records, so the next checkpoint made
+  the aborted transaction's page writes durable (SONNY-6529) and an abort the
+  journal could not undo failed closed instead of discarding and redoing
+  committed state (SONNY-6657, SONNY-6648).
+
+  Black-box, against a real `geode serve`:
+    1. Two interactive sessions at once (a FIFO holds each shell's stdin open):
+       A opens a transaction and creates six nodes and stays open; B commits
+       six single-node transactions meanwhile (node slots round-robin over the
+       engine's shards, so A and B write the same pages). The server is
+       SIGKILLed with A still open: after the restart none of A's nodes is
+       there (not even through B's commit images) and all six of B's are.
+    2. A ROLLED-BACK transaction (node creates, a relationship, a relationship
+       property SET, a node property SET) is followed by a clean shutdown (a
+       full checkpoint) and a restart: nothing of it is durable. The same
+       rollback followed by a SIGKILL.
+    3. A statement that fails part-way (a unique-constraint violation on the
+       third row of an UNWIND) wrote nothing: absent after a checkpoint and
+       after a kill.
+
+  CANARY: REQ=REQ-SONNY-6659-ABORT-NOT-DURABLE; FEATURE="TransactionManagement"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny6659_6529_aborted_and_open_not_durable.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+  client:
+    timeout_ms: 120000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+default_timeout_ms: 120000
+
+tests:
+- name: open-transaction-a-and-six-commits-of-b-then-sigkill
+  description: 'See the header: A stays open with 6 nodes, B commits 6, then SIGKILL and restart.'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    FA=$(mktemp -u "${GEODE_DATA_DIR}.fa.XXXXXX"); FB=$(mktemp -u "${GEODE_DATA_DIR}.fb.XXXXXX"); mkfifo "$FA" "$FB"
+    OA=$(mktemp "${GEODE_DATA_DIR}.oa.XXXXXX"); OB=$(mktemp "${GEODE_DATA_DIR}.ob.XXXXXX")
+    "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" < "$FA" > "$OA" 2>&1 &
+    PA=$!
+    "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" < "$FB" > "$OB" 2>&1 &
+    PB=$!
+    exec 3> "$FA" 4> "$FB"
+    printf '%s\n' 'START TRANSACTION;' 'CREATE (:Aopen6659 {i: 1});' 'CREATE (:Aopen6659 {i: 2});' 'CREATE (:Aopen6659 {i: 3});' 'CREATE (:Aopen6659 {i: 4});' 'CREATE (:Aopen6659 {i: 5});' 'CREATE (:Aopen6659 {i: 6});' 'MATCH (a:Aopen6659) RETURN count(a) AS inside;' >&3
+    sleep 5
+    for k in 1 2 3 4 5 6; do
+      printf '%s\n' 'START TRANSACTION;' "CREATE (:Bcom6659 {i: $k});" 'COMMIT;' >&4
+      sleep 2
+    done
+    sleep 3
+    grep -c "transaction committed" "$OB" | grep -qx 6 || { cat "$OB"; echo B_COMMITS_NOT_ALL_ACKED; exit 1; }
+    grep -Eq '^\| 6 +\|' "$OA" || { cat "$OA"; echo A_NOT_OPEN; exit 1; }
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    exec 3>&- 4>&-; kill -9 $PA $PB 2>/dev/null || true; wait $PA $PB 2>/dev/null || true
+    rm -f "$FA" "$FB" "$OA" "$OB"
+    echo A_OPEN_B_COMMITTED_KILLED
+  timeout_ms: 150000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - A_OPEN_B_COMMITTED_KILLED
+
+- name: after-kill-open-writer-bytes-absent
+  description: None of the still-open transaction A's nodes came back through B's committed page images.
+  query: MATCH (a:Aopen6659) RETURN count(a) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: after-kill-committed-writer-present
+  description: All six of B's committed nodes are there.
+  query: MATCH (b:Bcom6659) RETURN count(b) AS c, sum(b.i) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":6'
+    - '"s":21'
+
+- name: after-kill-unlabeled-total
+  description: "The unlabeled scan agrees: only B's six nodes."
+  query: MATCH (n) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":6'
+
+- name: seed-relationship
+  description: A committed relationship with a property, the rollback target.
+  query: 'CREATE (:E6529 {i: 1})-[:R6529 {w: 1}]->(:E6529 {i: 2})'
+  expected:
+    exit_code: 0
+
+- name: rolled-back-transaction-1
+  description: Rollback of node creates, a relationship property SET, a node SET and a new relationship.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    F=$(mktemp -u "${GEODE_DATA_DIR}.fifo.XXXXXX"); mkfifo "$F"
+    OUT=$(mktemp "${GEODE_DATA_DIR}.shout.XXXXXX")
+    "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" < "$F" > "$OUT" 2>&1 &
+    SH=$!
+    exec 3> "$F"
+    printf '%s\n' 'START TRANSACTION;' 'CREATE (:Ab6529 {i: 1});' 'CREATE (:Ab6529 {i: 2});' 'MATCH (:E6529)-[r:R6529]->(:E6529) SET r.w = 99, r.extra = '"'"'x'"'"';' 'MATCH (e:E6529 {i: 1}) SET e.touched = 1;' 'MATCH (a:E6529 {i: 1}), (b:E6529 {i: 2}) CREATE (a)-[:R6529 {w: 5}]->(b);' 'ROLLBACK;' >&3
+    printf 'exit\n' >&3
+    exec 3>&-
+    wait $SH || true
+    grep -q "transaction rolled back" "$OUT" || { cat "$OUT"; echo NOT_ROLLED_BACK; exit 1; }
+    rm -f "$F" "$OUT"
+    echo ROLLED_BACK_1
+  timeout_ms: 150000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - ROLLED_BACK_1
+
+- name: clean-stop-after-rollback
+  description: 'SIGTERM: the shutdown checkpoint writes every resident page; the aborted writes must not be among them (the WALs are empty afterwards, asserted).'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -TERM -f "serve.*${GEODE_DATA_DIR}"
+    for i in $(seq 1 90); do
+      pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null; then echo SERVER_DID_NOT_STOP; exit 1; fi
+    n=$(find "${GEODE_DATA_DIR}" -path '*/wal/graph.wal' -size +0c | wc -l)
+    echo "CLEAN_AFTER_RB_NONEMPTY_WALS_$n"
+    [ "$n" = 0 ] || { echo "WAL_NOT_EMPTIED_AFTER_CLEAN_SHUTDOWN"; exit 1; }
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CLEAN_AFTER_RB_NONEMPTY_WALS_0
+
+- name: after-checkpoint-aborted-nodes-absent
+  description: The aborted transaction left nothing durable after the checkpoint.
+  query: MATCH (a:Ab6529) RETURN count(a) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: after-checkpoint-aborted-relationship-state
+  description: The aborted transaction left nothing durable after the checkpoint.
+  query: MATCH (:E6529)-[r:R6529]->(:E6529) RETURN count(r) AS c, sum(r.w) AS w, count(r.extra) AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+    - '"w":1'
+    - '"x":0'
+
+- name: after-checkpoint-aborted-node-set-absent
+  description: The aborted transaction left nothing durable after the checkpoint.
+  query: MATCH (e:E6529) WHERE e.touched IS NOT NULL RETURN count(e) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: rolled-back-transaction-2
+  description: The same rollback again, this time followed by a SIGKILL.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    F=$(mktemp -u "${GEODE_DATA_DIR}.fifo.XXXXXX"); mkfifo "$F"
+    OUT=$(mktemp "${GEODE_DATA_DIR}.shout.XXXXXX")
+    "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" < "$F" > "$OUT" 2>&1 &
+    SH=$!
+    exec 3> "$F"
+    printf '%s\n' 'START TRANSACTION;' 'CREATE (:Ab6529 {i: 1});' 'CREATE (:Ab6529 {i: 2});' 'MATCH (:E6529)-[r:R6529]->(:E6529) SET r.w = 99, r.extra = '"'"'x'"'"';' 'MATCH (e:E6529 {i: 1}) SET e.touched = 1;' 'MATCH (a:E6529 {i: 1}), (b:E6529 {i: 2}) CREATE (a)-[:R6529 {w: 5}]->(b);' 'ROLLBACK;' >&3
+    printf 'exit\n' >&3
+    exec 3>&-
+    wait $SH || true
+    grep -q "transaction rolled back" "$OUT" || { cat "$OUT"; echo NOT_ROLLED_BACK; exit 1; }
+    rm -f "$F" "$OUT"
+    echo ROLLED_BACK_2
+  timeout_ms: 150000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - ROLLED_BACK_2
+
+- name: sigkill-after-rollback
+  description: SIGKILL straight after the rollback and restart.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo KILL_AFTER_RB
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILL_AFTER_RB
+
+- name: after-kill-aborted-nodes-absent
+  description: The aborted transaction left nothing durable after the kill.
+  query: MATCH (a:Ab6529) RETURN count(a) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: after-kill-aborted-relationship-state
+  description: The aborted transaction left nothing durable after the kill.
+  query: MATCH (:E6529)-[r:R6529]->(:E6529) RETURN count(r) AS c, sum(r.w) AS w, count(r.extra) AS x
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+    - '"w":1'
+    - '"x":0'
+
+- name: after-kill-aborted-node-set-absent
+  description: The aborted transaction left nothing durable after the kill.
+  query: MATCH (e:E6529) WHERE e.touched IS NOT NULL RETURN count(e) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: unique-constraint
+  description: A unique constraint to fail a statement part-way.
+  query: CREATE CONSTRAINT u6529 FOR (n:U6529) REQUIRE n.k IS UNIQUE
+  expected:
+    exit_code: 0
+
+- name: failing-statement-writes-nothing
+  description: 'The third row violates the constraint: the statement fails 23505 and nothing was written.'
+  query: 'UNWIND [1,2,3,2,4] AS i CREATE (:U6529 {k: i})'
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '23505'
+    - nothing was written
+
+- name: failing-statement-nothing-visible
+  description: Nothing of the failed statement is visible.
+  query: MATCH (n:U6529) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: clean-stop-after-failed-statement
+  description: Checkpoint after the failed statement.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -TERM -f "serve.*${GEODE_DATA_DIR}"
+    for i in $(seq 1 90); do
+      pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null; then echo SERVER_DID_NOT_STOP; exit 1; fi
+    n=$(find "${GEODE_DATA_DIR}" -path '*/wal/graph.wal' -size +0c | wc -l)
+    echo "CLEAN_AFTER_FAIL_NONEMPTY_WALS_$n"
+    [ "$n" = 0 ] || { echo "WAL_NOT_EMPTIED_AFTER_CLEAN_SHUTDOWN"; exit 1; }
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CLEAN_AFTER_FAIL_NONEMPTY_WALS_0
+
+- name: failing-statement-nothing-durable-checkpoint
+  description: Still nothing after the checkpoint.
+  query: MATCH (n:U6529) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: failing-statement-again
+  description: Fail it again, then kill.
+  query: 'UNWIND [7,8,7] AS i CREATE (:U6529 {k: i})'
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '23505'
+
+- name: sigkill-after-failed-statement
+  description: SIGKILL after the failed statement.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo KILL_AFTER_FAIL
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILL_AFTER_FAIL
+
+- name: failing-statement-nothing-durable-kill
+  description: Still nothing after the kill.
+  query: MATCH (n:U6529) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: failing-statement-constraint-still-enforced
+  description: The constraint is still enforced after the recoveries, and a valid statement works.
+  query: 'UNWIND [1,2,3] AS i CREATE (:U6529 {k: i})'
+  expected:
+    exit_code: 0
+
+- name: valid-statement-visible
+  description: Three nodes.
+  query: MATCH (n:U6529) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":3'

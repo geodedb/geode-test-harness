@@ -1,0 +1,159 @@
+# SONNY-2806: a planned read matched an inline DECIMAL property by exact coefficient+scale
+# (`MATCH (n {x: 1.50})` missed a stored 1.5 on persisted sessions) while the legacy executor,
+# WHERE and MERGE matched by value.
+#
+# This spec stores 1.5 and 2 and requires the inline-map match, the WHERE match and MERGE to
+# agree (1.50 equals 1.5), before and after a server restart (the persisted store).
+
+version: '1.0'
+name: SONNY-2806 inline DECIMAL property match is by value
+description: Inline map, WHERE and MERGE all match 1.50 against stored 1.5
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: false
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: seed
+  description: Store 1.5 and 2
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:D2806 {x: 1.5}), (:D2806 {x: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: inline-map-match
+  description: 'MATCH (n:D2806 {x: 1.50}) finds the stored 1.5'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:D2806 {x: 1.50}) RETURN count(n) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: where-match
+  description: WHERE n.x = 1.50 finds it too
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:D2806) WHERE n.x = 1.50 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: inline-map-integer-valued
+  description: An inline 2.0 matches the stored integer 2
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:D2806 {x: 2.0}) RETURN count(n) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-matches
+  description: 'MERGE (n:D2806 {x: 1.50}) matches the existing node and creates nothing'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:D2806 {x: 1.50}) RETURN n.x AS x'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"x":"1.5"}]'
+  tags:
+  - storage
+  - sonny738
+- name: still-two-nodes
+  description: No third node appeared
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:D2806) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: restart
+  description: Restart the server so the persisted store is read back
+  type: bash
+  command: |-
+    echo restart
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags:
+  - storage
+  - sonny738
+  - restart
+- name: inline-map-match-after-restart
+  description: After the restart the inline-map match still finds 1.5
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:D2806 {x: 1.50}) RETURN count(n) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-after-restart
+  description: MERGE after the restart still matches
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:D2806 {x: 1.50}) RETURN n.x AS x'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"x":"1.5"}]'
+  tags:
+  - storage
+  - sonny738
+- name: still-two-nodes-after-restart
+  description: Still two nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:D2806) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738

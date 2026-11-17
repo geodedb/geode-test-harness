@@ -1,0 +1,156 @@
+version: '1.0'
+name: SONNY-2409 6473 whole zeroed pages with rebuilt indexes fail reads closed (DataCorruption)
+description: |
+  SONNY-2409 (and SONNY-6473 item 2, SONNY-6640): a damaged store page must fail
+  a read closed, never read as a fresh (empty) page.
+
+  graph-storage's pager skipped its CRC32C when a page's 32-byte header was all
+  zero, so damage elsewhere in the page went undetected, and an all-zero page
+  below the high-water mark read as a page nobody had written. Reads that hit
+  such a page returned partial data (or, in the adapter, an engine read error
+  was turned into "absent": SONNY-6640). Every read must instead fail with a
+  typed corruption error and no partial result; a COUNT may answer the full
+  count because it is served from the durable live-node counts.
+
+  Black-box: seed a graph, stop cleanly, zero every WRITTEN node page whole
+  (header included, page 0 included), delete the hydration snapshots and empty
+  labels.idx so the reopen rebuilds the derived indexes from the node store (as
+  after a crash), restart, and read. Without the fix the zeroed pages read as
+  never-written pages and the reads answered OK with short results.
+
+  CANARY: REQ=REQ-SONNY-2409-ZEROED-PAGE-FAIL-CLOSED; FEATURE="StorageIntegrity"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny2409_zeroed_pages_rebuild.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+  client:
+    timeout_ms: 120000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+default_timeout_ms: 120000
+
+tests:
+- name: seed
+  description: 300 nodes of one label, each with a property (several node and property pages).
+  query: "UNWIND range(1, 301) AS i CREATE (:Person2409 {name: 'person-x', n: i})"
+  expected:
+    exit_code: 0
+
+- name: baseline-labeled-read
+  description: Before the damage the labeled read returns the data.
+  query: MATCH (p:Person2409) RETURN count(p) AS c, sum(p.n) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":300'
+    - '"s":45150'
+
+- name: clean-stop-and-damage
+  description: 'Stop cleanly (SIGTERM: a full checkpoint, nothing in flight), then damage the files, then restart on them.'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -TERM -f "serve.*${GEODE_DATA_DIR}"
+    for i in $(seq 1 90); do
+      pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null; then echo SERVER_DID_NOT_STOP; exit 1; fi
+    python3 -I - <<'PY'
+    import os, glob, sys
+    d = os.environ["GEODE_DATA_DIR"]
+    PAGE, HDR = 8192, 32
+    fname, mode, invalidate = 'nodes.store', 'page', True
+    tops = {}
+    for p in glob.glob(os.path.join(d, "*", "graphs", "*", fname)):
+        top = p.split(os.sep)[len(d.split(os.sep))]
+        tops[top] = tops.get(top, 0) + os.path.getsize(p)
+    if not tops:
+        sys.exit("no %s under the data dir" % fname)
+    top = max(tops, key=tops.get)        # the graph holding the data (the security graph is tiny)
+    n = 0
+    for p in glob.glob(os.path.join(d, top, "graphs", "*", fname)):
+        with open(p, "r+b") as f:
+            for pg in range(os.path.getsize(p) // PAGE):
+                f.seek(pg * PAGE)
+                if f.read(HDR) == b"\0" * HDR:
+                    continue                 # never written
+                f.seek(pg * PAGE)
+                f.write(b"\0" * (HDR if mode == "header" else PAGE))
+                n += 1
+    inv = 0
+    if invalidate:
+        for p in glob.glob(os.path.join(d, top, "**", "hydration_*.snap"), recursive=True):
+            os.remove(p); inv += 1
+        for p in glob.glob(os.path.join(d, top, "**", "labels.idx"), recursive=True):
+            open(p, "wb").close(); inv += 1
+    if n == 0:
+        sys.exit("no written page found to damage")
+    print("DAMAGED_%d_PAGES_INVALIDATED_%d" % (n, inv))
+    PY
+  timeout_ms: 150000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - DAMAGED_
+
+- name: after-page-damage-labeled-count-fails-closed
+  description: 'With the derived indexes rebuilt from the damaged node store, even the labeled count is refused: 58000 DataCorruption.'
+  query: MATCH (p:Person2409) RETURN count(p) AS c
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    - DataCorruption
+    stdout_not_contains:
+    - '"c":300'
+
+- name: after-page-damage-labeled-read-fails-closed
+  description: A labeled read is refused.
+  query: MATCH (p:Person2409) RETURN p.name AS n
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    - DataCorruption
+    stdout_not_contains:
+    - person-x
+
+- name: after-page-damage-unlabeled-read-fails-closed
+  description: 'The unlabeled scan is refused (page 0 included: it reads as a fresh page without the fix).'
+  query: MATCH (p) RETURN p.name AS n
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    - DataCorruption
+    stdout_not_contains:
+    - person-x
+
+- name: after-page-damage-unlabeled-count-fails-closed
+  description: 'The unlabeled count is refused as well: it never reads as zero or as a short count.'
+  query: MATCH (p) RETURN count(p) AS c
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    - DataCorruption
+    stdout_not_contains:
+    - '"c":0'

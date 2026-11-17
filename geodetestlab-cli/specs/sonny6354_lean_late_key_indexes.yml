@@ -1,0 +1,321 @@
+# SONNY-6354: residuals of SONNY-6268 and SONNY-3056 in the storage layer.
+#   (1) setNodeProperty failing on bit-63 reserved ids: an internal id invariant, covered by the
+#       in-process store test (not reachable from a client; such an id is refused at creation).
+#   (2) Lean index mode (GEODE_INDEX_MERGE_KEYS_ONLY=1): the exact node-property index held a
+#       key only once registered by the first MERGE on it; nodes written earlier were never
+#       added, yet every seek trusted the index as complete, so a WHERE / inline-map seek and the
+#       bulk edge-endpoint resolvers missed them, and the index saved at shutdown carried the
+#       hole across a reopen.
+#   (3) A composite MERGE key registered at runtime was backfilled from resident (cached) nodes
+#       only, so an evicted holder had no composite entry and the composite probe's
+#       authoritative miss lost it (a MERGE then created a duplicate).
+#
+# This spec starts a real `geode serve` in lean index mode with a 32-entry node cache
+# (GEODE_INDEX_MERGE_KEYS_ONLY=1, GEODE_NODE_CACHE_ENTRIES=32), writes 300 nodes before their
+# key is registered, and proves seeks, edge-endpoint resolution and composite MERGE find the old
+# nodes before and after a SIGKILL + reopen.
+
+version: '1.0'
+name: SONNY-6354 lean index late keys and composite MERGE backfill
+description: Late-registered MERGE keys in lean index mode with a small node cache
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: false
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_INDEX_MERGE_KEYS_ONLY: '1'
+      GEODE_NODE_CACHE_ENTRIES: '32'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: seed-late-key-nodes
+  description: '300 nodes (far more than the 32-entry node cache) carrying a key `j` written BEFORE it is a MERGE key (lean index mode: j is not in the exact index)'
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:S6354 {j: 0, t: 's0'}); CREATE (:S6354 {j: 1, t: 's1'}); CREATE (:S6354 {j: 2, t: 's2'}); CREATE (:S6354 {j: 3, t: 's3'}); CREATE (:S6354 {j: 4, t: 's4'}); CREATE (:S6354 {j: 5, t: 's5'}); CREATE (:S6354 {j: 6, t: 's6'}); CREATE (:S6354 {j: 7, t: 's7'}); CREATE (:S6354 {j: 8, t: 's8'}); CREATE (:S6354 {j: 9, t: 's9'}); CREATE (:S6354 {j: 10, t: 's10'}); CREATE (:S6354 {j: 11, t: 's11'}); CREATE (:S6354 {j: 12, t: 's12'}); CREATE (:S6354 {j: 13, t: 's13'}); CREATE (:S6354 {j: 14, t: 's14'}); CREATE (:S6354 {j: 15, t: 's15'}); CREATE (:S6354 {j: 16, t: 's16'}); CREATE (:S6354 {j: 17, t: 's17'}); CREATE (:S6354 {j: 18, t: 's18'}); CREATE (:S6354 {j: 19, t: 's19'}); CREATE (:S6354 {j: 20, t: 's20'}); CREATE (:S6354 {j: 21, t: 's21'}); CREATE (:S6354 {j: 22, t: 's22'}); CREATE (:S6354 {j: 23, t: 's23'}); CREATE (:S6354 {j: 24, t: 's24'}); CREATE (:S6354 {j: 25, t: 's25'}); CREATE (:S6354 {j: 26, t: 's26'}); CREATE (:S6354 {j: 27, t: 's27'}); CREATE (:S6354 {j: 28, t: 's28'}); CREATE (:S6354 {j: 29, t: 's29'}); CREATE (:S6354 {j: 30, t: 's30'}); CREATE (:S6354 {j: 31, t: 's31'}); CREATE (:S6354 {j: 32, t: 's32'}); CREATE (:S6354 {j: 33, t: 's33'}); CREATE (:S6354 {j: 34, t: 's34'}); CREATE (:S6354 {j: 35, t: 's35'}); CREATE (:S6354 {j: 36, t: 's36'}); CREATE (:S6354 {j: 37, t: 's37'}); CREATE (:S6354 {j: 38, t: 's38'}); CREATE (:S6354 {j: 39, t: 's39'}); CREATE (:S6354 {j: 40, t: 's40'}); CREATE (:S6354 {j: 41, t: 's41'}); CREATE (:S6354 {j: 42, t: 's42'}); CREATE (:S6354 {j: 43, t: 's43'}); CREATE (:S6354 {j: 44, t: 's44'}); CREATE (:S6354 {j: 45, t: 's45'}); CREATE (:S6354 {j: 46, t: 's46'}); CREATE (:S6354 {j: 47, t: 's47'}); CREATE (:S6354 {j: 48, t: 's48'}); CREATE (:S6354 {j: 49, t: 's49'}); CREATE (:S6354 {j: 50, t: 's50'}); CREATE (:S6354 {j: 51, t: 's51'}); CREATE (:S6354 {j: 52, t: 's52'}); CREATE (:S6354 {j: 53, t: 's53'}); CREATE (:S6354 {j: 54, t: 's54'}); CREATE (:S6354 {j: 55, t: 's55'}); CREATE (:S6354 {j: 56, t: 's56'}); CREATE (:S6354 {j: 57, t: 's57'}); CREATE (:S6354 {j: 58, t: 's58'}); CREATE (:S6354 {j: 59, t: 's59'}); CREATE (:S6354 {j: 60, t: 's60'}); CREATE (:S6354 {j: 61, t: 's61'}); CREATE (:S6354 {j: 62, t: 's62'}); CREATE (:S6354 {j: 63, t: 's63'}); CREATE (:S6354 {j: 64, t: 's64'}); CREATE (:S6354 {j: 65, t: 's65'}); CREATE (:S6354 {j: 66, t: 's66'}); CREATE (:S6354 {j: 67, t: 's67'}); CREATE (:S6354 {j: 68, t: 's68'}); CREATE (:S6354 {j: 69, t: 's69'}); CREATE (:S6354 {j: 70, t: 's70'}); CREATE (:S6354 {j: 71, t: 's71'}); CREATE (:S6354 {j: 72, t: 's72'}); CREATE (:S6354 {j: 73, t: 's73'}); CREATE (:S6354 {j: 74, t: 's74'}); CREATE (:S6354 {j: 75, t: 's75'}); CREATE (:S6354 {j: 76, t: 's76'}); CREATE (:S6354 {j: 77, t: 's77'}); CREATE (:S6354 {j: 78, t: 's78'}); CREATE (:S6354 {j: 79, t: 's79'}); CREATE (:S6354 {j: 80, t: 's80'}); CREATE (:S6354 {j: 81, t: 's81'}); CREATE (:S6354 {j: 82, t: 's82'}); CREATE (:S6354 {j: 83, t: 's83'}); CREATE (:S6354 {j: 84, t: 's84'}); CREATE (:S6354 {j: 85, t: 's85'}); CREATE (:S6354 {j: 86, t: 's86'}); CREATE (:S6354 {j: 87, t: 's87'}); CREATE (:S6354 {j: 88, t: 's88'}); CREATE (:S6354 {j: 89, t: 's89'}); CREATE (:S6354 {j: 90, t: 's90'}); CREATE (:S6354 {j: 91, t: 's91'}); CREATE (:S6354 {j: 92, t: 's92'}); CREATE (:S6354 {j: 93, t: 's93'}); CREATE (:S6354 {j: 94, t: 's94'}); CREATE (:S6354 {j: 95, t: 's95'}); CREATE (:S6354 {j: 96, t: 's96'}); CREATE (:S6354 {j: 97, t: 's97'}); CREATE (:S6354 {j: 98, t: 's98'}); CREATE (:S6354 {j: 99, t: 's99'}); CREATE (:S6354 {j: 100, t: 's100'}); CREATE (:S6354 {j: 101, t: 's101'}); CREATE (:S6354 {j: 102, t: 's102'}); CREATE (:S6354 {j: 103, t: 's103'}); CREATE (:S6354 {j: 104, t: 's104'}); CREATE (:S6354 {j: 105, t: 's105'}); CREATE (:S6354 {j: 106, t: 's106'}); CREATE (:S6354 {j: 107, t: 's107'}); CREATE (:S6354 {j: 108, t: 's108'}); CREATE (:S6354 {j: 109, t: 's109'}); CREATE (:S6354 {j: 110, t: 's110'}); CREATE (:S6354 {j: 111, t: 's111'}); CREATE (:S6354 {j: 112, t: 's112'}); CREATE (:S6354 {j: 113, t: 's113'}); CREATE (:S6354 {j: 114, t: 's114'}); CREATE (:S6354 {j: 115, t: 's115'}); CREATE (:S6354 {j: 116, t: 's116'}); CREATE (:S6354 {j: 117, t: 's117'}); CREATE (:S6354 {j: 118, t: 's118'}); CREATE (:S6354 {j: 119, t: 's119'}); CREATE (:S6354 {j: 120, t: 's120'}); CREATE (:S6354 {j: 121, t: 's121'}); CREATE (:S6354 {j: 122, t: 's122'}); CREATE (:S6354 {j: 123, t: 's123'}); CREATE (:S6354 {j: 124, t: 's124'}); CREATE (:S6354 {j: 125, t: 's125'}); CREATE (:S6354 {j: 126, t: 's126'}); CREATE (:S6354 {j: 127, t: 's127'}); CREATE (:S6354 {j: 128, t: 's128'}); CREATE (:S6354 {j: 129, t: 's129'}); CREATE (:S6354 {j: 130, t: 's130'}); CREATE (:S6354 {j: 131, t: 's131'}); CREATE (:S6354 {j: 132, t: 's132'}); CREATE (:S6354 {j: 133, t: 's133'}); CREATE (:S6354 {j: 134, t: 's134'}); CREATE (:S6354 {j: 135, t: 's135'}); CREATE (:S6354 {j: 136, t: 's136'}); CREATE (:S6354 {j: 137, t: 's137'}); CREATE (:S6354 {j: 138, t: 's138'}); CREATE (:S6354 {j: 139, t: 's139'}); CREATE (:S6354 {j: 140, t: 's140'}); CREATE (:S6354 {j: 141, t: 's141'}); CREATE (:S6354 {j: 142, t: 's142'}); CREATE (:S6354 {j: 143, t: 's143'}); CREATE (:S6354 {j: 144, t: 's144'}); CREATE (:S6354 {j: 145, t: 's145'}); CREATE (:S6354 {j: 146, t: 's146'}); CREATE (:S6354 {j: 147, t: 's147'}); CREATE (:S6354 {j: 148, t: 's148'}); CREATE (:S6354 {j: 149, t: 's149'}); CREATE (:S6354 {j: 150, t: 's150'}); CREATE (:S6354 {j: 151, t: 's151'}); CREATE (:S6354 {j: 152, t: 's152'}); CREATE (:S6354 {j: 153, t: 's153'}); CREATE (:S6354 {j: 154, t: 's154'}); CREATE (:S6354 {j: 155, t: 's155'}); CREATE (:S6354 {j: 156, t: 's156'}); CREATE (:S6354 {j: 157, t: 's157'}); CREATE (:S6354 {j: 158, t: 's158'}); CREATE (:S6354 {j: 159, t: 's159'}); CREATE (:S6354 {j: 160, t: 's160'}); CREATE (:S6354 {j: 161, t: 's161'}); CREATE (:S6354 {j: 162, t: 's162'}); CREATE (:S6354 {j: 163, t: 's163'}); CREATE (:S6354 {j: 164, t: 's164'}); CREATE (:S6354 {j: 165, t: 's165'}); CREATE (:S6354 {j: 166, t: 's166'}); CREATE (:S6354 {j: 167, t: 's167'}); CREATE (:S6354 {j: 168, t: 's168'}); CREATE (:S6354 {j: 169, t: 's169'}); CREATE (:S6354 {j: 170, t: 's170'}); CREATE (:S6354 {j: 171, t: 's171'}); CREATE (:S6354 {j: 172, t: 's172'}); CREATE (:S6354 {j: 173, t: 's173'}); CREATE (:S6354 {j: 174, t: 's174'}); CREATE (:S6354 {j: 175, t: 's175'}); CREATE (:S6354 {j: 176, t: 's176'}); CREATE (:S6354 {j: 177, t: 's177'}); CREATE (:S6354 {j: 178, t: 's178'}); CREATE (:S6354 {j: 179, t: 's179'}); CREATE (:S6354 {j: 180, t: 's180'}); CREATE (:S6354 {j: 181, t: 's181'}); CREATE (:S6354 {j: 182, t: 's182'}); CREATE (:S6354 {j: 183, t: 's183'}); CREATE (:S6354 {j: 184, t: 's184'}); CREATE (:S6354 {j: 185, t: 's185'}); CREATE (:S6354 {j: 186, t: 's186'}); CREATE (:S6354 {j: 187, t: 's187'}); CREATE (:S6354 {j: 188, t: 's188'}); CREATE (:S6354 {j: 189, t: 's189'}); CREATE (:S6354 {j: 190, t: 's190'}); CREATE (:S6354 {j: 191, t: 's191'}); CREATE (:S6354 {j: 192, t: 's192'}); CREATE (:S6354 {j: 193, t: 's193'}); CREATE (:S6354 {j: 194, t: 's194'}); CREATE (:S6354 {j: 195, t: 's195'}); CREATE (:S6354 {j: 196, t: 's196'}); CREATE (:S6354 {j: 197, t: 's197'}); CREATE (:S6354 {j: 198, t: 's198'}); CREATE (:S6354 {j: 199, t: 's199'}); CREATE (:S6354 {j: 200, t: 's200'}); CREATE (:S6354 {j: 201, t: 's201'}); CREATE (:S6354 {j: 202, t: 's202'}); CREATE (:S6354 {j: 203, t: 's203'}); CREATE (:S6354 {j: 204, t: 's204'}); CREATE (:S6354 {j: 205, t: 's205'}); CREATE (:S6354 {j: 206, t: 's206'}); CREATE (:S6354 {j: 207, t: 's207'}); CREATE (:S6354 {j: 208, t: 's208'}); CREATE (:S6354 {j: 209, t: 's209'}); CREATE (:S6354 {j: 210, t: 's210'}); CREATE (:S6354 {j: 211, t: 's211'}); CREATE (:S6354 {j: 212, t: 's212'}); CREATE (:S6354 {j: 213, t: 's213'}); CREATE (:S6354 {j: 214, t: 's214'}); CREATE (:S6354 {j: 215, t: 's215'}); CREATE (:S6354 {j: 216, t: 's216'}); CREATE (:S6354 {j: 217, t: 's217'}); CREATE (:S6354 {j: 218, t: 's218'}); CREATE (:S6354 {j: 219, t: 's219'}); CREATE (:S6354 {j: 220, t: 's220'}); CREATE (:S6354 {j: 221, t: 's221'}); CREATE (:S6354 {j: 222, t: 's222'}); CREATE (:S6354 {j: 223, t: 's223'}); CREATE (:S6354 {j: 224, t: 's224'}); CREATE (:S6354 {j: 225, t: 's225'}); CREATE (:S6354 {j: 226, t: 's226'}); CREATE (:S6354 {j: 227, t: 's227'}); CREATE (:S6354 {j: 228, t: 's228'}); CREATE (:S6354 {j: 229, t: 's229'}); CREATE (:S6354 {j: 230, t: 's230'}); CREATE (:S6354 {j: 231, t: 's231'}); CREATE (:S6354 {j: 232, t: 's232'}); CREATE (:S6354 {j: 233, t: 's233'}); CREATE (:S6354 {j: 234, t: 's234'}); CREATE (:S6354 {j: 235, t: 's235'}); CREATE (:S6354 {j: 236, t: 's236'}); CREATE (:S6354 {j: 237, t: 's237'}); CREATE (:S6354 {j: 238, t: 's238'}); CREATE (:S6354 {j: 239, t: 's239'}); CREATE (:S6354 {j: 240, t: 's240'}); CREATE (:S6354 {j: 241, t: 's241'}); CREATE (:S6354 {j: 242, t: 's242'}); CREATE (:S6354 {j: 243, t: 's243'}); CREATE (:S6354 {j: 244, t: 's244'}); CREATE (:S6354 {j: 245, t: 's245'}); CREATE (:S6354 {j: 246, t: 's246'}); CREATE (:S6354 {j: 247, t: 's247'}); CREATE (:S6354 {j: 248, t: 's248'}); CREATE (:S6354 {j: 249, t: 's249'}); CREATE (:S6354 {j: 250, t: 's250'}); CREATE (:S6354 {j: 251, t: 's251'}); CREATE (:S6354 {j: 252, t: 's252'}); CREATE (:S6354 {j: 253, t: 's253'}); CREATE (:S6354 {j: 254, t: 's254'}); CREATE (:S6354 {j: 255, t: 's255'}); CREATE (:S6354 {j: 256, t: 's256'}); CREATE (:S6354 {j: 257, t: 's257'}); CREATE (:S6354 {j: 258, t: 's258'}); CREATE (:S6354 {j: 259, t: 's259'}); CREATE (:S6354 {j: 260, t: 's260'}); CREATE (:S6354 {j: 261, t: 's261'}); CREATE (:S6354 {j: 262, t: 's262'}); CREATE (:S6354 {j: 263, t: 's263'}); CREATE (:S6354 {j: 264, t: 's264'}); CREATE (:S6354 {j: 265, t: 's265'}); CREATE (:S6354 {j: 266, t: 's266'}); CREATE (:S6354 {j: 267, t: 's267'}); CREATE (:S6354 {j: 268, t: 's268'}); CREATE (:S6354 {j: 269, t: 's269'}); CREATE (:S6354 {j: 270, t: 's270'}); CREATE (:S6354 {j: 271, t: 's271'}); CREATE (:S6354 {j: 272, t: 's272'}); CREATE (:S6354 {j: 273, t: 's273'}); CREATE (:S6354 {j: 274, t: 's274'}); CREATE (:S6354 {j: 275, t: 's275'}); CREATE (:S6354 {j: 276, t: 's276'}); CREATE (:S6354 {j: 277, t: 's277'}); CREATE (:S6354 {j: 278, t: 's278'}); CREATE (:S6354 {j: 279, t: 's279'}); CREATE (:S6354 {j: 280, t: 's280'}); CREATE (:S6354 {j: 281, t: 's281'}); CREATE (:S6354 {j: 282, t: 's282'}); CREATE (:S6354 {j: 283, t: 's283'}); CREATE (:S6354 {j: 284, t: 's284'}); CREATE (:S6354 {j: 285, t: 's285'}); CREATE (:S6354 {j: 286, t: 's286'}); CREATE (:S6354 {j: 287, t: 's287'}); CREATE (:S6354 {j: 288, t: 's288'}); CREATE (:S6354 {j: 289, t: 's289'}); CREATE (:S6354 {j: 290, t: 's290'}); CREATE (:S6354 {j: 291, t: 's291'}); CREATE (:S6354 {j: 292, t: 's292'}); CREATE (:S6354 {j: 293, t: 's293'}); CREATE (:S6354 {j: 294, t: 's294'}); CREATE (:S6354 {j: 295, t: 's295'}); CREATE (:S6354 {j: 296, t: 's296'}); CREATE (:S6354 {j: 297, t: 's297'}); CREATE (:S6354 {j: 298, t: 's298'}); CREATE (:S6354 {j: 299, t: 's299'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: register-key-by-merge
+  description: The first MERGE on `j` (through another label) registers it
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:Other6354 {j: -1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: where-seek-finds-old-node
+  description: WHERE seek on the late key finds a node written before the registration
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S6354) WHERE n.j = 5 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: inline-map-seek-finds-old-node
+  description: Inline-map seek finds another
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:S6354 {j: 7}) RETURN n.t AS t'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"t":"s7"}]'
+  tags:
+  - storage
+  - sonny738
+- name: seek-high-and-low
+  description: Seek on nodes far apart in the store (evicted from the cache)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S6354) WHERE n.j = 299 OR n.j = 150 RETURN n.t AS t ORDER BY t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"t":"s150"},{"t":"s299"}]'
+  tags:
+  - storage
+  - sonny738
+- name: edge-endpoints-resolve
+  description: An edge between two pre-registration nodes resolves both endpoints (a zero index posting used to be an authoritative miss)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:S6354 {j: 9}), (b:S6354 {j: 10}) CREATE (a)-[:E6354]->(b)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: edge-created
+  description: The edge exists exactly once
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (:S6354 {j: 9})-[r:E6354]->(:S6354 {j: 10}) RETURN count(r) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: composite-merge-seed
+  description: Nodes with a composite natural key written before it is registered
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:C6354 {src: 'gbif', sid: 0, t: 'c0'}); CREATE (:C6354 {src: 'gbif', sid: 1, t: 'c1'}); CREATE (:C6354 {src: 'gbif', sid: 2, t: 'c2'}); CREATE (:C6354 {src: 'gbif', sid: 3, t: 'c3'}); CREATE (:C6354 {src: 'gbif', sid: 4, t: 'c4'}); CREATE (:C6354 {src: 'gbif', sid: 5, t: 'c5'}); CREATE (:C6354 {src: 'gbif', sid: 6, t: 'c6'}); CREATE (:C6354 {src: 'gbif', sid: 7, t: 'c7'}); CREATE (:C6354 {src: 'gbif', sid: 8, t: 'c8'}); CREATE (:C6354 {src: 'gbif', sid: 9, t: 'c9'}); CREATE (:C6354 {src: 'gbif', sid: 10, t: 'c10'}); CREATE (:C6354 {src: 'gbif', sid: 11, t: 'c11'}); CREATE (:C6354 {src: 'gbif', sid: 12, t: 'c12'}); CREATE (:C6354 {src: 'gbif', sid: 13, t: 'c13'}); CREATE (:C6354 {src: 'gbif', sid: 14, t: 'c14'}); CREATE (:C6354 {src: 'gbif', sid: 15, t: 'c15'}); CREATE (:C6354 {src: 'gbif', sid: 16, t: 'c16'}); CREATE (:C6354 {src: 'gbif', sid: 17, t: 'c17'}); CREATE (:C6354 {src: 'gbif', sid: 18, t: 'c18'}); CREATE (:C6354 {src: 'gbif', sid: 19, t: 'c19'}); CREATE (:C6354 {src: 'gbif', sid: 20, t: 'c20'}); CREATE (:C6354 {src: 'gbif', sid: 21, t: 'c21'}); CREATE (:C6354 {src: 'gbif', sid: 22, t: 'c22'}); CREATE (:C6354 {src: 'gbif', sid: 23, t: 'c23'}); CREATE (:C6354 {src: 'gbif', sid: 24, t: 'c24'}); CREATE (:C6354 {src: 'gbif', sid: 25, t: 'c25'}); CREATE (:C6354 {src: 'gbif', sid: 26, t: 'c26'}); CREATE (:C6354 {src: 'gbif', sid: 27, t: 'c27'}); CREATE (:C6354 {src: 'gbif', sid: 28, t: 'c28'}); CREATE (:C6354 {src: 'gbif', sid: 29, t: 'c29'}); CREATE (:C6354 {src: 'gbif', sid: 30, t: 'c30'}); CREATE (:C6354 {src: 'gbif', sid: 31, t: 'c31'}); CREATE (:C6354 {src: 'gbif', sid: 32, t: 'c32'}); CREATE (:C6354 {src: 'gbif', sid: 33, t: 'c33'}); CREATE (:C6354 {src: 'gbif', sid: 34, t: 'c34'}); CREATE (:C6354 {src: 'gbif', sid: 35, t: 'c35'}); CREATE (:C6354 {src: 'gbif', sid: 36, t: 'c36'}); CREATE (:C6354 {src: 'gbif', sid: 37, t: 'c37'}); CREATE (:C6354 {src: 'gbif', sid: 38, t: 'c38'}); CREATE (:C6354 {src: 'gbif', sid: 39, t: 'c39'}); CREATE (:C6354 {src: 'gbif', sid: 40, t: 'c40'}); CREATE (:C6354 {src: 'gbif', sid: 41, t: 'c41'}); CREATE (:C6354 {src: 'gbif', sid: 42, t: 'c42'}); CREATE (:C6354 {src: 'gbif', sid: 43, t: 'c43'}); CREATE (:C6354 {src: 'gbif', sid: 44, t: 'c44'}); CREATE (:C6354 {src: 'gbif', sid: 45, t: 'c45'}); CREATE (:C6354 {src: 'gbif', sid: 46, t: 'c46'}); CREATE (:C6354 {src: 'gbif', sid: 47, t: 'c47'}); CREATE (:C6354 {src: 'gbif', sid: 48, t: 'c48'}); CREATE (:C6354 {src: 'gbif', sid: 49, t: 'c49'}); CREATE (:C6354 {src: 'gbif', sid: 50, t: 'c50'}); CREATE (:C6354 {src: 'gbif', sid: 51, t: 'c51'}); CREATE (:C6354 {src: 'gbif', sid: 52, t: 'c52'}); CREATE (:C6354 {src: 'gbif', sid: 53, t: 'c53'}); CREATE (:C6354 {src: 'gbif', sid: 54, t: 'c54'}); CREATE (:C6354 {src: 'gbif', sid: 55, t: 'c55'}); CREATE (:C6354 {src: 'gbif', sid: 56, t: 'c56'}); CREATE (:C6354 {src: 'gbif', sid: 57, t: 'c57'}); CREATE (:C6354 {src: 'gbif', sid: 58, t: 'c58'}); CREATE (:C6354 {src: 'gbif', sid: 59, t: 'c59'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: composite-merge-matches
+  description: A composite MERGE on (src, sid) registered at runtime resolves an old, evicted holder instead of creating a duplicate
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:C6354 {src: 'gbif', sid: 3}) RETURN n.t AS t"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"t":"c3"}]'
+  tags:
+  - storage
+  - sonny738
+- name: composite-merge-no-duplicate
+  description: Still one node for that key
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:C6354 {src: 'gbif', sid: 3}) RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: composite-merge-creates-absent
+  description: 'A value no node holds is an authoritative miss: MERGE creates it'
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:C6354 {src: 'gbif', sid: 999999}) RETURN n.sid AS sid"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"sid":999999}]'
+  tags:
+  - storage
+  - sonny738
+- name: late-write-seek
+  description: A node written after the registration is found too
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:S6354 {j: 100000, t: 'late'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: late-write-found
+  description: '...'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S6354) WHERE n.j = 100000 RETURN n.t AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"t":"late"}]'
+  tags:
+  - storage
+  - sonny738
+- name: sigkill
+  description: SIGKILL and reopen (the index is rebuilt/reloaded from what is on disk)
+  type: bash
+  command: |-
+    set -e
+    [ -n "${GEODE_DATA_DIR}" ] || { echo "GEODE_DATA_DIR unset"; exit 1; }
+    BN="$(basename "${GEODE_BINARY:-geode}")"
+    pkill -9 -f "$BN serve.*--data-dir ${GEODE_DATA_DIR} " || true
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags:
+  - storage
+  - sonny738
+  - crash
+- name: after-reopen-where-seek
+  description: After the reopen the WHERE seek still finds an old node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S6354) WHERE n.j = 11 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: after-reopen-inline-seek
+  description: '...and the inline seek'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:S6354 {j: 13}) RETURN n.t AS t'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"t":"s13"}]'
+  tags:
+  - storage
+  - sonny738
+- name: after-reopen-late-node
+  description: '...and the node written late'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S6354) WHERE n.j = 100000 RETURN n.t AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"t":"late"}]'
+  tags:
+  - storage
+  - sonny738
+- name: after-reopen-edge
+  description: '...and the edge'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (:S6354 {j: 9})-[r:E6354]->(:S6354 {j: 10}) RETURN count(r) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: after-reopen-count
+  description: No node was lost or duplicated
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S6354) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":301}]'
+  tags:
+  - storage
+  - sonny738
+- name: after-reopen-composite-merge
+  description: A composite MERGE after the reopen still matches the old holder
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:C6354 {src: 'gbif', sid: 4}) RETURN n.t AS t"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"t":"c4"}]'
+  tags:
+  - storage
+  - sonny738
+- name: after-reopen-composite-count
+  description: '61 composite-keyed nodes: 60 seeded + sid 999999'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:C6354) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":61}]'
+  tags:
+  - storage
+  - sonny738

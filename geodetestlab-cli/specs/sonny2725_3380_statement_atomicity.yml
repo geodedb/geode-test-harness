@@ -1,0 +1,450 @@
+# SONNY-2725: a MERGE statement that fails part-way left what it had already written in the
+# in-memory store (no statement atomicity).
+# SONNY-3380: a duplicate SET through MERGE-aliased variables was refused only AFTER the
+# create (non-atomic).
+#
+# This spec drives a real server: the error is raised at several points of multi-clause MERGE
+# statements (a later MERGE's key, ON CREATE SET, a relationship MERGE, the RETURN, a FOR
+# iteration, one row of MATCH ... MERGE, ON MATCH SET on an existing node) and, after each, a
+# separate query proves nothing the statement wrote is visible. The aliased-SET refusal (22G0M)
+# leaves nothing created, including inside an explicit transaction.
+
+version: '1.0'
+name: SONNY-2725 / SONNY-3380 failed MERGE statements leave nothing
+description: Statement atomicity of MERGE failures and aliased duplicate SET refusals
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: merge-later-key-fails
+  description: "Second MERGE's key divides by zero: the first MERGE's node is undone"
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:MA {k: 1}) MERGE (b:MB {k: 1 / 0})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-later-key-fails-left-nothing
+  description: Nothing the failed statement wrote is visible
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:MA) RETURN count(a) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-third-clause-fails
+  description: 'Three MERGEs, the last fails: both earlier creates are undone'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:MA2 {k: 1}) MERGE (b:MB2 {k: 2}) MERGE (c:MC2 {k: 1 / 0})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-third-clause-fails-left-nothing
+  description: Nothing the failed statement wrote is visible
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) WHERE n:MA2 OR n:MB2 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-on-create-set-fails
+  description: ON CREATE SET fails after the create
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:MD {k: 1}) ON CREATE SET a.w = 1 / 0'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-on-create-set-fails-left-nothing
+  description: Nothing the failed statement wrote is visible
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:MD) RETURN count(a) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-relationship-fails
+  description: A relationship MERGE fails after the node MERGE
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:ME {k: 1}) MERGE (a)-[:R2725]->(b:MF {k: 1 / 0})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-relationship-fails-left-nothing
+  description: Nothing the failed statement wrote is visible
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) WHERE n:ME OR n:MF RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-for-last-iteration-fails
+  description: 'FOR ... MERGE: the third iteration fails, the first two creates are undone'
+  args:
+  - query
+  - '-'
+  stdin: 'FOR i IN [1, 2, 0] MERGE (:MC {k: 10 / i})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-for-last-iteration-fails-left-nothing
+  description: Nothing the failed statement wrote is visible
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:MC) RETURN count(a) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: seed-match-merge
+  description: Three MS nodes for the MATCH ... MERGE case
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:MS {i: 0}), (:MS {i: 1}), (:MS {i: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: match-merge-one-row-fails
+  description: "MATCH ... MERGE where the last row fails: the other rows' creates are undone"
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (s:MS) MERGE (m:MT {k: 10 / (2 - s.i)})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: match-merge-one-row-fails-left-nothing
+  description: Nothing the failed statement wrote is visible
+  args:
+  - query
+  - '-'
+  stdin: MATCH (m:MT) RETURN count(m) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: seed-on-match
+  description: A node for ON MATCH SET
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:MI {k: 1, v: 0})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-on-match-set-then-return-fails
+  description: 'ON MATCH SET then the RETURN fails: the property is back to 0'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:MI {k: 1}) ON MATCH SET a.v = 1 RETURN 10 / (a.k - 1) AS x'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-on-match-set-then-return-fails-left-nothing
+  description: Nothing the failed statement wrote is visible
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:MI) RETURN a.v AS v
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"v":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-without-error-applies-once
+  description: Without the error the same statement applies once
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:MA {k: 1}) MERGE (b:MB {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-without-error-matches-again
+  description: '...and matches on the second run'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:MA {k: 1}) MERGE (b:MB {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-applied-once-count
+  description: One node each
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:MA), (b:MB) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: alias-set-created-node
+  description: 'MERGE-aliased variables assign one property twice (created node): refused 22G0M'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:SA {k: 1}) MERGE (b:SA {k: 1}) SET a.x = 1, b.x = 2'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0M"'
+  tags:
+  - storage
+  - sonny738
+- name: alias-set-created-node-nothing
+  description: 'Nothing was created before the refusal (SONNY-3380: it used to refuse after the create)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SA) RETURN count(a) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: seed-existing
+  description: An existing SB node
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:SB {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: alias-set-existing-node
+  description: 'Same aliasing over an existing node: refused'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:SB {k: 1}) MERGE (b:SB {k: 1}) SET a.x = 1, b.x = 2'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0M"'
+  tags:
+  - storage
+  - sonny738
+- name: alias-set-existing-node-unchanged
+  description: The existing node has no x
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SB) RETURN count(a) AS c, count(a.x) AS withx
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1,"withx":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: alias-set-runtime-created
+  description: 'Aliasing only visible at runtime (k: 1 + 0): refused, nothing created'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:SC {k: 1 + 0}) MERGE (b:SC {k: 1}) SET a.x = 1, b.x = 2'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0M"'
+  tags:
+  - storage
+  - sonny738
+- name: alias-set-runtime-created-nothing
+  description: No SC node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SC) RETURN count(a) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: alias-set-same-value-twice
+  description: 'Even the same value twice is one property assigned twice: refused'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:SE {k: 1}) MERGE (b:SE {k: 1}) SET a.x = 1, b.x = 1'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0M"'
+  tags:
+  - storage
+  - sonny738
+- name: alias-set-same-value-twice-nothing
+  description: No SE node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SE) RETURN count(a) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: distinct-targets-allowed
+  description: Two distinct merged nodes take their own SET
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:SD {k: 1}) MERGE (b:SD {k: 2}) SET a.x = 1, b.x = 2'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: distinct-targets-applied
+  description: Each node carries its value
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:SD) RETURN a.k AS k, a.x AS x ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1,"x":1},{"k":2,"x":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: txn-alias-refusal-aborts-transaction-and-rolls-back
+  description: Inside an explicit transaction a refused aliased SET writes nothing and the rolled-back transaction leaves only what existed
+  args:
+  - query
+  - '-'
+  stdin: 'BEGIN; CREATE (:ST {k: 0}); MERGE (a:ST {k: 1}) MERGE (b:ST {k: 1}) SET a.x = 1, b.x = 2; ROLLBACK'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0M"'
+  tags:
+  - storage
+  - sonny738
+- name: txn-alias-nothing-left
+  description: No ST node survived (neither the CREATE before nor the MERGE)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:ST) RETURN count(a) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738

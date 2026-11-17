@@ -1,0 +1,243 @@
+version: '1.0'
+name: 'SONNY-3351/6434: large QUIC requests, responses and remote backups complete (quic loss recovery / ack processing)'
+description: |
+  Tickets: SONNY-3351 (quic v0.1.44 loss recovery dropped lost-but-unretransmitted
+  STREAM data and left a permanent hole in the stream: a ~1 MiB request or response
+  was never delivered, loss- and timing-dependent) and SONNY-6434 (quic: ack
+  processing did a linear scan per retransmit entry, so the server's network thread
+  fell to ~80 packets/s and a remote `geode backup create --server` of a store above
+  ~11-14 MB never completed; the acceptor watchdog could even restart the server
+  mid-transfer). Both are fixed in the quic library (v0.1.47 / v0.1.49, pinned by
+  geode); the library has its own lossy-transfer test, so this spec pins the
+  USER-VISIBLE contract through real `geode serve` over loopback QUIC:
+
+    * statements of 256 KiB, 1 MiB and 4 MiB (and a 4 MiB result going back out)
+      are delivered intact and answered promptly, each over a connection of its own
+      and with the server serving a small request afterwards (3351);
+    * a remote backup of a store holding ~24 MB of distinct (incompressible)
+      property data completes inside its --timeout, the file on disk is exactly
+      the size the CLI announces, the server is still the same process afterwards
+      (no watchdog restart mid-transfer), and the backup restores into a directory
+      that a new server serves with the exact payload bytes (6434).
+
+  Not covered (and why): the library's per-ACK algorithmic cost and the exact loss
+  pattern are only observable in-process (quic's own lossy transfer tests and
+  geode's zig build test-sonny6430-remote-backup-large / test-quic-condition-cadence).
+
+  Run with GEODE_ADMIN_PASSWORD set to a policy-compliant passphrase, e.g.
+    GEODE_ADMIN_PASSWORD='Orbit Lantern Meadow Quartz 2026 Delta!'
+
+  CANARY: REQ=REQ-QUIC-LARGE-TRANSFER-001; FEATURE="QuicTransport"; ASPECT=LargeTransfersComplete; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny3351_quic_large_transfers.yml; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true  # scratch servers + on-disk backup files; not meaningful to promote to multi-node
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+
+tests:
+- name: large-statements-are-delivered-and-answered
+  description: |
+    256 KiB, 1 MiB and 4 MiB string literals: sent as statements, answered with the same bytes (so a 4 MiB response also crosses the wire intact).
+  type: bash
+  timeout_ms: 600000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX)
+    start_server "$W/data" "$W/s.log" || exit 1
+    SPID0=$SPID
+    payload() { python3 -I -c '
+    import hashlib, sys
+    n = int(sys.argv[1]); seed = sys.argv[2]
+    out = []; i = 0; have = 0
+    while have < n:
+        h = hashlib.sha256(f"{seed}:{i}".encode()).hexdigest(); out.append(h); have += len(h); i += 1
+    sys.stdout.write("".join(out)[:n])' "$1" "$2"; }
+    for n in 262144 1048576 4194304; do
+      P=$(payload "$n" "s$n")
+      printf "RETURN '%s' AS s;" "$P" > "$W/q$n.gql"
+      START=$(date +%s.%N)
+      timeout 150 "$BIN" query -f "$W/q$n.gql" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" --timeout 120 --format json > "$W/out$n.json" 2> "$W/err$n.txt"; RC=$?
+      END=$(date +%s.%N)
+      [ "$RC" = 0 ] || { tail -5 "$W/err$n.txt"; fail "$n bytes: rc=$RC"; }
+      python3 -I - "$W/out$n.json" "$n" "s$n" <<'PYEOF' || fail "$n bytes: answer differs from what was sent"
+    import hashlib, json, sys
+    path, n, seed = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    out = []; i = 0; have = 0
+    while have < n:
+        h = hashlib.sha256(f"{seed}:{i}".encode()).hexdigest(); out.append(h); have += len(h); i += 1
+    want = "".join(out)[:n]
+    doc = json.load(open(path))
+    got = doc["rows"][0]["s"]
+    sys.exit(0 if got == want else 1)
+    PYEOF
+      SMALL=$(cnt "RETURN 1 AS c"); [ "$SMALL" = 1 ] || fail "$n bytes: server did not serve a small request afterwards"
+      kill -0 "$SPID0" 2>/dev/null || fail "$n bytes: server process died"
+      echo "LARGE_${n}_ANSWERED_INTACT in $(python3 -I -c "print(round($END-$START,1))")s"
+    done
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - LARGE_262144_ANSWERED_INTACT
+    - LARGE_1048576_ANSWERED_INTACT
+    - LARGE_4194304_ANSWERED_INTACT
+  tags: [quic, transport, sonny-3351, large-message]
+
+- name: remote-backup-of-a-large-store-completes-and-restores
+  description: |
+    ~24 MB of distinct property data (24 x 1,000,000-byte strings, just under the 1 MiB single-property cap): `backup create --server` completes within --timeout, the file is the announced size, the same server process is alive, and the restored directory serves the exact bytes.
+  type: bash
+  timeout_ms: 1200000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX); mkdir -p "$W/cwd"
+    start_server "$W/src" "$W/src.log" || exit 1
+    SPID0=$SPID
+    gen() { python3 -I -c '
+    import hashlib, sys
+    n = int(sys.argv[1]); seed = sys.argv[2]
+    out = []; i = 0; have = 0
+    while have < n:
+        h = hashlib.sha256(f"{seed}:{i}".encode()).hexdigest(); out.append(h); have += len(h); i += 1
+    sys.stdout.write("".join(out)[:n])' "$1" "$2"; }
+    for i in $(seq 1 24); do
+      printf "INSERT (:Blob {id: %s, payload: '%s'});" "$i" "$(gen 1000000 "blob$i")" > "$W/ins.gql"
+      OUT=$(timeout 150 "$BIN" query -f "$W/ins.gql" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" --timeout 120 2>&1); RC=$?
+      [ "$RC" = 0 ] || { echo "$OUT" | tail -3; fail "insert blob $i rc=$RC"; }
+    done
+    [ "$(cnt "MATCH (b:Blob) RETURN count(b) AS c")" = 24 ] || fail "seed count"
+    START=$(date +%s)
+    OUT=$(bk --output "$W/big.backup" --timeout 300); RC=$?
+    END=$(date +%s)
+    [ "$RC" = 0 ] || { echo "$OUT" | tail -8; fail "remote backup rc=$RC after $((END-START))s"; }
+    echo "$OUT" | grep -q "Backup created successfully" || { echo "$OUT" | tail -5; fail "no success line"; }
+    ANNOUNCED=$(echo "$OUT" | sed -n 's/.*Backup completed: .* (\([0-9]*\) bytes).*/\1/p' | head -1)
+    ACTUAL=$(stat -c%s "$W/big.backup")
+    [ -n "$ANNOUNCED" ] && [ "$ANNOUNCED" = "$ACTUAL" ] || fail "announced size '$ANNOUNCED' != file size '$ACTUAL'"
+    [ "$ACTUAL" -gt 20000000 ] || fail "backup is only $ACTUAL bytes; expected > 20 MB (the old stall was above ~11-14 MB)"
+    kill -0 "$SPID0" 2>/dev/null || fail "server process died (watchdog restart?)"
+    [ "$(cnt "RETURN 1 AS c")" = 1 ] || fail "server stopped answering after the backup"
+    stop_server
+    OUT=$(cd "$W/cwd" && "$BIN" restore "$W/big.backup" --data-dir "$W/restored" --hmac-key-file "$W/src/.geode_hmac_key" --yes 2>&1); RC=$?
+    [ "$RC" = 0 ] || { echo "$OUT" | tail -8; fail "restore rc=$RC"; }
+    echo "$OUT" | grep -q "graph 'default': 24 nodes" || { echo "$OUT" | tail -8; fail "restore did not report 24 nodes"; }
+    start_server "$W/restored" "$W/r.log" || fail "server on restored dir"
+    [ "$(cnt "MATCH (b:Blob) RETURN count(b) AS c")" = 24 ] || fail "restored Blob count"
+    timeout 100 "$BIN" query "MATCH (b:Blob {id: 7}) RETURN b.payload AS s" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" --format json 2>/dev/null > "$W/blob7.json" || fail "read blob 7"
+    python3 -I - "$W/blob7.json" <<'PYEOF' || fail "restored payload bytes differ"
+    import hashlib, json, sys
+    n, seed = 1000000, "blob7"
+    out = []; i = 0; have = 0
+    while have < n:
+        h = hashlib.sha256(f"{seed}:{i}".encode()).hexdigest(); out.append(h); have += len(h); i += 1
+    want = "".join(out)[:n]
+    sys.exit(0 if json.load(open(sys.argv[1]))["rows"][0]["s"] == want else 1)
+    PYEOF
+    stop_server
+    echo "REMOTE_BACKUP_OF_${ACTUAL}_BYTES_COMPLETED_AND_RESTORED in $((END-START))s"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - REMOTE_BACKUP_OF_
+  tags: [quic, transport, backup, sonny-6434, sonny-6430, large-message]

@@ -1,0 +1,298 @@
+# SONNY-3059 (DATA INTEGRITY): ROLLBACK (and a failed-statement rollback) undid only created
+# nodes/edges; SET, REMOVE, DELETE, label changes and MERGE ON MATCH changes survived.
+#
+# This spec drives a real server through the CLI. One explicit transaction mixes SET, REMOVE,
+# DETACH DELETE, a label add, a CREATE and a relationship-property SET; after ROLLBACK a
+# separate query must show the original graph. Failed statements (a later row or the RETURN
+# fails) must leave no partial SET/DELETE/label/REMOVE. A rolled-back transaction must also
+# stay rolled back across a SIGKILL + restart (the committed state is the only one recovered).
+
+version: '1.0'
+name: SONNY-3059 ROLLBACK and failed statements undo SET/REMOVE/DELETE/labels/MERGE
+description: Full undo on ROLLBACK and failed statements, including across a crash
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: false
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: seed
+  description: Three RB nodes (with properties) and an edge
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:RB {k: 1, v: 'orig', t: 'x'}), (:RB {k: 2, v: 'two'}), (:RB {k: 3, v: 'three'}); CREATE (:RB {k: 4})-[:RE {w: 1}]->(:RC {k: 5})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-set-remove-delete-label-create-edgeprop
+  description: One explicit transaction does SET, REMOVE, DETACH DELETE, a label add, a CREATE and a relationship SET, then ROLLBACK
+  args:
+  - query
+  - '-'
+  stdin: "BEGIN; MATCH (n:RB {k: 1}) SET n.v = 'changed'; MATCH (n:RB {k: 1}) REMOVE n.t; MATCH (n:RB {k: 2}) DETACH DELETE n; MATCH (n:RB {k: 3}) SET n:Extra; CREATE (:RB {k: 9}); MATCH (:RB)-[r:RE]->() SET r.w = 99; ROLLBACK"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: after-rollback-nodes
+  description: 'Everything is back: v, t, the deleted node, no label Extra, no k=9 node'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:RB) RETURN n.k AS k, n.v AS v, n.t AS t, labels(n) AS l ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1,"v":"orig","t":"x","l":["RB"]},{"k":2,"v":"two","t":null,"l":["RB"]},{"k":3,"v":"three","t":null,"l":["RB"]},{"k":4,"v":null,"t":null,"l":["RB"]}]'
+  tags:
+  - storage
+  - sonny738
+- name: after-rollback-relationship
+  description: The relationship property is back to 1 and the edge of the deleted-node scenario is intact
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[r:RE]->() RETURN r.w AS w
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"w":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-merge-on-match-remove-delete
+  description: MERGE ON MATCH SET, REMOVE of a property and DETACH DELETE of an edge's endpoint, then ROLLBACK
+  args:
+  - query
+  - '-'
+  stdin: "BEGIN; MERGE (a:RB {k: 1}) ON MATCH SET a.v = 'merged'; MATCH (n:RB {k: 3}) REMOVE n.v; MATCH (n:RB {k: 4}) DETACH DELETE n; ROLLBACK"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: after-rollback-2-nodes
+  description: Properties and the node k=4 are intact
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:RB) RETURN n.k AS k, n.v AS v ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1,"v":"orig"},{"k":2,"v":"two"},{"k":3,"v":"three"},{"k":4,"v":null}]'
+  tags:
+  - storage
+  - sonny738
+- name: after-rollback-2-edge
+  description: The DETACH DELETEd node's edge is back
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:RB)-[r:RE]->(:RC) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-statement-set
+  description: A SET that fails on a later row (division by zero at k = 3) leaves no row changed
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:RB) SET n.z = 1 / (n.k - 3)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-statement-set-none
+  description: No z anywhere
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:RB) WHERE n.z IS NOT NULL RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-statement-delete
+  description: A DELETE whose RETURN fails deletes nothing
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:RB) DELETE n RETURN 1 / 0 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-statement-delete-none
+  description: All four RB nodes remain
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:RB) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":4}]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-statement-label
+  description: A label add followed by a failing RETURN leaves no label
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:RB {k: 2}) SET n:Tagged RETURN 1 / 0 AS x'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-statement-label-none
+  description: No Tagged label
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Tagged) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-statement-remove
+  description: A REMOVE followed by a failing RETURN keeps the property
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:RB {k: 1}) REMOVE n.v RETURN 1 / 0 AS x'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-statement-remove-none
+  description: v is still orig
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:RB {k: 1}) RETURN n.v AS v'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"v":"orig"}]'
+  tags:
+  - storage
+  - sonny738
+- name: committed-transaction-persists
+  description: 'Control: a COMMITted transaction keeps its changes'
+  args:
+  - query
+  - '-'
+  stdin: "BEGIN; MATCH (n:RB {k: 1}) SET n.v = 'committed'; COMMIT"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: committed-value-visible
+  description: The committed value is visible
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:RB {k: 1}) RETURN n.v AS v'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"v":"committed"}]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-then-crash
+  description: An uncommitted-then-rolled-back transaction followed by a SIGKILL must not resurface after recovery
+  args:
+  - query
+  - '-'
+  stdin: "BEGIN; MATCH (n:RB {k: 1}) SET n.v = 'ghost'; MATCH (n:RB {k: 3}) DETACH DELETE n; CREATE (:RB {k: 77}); ROLLBACK"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: sigkill
+  description: SIGKILL the server (no checkpoint) and restart on the same data dir
+  type: bash
+  command: |-
+    set -e
+    [ -n "${GEODE_DATA_DIR}" ] || { echo "GEODE_DATA_DIR unset"; exit 1; }
+    BN="$(basename "${GEODE_BINARY:-geode}")"
+    pkill -9 -f "$BN serve.*--data-dir ${GEODE_DATA_DIR} " || true
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags:
+  - storage
+  - sonny738
+  - crash
+- name: after-crash-state
+  description: 'Recovery shows the committed state only: v = committed, k=3 present, no k=77'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:RB) RETURN n.k AS k, n.v AS v ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1,"v":"committed"},{"k":2,"v":"two"},{"k":3,"v":"three"},{"k":4,"v":null}]'
+  tags:
+  - storage
+  - sonny738

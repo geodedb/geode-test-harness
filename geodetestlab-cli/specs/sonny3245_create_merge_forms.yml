@@ -1,0 +1,501 @@
+# SONNY-3245: invalid CREATE forms were accepted (relabelling/adding properties to a bound
+# variable, undirected relationships, multi-type relationships, redeclared variables) and the
+# null/list MERGE semantics were wrong (null key, list-valued key; a null property stored).
+# ISO/IEC 39075:2024 16.5.
+#
+# This spec drives a real server: every invalid form is refused with 42000 and writes nothing;
+# valid neighbours (bare reuse, left-pointing edges, multi-hop chains created once per node,
+# INSERT) still work; null properties are absent; MERGE on a null key is 22004; a list-valued
+# MERGE key matches by value.
+
+version: '1.0'
+name: SONNY-3245 invalid CREATE forms refused; null/list MERGE semantics
+description: CREATE/INSERT pattern validation and MERGE null/list keys
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: seed
+  description: A node for the MATCH ... CREATE forms
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:A3245 {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: relabel-bound-refused
+  description: 'Invalid CREATE/INSERT form refused with 42000 (ISO 16.5): MATCH (n:A3245) CREATE (n:Extra3245)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:A3245) CREATE (n:Extra3245)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: property-on-bound-refused
+  description: 'Invalid CREATE/INSERT form refused with 42000 (ISO 16.5): MATCH (n:A3245) CREATE (n {extra: 1})'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:A3245) CREATE (n {extra: 1})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: relabel-bound-in-path-refused
+  description: 'Invalid CREATE/INSERT form refused with 42000 (ISO 16.5): MATCH (n:A3245) CREATE (n:Extra3245)-[:T3245]->(:Z3245)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:A3245) CREATE (n:Extra3245)-[:T3245]->(:Z3245)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: undirected-create-refused
+  description: 'Invalid CREATE/INSERT form refused with 42000 (ISO 16.5): CREATE (a:U3245)-[:T3245]-(b:V3245)'
+  args:
+  - query
+  - '-'
+  stdin: CREATE (a:U3245)-[:T3245]-(b:V3245)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: undirected-insert-refused
+  description: 'Invalid CREATE/INSERT form refused with 42000 (ISO 16.5): INSERT (a:U3245)-[:T3245]-(b:V3245)'
+  args:
+  - query
+  - '-'
+  stdin: INSERT (a:U3245)-[:T3245]-(b:V3245)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: multi-type-refused
+  description: 'Invalid CREATE/INSERT form refused with 42000 (ISO 16.5): CREATE (a:X3245)-[:T3245|U3245]->(b:Y3245)'
+  args:
+  - query
+  - '-'
+  stdin: CREATE (a:X3245)-[:T3245|U3245]->(b:Y3245)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: redeclared-variable-refused
+  description: 'Invalid CREATE/INSERT form refused with 42000 (ISO 16.5): CREATE (a:R3245), (a:R3245)'
+  args:
+  - query
+  - '-'
+  stdin: CREATE (a:R3245), (a:R3245)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: redeclared-with-property-refused
+  description: 'Invalid CREATE/INSERT form refused with 42000 (ISO 16.5): CREATE (a:R3245)-[:T3245]->(b:Q3245), (a {k: 2})'
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:R3245)-[:T3245]->(b:Q3245), (a {k: 2})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: nothing-written
+  description: None of the refused forms wrote anything
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) WHERE n:Extra3245 OR n:Z3245 OR n:U3245 OR n:V3245 OR n:X3245 OR n:Y3245 OR n:R3245 OR n:Q3245 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: bare-reuse-ok
+  description: A bare reuse of a declared variable is allowed
+  args:
+  - query
+  - '-'
+  stdin: CREATE (a:R2_3245), (a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: bare-reuse-one-node
+  description: It created one node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:R2_3245) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: match-create-bound-ok
+  description: MATCH ... CREATE (n)-[:T]->(:Z) with a bare bound variable is allowed
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:A3245) CREATE (n)-[:T3245]->(:Z3245)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: match-create-bound-created
+  description: One Z3245 node hangs off the bound node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:A3245)-[:T3245]->(z:Z3245) RETURN count(z) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: left-arrow-ok
+  description: A left-pointing edge is stored the right way
+  args:
+  - query
+  - '-'
+  stdin: CREATE (a:L3245)<-[:T3245]-(b:L3245)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: left-arrow-direction
+  description: Exactly one T3245 edge between L nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:L3245)-[r:T3245]->(:L3245) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: chain-middle-node-once
+  description: A middle node between two CREATE hops is created once
+  args:
+  - query
+  - '-'
+  stdin: CREATE (:AA3245)-[:BB3245]->(:CC3245)-[:DD3245]->(:EE3245)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: chain-middle-count
+  description: One CC3245 node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:CC3245) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: chain-connected
+  description: The chain is connected through that single node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:AA3245)-[:BB3245]->(:CC3245)-[:DD3245]->(e:EE3245) RETURN count(e) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: match-create-chain-after-match
+  description: A MATCH ... CREATE of a multi-hop path with a mixed-direction tail
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:AA3245) CREATE (a)-[:BB3245]->(:FF3245 {i: 1})-[:DD3245]->(:GG3245)<-[:HH3245]-(:II3245)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: chain-after-match-nodes-once
+  description: FF and GG created once each
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) WHERE n:FF3245 OR n:GG3245 OR n:II3245 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: chain-after-match-wired
+  description: The whole path is wired the right way
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:AA3245)-[:BB3245]->(:FF3245)-[:DD3245]->(:GG3245)<-[:HH3245]-(i:II3245) RETURN count(i) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: insert-chain
+  description: INSERT of a chain
+  args:
+  - query
+  - '-'
+  stdin: INSERT (:JJ3245)-[:BB3245]->(:KK3245)-[:DD3245]->(:LL3245)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: insert-chain-middle-once
+  description: One KK3245
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:KK3245) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: null-property-absent
+  description: A null property value is absent, not stored
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (n:P3245 {k: 1, p: null})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: null-property-keys
+  description: Only k is a key
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P3245) RETURN size(keys(n)) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: set-null-removes
+  description: SET n.k = null removes the property
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P3245) SET n.k = null
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: set-null-keys
+  description: No keys left
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P3245) RETURN size(keys(n)) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: rel-null-property
+  description: A relationship's null property is absent too
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:E3245)-[:ER3245 {w: 1, z: null}]->(:E3245)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: rel-null-property-keys
+  description: One key
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[r:ER3245]->() RETURN size(keys(r)) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-null-key-refused
+  description: 'MERGE with a null key is refused (22004): it can match nothing and would create an element without the key'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:Mn3245 {k: null})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22004"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-null-key-nothing
+  description: Nothing created
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Mn3245) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-list-key-creates
+  description: A list-valued MERGE key creates
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:Mn3245 {k: [1, 2]})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-list-key-matches
+  description: '...and matches by value the second time'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:Mn3245 {k: [1, 2]})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-list-key-once
+  description: One node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Mn3245) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-create-return-variable
+  description: FOR ... CREATE (m) RETURN m.k returns the created value
+  args:
+  - query
+  - '-'
+  stdin: 'FOR u IN [1] CREATE (m:FU3245 {k: u}) RETURN m.k AS k'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1}]'
+  tags:
+  - storage
+  - sonny738

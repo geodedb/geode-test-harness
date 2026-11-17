@@ -1,0 +1,405 @@
+version: '1.0'
+name: "SONNY-6288/6300: server restore lands beside the server's real data dir, never in place"
+description: |
+  SONNY-6288 (DATA SAFETY): the server-side restore handler (QUIC and gRPC) chose
+  its target from an environment lookup at request time (GEODE_DATA_DIR, else
+  ./data) instead of the data directory the engine actually had open, wrote in
+  place with no staging, and answered 'Restore completed' while the running
+  server kept serving its old data (and, with GEODE_DATA_DIR pointing at the live
+  store, the restore was written over the open store and then lost when the
+  adapter checkpointed its in-memory state over it).
+  Related: SONNY-6300 item 1 (no code path restores in place over a live store).
+
+  The contract that shipped: a server never restores into its own data directory.
+  `geode restore --server` makes the server restore its newest server-managed
+  backup into a NEW directory beside the one it has open
+  (<data dir>.restored-<backup id>-<ms>), staged, verified byte for byte,
+  opened cold and counted per graph before the rename; the answer names the
+  directory and says the server keeps serving its current data until restarted
+  on it. A failed restore leaves nothing behind.
+
+  Black-box proof against a real `geode serve --data-dir X` (GEODE_DATA_DIR unset,
+  or set to a DIFFERENT directory), seeded with 2 nodes, backed up over the wire,
+  then grown to 4 nodes:
+    * restore answers success and names a directory beside X (X.restored-*);
+    * nothing is written into the CLI's working directory (no ./data) or into the
+      unrelated GEODE_DATA_DIR directory, and X itself gains no restored files;
+    * the live server still answers 4 nodes (it never swapped its store), the
+      answer says so, and after a restart on X the 4 nodes are still there;
+    * a new server started on the reported directory serves the backup's 2 nodes;
+    * a corrupt server-side backup or no backup at all is a clear error, leaves no
+      restored directory, and the live server keeps serving unchanged.
+
+  Run with GEODE_ADMIN_PASSWORD set to a policy-compliant passphrase, e.g.
+    GEODE_ADMIN_PASSWORD='Orbit Lantern Meadow Quartz 2026 Delta!'
+
+  CANARY: REQ=REQ-BACKUP-RESTORE-003; FEATURE="ServerRestore"; ASPECT=RestoreTargetIsServerDataDir; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6288_server_restore_target.yml; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true  # scratch servers + on-disk backup files; not meaningful to promote to multi-node
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+
+tests:
+- name: restore-beside-data-dir-with-only-data-dir-flag
+  description: |
+    Server started with --data-dir X and NO GEODE_DATA_DIR (the case that used to write ./data in the server's cwd and report 'Restore completed').
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    srv_restore() { # runs the CLI from $W/cwd, prints its output
+      (cd "$W/cwd" && "$BIN" restore --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" --yes 2>&1)
+    }
+    pcount() { cnt "MATCH (n:P) RETURN count(n) AS c"; }
+    restore_contract() { # <tag> [extra server env]
+      local tag="$1"; shift
+      local X="$W/X_$tag" out rc dir got
+      mkdir -p "$W/cwd"
+      start_server "$X" "$W/$tag.1.log" "$@" || fail "$tag: server start"
+      q "INSERT (:P {id:1})" >/dev/null; q "INSERT (:P {id:2})" >/dev/null
+      [ "$(pcount)" = 2 ] || fail "$tag: seed"
+      bk --output "$W/$tag.backup" | grep -q "Backup created successfully" || fail "$tag: backup"
+      q "INSERT (:P {id:3})" >/dev/null; q "INSERT (:P {id:4})" >/dev/null
+      [ "$(pcount)" = 4 ] || fail "$tag: grow to 4"
+      out=$(srv_restore); rc=$?
+      [ "$rc" = 0 ] || { echo "$out" | tail -8; fail "$tag: restore rc=$rc"; }
+      echo "$out" | grep -q "restored and verified into" || { echo "$out" | tail -8; fail "$tag: no verified-into line"; }
+      dir=$(echo "$out" | sed -n 's/^  Restored into: //p' | head -1)
+      case "$dir" in "$X".restored-*) ;; *) echo "$out" | tail; fail "$tag: restored dir '$dir' is not beside $X" ;; esac
+      [ -d "$dir" ] || fail "$tag: reported directory does not exist"
+      echo "$out" | grep -q "still serves" || fail "$tag: answer does not say the server keeps serving its data"
+      echo "$out" | grep -q "graph 'default': 2 nodes" || { echo "$out" | tail -8; fail "$tag: per-graph counts missing"; }
+      # nothing in the CLI's cwd, nothing new inside X, no restored files beside X except the reported dir
+      [ -z "$(ls -A "$W/cwd")" ] || fail "$tag: restore wrote into the working directory: $(ls -A "$W/cwd")"
+      ls "$W" | grep -c "^X_$tag.restored-" | grep -qx 1 || fail "$tag: expected exactly one restored directory beside the data dir"
+      [ -e "$X/restore" ] && fail "$tag: restore wrote inside the live data directory"
+      # the running server did not swap its store, and says so truthfully
+      got=$(pcount); [ "$got" = 4 ] || fail "$tag: live server serves $got P nodes after restore, want 4 (unchanged)"
+      stop_server
+      # previous data intact after a restart on the old directory
+      start_server "$X" "$W/$tag.2.log" "$@" || fail "$tag: restart on old dir"
+      got=$(pcount); [ "$got" = 4 ] || fail "$tag: after restart on the old dir: $got P nodes, want 4"
+      stop_server
+      # a server started on the reported directory serves the backup
+      start_server "$dir" "$W/$tag.3.log" || fail "$tag: server on restored dir"
+      got=$(pcount); [ "$got" = 2 ] || fail "$tag: restored dir serves $got P nodes, want 2"
+      stop_server
+      start_server "$dir" "$W/$tag.4.log" || fail "$tag: restart on restored dir"
+      got=$(pcount); [ "$got" = 2 ] || fail "$tag: restored dir after restart serves $got P nodes, want 2"
+      stop_server
+      echo "SERVER_RESTORE_${tag}_OK"
+    }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX)
+    restore_contract FLAG
+    if [ -e "$W/cwd/data" ]; then fail "a ./data directory appeared"; fi
+    echo "NO_DATA_DIR_IN_CWD"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SERVER_RESTORE_FLAG_OK
+    - NO_DATA_DIR_IN_CWD
+  tags: [backup, restore, server, sonny-6288, sonny-6300]
+
+- name: restore-ignores-unrelated-geode-data-dir-env
+  description: |
+    Server started with --data-dir X while GEODE_DATA_DIR points at a different directory Y: the restore lands beside X and Y is never created or written.
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    srv_restore() { # runs the CLI from $W/cwd, prints its output
+      (cd "$W/cwd" && "$BIN" restore --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" --yes 2>&1)
+    }
+    pcount() { cnt "MATCH (n:P) RETURN count(n) AS c"; }
+    restore_contract() { # <tag> [extra server env]
+      local tag="$1"; shift
+      local X="$W/X_$tag" out rc dir got
+      mkdir -p "$W/cwd"
+      start_server "$X" "$W/$tag.1.log" "$@" || fail "$tag: server start"
+      q "INSERT (:P {id:1})" >/dev/null; q "INSERT (:P {id:2})" >/dev/null
+      [ "$(pcount)" = 2 ] || fail "$tag: seed"
+      bk --output "$W/$tag.backup" | grep -q "Backup created successfully" || fail "$tag: backup"
+      q "INSERT (:P {id:3})" >/dev/null; q "INSERT (:P {id:4})" >/dev/null
+      [ "$(pcount)" = 4 ] || fail "$tag: grow to 4"
+      out=$(srv_restore); rc=$?
+      [ "$rc" = 0 ] || { echo "$out" | tail -8; fail "$tag: restore rc=$rc"; }
+      echo "$out" | grep -q "restored and verified into" || { echo "$out" | tail -8; fail "$tag: no verified-into line"; }
+      dir=$(echo "$out" | sed -n 's/^  Restored into: //p' | head -1)
+      case "$dir" in "$X".restored-*) ;; *) echo "$out" | tail; fail "$tag: restored dir '$dir' is not beside $X" ;; esac
+      [ -d "$dir" ] || fail "$tag: reported directory does not exist"
+      echo "$out" | grep -q "still serves" || fail "$tag: answer does not say the server keeps serving its data"
+      echo "$out" | grep -q "graph 'default': 2 nodes" || { echo "$out" | tail -8; fail "$tag: per-graph counts missing"; }
+      # nothing in the CLI's cwd, nothing new inside X, no restored files beside X except the reported dir
+      [ -z "$(ls -A "$W/cwd")" ] || fail "$tag: restore wrote into the working directory: $(ls -A "$W/cwd")"
+      ls "$W" | grep -c "^X_$tag.restored-" | grep -qx 1 || fail "$tag: expected exactly one restored directory beside the data dir"
+      [ -e "$X/restore" ] && fail "$tag: restore wrote inside the live data directory"
+      # the running server did not swap its store, and says so truthfully
+      got=$(pcount); [ "$got" = 4 ] || fail "$tag: live server serves $got P nodes after restore, want 4 (unchanged)"
+      stop_server
+      # previous data intact after a restart on the old directory
+      start_server "$X" "$W/$tag.2.log" "$@" || fail "$tag: restart on old dir"
+      got=$(pcount); [ "$got" = 4 ] || fail "$tag: after restart on the old dir: $got P nodes, want 4"
+      stop_server
+      # a server started on the reported directory serves the backup
+      start_server "$dir" "$W/$tag.3.log" || fail "$tag: server on restored dir"
+      got=$(pcount); [ "$got" = 2 ] || fail "$tag: restored dir serves $got P nodes, want 2"
+      stop_server
+      start_server "$dir" "$W/$tag.4.log" || fail "$tag: restart on restored dir"
+      got=$(pcount); [ "$got" = 2 ] || fail "$tag: restored dir after restart serves $got P nodes, want 2"
+      stop_server
+      echo "SERVER_RESTORE_${tag}_OK"
+    }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX)
+    Y="$W/envdir"
+    restore_contract BOTH "GEODE_DATA_DIR=$Y"
+    [ -e "$Y" ] && { ls -A "$Y"; fail "the unrelated GEODE_DATA_DIR directory was created/written: $(ls -A "$Y")"; }
+    ls "$W" | grep -q "^envdir" && fail "restore created something named after GEODE_DATA_DIR"
+    echo "ENV_DIR_UNTOUCHED"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SERVER_RESTORE_BOTH_OK
+    - ENV_DIR_UNTOUCHED
+  tags: [backup, restore, server, sonny-6288]
+
+- name: failed-server-restore-leaves-nothing-and-server-keeps-serving
+  description: |
+    No backup at all, then a bit-flipped server-side backup: a clear error, no restored directory, the live data directory unchanged, the server still answering.
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    srv_restore() { # runs the CLI from $W/cwd, prints its output
+      (cd "$W/cwd" && "$BIN" restore --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" --yes 2>&1)
+    }
+    pcount() { cnt "MATCH (n:P) RETURN count(n) AS c"; }
+    restore_contract() { # <tag> [extra server env]
+      local tag="$1"; shift
+      local X="$W/X_$tag" out rc dir got
+      mkdir -p "$W/cwd"
+      start_server "$X" "$W/$tag.1.log" "$@" || fail "$tag: server start"
+      q "INSERT (:P {id:1})" >/dev/null; q "INSERT (:P {id:2})" >/dev/null
+      [ "$(pcount)" = 2 ] || fail "$tag: seed"
+      bk --output "$W/$tag.backup" | grep -q "Backup created successfully" || fail "$tag: backup"
+      q "INSERT (:P {id:3})" >/dev/null; q "INSERT (:P {id:4})" >/dev/null
+      [ "$(pcount)" = 4 ] || fail "$tag: grow to 4"
+      out=$(srv_restore); rc=$?
+      [ "$rc" = 0 ] || { echo "$out" | tail -8; fail "$tag: restore rc=$rc"; }
+      echo "$out" | grep -q "restored and verified into" || { echo "$out" | tail -8; fail "$tag: no verified-into line"; }
+      dir=$(echo "$out" | sed -n 's/^  Restored into: //p' | head -1)
+      case "$dir" in "$X".restored-*) ;; *) echo "$out" | tail; fail "$tag: restored dir '$dir' is not beside $X" ;; esac
+      [ -d "$dir" ] || fail "$tag: reported directory does not exist"
+      echo "$out" | grep -q "still serves" || fail "$tag: answer does not say the server keeps serving its data"
+      echo "$out" | grep -q "graph 'default': 2 nodes" || { echo "$out" | tail -8; fail "$tag: per-graph counts missing"; }
+      # nothing in the CLI's cwd, nothing new inside X, no restored files beside X except the reported dir
+      [ -z "$(ls -A "$W/cwd")" ] || fail "$tag: restore wrote into the working directory: $(ls -A "$W/cwd")"
+      ls "$W" | grep -c "^X_$tag.restored-" | grep -qx 1 || fail "$tag: expected exactly one restored directory beside the data dir"
+      [ -e "$X/restore" ] && fail "$tag: restore wrote inside the live data directory"
+      # the running server did not swap its store, and says so truthfully
+      got=$(pcount); [ "$got" = 4 ] || fail "$tag: live server serves $got P nodes after restore, want 4 (unchanged)"
+      stop_server
+      # previous data intact after a restart on the old directory
+      start_server "$X" "$W/$tag.2.log" "$@" || fail "$tag: restart on old dir"
+      got=$(pcount); [ "$got" = 4 ] || fail "$tag: after restart on the old dir: $got P nodes, want 4"
+      stop_server
+      # a server started on the reported directory serves the backup
+      start_server "$dir" "$W/$tag.3.log" || fail "$tag: server on restored dir"
+      got=$(pcount); [ "$got" = 2 ] || fail "$tag: restored dir serves $got P nodes, want 2"
+      stop_server
+      start_server "$dir" "$W/$tag.4.log" || fail "$tag: restart on restored dir"
+      got=$(pcount); [ "$got" = 2 ] || fail "$tag: restored dir after restart serves $got P nodes, want 2"
+      stop_server
+      echo "SERVER_RESTORE_${tag}_OK"
+    }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX); mkdir -p "$W/cwd"
+    X="$W/X_FAIL"
+    start_server "$X" "$W/f.1.log" || exit 1
+    q "INSERT (:P {id:1})" >/dev/null; q "INSERT (:P {id:2})" >/dev/null
+    OUT=$(srv_restore); RC=$?
+    [ "$RC" != 0 ] || { echo "$OUT" | tail; fail "restore with no backup succeeded"; }
+    echo "$OUT" | grep -q "BackupMetadataNotFound" || { echo "$OUT" | tail -5; fail "no-backup error not named"; }
+    echo "$OUT" | grep -q "was not changed" || fail "no-backup error does not say the data dir was not changed"
+    echo "$OUT" | grep -q "Server restore completed" && fail "no-backup restore claimed completion"
+    echo "NO_BACKUP_REFUSED"
+    bk --output "$W/f.backup" | grep -q "Backup created successfully" || fail "backup"
+    B=$(ls "$X"/backups/full_*.backup | head -1)
+    python3 -I - "$B" <<'PYEOF'
+    import sys
+    p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[len(b) // 2] ^= 0xFF; open(p, "wb").write(b)
+    PYEOF
+    q "INSERT (:P {id:3})" >/dev/null
+    OUT=$(srv_restore); RC=$?
+    [ "$RC" != 0 ] || { echo "$OUT" | tail; fail "restore of a corrupt backup succeeded"; }
+    echo "$OUT" | grep -q "Server restore completed" && fail "corrupt restore claimed completion"
+    echo "$OUT" | grep -qE "Restore failed|Server returned error" || { echo "$OUT" | tail -5; fail "corrupt restore not reported as a failure"; }
+    echo "CORRUPT_BACKUP_REFUSED"
+    ls "$W" | grep -q "restored" && fail "a failed restore left a restored directory: $(ls "$W")"
+    [ -z "$(ls -A "$W/cwd")" ] || fail "failed restore wrote into cwd"
+    [ "$(pcount)" = 3 ] || fail "live server stopped serving its data after a failed restore"
+    stop_server
+    start_server "$X" "$W/f.2.log" || fail "restart"
+    [ "$(pcount)" = 3 ] || fail "data lost after a failed restore + restart"
+    stop_server
+    echo "FAILED_RESTORE_LEAVES_NOTHING"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - NO_BACKUP_REFUSED
+    - CORRUPT_BACKUP_REFUSED
+    - FAILED_RESTORE_LEAVES_NOTHING
+  tags: [backup, restore, server, sonny-6288, negative]

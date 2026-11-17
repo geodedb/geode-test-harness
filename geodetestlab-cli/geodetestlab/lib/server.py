@@ -79,6 +79,8 @@ def kill_stale_servers() -> None:
     Uses a scoped pattern that only matches servers started with a
     ``geode-test-`` temp directory to avoid killing unrelated processes.
     """
+    if os.environ.get("GEODE_HARNESS_KILL_STALE") != "1":
+        return
     try:
         subprocess.run(
             ["pkill", "-f", "geode serve.*geode-test-"],

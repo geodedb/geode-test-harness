@@ -138,15 +138,18 @@ def _kill_geode_processes() -> None:
             pass
         _tracked_pids.discard(pid)
 
-    # Fallback: pattern-based cleanup scoped to our test temp dirs
-    try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "geode serve.*geode-test-"],
-            capture_output=True,
-            timeout=5,
-        )
-    except Exception:
-        pass
+    # Fallback: pattern-based cleanup scoped to our test temp dirs.  DISABLED
+    # unless GEODE_HARNESS_KILL_STALE=1: the pattern matches every harness
+    # server on the machine, so one run's exit SIGKILLed other runs' servers.
+    if os.environ.get("GEODE_HARNESS_KILL_STALE") == "1":
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", "geode serve.*geode-test-"],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
 
 
 def _kill_child_processes() -> None:

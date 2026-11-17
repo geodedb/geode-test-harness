@@ -17,6 +17,7 @@ identically on Debug and ReleaseSafe binaries — no security knob disabled.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -44,7 +45,7 @@ def provision_tls_certs() -> tuple[str, str, str, str] | None:
     if shutil.which("openssl") is None:
         return None
 
-    cert_dir = tempfile.mkdtemp(prefix="geode-test-tls-")
+    cert_dir = tempfile.mkdtemp(prefix=os.environ.get("GEODE_HARNESS_DATA_PREFIX", "geode-test-") + "tls-")
     ca_key = str(Path(cert_dir) / "ca.key")
     ca_crt = str(Path(cert_dir) / "ca.crt")
     leaf_key = str(Path(cert_dir) / "leaf.key")

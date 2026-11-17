@@ -1,0 +1,473 @@
+# SONNY-3381: statement and transaction undo reverted the graph store but not the full-text
+# and vector index entries, so after a failed statement or a ROLLBACK a search answered for a
+# value the store no longer held (and missed one it still held).
+#
+# This spec drives a real server: a fulltext index and a vector (knn) index; failed SET /
+# DELETE / REMOVE / CREATE statements and a ROLLBACKed transaction must leave both indexes
+# answering for exactly what the store holds; a committed write is indexed (control).
+
+version: '1.0'
+name: SONNY-3381 undo reverts fulltext and vector index entries
+description: Fulltext and knn answers after failed statements and ROLLBACK
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: create-fulltext-index
+  description: Fulltext index on D3381.body
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX f3381 FOR (n:D3381) ON (n.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: seed
+  description: Two documents
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:D3381 {k: 1, body: 'apple'}), (:D3381 {k: 2, body: 'pear'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: seed-searchable
+  description: "'apple' is found"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'apple')
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[0-9.eE+-]+\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-set
+  description: A SET to 'zebra' followed by a failing RETURN
+  args:
+  - query
+  - '-'
+  stdin: MATCH (d:D3381) WHERE d.k = 1 SET d.body = 'zebra' RETURN 10 / (d.k - 1) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-set-not-indexed
+  description: "'zebra' is not searchable"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'zebra')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-set-old-still-indexed
+  description: "'apple' still is"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'apple')
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[0-9.eE+-]+\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-delete
+  description: A DETACH DELETE whose RETURN fails leaves the document
+  args:
+  - query
+  - '-'
+  stdin: MATCH (d:D3381) WHERE d.k = 2 DETACH DELETE d RETURN 1 / 0 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-delete-still-searchable
+  description: "'pear' is still found"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'pear')
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[0-9.eE+-]+\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-remove
+  description: REMOVE of the indexed property then a failing RETURN
+  args:
+  - query
+  - '-'
+  stdin: MATCH (d:D3381) WHERE d.k = 2 REMOVE d.body RETURN 10 / (d.k - 2) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-remove-still-searchable
+  description: "'pear' is still found"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'pear')
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[0-9.eE+-]+\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-create
+  description: A CREATE with a failing RETURN
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (d:D3381 {k: 3, body: 'kiwi'}) RETURN 10 / (d.k - 3) AS x"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-create-not-searchable
+  description: "'kiwi' is not searchable"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'kiwi')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-txn
+  description: A transaction SETs, deletes and creates then ROLLBACKs
+  args:
+  - query
+  - '-'
+  stdin: "BEGIN; MATCH (d:D3381) WHERE d.k = 1 SET d.body = 'mango'; MATCH (d:D3381) WHERE d.k = 2 DETACH DELETE d; CREATE (:D3381 {k: 3, body: 'kiwi'}); ROLLBACK"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-set-not-indexed
+  description: "'mango' is not searchable"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'mango')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-set-old-indexed
+  description: "'apple' is"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'apple')
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[0-9.eE+-]+\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-delete-restored
+  description: "'pear' is searchable again"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'pear')
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[0-9.eE+-]+\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-create-gone
+  description: "'kiwi' is not"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'kiwi')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+  tags:
+  - storage
+  - sonny738
+- name: commit-set
+  description: 'Control: a committed SET is indexed'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (d:D3381) WHERE d.k = 1 SET d.body = 'plum'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: commit-set-searchable
+  description: "'plum' found"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'plum')
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[0-9.eE+-]+\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: commit-create
+  description: 'Control: a committed CREATE is indexed'
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:D3381 {k: 4, body: 'fig'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: commit-create-searchable
+  description: "'fig' found"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('f3381', 'fig')
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[0-9.eE+-]+\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: create-vector-index
+  description: Vector index on V3381.emb
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX v3381 ON V3381 (emb) USING vector WITH (metric = 'l2')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: seed-vectors
+  description: Two vectors and a node without one
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:V3381 {k: 1, emb: vectorf32([1.0, 0.0, 0.0])}), (:V3381 {k: 2, emb: vectorf32([0.0, 1.0, 0.0])}), (:V3381 {k: 3})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: knn-seed
+  description: knn finds node 1 for [0.9,0.1,0]
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE id(v) IN knn('emb', vectorf32([0.9, 0.1, 0.0]), 1, 'l2') AND v.k = 1 RETURN v.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-first-vector-set
+  description: Give node 3 its first vector, then fail
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE v.k = 3 SET v.emb = vectorf32([0.0, 0.0, 1.0]) RETURN 10 / (v.k - 3) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-first-vector-none
+  description: Node 3 holds no vector
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE v.k = 3 AND v.emb IS NOT NULL RETURN count(v) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-first-vector-not-ranked
+  description: knn does not rank node 3 for [0,0,1]
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE id(v) IN knn('emb', vectorf32([0.0, 0.0, 1.0]), 1, 'l2') AND v.k = 3 RETURN v.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+  tags:
+  - storage
+  - sonny738
+- name: failed-overwrite
+  description: Overwrite node 1's vector, then fail
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE v.k = 1 SET v.emb = vectorf32([0.0, -1.0, 0.0]) RETURN 10 / (v.k - 1) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - storage
+  - sonny738
+- name: failed-overwrite-still-nearest
+  description: Node 1 is still nearest to [1,0,0]
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE id(v) IN knn('emb', vectorf32([1.0, 0.0, 0.0]), 1, 'l2') AND v.k = 1 RETURN v.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-vectors
+  description: A transaction sets node 3's first vector and overwrites node 2's, then ROLLBACKs
+  args:
+  - query
+  - '-'
+  stdin: BEGIN; MATCH (v:V3381) WHERE v.k = 3 SET v.emb = vectorf32([0.0, 0.0, 1.0]); MATCH (v:V3381) WHERE v.k = 2 SET v.emb = vectorf32([-1.0, 0.0, 0.0]); ROLLBACK
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-first-vector-not-ranked
+  description: Node 3 is not ranked
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE id(v) IN knn('emb', vectorf32([0.0, 0.0, 1.0]), 1, 'l2') AND v.k = 3 RETURN v.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-overwrite-restored
+  description: Node 2 still nearest to [0,1,0]
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE id(v) IN knn('emb', vectorf32([0.0, 1.0, 0.0]), 1, 'l2') AND v.k = 2 RETURN v.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: commit-first-vector
+  description: 'Control: a committed first vector is ranked'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE v.k = 3 SET v.emb = vectorf32([0.0, 0.0, 1.0])
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: commit-first-vector-ranked
+  description: Node 3 nearest to [0,0,1]
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:V3381) WHERE id(v) IN knn('emb', vectorf32([0.0, 0.0, 1.0]), 1, 'l2') AND v.k = 3 RETURN v.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":3}]'
+  tags:
+  - storage
+  - sonny738

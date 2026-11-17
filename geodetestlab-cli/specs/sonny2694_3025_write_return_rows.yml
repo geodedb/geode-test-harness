@@ -1,0 +1,304 @@
+# SONNY-2694 (DATA LOSS): writes behind an aggregating RETURN were silently dropped
+# (MATCH ... CREATE / MERGE / REMOVE ... RETURN count(*) applied nothing).
+# SONNY-3025: a plain RETURN after MATCH ... CREATE / MERGE returned ONE row (the last
+# created or merged entities) instead of one row per matched row (ISO 14.11).
+#
+# This spec drives a real server: each statement must both write what it names and return
+# the rows/aggregate the RETURN asks for, and a follow-up read must see the writes.
+
+version: '1.0'
+name: SONNY-2694 / SONNY-3025 writes behind RETURN apply; plain RETURN is one row per match
+description: Aggregating and plain RETURN after MATCH ... CREATE/MERGE/SET/REMOVE
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: seed
+  description: Three Z nodes and two Q nodes
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Z25 {k: 0, g: 0}), (:Z25 {k: 1, g: 0}), (:Z25 {k: 2, g: 1}); CREATE (:Q25 {k: 0}), (:Q25 {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: create-count
+  description: MATCH ... CREATE ... RETURN count(*) answers 3 and creates 3 nodes
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:Z25) CREATE (z)-[:T25]->(m:M25 {k: z.k * 10}) RETURN count(*) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: create-count-applied
+  description: The 3 created nodes exist (they were dropped before the fix)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (m:M25) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: create-edges-applied
+  description: And the 3 relationships
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:Z25)-[r:T25]->(:M25) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: create-plain-return
+  description: 'Plain RETURN after MATCH ... CREATE: one row per matched row'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:Z25) CREATE (z)-[:T25b]->(m:M25b {k: z.k}) RETURN z.k AS zk, m.k AS mk ORDER BY zk'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"zk":0,"mk":0},{"zk":1,"mk":1},{"zk":2,"mk":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-plain-return-first-run
+  description: MATCH ... MERGE creates and returns one row per matched row
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:Z25) MERGE (m:M25c {k: z.k}) RETURN z.k AS zk, m.k AS mk ORDER BY zk'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"zk":0,"mk":0},{"zk":1,"mk":1},{"zk":2,"mk":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-plain-return-second-run
+  description: The second run binds the same nodes and still returns three rows
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:Z25) MERGE (m:M25c {k: z.k}) RETURN z.k AS zk, m.k AS mk ORDER BY zk'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"zk":0,"mk":0},{"zk":1,"mk":1},{"zk":2,"mk":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-created-once
+  description: Three M25c nodes, not six
+  args:
+  - query
+  - '-'
+  stdin: MATCH (m:M25c) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-shared-key
+  description: Two matched rows MERGEing the same key return two rows over one node
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:Z25) WHERE z.k < 2 MERGE (m:M25d {g: z.g}) RETURN z.k AS zk, m.g AS g ORDER BY zk'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"zk":0,"g":0},{"zk":1,"g":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-shared-key-one-node
+  description: Only one node was created
+  args:
+  - query
+  - '-'
+  stdin: MATCH (m:M25d) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-count-applied
+  description: MATCH ... MERGE ... RETURN count(*) applies the MERGE
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:Z25) MERGE (m:M25e {k: z.k}) RETURN count(*) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-count-applied-check
+  description: The three merged nodes exist
+  args:
+  - query
+  - '-'
+  stdin: MATCH (m:M25e) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: set-count
+  description: MATCH ... SET ... RETURN count(*) applies the SET
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z25) SET z.s = 1 RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: set-count-applied
+  description: All three nodes carry the property
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z25) WHERE z.s = 1 RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: remove-count
+  description: MATCH ... REMOVE ... RETURN count(*) applies the REMOVE (the ticket's REMOVE case)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z25) REMOVE z.s RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: remove-count-applied
+  description: The property is gone from all three
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z25) WHERE z.s IS NULL RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: set-sum
+  description: An aggregate other than count behind a write applies it as well
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z25) SET z.t = z.k + 1 RETURN sum(z.t) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"s":6}]'
+  tags:
+  - storage
+  - sonny738
+- name: set-sum-applied
+  description: The SET landed
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z25) WHERE z.t = z.k + 1 RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: relationship-merge-return
+  description: A relationship MERGE returns the bound row per match
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (q:Q25), (z:Z25 {k: 0}) MERGE (q)-[r:W25 {w: 1}]->(z) RETURN q.k AS qk, r.w AS w, z.k AS zk ORDER BY qk'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"qk":0,"w":1,"zk":0},{"qk":1,"w":1,"zk":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: relationship-merge-applied
+  description: The two relationships exist exactly once
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:Q25)-[r:W25]->(:Z25) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: limit-one-row
+  description: A LIMIT still bounds the rows but not the writes
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:Z25) WHERE z.k = 2 CREATE (m:M25f {k: 1}) RETURN z.k AS zk, m.k AS mk LIMIT 1'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"zk":2,"mk":1}]'
+  tags:
+  - storage
+  - sonny738

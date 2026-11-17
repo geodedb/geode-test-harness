@@ -1,0 +1,305 @@
+# SONNY-3111: the write shapes v0.8.23 refuses with 0A000 (chained writes after WITH, MERGE
+# with CREATE or DELETE, DELETE of a created variable, ...). The ticket is the feature to
+# implement them; until then the contract this spec pins is the fail-closed matrix: every
+# shape the allowlist does not accept is refused with 0A000 BEFORE anything is written (never
+# silently dropped, never half applied), and the allowlisted neighbours still write what they
+# name. Each refusal is followed by reads proving nothing changed.
+
+version: '1.0'
+name: 'SONNY-3111 write-shape allowlist: refuse whole or write exactly'
+description: Write-shape matrix fails closed with 0A000, nothing written
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: seed
+  description: Fixture nodes
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:S1 {i: 1}), (:S1 {i: 2}); CREATE (:S2a {i: 1})-[:R3111]->(:S2b {i: 10}), (:S2a {i: 2})-[:R3111]->(:S2b {i: 20}), (:S2b {i: 30}); CREATE (:S11d {i: 1}), (:S12m {i: 1}), (:S18d {i: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: chained-match-delete-after-with-refused
+  description: 'Refused with 0A000 before anything is written: MATCH (q:S1) WITH q MATCH (q) DELETE q'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:S1) WITH q MATCH (q) DELETE q
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: chained-match-set-after-with-refused
+  description: 'Refused with 0A000 before anything is written: MATCH (n:S2a) WHERE n.i = 1 WITH n MATCH (n)-[:R3111]->(x) SET x.x = 1'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S2a) WHERE n.i = 1 WITH n MATCH (n)-[:R3111]->(x) SET x.x = 1
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: chained-match-merge-after-with-refused
+  description: 'Refused with 0A000 before anything is written: MATCH (n:S2a) WITH n MATCH (n)-[:R3111]->(x) MERGE (:S5 {k: x.i})'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:S2a) WITH n MATCH (n)-[:R3111]->(x) MERGE (:S5 {k: x.i})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: write-after-second-with-refused
+  description: 'Refused with 0A000 before anything is written: MATCH (n:S2a) WITH n WITH n WHERE n.i = 2 SET n.y = 7'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S2a) WITH n WITH n WHERE n.i = 2 SET n.y = 7
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: write-after-with-after-create-refused
+  description: 'Refused with 0A000 before anything is written: CREATE (a:S9 {i: 1}) WITH a CREATE (:S9b {from: a.i})'
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:S9 {i: 1}) WITH a CREATE (:S9b {from: a.i})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-with-delete-refused
+  description: 'Refused with 0A000 before anything is written: MATCH (d:S11d) MERGE (:S11 {k: 1}) DELETE d'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (d:S11d) MERGE (:S11 {k: 1}) DELETE d'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: delete-of-created-variable-refused
+  description: 'Refused with 0A000 before anything is written: MATCH (m:S12m) CREATE (z:S12z) DELETE z'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (m:S12m) CREATE (z:S12z) DELETE z
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: create-delete-no-match-refused
+  description: 'Refused with 0A000 before anything is written: CREATE (z:S13) DELETE z'
+  args:
+  - query
+  - '-'
+  stdin: CREATE (z:S13) DELETE z
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: with-after-match-create-refused
+  description: 'Refused with 0A000 before anything is written: MATCH (n:S2a) CREATE (z:S17) WITH z SET z.k = 1'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:S2a) CREATE (z:S17) WITH z SET z.k = 1
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-aggregating-return-refused
+  description: 'Refused with 0A000 before anything is written: FOR v IN [1, 2, 3] CREATE (:S20 {v: v}) RETURN count(*) AS c'
+  args:
+  - query
+  - '-'
+  stdin: 'FOR v IN [1, 2, 3] CREATE (:S20 {v: v}) RETURN count(*) AS c'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: call-subquery-that-writes-refused
+  description: 'Refused with 0A000 before anything is written: CALL { CREATE (:S22) RETURN 1 AS x } RETURN x'
+  args:
+  - query
+  - '-'
+  stdin: CALL { CREATE (:S22) RETURN 1 AS x } RETURN x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: path-delete-refused
+  description: 'Refused with 0A000 before anything is written: MATCH p = (:S2a {i: 2})-[:R3111]->(:S2b) DETACH DELETE p'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH p = (:S2a {i: 2})-[:R3111]->(:S2b) DETACH DELETE p'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: label-set-on-relationship-refused
+  description: 'Refused with 0A000 before anything is written: MATCH (:S2a)-[r:R3111]->() SET r:L24'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:S2a)-[r:R3111]->() SET r:L24
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-with-create-refused
+  description: MERGE ... CREATE is refused with 0A000 naming the shape
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (a:S10 {k: 1}) CREATE (:S10c {k: 2})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - MERGE followed by CREATE is not supported
+  tags:
+  - storage
+  - sonny738
+- name: accepted-shape-with-aggregate-create
+  description: 'The shape the engine does accept: a WITH of values followed by one CREATE'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:S2a) WITH count(n) AS c CREATE (:S19 {c: c})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"nodes_created":1,"relationships_created":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: accepted-shape-applied
+  description: '...and it wrote the count'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (s:S19) RETURN s.c AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: nothing-from-refused-created
+  description: No node of any refused statement exists
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) WHERE n:S5 OR n:S9 OR n:S9b OR n:S10 OR n:S10c OR n:S11 OR n:S12z OR n:S13 OR n:S17 OR n:S20 OR n:S22 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: nothing-deleted
+  description: No node was deleted by a refused statement
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) WHERE n:S1 OR n:S11d OR n:S12m OR n:S18d RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":5}]'
+  tags:
+  - storage
+  - sonny738
+- name: nothing-set
+  description: No property or label was written by a refused statement
+  args:
+  - query
+  - '-'
+  stdin: MATCH (x:S2b) RETURN x.i AS i, x.x AS x ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"i":10,"x":null},{"i":20,"x":null},{"i":30,"x":null}]'
+  tags:
+  - storage
+  - sonny738
+- name: path-delete-nothing
+  description: The path's nodes and relationship remain
+  args:
+  - query
+  - '-'
+  stdin: MATCH (:S2a)-[r:R3111]->(:S2b) RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738

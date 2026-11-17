@@ -1,0 +1,255 @@
+# SONNY-6467: parser/executor residuals found while fixing SONNY-6460. Black-box parts:
+#   item 1  `NOT (k = 1)` was parsed as a graph pattern (any identifier not followed by '.'
+#           "looks like a pattern"), in WHERE and FILTER; it is a negated comparison, while
+#           `NOT (q)-[:S]->()` stays a negated pattern predicate.
+#   item 2  a CALL in a transaction body ignored RETURN / ORDER BY / SKIP / LIMIT.
+#   item 3  FILTER after an inline LET or between two MATCH statements was refused (ISO 14.6).
+# Not black-box: unfreed values from direct eval.evalExpr callers, tests compiled by no step,
+# and loopback address sharing between test steps (test-infrastructure).
+
+version: '1.0'
+name: SONNY-6467 NOT (expr), CALL in transaction bodies, FILTER placement
+description: Parser residuals
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: seed
+  description: Q6467 nodes with an S edge
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Q6467 {k: 0}), (:Q6467 {k: 1}), (:Q6467 {k: 2}), (:Q6467 {k: 3}); MATCH (a:Q6467 {k: 0}), (b:Q6467 {k: 3}) CREATE (a)-[:S6467]->(b)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: not-paren-comparison-in-with-where
+  description: NOT (k = 1) is a negated comparison, not a graph pattern
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) WITH q.k AS k WHERE NOT (k = 1) RETURN k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":0},{"k":2},{"k":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: not-paren-or
+  description: NOT (k = 1 OR k = 2)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) WITH q.k AS k WHERE NOT (k = 1 OR k = 2) RETURN k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":0},{"k":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: not-paren-boolean-alias
+  description: NOT (`big`) over a backquoted boolean alias
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) WITH q.k > 1 AS `big` WHERE NOT (`big`) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: not-paren-in
+  description: NOT (k IN [0, 3])
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) WITH q.k AS k WHERE NOT (k IN [0, 3]) RETURN k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: not-paren-in-filter
+  description: NOT (k < 2) in FILTER
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) LET k = q.k FILTER NOT (k < 2) RETURN k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":2},{"k":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: not-pattern-still-a-pattern
+  description: NOT (q)-[:S]->() is still a negated pattern predicate
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) WHERE NOT (q)-[:S6467]->() RETURN q.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1},{"k":2},{"k":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: not-pattern-incoming
+  description: NOT (q)<-[:S]-(:Q)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) WHERE NOT (q)<-[:S6467]-(:Q6467) RETURN q.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":0},{"k":1},{"k":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: not-paren-property-comparison
+  description: NOT (q.k = 1) in WHERE
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) WHERE NOT (q.k = 1) RETURN q.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":0},{"k":2},{"k":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: filter-after-let
+  description: FILTER after an inline LET (6467 item 3)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) LET x = q.k * 2 FILTER x > 2 RETURN q.k AS k, x AS x ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":2,"x":4},{"k":3,"x":6}]'
+  tags:
+  - storage
+  - sonny738
+- name: filter-between-matches
+  description: FILTER between two MATCH statements
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) FILTER q.k < 1 MATCH (q)-[:S6467]->(x) RETURN x.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: filter-then-with-where
+  description: LET, WITH and WHERE together
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6467) LET x = q.k * 2 WITH q, x WHERE x > 2 RETURN q.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":2},{"k":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: seed-label-z
+  description: A label that sorts last for the CALL tests
+  args:
+  - query
+  - '-'
+  stdin: CREATE (:Zzz6467)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: call-body-order-desc-limit
+  description: RETURN label ORDER BY label DESC LIMIT 1 yields the greatest label
+  args:
+  - query
+  - '-'
+  stdin: START TRANSACTION { CALL db.labels() YIELD label RETURN label ORDER BY label DESC LIMIT 1 }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"label":"Zzz6467"}]'
+  tags:
+  - storage
+  - sonny738
+- name: call-body-skip-limit
+  description: SKIP/LIMIT apply too (one row, not the whole procedure output)
+  args:
+  - query
+  - '-'
+  stdin: START TRANSACTION { CALL db.labels() YIELD label RETURN label AS l ORDER BY l DESC SKIP 1 LIMIT 1 }
+  expect:
+    exit_code: 0
+    stdout_regex:
+    - '"columns":\[\{"name":"l","type":"STRING"\}\],"rows":\[\{"l":"[^"]+"\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: call-body-filter
+  description: FILTER then ORDER BY LIMIT
+  args:
+  - query
+  - '-'
+  stdin: START TRANSACTION { CALL db.labels() YIELD label FILTER label <> 'Zzz6467' RETURN label ORDER BY label DESC LIMIT 1 }
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - Zzz6467"}
+    stdout_regex:
+    - '"rows":\[\{"label":"[^"]+"\}\]'
+  tags:
+  - storage
+  - sonny738
+- name: call-body-column-name
+  description: The result column is the RETURN's name
+  args:
+  - query
+  - '-'
+  stdin: START TRANSACTION { CALL db.labels() YIELD label RETURN label ORDER BY label DESC LIMIT 1 }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"columns":[{"name":"label","type":"STRING"}]'
+  tags:
+  - storage
+  - sonny738

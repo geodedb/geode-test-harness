@@ -891,7 +891,7 @@ def run_tests(
     # An empty spec runs zero tests: skip server provisioning entirely so
     # it completes cleanly (exit 0, total 0) even without a geode binary.
     if spec.mode == "server" and spec.tests:
-        data_dir = Path(tempfile.mkdtemp(prefix="geode-test-"))
+        data_dir = Path(tempfile.mkdtemp(prefix=os.environ.get("GEODE_HARNESS_DATA_PREFIX", "geode-test-")))
         server_state.port = server_port or get_free_port()
 
         _run_pre_server_commands(spec.pre_server, dry_run, verbose)
@@ -910,6 +910,11 @@ def run_tests(
         # which refuses --insecure-tls-skip-verify (insecure_tls_gate.zig). Skip
         # when the spec already supplies its own --cert (respect its intent) or
         # when openssl is unavailable (fall back to the debug-only insecure path).
+        # run_tests may be re-entered with the same spec by the spec-level retry;
+        # restore the declared args so a prior attempt's (deleted) leaf is not reused.
+        if not hasattr(spec, "_declared_server_args"):
+            spec._declared_server_args = list(spec.server_args)
+        spec.server_args = list(spec._declared_server_args)
         server_args = list(spec.server_args)
         if not args_contain_flag(server_args, "--cert"):
             provisioned = provision_tls_certs()
@@ -917,6 +922,12 @@ def run_tests(
                 single_server_cert_dir, ca_crt, leaf_crt, leaf_key = provisioned
                 server_args.extend(["--cert", leaf_crt, "--key", leaf_key])
                 env["GEODE_TEST_CA_CERT"] = ca_crt
+                # Every restart path (restart_server, died/hung/crashed server
+                # recovery) starts the server from spec.server_args, so the
+                # verified-TLS leaf must be part of it; otherwise a restarted
+                # server presents its own self-signed cert, which the
+                # --ca-cert clients refuse, and every query times out.
+                spec.server_args = list(server_args)
 
         try:
             server_state.process = _start_initial_server(

@@ -1,0 +1,706 @@
+# SONNY-6540 -> SONNY-6555 -> SONNY-6587: a chain of residual query defects. Black-box parts:
+#   6587 item 2 / 6555 item 2 / 6540 item 2  PROFILE reports the exact-index seek (a point write
+#                                             names the catalog index it used; a read shows IndexSeek)
+#   6587 items 3, 4   head()/last() of a non-list is 22G03 (not NULL); range() end-exclusive,
+#                     integer-only, non-zero step
+#   6587 item 5       a FOR body that writes after a WITH writes for every row and element
+#   6555 item 4       length(NULL)/size(NULL) answer NULL (ISO), not 0
+#   6555 item 5       runtime arity errors (sqrt(), upper('a','b')) are 42000, not 22023
+#   6555 item 6       a WITH accepts SKIP/OFFSET before LIMIT (ISO order); a repeated clause is refused
+#   6555 item 7       statements after a FOR read the whole FOR table (DISTINCT/aggregating/limiting WITH)
+#   6540 item 5       an intermediate aggregating WITH honours the part's WHERE/ORDER BY/LIMIT/SKIP
+#   6540 item 9       abs('x') / toString(1, 2) are refused 42000
+# Not black-box (in-process tests): path-value ownership (leaks), the allocation-failure sweep,
+# the ordered-index column-class probe, PathExpand's simple-path check in the (test-only) plan
+# pipeline, adjacency hydrate OOM, the 65536-element parser budget, dead-code removals.
+
+version: '1.0'
+name: SONNY-6587 / SONNY-6555 / SONNY-6540 query residuals
+description: PROFILE seeks, list functions, arity codes, WITH paging, FOR chains, chain WITH stages
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: head-of-non-list-is-22G03
+  description: head(5) is a type error, not NULL (6587 item 3)
+  args:
+  - query
+  - '-'
+  stdin: RETURN head(5) AS h
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - storage
+  - sonny738
+- name: last-of-non-list-is-22G03
+  description: last('abc') is a type error
+  args:
+  - query
+  - '-'
+  stdin: RETURN last('abc') AS l
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - storage
+  - sonny738
+- name: tail-of-non-list-is-22G03
+  description: tail(5) is a type error
+  args:
+  - query
+  - '-'
+  stdin: RETURN tail(5) AS t
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - storage
+  - sonny738
+- name: head-last-of-list-and-null
+  description: head/last of lists, empty list and NULL
+  args:
+  - query
+  - '-'
+  stdin: RETURN head([1, 2]) AS h, last([1, 2]) AS l, head([]) AS he, last(null) AS lnl
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"h":1,"l":2,"he":null,"lnl":null}]'
+  tags:
+  - storage
+  - sonny738
+- name: range-end-exclusive
+  description: 'range() is the documented Geode extension: end-exclusive (6587 item 4)'
+  args:
+  - query
+  - '-'
+  stdin: RETURN range(1, 4) AS a, range(1, 7, 2) AS b, range(5, 1, -2) AS c, range(3, 3) AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"a":[1,2,3],"b":[1,3,5],"c":[5,3],"d":[]}]'
+  tags:
+  - storage
+  - sonny738
+- name: range-non-integer-refused
+  description: range(1.5, 3) is a type error
+  args:
+  - query
+  - '-'
+  stdin: RETURN range(1.5, 3) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - storage
+  - sonny738
+- name: range-zero-step-refused
+  description: range(1, 4, 0) is refused
+  args:
+  - query
+  - '-'
+  stdin: RETURN range(1, 4, 0) AS x
+  expect:
+    exit_code: 1
+    stdout_not_contains:
+    - '"rows":[{'
+  tags:
+  - storage
+  - sonny738
+- name: length-of-null-is-null
+  description: length(NULL) and size(NULL) answer NULL, not 0 (6555 item 4; ISO)
+  args:
+  - query
+  - '-'
+  stdin: RETURN length(NULL) AS a, size(NULL) AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"a":null,"b":null}]'
+  tags:
+  - storage
+  - sonny738
+- name: arity-sqrt-is-42000
+  description: A runtime arity error is a syntax-rule violation 42000, not 22023 (6555 item 5)
+  args:
+  - query
+  - '-'
+  stdin: RETURN sqrt() AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: arity-upper-is-42000
+  description: upper('a','b')
+  args:
+  - query
+  - '-'
+  stdin: RETURN upper('a', 'b') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: arity-abs-string-42000
+  description: abs('x') and toString(1,2) are refused 42000 (6540 item 9)
+  args:
+  - query
+  - '-'
+  stdin: RETURN abs('x') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: arity-tostring-42000
+  description: toString(1, 2)
+  args:
+  - query
+  - '-'
+  stdin: RETURN toString(1, 2) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: arity-error-after-rows-is-still-refused-on-rows
+  description: The arity error is raised when rows reach the call
+  args:
+  - query
+  - '-'
+  stdin: UNWIND [1, 2] AS n RETURN sqrt() AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: seed-for-write
+  description: Two W6587 nodes with list properties
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:W6587 {k: 1, l: [10, 20]}), (:W6587 {k: 2, l: [30]})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-after-with-every-row
+  description: MATCH ... WITH z FOR x IN z.l CREATE writes for EVERY row and element (the first row only before the fix)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:W6587) WITH z FOR x IN z.l CREATE (:W6587Out {k: z.k, x: x})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-after-with-rows
+  description: 'Three Out nodes: (1,10) (1,20) (2,30)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (o:W6587Out) RETURN o.k AS k, o.x AS x ORDER BY k, x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1,"x":10},{"k":1,"x":20},{"k":2,"x":30}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-after-values-with
+  description: WITH of values then FOR ... CREATE
+  args:
+  - query
+  - '-'
+  stdin: 'WITH 7 AS k FOR x IN [10, 20, 30] CREATE (:W6587Out2 {k: k, x: x})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: for-after-values-with-rows
+  description: Three nodes with k = 7
+  args:
+  - query
+  - '-'
+  stdin: MATCH (o:W6587Out2) RETURN o.k AS k, o.x AS x ORDER BY x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":7,"x":10},{"k":7,"x":20},{"k":7,"x":30}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-after-with-match-set
+  description: A MATCH ... SET inside the FOR body sees each row
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = z.k RETURN o.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"k":1'
+    - '"k":2'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-staged-return-refused
+  description: 'SONNY-6717: ORDER BY in a writing FOR body RETURN is refused 0A000 (it was applied per element: [2,1])'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = 99 RETURN o.k AS k ORDER BY k
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-after-with-match-set-applied
+  description: Both rows were written
+  args:
+  - query
+  - '-'
+  stdin: MATCH (o:W6587) RETURN o.k AS k, o.seen AS seen ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1,"seen":2},{"k":2,"seen":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: profile-index-setup
+  description: A catalog index and a node
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:PW6587 {k: 'a'}), (:PW6587 {k: 'b'}), (:PN6587 {k: 'a'}); CREATE INDEX pw6587_k FOR (n:PW6587) ON (n.k)"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: profile-point-write-names-index
+  description: PROFILE of a point write served by the exact-index seek names the catalog index it used (6587 item 2)
+  args:
+  - query
+  - '-'
+  stdin: PROFILE MATCH (n:PW6587) WHERE n.k = 'a' SET n.v = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"index_name":"pw6587_k"'
+    - '"op":"NodeIndexScan"'
+  tags:
+  - storage
+  - sonny738
+- name: profile-point-write-no-match
+  description: '...also when the seek finds nothing'
+  args:
+  - query
+  - '-'
+  stdin: PROFILE MATCH (n:PW6587) WHERE n.k = 'zz' SET n.v = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"index_name":"pw6587_k"'
+  tags:
+  - storage
+  - sonny738
+- name: profile-label-without-index
+  description: A label with no index names none
+  args:
+  - query
+  - '-'
+  stdin: PROFILE MATCH (n:PN6587) WHERE n.k = 'a' SET n.v = 1
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - '"index_name"'
+  tags:
+  - storage
+  - sonny738
+- name: profile-read-names-index
+  description: PROFILE of an exact-index read reports an IndexSeek with its row count (6555 item 2 / 6540 item 2)
+  args:
+  - query
+  - '-'
+  stdin: "PROFILE MATCH (n:PW6587 {k: 'b'}) RETURN n.k AS k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"op":"IndexSeek"'
+    - '"index_name":"pw6587_k"'
+    - '"rows":1'
+  tags:
+  - storage
+  - sonny738
+- name: point-write-applied
+  description: The point write itself applied
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:PW6587) WHERE n.v = 1 RETURN n.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":"a"}]'
+  tags:
+  - storage
+  - sonny738
+- name: seed-paging
+  description: Four F6555 nodes with lists
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:F6555 {g: 1, k: 1, l: [1, 1, 2]}), (b:F6555 {g: 1, k: 2, l: [2, 3]}), (c:F6555 {g: 2, k: 4, l: [5]})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: with-skip-then-limit
+  description: WITH ... ORDER BY s SKIP 1 LIMIT 2 (the ISO order) is accepted (6555 item 6)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:F6555) WITH n.k AS s ORDER BY s SKIP 1 LIMIT 2 RETURN s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"s":2},{"s":4}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-offset-then-limit
+  description: OFFSET spelling
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:F6555) WITH n.k AS s ORDER BY s OFFSET 1 LIMIT 2 RETURN s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"s":2},{"s":4}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-limit-then-skip
+  description: LIMIT before SKIP stays accepted as a Geode extension
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:F6555) WITH n.k AS s ORDER BY s LIMIT 2 SKIP 1 RETURN s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"s":2},{"s":4}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-repeated-skip-refused
+  description: A repeated clause is refused 42000
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:F6555) WITH n.k AS s SKIP 1 LIMIT 2 SKIP 1 RETURN s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: with-repeated-limit-refused
+  description: '...'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:F6555) WITH n.k AS s LIMIT 2 LIMIT 3 RETURN s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - storage
+  - sonny738
+- name: for-then-match-count
+  description: FOR ... MATCH counts every list element (6555 item 7)
+  args:
+  - query
+  - '-'
+  stdin: FOR x IN [1, 1, 2] MATCH (z:F6555) WHERE z.k = x RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-then-with-distinct
+  description: FOR ... MATCH ... WITH DISTINCT reads all rows
+  args:
+  - query
+  - '-'
+  stdin: FOR x IN [1, 1, 2] MATCH (z:F6555) WHERE z.k = x WITH DISTINCT z.k AS k RETURN k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-then-with-aggregate
+  description: FOR ... MATCH ... WITH aggregate
+  args:
+  - query
+  - '-'
+  stdin: FOR x IN [1, 2, 4] MATCH (z:F6555) WHERE z.k = x WITH z.g AS g, count(*) AS c RETURN g, c ORDER BY g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":1,"c":2},{"g":2,"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-then-with-limit
+  description: FOR ... MATCH ... WITH ORDER BY LIMIT 1
+  args:
+  - query
+  - '-'
+  stdin: FOR x IN [1, 2] MATCH (z:F6555) WHERE z.k = x WITH z ORDER BY z.k DESC LIMIT 1 RETURN z.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-for-then-match
+  description: MATCH ... WITH z FOR x IN z.l MATCH ... counts 4
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:F6555) WITH z FOR x IN z.l MATCH (w:F6555) WHERE w.k = x RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":4}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-for-return-distinct
+  description: Last RETURN DISTINCT over a FOR table
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:F6555) WITH z FOR x IN z.l RETURN DISTINCT x ORDER BY x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"x":1},{"x":2},{"x":3},{"x":5}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-return-distinct
+  description: FOR x IN [1,1,2] RETURN DISTINCT x
+  args:
+  - query
+  - '-'
+  stdin: FOR x IN [1, 1, 2] RETURN DISTINCT x ORDER BY x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"x":1},{"x":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: seed-chain
+  description: C6540 nodes with an edge fan-out
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (a:C6540 {g: 1, k: 1}), (b:C6540 {g: 1, k: 2}), (c:C6540 {g: 2, k: 4}), (:C6540 {g: 3, k: 8}), (a)-[:R6540]->(:Y6540 {v: 10}), (a)-[:R6540]->(:Y6540 {v: 20}), (b)-[:R6540]->(:Y6540 {v: 30}), (c)-[:R6540]->(:Y6540 {v: 40})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: aggregating-with-where
+  description: MATCH (z:C6540) WITH z WITH z.g AS g, count(*) AS c WHERE c > 1 RETURN g, c
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z WITH z.g AS g, count(*) AS c WHERE c > 1 RETURN g, c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":1,"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: aggregating-with-order-limit
+  description: MATCH (z:C6540) WITH z WITH z.g AS g, sum(z.k) AS s ORDER BY s DESC LIMIT 1 RETURN g, s
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z WITH z.g AS g, sum(z.k) AS s ORDER BY s DESC LIMIT 1 RETURN g, s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":3,"s":8}]'
+  tags:
+  - storage
+  - sonny738
+- name: aggregating-with-skip
+  description: MATCH (z:C6540) WITH z WITH z.g AS g, sum(z.k) AS s ORDER BY s LIMIT 2 SKIP 1 RETURN g, s
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z WITH z.g AS g, sum(z.k) AS s ORDER BY s LIMIT 2 SKIP 1 RETURN g, s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":2,"s":4},{"g":3,"s":8}]'
+  tags:
+  - storage
+  - sonny738
+- name: aggregate-of-aggregate
+  description: MATCH (z:C6540) WITH z WITH z.g AS g, count(*) AS c WHERE c >= 1 WITH sum(c) AS total RETURN total
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z WITH z.g AS g, count(*) AS c WHERE c >= 1 WITH sum(c) AS total RETURN total
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"total":4}]'
+  tags:
+  - storage
+  - sonny738
+- name: aggregating-with-then-return-aggregate
+  description: MATCH (z:C6540) WITH z WITH z.g AS g, sum(z.k) AS s RETURN sum(s) AS t
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z WITH z.g AS g, sum(z.k) AS s RETURN sum(s) AS t
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"t":15}]'
+  tags:
+  - storage
+  - sonny738
+- name: aggregating-with-where-then-match
+  description: MATCH (z:C6540) WITH z WITH z.g AS g, count(*) AS c WHERE c > 1 MATCH (w:C6540) WHERE w.g = g RETURN w.k AS k ORDER BY k
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z WITH z.g AS g, count(*) AS c WHERE c > 1 MATCH (w:C6540) WHERE w.g = g RETURN w.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-distinct-chain
+  description: MATCH (z:C6540) WITH z.g AS g WITH DISTINCT g WITH g RETURN g ORDER BY g
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z.g AS g WITH DISTINCT g WITH g RETURN g ORDER BY g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":1},{"g":2},{"g":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-order-limit-chain
+  description: MATCH (z:C6540) WITH z.g AS g ORDER BY g LIMIT 1 WITH g RETURN g
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z.g AS g ORDER BY g LIMIT 1 WITH g RETURN g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-expand-aggregate
+  description: MATCH (z:C6540) WITH z MATCH (z)-[:R6540]->(y:Y6540) WITH z.g AS g, sum(y.v) AS s RETURN g, s ORDER BY g
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z MATCH (z)-[:R6540]->(y:Y6540) WITH z.g AS g, sum(y.v) AS s RETURN g, s ORDER BY g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":1,"s":60},{"g":2,"s":40}]'
+  tags:
+  - storage
+  - sonny738
+- name: with-expand-where-count
+  description: MATCH (z:C6540) WITH z MATCH (z)-[:R6540]->(y:Y6540) WHERE y.v > 10 WITH z.g AS g, count(y) AS c RETURN g, c ORDER BY g
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:C6540) WITH z MATCH (z)-[:R6540]->(y:Y6540) WHERE y.v > 10 WITH z.g AS g, count(y) AS c RETURN g, c ORDER BY g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":1,"c":2},{"g":2,"c":1}]'
+  tags:
+  - storage
+  - sonny738

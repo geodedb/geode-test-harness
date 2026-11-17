@@ -1,0 +1,200 @@
+version: '1.0'
+name: SONNY-3028 3121 DROP GRAPH waits for, and never frees under, the graph's users
+description: |
+  SONNY-3028 (MEMORY SAFETY): DROP GRAPH freed the graph under its lock holders
+  (the statement locked the CURRENT graph, not the named one), the engineIsOpen
+  check-then-use raced, and an in-program engine transaction slot dangled after
+  the graph it pointed at was dropped. Any holder of the schema permission could
+  crash the server.
+  SONNY-3121 (MEMORY SAFETY): with group commit disabled (GEODE_GROUP_COMMIT=0)
+  the direct bulk MERGE fast paths used the graph with no pin, so a DROP GRAPH
+  racing them was a use-after-free. SONNY-6472: a write racing a DROP GRAPH
+  brought the graph back (getOrCreateGraph created any graph it did not have);
+  it now fails with GraphNotFound.
+
+  Black-box (the server runs with GEODE_GROUP_COMMIT=0 so the direct bulk
+  helpers are the write path):
+    1. A transaction that has changed a graph cannot see that graph dropped
+       under it: DROP GRAPH <that graph> from the SAME session answers
+       "Object in use" (55006), the transaction is then aborted, and the graph
+       and its data are intact (no dangling slot, no crash).
+    2. A DROP GRAPH from ANOTHER session while a transaction holds changes on
+       the graph is refused 55006 (exit 1); once the holder commits, the drop
+       goes through and the graph is gone from SHOW GRAPHS.
+    3. A race loop: four clients stream bulk MERGE statements (one connection,
+       one statement per line) into a graph while another client drops it,
+       three rounds of CREATE / race / DROP. The server must survive every
+       round (a use-after-free crashes it), every error a writer sees must be
+       "Graph does not exist" (3F000), and after the last drop the graph must
+       NOT exist again (a racing write must not recreate it).
+
+  CANARY: REQ=REQ-SONNY-3028-DROP-GRAPH-LOCK-HOLDERS; FEATURE="MultiGraphIsolation"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny3028_3121_drop_graph_races.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+    env:
+      GEODE_GROUP_COMMIT: '0'
+  client:
+    timeout_ms: 120000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+default_timeout_ms: 120000
+
+tests:
+- name: create-graph
+  description: The graph the drops target.
+  query: CREATE GRAPH g3028
+  expected:
+    exit_code: 0
+
+- name: seed-graph
+  description: One committed node.
+  query: 'USE GRAPH g3028; CREATE (:K3028 {i: 1})'
+  expected:
+    exit_code: 0
+
+- name: drop-graph-inside-own-transaction-refused
+  description: 'Same-session DROP of the graph the open transaction changed: refused (Object in use), no crash.'
+  type: bash
+  command: |
+    set -e
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    OUT=$({ printf '%s\n' 'USE GRAPH g3028;' 'START TRANSACTION;' 'CREATE (:T3028 {i: 10});' 'DROP GRAPH g3028;' 'CREATE (:T3028 {i: 11});' 'ROLLBACK;' 'exit'; } | "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1) || true
+    echo "$OUT" | grep -q "Object in use: an open transaction" || { echo "$OUT"; echo DROP_NOT_REFUSED; exit 1; }
+    echo SAME_SESSION_DROP_REFUSED
+  timeout_ms: 150000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SAME_SESSION_DROP_REFUSED
+
+- name: graph-intact-after-refused-drop
+  description: The graph and its committed data are intact; the rolled-back node is gone.
+  query: USE GRAPH g3028; MATCH (k:K3028) RETURN count(k) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+
+- name: graph-intact-rolled-back-gone
+  description: The rolled-back create left nothing.
+  query: USE GRAPH g3028; MATCH (t:T3028) RETURN count(t) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: drop-graph-from-other-session-while-held-refused
+  description: 'Another session cannot drop a graph an open transaction changed: 55006 / exit 1; the holder then commits.'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    G="${GEODE_BINARY:-geode}"
+    F=$(mktemp -u "${GEODE_DATA_DIR}.fifo.XXXXXX"); mkfifo "$F"
+    OUT=$(mktemp "${GEODE_DATA_DIR}.shout.XXXXXX")
+    "$G" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" < "$F" > "$OUT" 2>&1 &
+    SH=$!
+    exec 3> "$F"
+    printf '%s\n' 'USE GRAPH g3028;' 'START TRANSACTION;' 'CREATE (:Held3028 {i: 1});' >&3
+    sleep 5
+    set +e
+    R=$("$G" query "DROP GRAPH g3028" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1); RC=$?
+    set -e
+    echo "$R" | grep -q '"error_code":"55006"' || { echo "$R"; echo OTHER_SESSION_DROP_NOT_REFUSED; kill -9 $SH; exit 1; }
+    [ "$RC" -eq 1 ] || { echo "rc=$RC"; kill -9 $SH; exit 1; }
+    printf '%s\n' 'COMMIT;' 'exit' >&3
+    exec 3>&-
+    wait $SH || true
+    grep -q "transaction committed" "$OUT" || { cat "$OUT"; echo HOLDER_NOT_COMMITTED; exit 1; }
+    rm -f "$F" "$OUT"
+    echo OTHER_SESSION_DROP_REFUSED_WHILE_HELD
+  timeout_ms: 150000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - OTHER_SESSION_DROP_REFUSED_WHILE_HELD
+
+- name: held-write-committed
+  description: The holder's commit made its node durable and visible.
+  query: USE GRAPH g3028; MATCH (h:Held3028) RETURN count(h) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+
+- name: drop-after-holder-ended
+  description: Once the holder committed the drop goes through.
+  query: DROP GRAPH g3028
+  expected:
+    exit_code: 0
+
+- name: dropped-graph-gone
+  description: The graph is gone from SHOW GRAPHS.
+  query: SHOW GRAPHS
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"default"'
+    stdout_not_contains:
+    - g3028
+
+- name: bulk-merge-vs-drop-graph-race-loop
+  description: 'Three rounds of four bulk-MERGE streams racing a DROP GRAPH with group commit off: the server survives, writers see only Graph-does-not-exist, the dropped graph is not recreated.'
+  type: bash
+  command: |
+    set -e
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    G="${GEODE_BINARY:-geode}"
+    Q() { "$G" query "$1" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1; }
+    ERRS=$(mktemp)
+    writer() { # one connection, one MERGE statement per line, into the graph that is being dropped
+      for k in $(seq 1 150); do echo "MERGE (:R3121 {a: $1, b: $k, c: 'x'})"; done | \
+        "$G" query --batch -g r3121 --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1 | \
+        grep -o '"error_code":"[0-9A-Z]*"' >> "$ERRS" || true
+    }
+    for round in 1 2 3; do
+      Q "CREATE GRAPH r3121" >/dev/null
+      for w in 1 2 3 4; do writer $w & done
+      sleep 3
+      D=$(Q "DROP GRAPH r3121") || true
+      echo "$D" | grep -q '"status_class":"00000"' || { echo "$D"; echo "DROP_FAILED_ROUND_$round"; exit 1; }
+      wait
+    done
+    Q "RETURN 1 AS alive" | grep -q '"alive":1' || { echo SERVER_DEAD; exit 1; }
+    BAD=$(sort -u "$ERRS" | grep -v '"error_code":"3F000"' || true)
+    [ -z "$BAD" ] || { echo "UNEXPECTED_WRITER_ERRORS: $BAD"; exit 1; }
+    LIST=$(Q "SHOW GRAPHS")
+    echo "$LIST" | grep -q 'r3121' && { echo "$LIST"; echo GRAPH_RECREATED_BY_A_RACING_WRITE; exit 1; }
+    echo "RACE_SURVIVED_3_ROUNDS_WRITER_ERRORS_$(wc -l < "$ERRS")"
+    rm -f "$ERRS"
+  timeout_ms: 500000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RACE_SURVIVED_3_ROUNDS
+
+- name: server-alive-after-race
+  description: The server still answers.
+  query: RETURN 1 AS alive
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"alive":1'

@@ -1,0 +1,343 @@
+# SONNY-6489: value-semantics residuals. Black-box parts: TimeParse is reported as ISO 22007 (it
+# was 58000); the top-K ORDER BY heap compares integers, decimals and doubles exactly (it went
+# through doubles); stored-list string elements compare by NFC form; localdatetime() is local
+# (no zone suffix); duration rendering keeps fractions (PT1.5S printed PT1S); mixing a
+# month-based and a day-based duration raises 22G14; duration overflow is 22015 and datetime
+# overflow 22008. Not black-box: the partial NFC normaliser used by FTS (library-internal), and
+# `--listen ::1:0` allocator double frees (covered with the address grammar by SONNY-6487).
+
+version: '1.0'
+name: SONNY-6489 value residuals
+description: Temporal codes and rendering, exact top-K ordering, NFC list comparison
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: datetime-garbage-22007
+  description: TimeParse errors are ISO 22007 (invalid datetime format), not 58000 (6489 item 1)
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('garbage') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+  tags:
+  - storage
+  - sonny738
+- name: date-out-of-range-22007
+  description: date('2024-13-45')
+  args:
+  - query
+  - '-'
+  stdin: RETURN date('2024-13-45') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+  tags:
+  - storage
+  - sonny738
+- name: time-nope-22007
+  description: time('nope')
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('nope') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+  tags:
+  - storage
+  - sonny738
+- name: localdatetime-nope-22007
+  description: localdatetime('nope')
+  args:
+  - query
+  - '-'
+  stdin: RETURN localdatetime('nope') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+  tags:
+  - storage
+  - sonny738
+- name: duration-bad-22G0H
+  description: duration('P1Q') is an invalid duration format
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('P1Q') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0H"'
+  tags:
+  - storage
+  - sonny738
+- name: duration-keeps-fraction
+  description: Duration rendering keeps fractions of a second (PT1.5S, not PT1S) (6489 item 4)
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('PT1.5S') AS a, duration('PT0.5S') AS b, duration('PT-0.25S') AS c, duration('P1DT2H3M4.000001S') AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"a":{"type":"INTERVAL","value":"PT1.5S"},"b":{"type":"INTERVAL","value":"PT0.5S"},"c":{"type":"INTERVAL","value":"PT-0.25S"},"d":{"type":"INTERVAL","value":"P1DT2H3M4.000001S"}}]'
+  tags:
+  - storage
+  - sonny738
+- name: duration-cast-roundtrip
+  description: CAST to STRING keeps the fraction and parses back equal
+  args:
+  - query
+  - '-'
+  stdin: RETURN CAST(duration('PT1.5S') AS STRING) AS s, duration(CAST(duration('PT-0.25S') AS STRING)) = duration('PT-0.25S') AS eq
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"s":"PT1.5S","eq":true}]'
+  tags:
+  - storage
+  - sonny738
+- name: localdatetime-is-local
+  description: 'localdatetime() is a local timestamp: no zone suffix (6489 item 4)'
+  args:
+  - query
+  - '-'
+  stdin: RETURN localdatetime('2024-01-01T10:00:00') AS x, CAST(localdatetime('2024-01-01T10:00:00') AS STRING) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"x":{"type":"TIMESTAMP","value":"2024-01-01T10:00:00"},"s":"2024-01-01T10:00:00"}]'
+  tags:
+  - storage
+  - sonny738
+- name: datetime-keeps-zulu
+  description: datetime() with Z keeps it
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('2024-01-01T10:00:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '2024-01-01T10:00:00Z'
+  tags:
+  - storage
+  - sonny738
+- name: duration-mixed-unit-groups-22G14
+  description: Adding a year-to-month and a day-to-second duration raises 22G14 (6489 item 6)
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('P1M') + duration('P1D') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G14"'
+  tags:
+  - storage
+  - sonny738
+- name: duration-subtract-mixed-22G14
+  description: '...and so does subtracting'
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('PT1H') - duration('P1Y') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G14"'
+  tags:
+  - storage
+  - sonny738
+- name: duration-same-group-ok
+  description: Same-group arithmetic works
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('P1M') + duration('P1Y') AS a, duration('PT20H') + duration('PT20H') AS b, duration('P1M') + duration('PT0S') AS c, duration('P1M1D') + duration('P1D') AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"a":{"type":"INTERVAL","value":"P1Y1M"},"b":{"type":"INTERVAL","value":"P1DT16H"},"c":{"type":"INTERVAL","value":"P1M"},"d":{"type":"INTERVAL","value":"P1M2D"}}]'
+  tags:
+  - storage
+  - sonny738
+- name: duration-overflow-22015
+  description: Interval overflow is 22015
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('PT1H') * 9223372036854775807 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22015"'
+  tags:
+  - storage
+  - sonny738
+- name: duration-month-overflow-22015
+  description: Month-field overflow is 22015
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('P2147483647M') + duration('P1M') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22015"'
+  tags:
+  - storage
+  - sonny738
+- name: datetime-overflow-22008
+  description: Datetime arithmetic overflow is 22008
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('2024-01-01T00:00:00Z') + duration('P2147483647D') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22008"'
+  tags:
+  - storage
+  - sonny738
+- name: date-overflow-22008
+  description: Date + huge duration overflows 22008
+  args:
+  - query
+  - '-'
+  stdin: RETURN DATE '2026-01-01' + duration('P2147483647D') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22008"'
+  tags:
+  - storage
+  - sonny738
+- name: seed-numbers
+  description: Integers beyond 2^53 and decimals
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:N6489 {k: 9007199254740993}), (:N6489 {k: 9007199254740991}), (:N6489 {k: 0.1}), (:N6489 {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: topk-asc-exact
+  description: Top-K ORDER BY ASC LIMIT compares exactly (not through doubles) (6489 item 2)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:N6489) RETURN n.k AS k ORDER BY n.k LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":"0.1"},{"k":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: topk-desc-exact
+  description: 'DESC: 2^53+1 outranks 2^53-1 (through doubles they tie)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:N6489) RETURN n.k AS k ORDER BY n.k DESC LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":9007199254740993},{"k":9007199254740991}]'
+  tags:
+  - storage
+  - sonny738
+- name: topk-matches-full-sort
+  description: The unlimited sort agrees with the top-K prefix
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:N6489) RETURN n.k AS k ORDER BY n.k DESC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":9007199254740993},{"k":9007199254740991},{"k":1},{"k":"0.1"}]'
+  tags:
+  - storage
+  - sonny738
+- name: seed-lists
+  description: 'Stored lists of strings: NFC and NFD spellings'
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:L6489 {k: 1, t: ['café', 'x']}), (:L6489 {k: 2, t: ['café', 'x']}), (:L6489 {k: 3, t: ['cafe', 'x']})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: list-nfc-equal
+  description: Stored-list string elements compare by NFC form (6489 item 3)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:L6489 {k: 1}), (b:L6489 {k: 2}) RETURN a.t = b.t AS r'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"r":true}]'
+  tags:
+  - storage
+  - sonny738
+- name: list-nfc-different
+  description: A genuinely different string stays different
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:L6489 {k: 1}), (b:L6489 {k: 3}) RETURN a.t = b.t AS r'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"r":false}]'
+  tags:
+  - storage
+  - sonny738
+- name: string-nfc-equal
+  description: Scalar strings too
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'café' = 'café' AS r
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"r":true}]'
+  tags:
+  - storage
+  - sonny738
