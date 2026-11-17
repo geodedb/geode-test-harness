@@ -190,7 +190,7 @@ class TestStep:
             timeout_ms=data.get("timeout_ms", 5000),
             wait_ms=data.get("wait_ms", 0),
             expected=HttpExpected.from_dict(data.get("expect")) if step_type == "http" else None,
-            gql_expected=data.get("expect") if step_type == "gql" else None,
+            gql_expected=data.get("expect") if step_type in ("gql", "bash") else None,
             target=data.get("target"),
             sig=data.get("sig"),
             allow_failure=bool(data.get("allow_failure", False)),
