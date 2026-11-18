@@ -1,0 +1,247 @@
+version: '1.0'
+name: A cluster accepts DECIMAL values and ordinary MERGE / INSERT / CREATE shapes on every node, also after snapshot catch-up (SONNY-6718)
+description: |
+  SONNY-6718: on a cluster leader a write carrying an exact numeric literal
+  (`3.5`, an SQL/GQL DECIMAL) was refused (ClusterWriteNotReplicable) because no
+  replication codec carried a decimal; `INSERT`, several comma-separated
+  chains in one CREATE and list / date property values were refused too; and a
+  MERGE that MATCHED an existing node with a SET freed its property list with
+  the wrong allocator, so libc aborted the leader process ("free(): invalid
+  pointer") and the cluster lost its leader.
+
+  Proof over 3 real `geode serve` processes (verified peer TLS, every node with
+  GEODE_RAFT_SNAPSHOT_ENTRIES=25):
+    1. with all nodes up: CREATE with 3.5, MERGE ... SET (creating, then
+       MATCHING), INSERT with 1.50, a CREATE with a list property, and a
+       multi-chain CREATE of two nodes and a relationship with a decimal
+       property are accepted; EVERY node then answers the same rows, column
+       type DECIMAL, with the scale intact ("1.50" is not "1.5"), the list of
+       size 3 and the relationship's decimal;
+    2. node 0 is SIGKILLed; 60 more decimal CREATEs and a matched MERGE ... SET
+       and a MATCH ... SET go through the other two (the log is compacted past
+       node 0 several times);
+    3. node 0 restarts, catches up from the leader's snapshot, and EVERY node
+       again answers identical rows: the decimals installed from the snapshot
+       and replayed entries are exactly those the leader evaluated.
+
+  Documented residuals that stay refused with 40001 (docs/CLUSTER_WRITES.md):
+  a relationship MERGE, a CREATE hanging a new node off a MATCHed one, a map
+  property value, more than 32 nodes or 32 edges in one entry.
+
+  CANARY: REQ=REQ-SONNY-6718-CLUSTER-ORDINARY-WRITES; FEATURE="DistributedCluster"; ASPECT=DecimalMergeAcrossNodesAndSnapshots; STATUS=TESTED; OWNER=distributed; UPDATED=2026-11-18
+
+cluster:
+  nodes: 3
+  target_node: leader
+  startup_timeout_ms: 120000
+  shared_env:
+    GEODE_RAFT_SNAPSHOT_ENTRIES: '25'
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: decimal_and_merge_writes_replicate_to_every_node_including_after_snapshot_catchup
+  type: sequential
+  timeout_ms: 3000000
+  steps:
+  - type: bash
+    timeout_ms: 900000
+    command: |
+      PYF=$(mktemp)
+      cat > "${PYF}" <<'PY'
+      import sys, json
+      d = json.load(sys.stdin)
+      if sys.argv[1] == "rows":
+          print(",".join("%s=%s" % (r["id"], r["v"]) for r in d["rows"] if r.get("v") is not None))
+      else:
+          print({c["name"]: c["type"] for c in d["columns"]}["v"])
+      PY
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() { "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json -U geode -P "${PW}" --timeout 60 "$2" 2>&1; }
+      # w <query> [ports...]: run on whichever of the given nodes is the leader
+      w() {
+        local query="$1"; shift
+        local ps=("$@"); [ ${#ps[@]} -eq 0 ] && ps=("${PORTS[@]}")
+        local deadline=$(( $(date +%s) + 300 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${ps[@]}"; do
+            out=$(q "${P}" "${query}")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+            echo "${out}" | grep -q 'ClusterNotLeader' || { echo "REFUSED/FAILED on ${P}: ${query} => ${out:0:300}"; return 1; }
+          done
+          sleep 1
+        done
+        echo "no leader accepted: ${query}"; return 1
+      }
+      # check: on EVERY node the Dm rows equal the expected "id=value" lines (stdin),
+      # the list property has 3 items, and the edge exists; polls up to 150 s.
+      check() {
+        local want="$1" deadline=$(( $(date +%s) + 150 )) bad=""
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          bad=""
+          for P in "${PORTS[@]}"; do
+            rows=$(q "${P}" "MATCH (n:Dm) RETURN n.id AS id, n.v AS v ORDER BY id")
+            got=$(echo "${rows}" | python3 "${PYF}" rows 2>/dev/null || echo ERR)
+            [ "${got}" = "${want}" ] || { bad="node :${P} has [${got:0:300}] want [${want:0:300}]"; break; }
+            types=$(echo "${rows}" | python3 "${PYF}" type 2>/dev/null || echo ERR)
+            [ "${types}" = "DECIMAL" ] || { bad="node :${P} column v is ${types}, want DECIMAL"; break; }
+          done
+          [ -z "${bad}" ] && { echo "converged: ${want:0:80}"; return 0; }
+          sleep 1
+        done
+        echo "NO CONVERGENCE: ${bad}"; return 1
+      }
+      w "CREATE (:Dm {id: 0, v: 3.5})" || exit 1
+      w "MERGE (n:Dm {id: 1}) SET n.v = 0.25" || exit 1
+      w "MERGE (n:Dm {id: 1}) SET n.v = 0.75" || exit 1
+      w "INSERT (:Dm {id: 2, v: 1.50})" || exit 1
+      w "CREATE (:Dl {id: 3, l: [1, 2, 3]})" || exit 1
+      w "CREATE (a:Ea {k: 1}), (b:Eb {k: 2}), (a)-[:LNK {w: 2.5}]->(b)" || exit 1
+      check "0=3.5,1=0.75,2=1.50" || exit 1
+      for P in "${PORTS[@]}"; do
+        out=$(q "${P}" "MATCH (n:Dl) RETURN size(n.l) AS s"); echo "${out}" | grep -q '"s":3' || { echo "list on :${P}: ${out:0:200}"; exit 1; }
+        out=$(q "${P}" "MATCH (:Ea)-[r:LNK]->(:Eb) RETURN r.w AS w"); echo "${out}" | grep -q '"w":"2.5"' || { echo "edge decimal on :${P}: ${out:0:200}"; exit 1; }
+      done
+      echo phase1_ok
+  - type: signal
+    target: node:0
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 1500
+  - type: bash
+    timeout_ms: 900000
+    command: |
+      PYF=$(mktemp)
+      cat > "${PYF}" <<'PY'
+      import sys, json
+      d = json.load(sys.stdin)
+      if sys.argv[1] == "rows":
+          print(",".join("%s=%s" % (r["id"], r["v"]) for r in d["rows"] if r.get("v") is not None))
+      else:
+          print({c["name"]: c["type"] for c in d["columns"]}["v"])
+      PY
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() { "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json -U geode -P "${PW}" --timeout 60 "$2" 2>&1; }
+      # w <query> [ports...]: run on whichever of the given nodes is the leader
+      w() {
+        local query="$1"; shift
+        local ps=("$@"); [ ${#ps[@]} -eq 0 ] && ps=("${PORTS[@]}")
+        local deadline=$(( $(date +%s) + 300 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${ps[@]}"; do
+            out=$(q "${P}" "${query}")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+            echo "${out}" | grep -q 'ClusterNotLeader' || { echo "REFUSED/FAILED on ${P}: ${query} => ${out:0:300}"; return 1; }
+          done
+          sleep 1
+        done
+        echo "no leader accepted: ${query}"; return 1
+      }
+      # check: on EVERY node the Dm rows equal the expected "id=value" lines (stdin),
+      # the list property has 3 items, and the edge exists; polls up to 150 s.
+      check() {
+        local want="$1" deadline=$(( $(date +%s) + 150 )) bad=""
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          bad=""
+          for P in "${PORTS[@]}"; do
+            rows=$(q "${P}" "MATCH (n:Dm) RETURN n.id AS id, n.v AS v ORDER BY id")
+            got=$(echo "${rows}" | python3 "${PYF}" rows 2>/dev/null || echo ERR)
+            [ "${got}" = "${want}" ] || { bad="node :${P} has [${got:0:300}] want [${want:0:300}]"; break; }
+            types=$(echo "${rows}" | python3 "${PYF}" type 2>/dev/null || echo ERR)
+            [ "${types}" = "DECIMAL" ] || { bad="node :${P} column v is ${types}, want DECIMAL"; break; }
+          done
+          [ -z "${bad}" ] && { echo "converged: ${want:0:80}"; return 0; }
+          sleep 1
+        done
+        echo "NO CONVERGENCE: ${bad}"; return 1
+      }
+      # node 0 is dead: its two peers serve; the log is compacted past it
+      SURV=("${PORTS[1]}" "${PORTS[2]}")
+      EXP="0=3.5,1=0.75,2=1.50"
+      for i in $(seq 10 69); do
+        w "CREATE (:Dm {id: ${i}, v: ${i}.25})" "${SURV[@]}" || exit 1
+        EXP="${EXP},${i}=${i}.25"
+      done
+      w "MERGE (n:Dm {id: 1}) SET n.v = 9.99" "${SURV[@]}" || exit 1
+      w "MATCH (n:Dm {id: 0}) SET n.v = 3.50" "${SURV[@]}" || exit 1
+      EXP=$(echo "${EXP}" | sed 's/^0=3.5,1=0.75,/0=3.50,1=9.99,/')
+      echo "${EXP}" > "/tmp/geode-s6718-${PORTS[0]}.expected"
+      echo phase2_ok
+  - type: restart_node
+    target: node:0
+  - type: bash
+    timeout_ms: 900000
+    command: |
+      PYF=$(mktemp)
+      cat > "${PYF}" <<'PY'
+      import sys, json
+      d = json.load(sys.stdin)
+      if sys.argv[1] == "rows":
+          print(",".join("%s=%s" % (r["id"], r["v"]) for r in d["rows"] if r.get("v") is not None))
+      else:
+          print({c["name"]: c["type"] for c in d["columns"]}["v"])
+      PY
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() { "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json -U geode -P "${PW}" --timeout 60 "$2" 2>&1; }
+      # w <query> [ports...]: run on whichever of the given nodes is the leader
+      w() {
+        local query="$1"; shift
+        local ps=("$@"); [ ${#ps[@]} -eq 0 ] && ps=("${PORTS[@]}")
+        local deadline=$(( $(date +%s) + 300 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${ps[@]}"; do
+            out=$(q "${P}" "${query}")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+            echo "${out}" | grep -q 'ClusterNotLeader' || { echo "REFUSED/FAILED on ${P}: ${query} => ${out:0:300}"; return 1; }
+          done
+          sleep 1
+        done
+        echo "no leader accepted: ${query}"; return 1
+      }
+      # check: on EVERY node the Dm rows equal the expected "id=value" lines (stdin),
+      # the list property has 3 items, and the edge exists; polls up to 150 s.
+      check() {
+        local want="$1" deadline=$(( $(date +%s) + 150 )) bad=""
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          bad=""
+          for P in "${PORTS[@]}"; do
+            rows=$(q "${P}" "MATCH (n:Dm) RETURN n.id AS id, n.v AS v ORDER BY id")
+            got=$(echo "${rows}" | python3 "${PYF}" rows 2>/dev/null || echo ERR)
+            [ "${got}" = "${want}" ] || { bad="node :${P} has [${got:0:300}] want [${want:0:300}]"; break; }
+            types=$(echo "${rows}" | python3 "${PYF}" type 2>/dev/null || echo ERR)
+            [ "${types}" = "DECIMAL" ] || { bad="node :${P} column v is ${types}, want DECIMAL"; break; }
+          done
+          [ -z "${bad}" ] && { echo "converged: ${want:0:80}"; return 0; }
+          sleep 1
+        done
+        echo "NO CONVERGENCE: ${bad}"; return 1
+      }
+      EXP=$(cat "/tmp/geode-s6718-${PORTS[0]}.expected")
+      check "${EXP}" || exit 1
+      for P in "${PORTS[@]}"; do
+        out=$(q "${P}" "MATCH (n:Dl) RETURN size(n.l) AS s"); echo "${out}" | grep -q '"s":3' || { echo "list after catch-up on :${P}: ${out:0:200}"; exit 1; }
+        out=$(q "${P}" "MATCH (:Ea)-[r:LNK]->(:Eb) RETURN r.w AS w"); echo "${out}" | grep -q '"w":"2.5"' || { echo "edge decimal after catch-up on :${P}: ${out:0:200}"; exit 1; }
+      done
+      rm -f "/tmp/geode-s6718-${PORTS[0]}.expected"
+      echo catchup_ok
+  tags: [cluster, raft, decimal, merge, snapshot, sonny-6718]
