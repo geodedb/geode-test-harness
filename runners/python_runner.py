@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-# ruff: noqa: ASYNC230, BLE001, S110, SIM102, TRY002
-# Legacy runner: these findings predate the default-password change and are left as is.
 """
 Python client test runner.
 
 Executes test specifications using the Geode Python client library.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
+import logging
 import os
 import statistics
 import sys
@@ -24,20 +25,46 @@ import yaml
 _GEODE_CLIENT_AVAILABLE = False
 try:
     # First try the installed package
-    from geode_client import Client, Connection
+    from geode_client import Client, Connection, GeodeError, TransportError
 
     _GEODE_CLIENT_AVAILABLE = True
 except ImportError:
     # Try adding Python client from external repo sibling directory
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / "geode-client-python"))
     try:
-        from geode_client import Client, Connection
+        from geode_client import Client, Connection, GeodeError, TransportError
 
         _GEODE_CLIENT_AVAILABLE = True
     except ImportError:
         # Client not available - will report error at runtime
         Client = None
         Connection = None
+        GeodeError = None
+        TransportError = None
+
+logger = logging.getLogger(__name__)
+
+
+class RunnerError(Exception):
+    """A test step could not run (missing connection, malformed step)."""
+
+
+# What a failing step may raise: client/transport errors, I/O, timeouts, and the
+# lookup/type errors a malformed spec produces. Anything else is a runner bug and
+# propagates instead of being reported as a test error.
+_STEP_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    asyncio.TimeoutError,
+    RuntimeError,
+    LookupError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    RunnerError,
+    *(e for e in (GeodeError, TransportError) if e is not None),
+)
+# Closing an already-broken connection may fail in the same ways.
+_CLOSE_ERRORS = _STEP_ERRORS
 
 
 class DecimalEncoder(json.JSONEncoder):
@@ -109,14 +136,19 @@ class PythonTestRunner:
         if self.connection:
             try:
                 await self.connection.close()
-            except Exception:
-                pass  # Ignore connection close errors during teardown
+            except _CLOSE_ERRORS:
+                logger.debug(
+                    "ignoring connection close error during teardown", exc_info=True
+                )
         # Close all pooled connections
         for conn_id, conn in list(self.connections.items()):
             try:
                 await conn.close()
-            except Exception:
-                pass  # Ignore connection close errors during teardown
+            except _CLOSE_ERRORS:
+                logger.debug(
+                    "ignoring pooled connection close error during teardown",
+                    exc_info=True,
+                )
         self.connections.clear()
 
     def _get_connection(self, connection_id: str | None = None) -> Connection | None:
@@ -135,8 +167,10 @@ class PythonTestRunner:
         if connection_id in self.connections:
             try:
                 await self.connections[connection_id].close()
-            except Exception:
-                pass  # Ignore connection close errors during pool release
+            except _CLOSE_ERRORS:
+                logger.debug(
+                    "ignoring connection close error during pool release", exc_info=True
+                )
             del self.connections[connection_id]
 
     async def connect(self):
@@ -160,7 +194,7 @@ class PythonTestRunner:
         conn = self._get_connection(connection_id)
         if not conn:
             if connection_id:
-                raise Exception(f"Connection '{connection_id}' not found")
+                raise RunnerError(f"Connection '{connection_id}' not found")
             await self.connect()
             conn = self.connection
 
@@ -186,7 +220,7 @@ class PythonTestRunner:
         conn = self._get_connection(connection_id)
         if not conn:
             if connection_id:
-                raise Exception(f"Connection '{connection_id}' not found")
+                raise RunnerError(f"Connection '{connection_id}' not found")
             await self.connect()
             conn = self.connection
         await conn.begin()
@@ -195,7 +229,7 @@ class PythonTestRunner:
         """Commit transaction on specified or default connection."""
         conn = self._get_connection(connection_id)
         if not conn:
-            raise Exception(
+            raise RunnerError(
                 f"No active connection{' for ' + connection_id if connection_id else ''}"
             )
         await conn.commit()
@@ -204,7 +238,7 @@ class PythonTestRunner:
         """Rollback transaction on specified or default connection."""
         conn = self._get_connection(connection_id)
         if not conn:
-            raise Exception(
+            raise RunnerError(
                 f"No active connection{' for ' + connection_id if connection_id else ''}"
             )
         await conn.rollback()
@@ -242,7 +276,7 @@ class PythonTestRunner:
                     errors.append(
                         f"Iteration {i + 1}: {result.get('error', 'Unknown error')}"
                     )
-            except Exception as e:
+            except _STEP_ERRORS as e:
                 latencies.append((time.time() - start) * 1000)
                 errors.append(f"Iteration {i + 1}: {e!s}")
 
@@ -315,13 +349,14 @@ class PythonTestRunner:
                         "result": result,
                     }
 
-                if "columns" in expect:
-                    if set(result["columns"]) != set(expect["columns"]):
-                        return {
-                            "status": "failed",
-                            "error": f"Expected columns {expect['columns']}, got {result['columns']}",
-                            "result": result,
-                        }
+                if "columns" in expect and set(result["columns"]) != set(
+                    expect["columns"]
+                ):
+                    return {
+                        "status": "failed",
+                        "error": f"Expected columns {expect['columns']}, got {result['columns']}",
+                        "result": result,
+                    }
 
                 if "values" in expect and len(expect["values"]) > 0:
                     for i, expected_row in enumerate(expect["values"]):
@@ -383,13 +418,15 @@ class PythonTestRunner:
 
                         # Check expectations
                         expect = step.get("expect", {})
-                        if "rows" in expect and result["rows"] != expect["rows"]:
-                            if not step.get("expect_error", False):
-                                return {
-                                    "status": "failed",
-                                    "error": f"Step query: Expected {expect['rows']} rows, got {result['rows']}",
-                                    "results": results,
-                                }
+                        rows_mismatch = (
+                            "rows" in expect and result["rows"] != expect["rows"]
+                        )
+                        if rows_mismatch and not step.get("expect_error", False):
+                            return {
+                                "status": "failed",
+                                "error": f"Step query: Expected {expect['rows']} rows, got {result['rows']}",
+                                "results": results,
+                            }
                     elif step_type == "begin":
                         await self.begin_transaction(connection_id)
                     elif step_type == "commit":
@@ -408,7 +445,7 @@ class PythonTestRunner:
                     "error": "Test must have 'query' or 'steps'",
                 }
 
-        except Exception as e:
+        except _STEP_ERRORS as e:
             # Check if error was expected
             if test.get("expect_error", False) or any(
                 step.get("expect_error", False) for step in test.get("steps", [])
@@ -426,7 +463,7 @@ class PythonTestRunner:
             try:
                 if setup_step["type"] == "query":
                     await self.run_query(setup_step["text"])
-            except Exception as e:
+            except _STEP_ERRORS as e:
                 print(f"Setup failed: {e}", file=sys.stderr)
                 return {"status": "error", "error": f"Setup failed: {e}"}
 
@@ -448,7 +485,7 @@ class PythonTestRunner:
             try:
                 if cleanup_step["type"] == "query":
                     await self.run_query(cleanup_step["text"])
-            except Exception as e:
+            except _STEP_ERRORS as e:
                 print(f"Cleanup warning: {e}", file=sys.stderr)
 
         # Calculate summary
@@ -515,8 +552,8 @@ async def main():
         sys.exit(1)
 
     # Load spec
-    with open(args.spec) as f:
-        spec = yaml.safe_load(f)
+    spec_text = await asyncio.to_thread(args.spec.read_text)
+    spec = yaml.safe_load(spec_text)
 
     # Run tests
     runner = PythonTestRunner(args.server, args.verbose, transport=args.transport)
@@ -534,7 +571,7 @@ async def main():
 
         sys.exit(0)
 
-    except Exception as e:
+    except _STEP_ERRORS as e:
         # Ensure we always output valid JSON even when runner crashes
         error_result = {
             "summary": {

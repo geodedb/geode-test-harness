@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# ruff: noqa: BLE001, S110, SIM102
-# Legacy runner: these findings predate the default-password change and are left as is.
 """
 Interactive shell test runner for Geode.
 
@@ -40,6 +38,11 @@ try:
 except ImportError:
     PEXPECT_AVAILABLE = False
     pexpect = None
+
+# Errors pexpect raises (timeouts, EOF, spawn failures); empty when pexpect is absent.
+_PEXPECT_ERRORS: tuple[type[BaseException], ...] = (
+    (pexpect.ExceptionPexpect,) if pexpect is not None else ()
+)
 
 # ANSI escape code pattern for stripping terminal control sequences
 # Includes cursor movement, colors, and carriage returns
@@ -181,7 +184,7 @@ class ShellTestRunner:
             if self.shell_process:
                 self.log(f"Buffer contents: {self.shell_process.before}")
             return False
-        except Exception as e:
+        except (OSError, *_PEXPECT_ERRORS) as e:
             self.log(f"Failed to start shell: {e}")
             return False
 
@@ -192,8 +195,8 @@ class ShellTestRunner:
             try:
                 self.shell_process.sendline("/quit")
                 self.shell_process.expect(pexpect.EOF, timeout=5)
-            except Exception:
-                pass
+            except (OSError, *_PEXPECT_ERRORS) as e:
+                self.log(f"Shell did not quit cleanly: {e}")
             finally:
                 if self.shell_process.isalive():
                     self.shell_process.terminate(force=True)
@@ -432,7 +435,15 @@ class ShellTestRunner:
             else:
                 result["status"] = "error"
                 result["error"] = f"Unknown test type: {test_type}"
-        except Exception as e:
+        except (
+            OSError,
+            RuntimeError,
+            LookupError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            *_PEXPECT_ERRORS,
+        ) as e:
             result["status"] = "error"
             result["error"] = str(e)
 
@@ -496,14 +507,13 @@ def run_spec(
         runner.log(f"Server: {runner.server}, Data dir: {runner.data_dir}")
         runner.log(f"Manage server: {manage_server}")
 
-    if manage_server:
-        if not runner.start_server():
-            return [
-                {
-                    "status": "error",
-                    "error": f"Failed to start server on {runner.server}",
-                }
-            ]
+    if manage_server and not runner.start_server():
+        return [
+            {
+                "status": "error",
+                "error": f"Failed to start server on {runner.server}",
+            }
+        ]
 
     if not runner.start_shell():
         if manage_server:
