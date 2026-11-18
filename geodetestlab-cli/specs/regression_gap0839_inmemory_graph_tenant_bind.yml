@@ -178,6 +178,11 @@ tests:
 
     export GEODE_DISABLE_AUDIT=1
     export GEODE_ADMIN_PASSWORD="$PW"
+    # A server without --data-dir persists to the per-user default dir
+    # ($XDG_STATE_HOME/geode, docs/SERVER_FEATURES.md, ENG-3921/SONNY-6325), not in
+    # memory. Point that default at this scratch dir so concurrent runs and the
+    # user's own ~/.local/state/geode never share (and corrupt) one auth store.
+    export XDG_STATE_HOME="$WORKDIR/xdg"
 
     # Verified-TLS parity (release-binary safe): when the harness
     # provisioned a CA (GEODE_TEST_CA_CERT), ${GEODE_CLIENT_TLS} is
@@ -348,12 +353,14 @@ tests:
 
 - name: rg5-inmemory-evidence
   description: |
-    IN-MEMORY EVIDENCE — after CREATE GRAPH, a graph-bound session, and
-    CREATE USER, the scratch server's working directory listing must be
-    byte-identical to the post-startup baseline: no data/ directory and
-    no graph-store files ever appeared. This proves the KEY positive
-    above genuinely exercised in-memory graph storage (a disk-backed
-    graph would have created store files under a data dir).
+    NO-`--data-dir` EVIDENCE — a server started without --data-dir keeps its
+    graph data in the documented per-user default directory
+    ($XDG_STATE_HOME/geode, pointed at the scratch dir above), never in its
+    working directory: after CREATE GRAPH, a graph-bound session and
+    CREATE USER the working directory listing is unchanged from the
+    post-startup baseline, and the created graph is in the default dir.
+    (The server is no longer purely in-memory since ENG-3921/SONNY-6325; the
+    tenant-bind behaviour GAP-0839 pins is asserted by the tests above.)
   type: bash
   command: |
     DIRFILE=/tmp/rg5_gap0839_scratch.dir
@@ -364,16 +371,24 @@ tests:
     fi
     ls -A "$WORKDIR" | sort > /tmp/rg5_gap0839_after.txt
     if diff /tmp/rg5_gap0839_baseline.txt /tmp/rg5_gap0839_after.txt; then
-      echo "NO_ON_DISK_GRAPH_DATA"
+      echo "CWD_UNCHANGED"
     else
-      echo "ON_DISK_STATE_APPEARED"
+      echo "CWD_STATE_APPEARED"
+      exit 1
+    fi
+    if [ -d "$WORKDIR/xdg/geode" ] && grep -rqa 'rg5_g1' "$WORKDIR/xdg/geode"; then
+      echo "GRAPH_IN_DEFAULT_STATE_DIR"
+    else
+      echo "GRAPH_NOT_IN_DEFAULT_STATE_DIR"
+      find "$WORKDIR/xdg" -maxdepth 3 | head -20
       exit 1
     fi
   expected:
     exit_code: 0
     stdout_contains:
-    - NO_ON_DISK_GRAPH_DATA
-  tags: [gap-0839, in-memory, evidence]
+    - CWD_UNCHANGED
+    - GRAPH_IN_DEFAULT_STATE_DIR
+  tags: [gap-0839, evidence]
 
 - name: rg5-inmemory-server-stop
   description: |
