@@ -142,12 +142,12 @@ tests:
     below. Also includes a Decimal coefficient at exactly the documented
     38-digit maximum precision to prove that boundary constructs cleanly
     (contrast with decimal-precision-overflow, one digit past it).
-  query: RETURN Decimal('123.45', 2) AS dec, Decimal('99999999999999999999999999999999999999', 0) AS dec_max38, Interval('P1Y2M3DT4H5M6S') AS iv, Date('2025-01-15') AS d, Timestamp('2025-06-15 12:00:00') AS ts
+  query: RETURN Decimal('123.45', 2) AS dec_val, Decimal('99999999999999999999999999999999999999', 0) AS dec_max38, Interval('P1Y2M3DT4H5M6S') AS iv, Date('2025-01-15') AS d, Timestamp('2025-06-15 12:00:00') AS ts
   expected:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - '"dec":"123.45"'
+    - '"dec_val":"123.45"'
     - '"dec_max38":"99999999999999999999999999999999999999"'
     - INTERVAL
     - DATE
@@ -165,7 +165,7 @@ tests:
     enforcement, not exit_code noise.
   query: RETURN Decimal('999999999999999999999999999999999999999', 0) AS d
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
     - '"status_class":"22003"'
     - Numeric value out of range for DECIMAL
@@ -183,7 +183,7 @@ tests:
     where addition is NOT checked).
   query: RETURN decimal_mul(Decimal('99999999999999999999999999999999999999', 0), Decimal('2', 0)) AS d
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
     - '"status_class":"22003"'
     - Numeric value out of range for DECIMAL
@@ -205,7 +205,7 @@ tests:
     multiplication.
   query: RETURN decimal_add(Decimal('99999999999999999999999999999999999999', 0), Decimal('1', 0)) AS d
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
     - '"status_class":"22003"'
     - Numeric value out of range for DECIMAL
@@ -237,14 +237,15 @@ tests:
     bug rule). Interval('P9999999999Y') (10-digit year count, the numeric
     string itself exceeds i32::max before any multiply is attempted) hits
     a different, checked code path: std.fmt.parseInt's own overflow error,
-    caught gracefully. Probed real behavior: status_class 58000, error
-    "TimeParse", no crash.
+    caught gracefully. Real behavior: SQLSTATE 22015 (interval field
+    overflow, ISO/IEC 39075:2024 / SQL status codes), error "interval field
+    overflow", no crash; `geode query` exits 1 for an error status.
   query: RETURN Interval('P9999999999Y') AS iv
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
-    - '"status_class":"58000"'
-    - TimeParse
+    - '"status_class":"22015"'
+    - interval field overflow
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [advanced-types, negative, interval, overflow]
@@ -252,16 +253,15 @@ tests:
 - name: p28_datetime-out-of-range
   description: |
     NEGATIVE — Date('2025-13-15'), an out-of-range month (13), must be
-    rejected. Probed real behavior: status_class 58000, error "TimeParse".
-    Also confirmed Date('999999-01-15') (6-digit year) and
-    Timestamp('999999-06-15 12:00:00') hit the identical 58000/TimeParse
-    path — genuine calendar-field validation, no crash.
+    rejected. Real behavior: SQLSTATE 22007 (invalid datetime format), error
+    "invalid date, time, or datetime format"; `geode query` exits 1 for an
+    error status. Calendar-field validation, no crash.
   query: RETURN Date('2025-13-15') AS d
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
-    - '"status_class":"58000"'
-    - TimeParse
+    - '"status_class":"22007"'
+    - invalid date, time, or datetime format
     stdout_not_contains:
     - '"status_class":"00000"'
   tags: [advanced-types, negative, datetime, out-of-range]
@@ -277,7 +277,7 @@ tests:
     rejection, not a blanket parser failure.
   query: RETURN 99999999999999999999999999999 AS n
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
     - '"status_class":"42000"'
     - parse error

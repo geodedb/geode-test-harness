@@ -112,34 +112,26 @@ tests:
 
 - name: merge-undefined-var-pattern
   description: |
-    KEY NEGATIVE — MERGE (n:P16_Unbound {k: m.v}) references `m`, a
-    variable never bound by any MATCH pattern in this query. This used to
-    be a LIMITATION-PIN: `m.v` evaluated to NULL and MERGE silently created
-    a node with k=null (status_class 00000). Since geode e5e56535
-    (write-shape allowlist, SONNY-3166/SONNY-3182) the whole statement is
-    refused with 0A000 before anything is written. The limitation-pin
-    flipped once the fix landed: assert the refusal.
+    MERGE (n:P16_Unbound {k: m.v}) names a variable nothing binds: refused with
+    42000 "Variable not in scope" before anything is written (ISO/IEC 39075 20.12 SR 8).
   query: 'MERGE (n:P16_Unbound {k: m.v}) RETURN n.k AS k'
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
-    - '"status_class":"0A000"'
-    stdout_not_contains:
-    - '"status_class":"00000"'
+    - '"status_class":"42000"'
+    - Variable not in scope
   tags: [merge, negative, unbound-var, key-assertion]
 
 - name: merge-undefined-var-pattern-rerun-dedups
   description: |
-    KEY ASSERTION — re-running the identical unbound-var MERGE is refused
-    again (0A000), deterministically, rather than accepted on a second
-    execution.
+    KEY ASSERTION - re-running the identical unbound-var MERGE is refused again
+    (42000 Variable not in scope), deterministically, rather than accepted on a second execution.
   query: 'MERGE (n:P16_Unbound {k: m.v}) RETURN n.k AS k'
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
-    - '"status_class":"0A000"'
-    stdout_not_contains:
-    - '"status_class":"00000"'
+    - '"status_class":"42000"'
+    - Variable not in scope
   tags: [merge, negative, unbound-var, key-assertion]
 
 - name: merge-undefined-var-pattern-count
@@ -157,42 +149,39 @@ tests:
 
 - name: merge-null-key
   description: |
-    Probe — MERGE (n:P16_NullKey {k: null}) uses an explicit literal null
-    as the merge key. Probed real behavior: status_class 00000, NOT an
-    error. Creates a node with k=null on first execution. Asserted as the
-    real (accepted) behavior — LIMITATION-PIN (no rejection of null as a
-    merge-key value).
+    MERGE (n:P16_NullKey {k: null}) uses an explicit null as the merge key: refused with
+    22004 (null value not allowed) - a null property is absent and `k = null` is never true, so
+    MERGE would never match and must not create an element (SONNY-6433).
   query: 'MERGE (n:P16_NullKey {k: null}) RETURN n.k AS k'
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
-    - '"status_class":"00000"'
-    - '"k":null'
+    - '"status_class":"22004"'
+    - null value not allowed
   tags: [merge, negative, null-key, limitation-pin, silent-accept, key-assertion]
 
 - name: merge-null-key-rerun-dedups
   description: |
-    KEY ASSERTION — re-running the identical null-key MERGE must MATCH
-    the existing null-keyed node, not create a second one.
+    KEY ASSERTION - the null-key MERGE is refused (22004) on every execution, never accepted
+    on a second run (SONNY-6433).
   query: 'MERGE (n:P16_NullKey {k: null}) RETURN n.k AS k'
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
-    - '"status_class":"00000"'
-    - '"k":null'
+    - '"status_class":"22004"'
+    - null value not allowed
   tags: [merge, negative, null-key, limitation-pin, key-assertion]
 
 - name: merge-null-key-count
   description: |
-    KEY ASSERTION — count(n) must be exactly 1 after two executions of
-    the null-key MERGE. A bug would show count 2 (duplicate node created
-    because dedup on a null key value failed).
+    KEY ASSERTION - count(n) is exactly 0 after two refused executions of the null-key
+    MERGE: the refusal happens before any write (SONNY-6433).
   query: MATCH (n:P16_NullKey) RETURN count(n) AS c
   expected:
     exit_code: 0
     stdout_contains:
     - '"status_class":"00000"'
-    - '"c":1'
+    - '"c":0'
   tags: [merge, negative, null-key, key-assertion]
 
 - name: contradictory-oncreate-onmatch-first-execution-fires-create-arm

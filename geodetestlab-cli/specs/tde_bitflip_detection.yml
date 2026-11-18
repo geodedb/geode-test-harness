@@ -42,7 +42,7 @@ cli:
     - --log-level
     - warn
     - --enable-tde
-    - --enable-wal-encryption
+    # SONNY-6422/6442: --enable-wal-encryption was removed; the WAL is encrypted by the engine under GEODE_TDE_KEY
     - --tde-provider
     - MockKms
     env:
@@ -52,7 +52,7 @@ cli:
     format: json
 env:
   GEODE_TDE_KEY: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
-  GEODE_WAL_KEY: cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe
+  # SONNY-6422: GEODE_WAL_KEY removed (server refuses it); the WAL is encrypted by GEODE_TDE_KEY
   GEODE_TDE_ENABLED: 'true'
   GEODE_WAL_ENCRYPTION_ENABLED: 'true'
 
@@ -105,90 +105,148 @@ tests:
       row_count: 1
   tags: [tde, bitflip, baseline]
 
-- name: tde-bitflip-apply-and-restart
+- name: tde-bitflip-detected-on-copies-of-the-data-dir
   description: |
-    Stop the server (via restart_server), flip one byte in the ciphertext
-    body of every encrypted page-store file, then let the harness bring the
-    server back up.
-
-    The bash step runs in the Geode source directory; it reads GEODE_DATA_DIR
-    from env (injected by the harness for bash steps). If GEODE_DATA_DIR is
-    not set the test fails loudly rather than silently skipping, because a
-    skipped flip would let the downstream "no sentinel after corruption"
-    assertion pass vacuously.
-
-    Geode shards each graph's data across many per-shard page-store files
-    (`<root>/<graph_uuid>/graphs/<shard_uuid>/{nodes,props,var,...}.store`),
-    each AES-GCM encrypted per page. The sentinel node's bytes (and its
-    string value) live in exactly one shard's store files, so we flip every
-    sufficiently-large `.store` file to guarantee the sentinel's encrypted
-    page is corrupted. The page-level auth tag must then reject the tampered
-    page on read.
-
-    Byte offset 64 is chosen because:
-    - Page header (page_id/checksum/write_count) occupies the first bytes;
-    - Offset 64 is safely inside the ciphertext body of the first page,
-      so the flip corrupts authenticated ciphertext rather than the header.
+    Bit flips in the at-rest store files are DETECTED; nothing corrupt (and no
+    plaintext) is served. The engine refuses to start when the durable auth
+    state (the __geode_security graph) is unreadable, so the old "managed
+    restart on a flipped data dir" scenario cannot be expressed: the harness
+    needs that restart to succeed. Instead every scenario below copies the
+    (quiescent, cleanly checkpointed) data dir, flips ONE byte at offset 64 of
+    every 8 KiB page of every non-empty store file of one kind of one graph
+    (page 0 of a multi-page file is unused: only offsets in the pages that hold
+    rows are authenticated), and starts `geode serve --data-dir <copy>` on it,
+    with a bounded wait. Control: an uncorrupted copy starts and answers the
+    sentinel query. Per-kind behaviours asserted (exact current text):
+      default graph nodes/props/var.store -> the server starts; the graph is
+        quarantined: 58000 GraphQuarantined, log DecryptionFailed (AES-GCM tag)
+      default graph free.store -> 58000 "InvalidData: a record of the graph's
+        stored data could not be decoded", log failed to open ShardedGraphEngine
+      __geode_security free.store -> serve exits 1: "refusing to start without
+        durable auth state", AuthGraphUnavailable
+      __geode_security nodes.store -> login refused (exit 3): "Authentication
+        temporarily unavailable" or "Authentication failed" (which of the two
+        depends on the data dir layout; both are fail-closed refusals)
+    In every corrupted scenario the sentinel is never returned and never on disk
+    in plaintext.
   type: bash
+  timeout_ms: 600000
   command: |
-    DATA_DIR="${GEODE_DATA_DIR:-}"
-    if [ -z "$DATA_DIR" ] || [ ! -d "$DATA_DIR" ]; then
-      echo "FAIL: GEODE_DATA_DIR not available in bash step environment (got: '${DATA_DIR}')"
-      echo "The harness must export the active server data dir to bash steps."
+    SRC="${GEODE_DATA_DIR:-}"
+    if [ -z "$SRC" ] || [ ! -d "$SRC" ]; then
+      echo "FAIL: GEODE_DATA_DIR not available in bash step environment (got: '${SRC}')"
       exit 1
     fi
-
-    # Flip one byte at offset 64 in the ciphertext body of every encrypted
-    # page-store file large enough to have a body past offset 64. Files
-    # smaller than 128 bytes (e.g. empty free.store maps) are skipped.
-    FLIPPED=0
-    while IFS= read -r TARGET; do
-      [ -z "$TARGET" ] && continue
-      FILE_SIZE=$(stat -c%s "$TARGET" 2>/dev/null || stat -f%z "$TARGET" 2>/dev/null || echo 0)
-      if [ "$FILE_SIZE" -lt 128 ]; then
-        continue
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    export GEODE_TDE_KEY="${GEODE_TDE_KEY:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
+    export GEODE_ALLOW_TEST_AUDIT_KEYS=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DISABLE_AUDIT=1
+    W=$(mktemp -d)
+    FAILS=0
+    fail() { echo "FAIL: $*"; FAILS=$((FAILS+1)); }
+    # The two graph dirs: the security graph is the one holding the audit keys.
+    SEC=""; DEF=""
+    for g in "$SRC"/*/; do
+      g=$(basename "$g")
+      [ -d "$SRC/$g/graphs" ] || continue
+      if [ -f "$SRC/$g/audit.jsonl.pub" ]; then SEC="$g"; else DEF="$g"; fi
+    done
+    if [ -z "$SEC" ] || [ -z "$DEF" ]; then fail "cannot tell the security and default graph dirs apart (sec='$SEC' def='$DEF')"; fi
+    cat > "$W/flip.py" <<'PY'
+    import os, sys
+    root, kind = sys.argv[1], sys.argv[2]
+    n = 0
+    for dp, _, fns in os.walk(root):
+        for fn in fns:
+            if fn != kind + ".store":
+                continue
+            p = os.path.join(dp, fn)
+            sz = os.path.getsize(p)
+            if sz < 128:
+                continue
+            with open(p, "r+b") as f:
+                for off in range(64, sz, 8192):
+                    f.seek(off); b = f.read(1); f.seek(off); f.write(bytes([b[0] ^ 0xFF]))
+            n += 1
+    print(n)
+    PY
+    port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+    # scenario <name> <graph|NONE> <kind>; sets STATE (ready|exited|timeout), SRV_RC, QOUT, QRC, LOG
+    scenario() {
+      local name="$1" graph="$2" kind="$3" T P PORT i n
+      T="$W/$name"; mkdir -p "$T"; cp -a "$SRC" "$T/d"; rm -f "$T/d/.geode.lock"
+      if [ "$graph" != NONE ]; then
+        n=$(python3 "$W/flip.py" "$T/d/$graph/graphs" "$kind")
+        [ "${n:-0}" -ge 1 ] || fail "$name: no non-empty $kind.store file to corrupt in $graph"
       fi
-      dd if=/dev/urandom of="$TARGET" bs=1 count=1 seek=64 conv=notrunc 2>/dev/null || true
-      FLIPPED=$((FLIPPED + 1))
-    done < <(find "$DATA_DIR" -type f -name "*.store" 2>/dev/null)
-
-    if [ "$FLIPPED" -eq 0 ]; then
-      echo "FAIL: no *.store page files >=128 bytes found under $DATA_DIR to corrupt"
-      exit 1
-    fi
-
-    echo "bitflip_applied to ${FLIPPED} store file(s) at offset 64"
-  restart_server: true
+      PORT=$(port); LOG="$T/log"
+      timeout 40 "$BIN" serve --listen "127.0.0.1:${PORT}" --lsp-port=0 --data-dir "$T/d" --log-level warn >"$LOG" 2>&1 &
+      P=$!
+      STATE=timeout
+      for i in $(seq 1 80); do
+        sleep 0.5
+        if ! kill -0 "$P" 2>/dev/null; then STATE=exited; break; fi
+        if grep -q 'server ready' "$LOG"; then STATE=ready; break; fi
+      done
+      QOUT=""; QRC=""; SRV_RC=""
+      if [ "$STATE" = ready ]; then
+        QOUT=$("$BIN" query --server "127.0.0.1:${PORT}" --insecure-tls-skip-verify --no-saved-session --timeout 15 \
+               -U geode -P "$PW" "MATCH (n:BitflipTest) RETURN n.sentinel AS s" 2>&1)
+        QRC=$?
+        kill "$P" 2>/dev/null; wait "$P" 2>/dev/null
+      elif [ "$STATE" = exited ]; then
+        wait "$P"; SRV_RC=$?
+      else
+        kill "$P" 2>/dev/null; wait "$P" 2>/dev/null
+      fi
+      if grep -a -r -l BITFLIP_SENTINEL_NODE_XYZ --exclude='*.jsonl' --exclude-dir=timeseries --exclude-dir=fts "$T/d" >/dev/null 2>&1; then
+        fail "$name: sentinel found in plaintext on disk"
+      fi
+    }
+    has() { printf '%s' "$1" | grep -a -q -E -- "$2"; }
+    expect_ready_query() {  # <name> <qrc> <text-in-query-output> <text-in-log>
+      if [ "$STATE" != ready ]; then fail "$1: server state '$STATE' (wanted ready)"; return; fi
+      [ "$QRC" = "$2" ] || fail "$1: query exit $QRC (wanted $2): $QOUT"
+      has "$QOUT" "$3" || fail "$1: query output lacks '$3': $QOUT"
+      if has "$QOUT" BITFLIP_SENTINEL_NODE_XYZ; then fail "$1: sentinel served from corrupted store"; fi
+      if [ -n "$4" ] && ! has "$(cat "$LOG")" "$4"; then fail "$1: log lacks '$4'"; fi
+      echo "OK $1"
+    }
+    scenario control NONE x
+    if [ "$STATE" = ready ] && [ "$QRC" = 0 ] && has "$QOUT" '"status_class":"00000"' && has "$QOUT" BITFLIP_SENTINEL_NODE_XYZ; then
+      echo "OK control"
+    else fail "control: uncorrupted copy did not start and answer (state=$STATE qrc=$QRC): $QOUT"; fi
+    for k in nodes props var; do
+      scenario "default-$k" "$DEF" "$k"
+      expect_ready_query "default-$k" 1 'GraphQuarantined' 'DecryptionFailed'
+    done
+    scenario default-free "$DEF" free
+    expect_ready_query default-free 1 "InvalidData: a record of the graph's stored data could not be decoded" \
+      'failed to open ShardedGraphEngine for graph graph=default error=InvalidData'
+    scenario security-free "$SEC" free
+    if [ "$STATE" = exited ] && [ "$SRV_RC" = 1 ] && has "$(cat "$LOG")" 'refusing to start without durable auth state' && has "$(cat "$LOG")" 'error: AuthGraphUnavailable'; then
+      echo "OK security-free"
+    else fail "security-free: serve state=$STATE rc=$SRV_RC (wanted exited 1 with the durable-auth-state refusal): $(tail -c 600 "$LOG")"; fi
+    scenario security-nodes "$SEC" nodes
+    expect_ready_query security-nodes 3 'Authentication (temporarily unavailable|failed)' ''
+    scenario security-props "$SEC" props
+    expect_ready_query security-props 3 'Authentication (temporarily unavailable|failed)' 'graph=__geode_security error=DecryptionFailed'
+    rm -rf "$W"
+    if [ "$FAILS" -ne 0 ]; then echo "bitflip_failures=$FAILS"; exit 1; fi
+    echo "bitflip_all_detected"
   expect:
     exit_code: 0
-    stdout_contains: [bitflip_applied]
-  tags: [tde, bitflip, corrupt]
-
-- name: tde-bitflip-read-after-corruption
-  description: |
-    Read the sentinel node after the byte-flip. The server must either:
-    (a) exit non-zero — AES-GCM tag rejection propagated to client, OR
-    (b) exit 0 but NOT return BITFLIP_SENTINEL_NODE_XYZ in plaintext.
-    Returning the corrupted row as if it were valid is a critical failure.
-
-    The apply-and-restart step flips a byte in EVERY *.store file, which
-    includes the __geode_security graph's AES-GCM pages. On reopen the server
-    therefore cannot authenticate the admin credential against the tampered
-    security store and returns exit 3 ("Authentication failed") — this is the
-    fail-closed AES-GCM-tag-rejection outcome of case (a) surfacing at the auth
-    layer (the data read never runs, so the sentinel cannot leak — the empty
-    stdout still satisfies the primary no-plaintext oracle below). Accept 3
-    alongside the direct data-page rejection codes 0/1.
-  args:
-  - query
-  - MATCH (n:BitflipTest) RETURN n.sentinel AS s
-  expect:
-    exit_code:
-    - 0
-    - 1
-    - 3
-    stdout_not_contains: [BITFLIP_SENTINEL_NODE_XYZ]
-  tags: [tde, bitflip, detection, critical]
+    stdout_contains:
+    - OK control
+    - OK default-nodes
+    - OK default-props
+    - OK default-var
+    - OK default-free
+    - OK security-free
+    - OK security-nodes
+    - OK security-props
+    - bitflip_all_detected
+  tags: [tde, bitflip, corrupt, detection, critical]
 
 - name: tde-bitflip-plaintext-absent-after-flip
   description: 'CRITICAL: Sentinel must still not appear in plaintext on disk (no fallback write).'
@@ -205,22 +263,6 @@ tests:
   expect:
     exit_code: 1
   tags: [tde, bitflip, grep, critical]
-
-- name: tde-bitflip-cleanup
-  description: |
-    Best-effort cleanup; may fail if the data dir is in an unrecoverable state
-    due to the intentional corruption — that is expected and acceptable. Exit 3
-    (Authentication failed) is included because the byte-flip also corrupts the
-    __geode_security store, so the admin credential cannot be verified on reopen.
-  args:
-  - query
-  - MATCH (n:BitflipTest) DETACH DELETE n RETURN count(*) AS deleted
-  expect:
-    exit_code:
-    - 0
-    - 1
-    - 3
-  tags: [tde, teardown]
 
 invariants:
 - type: server_running

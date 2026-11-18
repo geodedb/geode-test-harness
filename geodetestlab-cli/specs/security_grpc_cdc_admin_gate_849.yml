@@ -212,13 +212,23 @@ tests:
     export GEODE_DISABLE_AUDIT=1
     export GEODE_ADMIN_PASSWORD="$PW"
 
+    # Verified-TLS parity (release-binary safe): serve the harness CA's leaf cert.
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+
     nohup "$BIN" serve --listen "127.0.0.1:${PORT}" --data-dir "$WORKDIR/data" --log-level warn \
+      ${SERVER_TLS_ARGS} \
       > "$WORKDIR/server.log" 2>&1 &
     echo $! > "$PIDFILE"
 
     READY=0
     for i in $(seq 1 100); do
-      if "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" -U geode -P "$PW" >/dev/null 2>&1; then
+      if "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} >/dev/null 2>&1; then
         READY=1
         break
       fi
@@ -231,7 +241,7 @@ tests:
     fi
     echo "SCRATCH_QUIC_READY"
 
-    USER_OUT=$("$BIN" query "CREATE USER rg7_user SET PASSWORD 'Rg7UserCdcPass!234' ROLE readwrite" --server "127.0.0.1:${PORT}" -U geode -P "$PW" 2>&1)
+    USER_OUT=$("$BIN" query "CREATE USER rg7_user SET PASSWORD 'Rg7UserCdcPass 234 Passphrase' ROLE readwrite" --server "127.0.0.1:${PORT}" -U geode -P "$PW" ${GEODE_CLIENT_TLS} 2>&1)
     echo "$USER_OUT"
     echo "$USER_OUT" | grep -qF 'rg7_user' || { echo "USER_CREATE_FAILED"; exit 1; }
 
@@ -457,7 +467,7 @@ tests:
     PORT=4449
     PROTO_DIR="src/proto"
 
-    HELLO_JSON='{"username":"rg7_user","password":"Rg7UserCdcPass!234","client_name":"rg7-nonadmin","client_version":"1","wanted_conformance":"iso"}'
+    HELLO_JSON='{"username":"rg7_user","password":"Rg7UserCdcPass 234 Passphrase","client_name":"rg7-nonadmin","client_version":"1","wanted_conformance":"iso"}'
     HELLO_OUT=$(timeout 15 grpcurl -plaintext -import-path "$PROTO_DIR" -proto geode.proto \
       -d "$HELLO_JSON" "127.0.0.1:${PORT}" geode.GeodeService/Handshake 2>&1)
     HELLO_STATUS=$?

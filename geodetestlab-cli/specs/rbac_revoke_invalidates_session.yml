@@ -55,7 +55,7 @@ tests:
 
 - name: revoke-preflight-cleanup
   description: Idempotent cleanup of any leftover state.
-  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  args: [query, -U, geode, -P, '${secret:admin_password}', --batch, '-']
   stdin: |
     DROP USER IF EXISTS rbac_revoke_bob;
     DROP USER IF EXISTS rbac_revoke_carol;
@@ -69,14 +69,14 @@ tests:
   tags: [rbac, setup]
 
 - name: revoke-create-bob-readonly
-  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_revoke_bob SET PASSWORD 'RbacRevoke-Bob-1234' ROLE readonly]
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_revoke_bob SET PASSWORD 'RbacRevoke Bob 1234 Passphrase' ROLE readonly]
   expect:
     exit_code: 0
     stdout_contains: [rbac_revoke_bob]
   tags: [rbac, setup]
 
 - name: revoke-create-carol-readwrite
-  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_revoke_carol SET PASSWORD 'RbacRevoke-Carol-1234' ROLE readwrite]
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rbac_revoke_carol SET PASSWORD 'RbacRevoke Carol 1234 Passphrase' ROLE readwrite]
   expect:
     exit_code: 0
     stdout_contains: [rbac_revoke_carol]
@@ -97,7 +97,7 @@ tests:
     POSITIVE — the READ grant lets readonly bob bind rbac_revoke_graph and
     read it. This also puts bob's bind_graph ALLOW into geode's GPS decision
     cache, which the post-revoke read below must not be served from.
-  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke-Bob-1234, '-']
+  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke Bob 1234 Passphrase, '-']
   stdin: |
     USE GRAPH rbac_revoke_graph;
     RETURN 1 AS x;
@@ -111,12 +111,12 @@ tests:
   description: |
     NEGATIVE — bob is readonly globally; READ grant does not confer write.
     A write attempt before the grant revoke must still fail with 42501.
-  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke-Bob-1234, '-']
+  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke Bob 1234 Passphrase, '-']
   stdin: |
     USE GRAPH rbac_revoke_graph;
     CREATE (n:RbacRevokeBobPre {v: 1}) RETURN n;
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42501', Permission denied]
   tags: [rbac, negative, pre_revoke]
 
@@ -136,7 +136,7 @@ tests:
     denied") before the CREATE is reached. This confirms the revoke was
     applied immediately to the enforcement layer (no stale grant cache);
     a stale cached bind ALLOW would instead reach the write gate (42501).
-  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke-Bob-1234, '-']
+  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke Bob 1234 Passphrase, '-']
   stdin: |
     USE GRAPH rbac_revoke_graph;
     CREATE (n:RbacRevokeBobPost {v: 1}) RETURN n;
@@ -153,7 +153,7 @@ tests:
     grant change bumped neither his auth_version nor the policy version,
     so the revoked grant kept working until restart. A grant change now
     bumps the policy version and invalidates the cached decision.
-  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke-Bob-1234, '-']
+  args: [query, -U, rbac_revoke_bob, -P, RbacRevoke Bob 1234 Passphrase, '-']
   stdin: |
     USE GRAPH rbac_revoke_graph;
     RETURN 1 AS x;
@@ -167,7 +167,7 @@ tests:
 
 - name: revoke-carol-can-write-before-downgrade
   description: POSITIVE — carol (readwrite) can write before downgrade.
-  args: [query, -U, rbac_revoke_carol, -P, RbacRevoke-Carol-1234, '-']
+  args: [query, -U, rbac_revoke_carol, -P, RbacRevoke Carol 1234 Passphrase, '-']
   stdin: 'CREATE (n:RbacRevokeCarolPre {v: 1}) RETURN n'
   expect:
     exit_code: 0
@@ -186,10 +186,10 @@ tests:
     NEGATIVE — after ALTER USER SET ROLE readonly, carol's next fresh
     connection write attempt must fail with 42501. This verifies that
     role downgrade is applied immediately — no caching window.
-  args: [query, -U, rbac_revoke_carol, -P, RbacRevoke-Carol-1234, '-']
+  args: [query, -U, rbac_revoke_carol, -P, RbacRevoke Carol 1234 Passphrase, '-']
   stdin: 'CREATE (n:RbacRevokeCarolPost {v: 1}) RETURN n'
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42501', Permission denied]
   tags: [rbac, negative, post_downgrade, gap0290]
 
@@ -203,7 +203,7 @@ tests:
 # spec. See: shell_session_stability.yml for the interactive session pattern.
 
 - name: revoke-cleanup
-  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  args: [query, -U, geode, -P, '${secret:admin_password}', --batch, '-']
   stdin: |
     DROP USER IF EXISTS rbac_revoke_bob;
     DROP USER IF EXISTS rbac_revoke_carol;

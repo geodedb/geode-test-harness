@@ -84,7 +84,7 @@ tests:
   # ------------------------------------------------------------ pre-clean --
 - name: p8_teardown_canary
   description: Idempotent pre-teardown so reruns start clean (CANARY)
-  args: [query, '-']
+  args: [query, --batch, '-']
   stdin: |
     MATCH (n:P8_Doc) DETACH DELETE n
     MATCH (n:P8_EmptyDoc) DETACH DELETE n
@@ -95,7 +95,7 @@ tests:
 
   # --------------------------------------------------------------- setup --
 - name: p8_setup_create_index
-  description: "Positive setup: create a REAL fulltext index (USING fulltext, not the unparsed CREATE FULLTEXT INDEX form) on P8_Doc.body"
+  description: 'Positive setup: create a REAL fulltext index (USING fulltext, not the unparsed CREATE FULLTEXT INDEX form) on P8_Doc.body'
   args: [query, '-']
   stdin: CREATE INDEX p8_fts_idx ON P8_Doc (body) USING fulltext
   expect:
@@ -116,7 +116,7 @@ tests:
   tags: [fulltext, setup, positive, show]
 
 - name: p8_setup_seed_docs
-  description: "Positive setup: seed 3 documents under the indexed label"
+  description: 'Positive setup: seed 3 documents under the indexed label'
   args: [query, '-']
   stdin: |
     CREATE (:P8_Doc {id: 1, body: 'the quick brown fox jumps over the lazy dog'}),
@@ -129,7 +129,7 @@ tests:
   tags: [fulltext, setup, positive, insert]
 
 - name: p8_setup_phrase_search_hits
-  description: "Positive: one phrase search hits via the real query surface (CALL geode.fts.phrase), proving setup end-to-end"
+  description: 'Positive: one phrase search hits via the real query surface (CALL geode.fts.phrase), proving setup end-to-end'
   args: [query, '-']
   stdin: CALL geode.fts.phrase('p8_fts_idx', 'quick brown') YIELD node, score RETURN node, score
   expect:
@@ -152,13 +152,11 @@ tests:
   args: [query, '-']
   stdin: |
     CALL geode.fts.phrase('p8_fts_idx', 'quick brown) YIELD node, score RETURN node, score
+  # geode query exits 1 for any error status.
   expect:
-    exit_code: 0
-    stdout_contains:
-    - '"status_class":"42000"'
-    - error
-    stdout_not_contains:
-    - '"status_class":"00000"'
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"', error]
+    stdout_not_contains: ['"status_class":"00000"']
   tags: [fulltext, negative, malformed-syntax]
 
   # -------------------------------------------------- search-before-index --
@@ -171,13 +169,11 @@ tests:
     — no crash, no hang.
   args: [query, '-']
   stdin: CALL geode.fts.phrase('p8_never_created_idx', 'quick brown') YIELD node, score RETURN node, score
+  # geode query exits 1 for any error status.
   expect:
-    exit_code: 0
-    stdout_contains:
-    - '"status_class":"0A000"'
-    - Unsupported
-    stdout_not_contains:
-    - '"status_class":"00000"'
+    exit_code: 1
+    stdout_contains: ['"status_class":"0A000"', Unsupported]
+    stdout_not_contains: ['"status_class":"00000"']
   tags: [fulltext, negative, no-index]
 
   # ------------------------------------------------------ dropped index --
@@ -209,18 +205,16 @@ tests:
     hang.
   args: [query, '-']
   stdin: CALL geode.fts.phrase('p8_fts_idx', 'quick brown') YIELD node, score RETURN node, score
+  # geode query exits 1 for any error status.
   expect:
-    exit_code: 0
-    stdout_contains:
-    - '"status_class":"0A000"'
-    - Unsupported
-    stdout_not_contains:
-    - '"status_class":"00000"'
+    exit_code: 1
+    stdout_contains: ['"status_class":"0A000"', Unsupported]
+    stdout_not_contains: ['"status_class":"00000"']
   tags: [fulltext, negative, dropped-index]
 
   # -------------------------------------------------------- empty index --
 - name: p8_search_empty_index_create
-  description: "Positive-boundary: create a fresh fulltext index over a label with zero rows"
+  description: 'Positive-boundary: create a fresh fulltext index over a label with zero rows'
   args: [query, '-']
   stdin: CREATE INDEX p8_empty_idx ON P8_EmptyDoc (body) USING fulltext
   expect:
@@ -305,7 +299,7 @@ tests:
   # ---------------------------------------------------------------- cleanup --
 - name: p8_teardown
   description: Remove all P8 test nodes and indexes (CANARY idempotent teardown)
-  args: [query, '-']
+  args: [query, --batch, '-']
   stdin: |
     MATCH (n:P8_Doc) DETACH DELETE n
     MATCH (n:P8_EmptyDoc) DETACH DELETE n

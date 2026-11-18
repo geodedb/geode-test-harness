@@ -51,8 +51,8 @@ cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 30000
     cleanup: true
     args:
@@ -83,7 +83,7 @@ tests:
     Prerequisite (positive) — a normal, valid WHERE filter on the seeded
     integer property must match the row, proving the baseline WHERE path
     itself works before we probe its negative edges.
-  query: "MATCH (n:P15_N) WHERE n.i = 1 RETURN n.s AS s"
+  query: MATCH (n:P15_N) WHERE n.i = 1 RETURN n.s AS s
   expected:
     exit_code: 0
     stdout_contains:
@@ -99,7 +99,7 @@ tests:
     status_class 00000, zero rows returned — the incomparable `<` is
     treated as false rather than raising a type-mismatch error. Asserted
     as the real (accepted) behavior, not claimed as a rejection.
-  query: "MATCH (n:P15_N) WHERE n.s < 5 RETURN n.s AS s"
+  query: MATCH (n:P15_N) WHERE n.s < 5 RETURN n.s AS s
   expected:
     exit_code: 0
     stdout_contains:
@@ -115,7 +115,7 @@ tests:
     missing property evaluates to NULL and NULL = 1 is null/false, so the
     row is filtered out silently (null semantics) rather than the query
     being rejected. Asserted as the real (accepted) behavior.
-  query: "MATCH (n:P15_N) WHERE n.nosuch = 1 RETURN n.s AS s"
+  query: MATCH (n:P15_N) WHERE n.nosuch = 1 RETURN n.s AS s
   expected:
     exit_code: 0
     stdout_contains:
@@ -129,9 +129,9 @@ tests:
     must be rejected as a syntax error. Probed real behavior: status_class
     42000, error "parse error" — a genuine parse-time rejection, not a
     silent-accept.
-  query: "MATCH (n:P15_N) WHERE n.i <> <> 1 RETURN n.s AS s"
+  query: MATCH (n:P15_N) WHERE n.i <> <> 1 RETURN n.s AS s
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
     - '"status_class":"42000"'
     - parse error
@@ -150,17 +150,20 @@ tests:
     nonexistent-property above) and silently filters every row, rather
     than rejecting the query for referencing an undeclared variable.
     Asserted as the real (accepted) behavior, not claimed as a rejection.
-  query: "MATCH (n:P15_N) WHERE m.i = 1 RETURN n"
+  query: MATCH (n:P15_N) WHERE m.i = 1 RETURN n
+  # Now rejected per ISO/IEC 39075 20.12 SR 8 (variable not in scope): status 42000; the CLI exits 1.
   expected:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
+    - '"status_class":"42000"'
+    - Variable not in scope
+    stdout_not_contains:
     - '"status_class":"00000"'
-    - '"rows":[]'
-  tags: [where-clause, negative, unbound-variable, limitation-pin, silent-accept]
+  tags: [where-clause, negative, unbound-variable]
 
 - name: cleanup-test-data
   description: Clean up all P15 test data.
-  query: "MATCH (n:P15_N) DETACH DELETE n"
+  query: MATCH (n:P15_N) DETACH DELETE n
   expected:
     exit_code: 0
   tags: [cleanup]

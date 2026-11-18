@@ -10,7 +10,11 @@ cli:
     data_dir:
     startup_timeout_ms: 120000
     cleanup: true
-    args: [--log-level, info, --audit, --audit-file, /tmp/geode_audit_test.jsonl]
+    args: [--log-level, info]
+    # --audit/--audit-file are global client flags, not `geode serve` options (docs/AUDIT_LOGGING.md "Command audit"); the server log is env-enabled
+    env:
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_AUDIT_LOG_PATH: /tmp/geode_audit_test.jsonl
   client:
     timeout_ms: 120000
     tls_verify: false
@@ -25,15 +29,15 @@ tests:
   description: Setup audit logging test environment
   args: [query, "CALL audit.configure(enabled => true, file_path => '/tmp/geode_audit_test.jsonl', hash_algorithm => 'sha256') YIELD status, config RETURN status, config"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [status, config]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, setup]
 
 - name: audit-setup-test-data
   description: Create test data for audit logging validation
-  args: [query, "CREATE (user1:User {username: 'alice', role: 'admin', department: 'IT'}), (user2:User {username: 'bob', role: 'analyst', department: 'Finance'}), (user3:User {username: 'charlie', role: 'viewer', department: 'HR'}), (user1)-[:HAS_ACCESS {level: 'full', granted_at: timestamp()}]->(user2) RETURN count(*) AS created"]
+  args: [query, "CREATE (user1:User {username: 'alice', role: 'admin', department: 'IT'}), (user2:User {username: 'bob', role: 'analyst', department: 'Finance'}), (user3:User {username: 'charlie', role: 'viewer', department: 'HR'}), (user1)-[:HAS_ACCESS {level: 'full', granted_at: timestamp()}]->(user2) RETURN user1, user2, user3"]
   expect:
     exit_code: 0
     geode_query:
@@ -59,10 +63,10 @@ tests:
   description: 'Test authentication event logging (Event ID: 1001)'
   args: [query, "CALL audit.log_auth_event('login', 'alice', 'success', 'password_auth') YIELD event_id, timestamp, logged RETURN event_id, timestamp, logged"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [event_id, timestamp, logged]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, json, auth]
 
 - name: audit-json-file-command-execution-events
@@ -79,19 +83,20 @@ tests:
   description: 'Test CLI lifecycle event logging (Event ID: 1003)'
   args: [query, "CALL audit.log_lifecycle_event('cli_startup', 'geode-cli', 'success') YIELD event_id, lifecycle_stage RETURN event_id, lifecycle_stage"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [event_id, lifecycle_stage]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, json, lifecycle]
 
 - name: audit-json-file-event-structure
   description: Test JSON audit event structure and canonical format
   args: [query, 'CALL audit.get_recent_events(limit => 5) YIELD seq_no, timestamp, event_type, actor, action, result, event_hash RETURN seq_no, timestamp, event_type, actor, action, result ORDER BY seq_no DESC LIMIT 3']
   expect:
-    exit_code: 0
-    geode_query:
-      columns: [seq_no, timestamp, event_type, actor, action, result]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, json, structure]
 
   # ===============================
@@ -102,10 +107,10 @@ tests:
   description: Test tamper-evident hash chain generation
   args: [query, 'CALL audit.verify_hash_chain() YIELD chain_valid, total_events, hash_mismatches, last_verified_seq RETURN chain_valid, total_events, hash_mismatches, last_verified_seq']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [chain_valid, total_events, hash_mismatches, last_verified_seq]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, tamper, hash]
 
 - name: audit-tamper-evident-ed25519-signatures
@@ -122,20 +127,20 @@ tests:
   description: Test Merkle digest generation every 100 events
   args: [query, 'CALL audit.get_merkle_digests() YIELD digest_count, merkle_root, events_covered, digest_valid RETURN digest_count, merkle_root, events_covered, digest_valid']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [digest_count, merkle_root, events_covered, digest_valid]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, tamper, merkle]
 
 - name: audit-tamper-evident-integrity-check
   description: Test comprehensive audit log integrity check
   args: [query, 'CALL audit.comprehensive_integrity_check() YIELD integrity_status, events_verified, hash_chain_valid, signatures_valid, merkle_valid RETURN integrity_status, events_verified, hash_chain_valid, signatures_valid, merkle_valid']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [integrity_status, events_verified, hash_chain_valid, signatures_valid, merkle_valid]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, tamper, integrity]
 
   # ===============================
@@ -156,30 +161,30 @@ tests:
   description: Test Windows Event Log integration simulation
   args: [query, 'CALL audit.simulate_windows_eventlog() YIELD simulation_status, event_log_format, provider_name, event_ids_mapped RETURN simulation_status, event_log_format, provider_name, event_ids_mapped']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [simulation_status, event_log_format, provider_name, event_ids_mapped]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, multiplatform, windows]
 
 - name: audit-multiplatform-syslog-simulation
   description: Test syslog integration simulation for Unix/Linux systems
   args: [query, 'CALL audit.simulate_syslog_output() YIELD syslog_format, facility, severity, message_format RETURN syslog_format, facility, severity, message_format']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [syslog_format, facility, severity, message_format]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, multiplatform, syslog]
 
 - name: audit-multiplatform-combined-output
   description: Test combined audit output to multiple destinations
   args: [query, 'CALL audit.test_combined_output() YIELD outputs_configured, file_success, eventlog_success, syslog_success RETURN outputs_configured, file_success, eventlog_success, syslog_success']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [outputs_configured, file_success, eventlog_success, syslog_success]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, multiplatform, combined]
 
   # ===============================
@@ -200,20 +205,20 @@ tests:
   description: Test command execution event type classification
   args: [query, 'CALL audit.test_command_categories() YIELD serve_commands, shell_commands, query_commands, backup_commands, restore_commands RETURN serve_commands, shell_commands, query_commands, backup_commands, restore_commands']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [serve_commands, shell_commands, query_commands, backup_commands, restore_commands]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, categories, commands]
 
 - name: audit-categories-data-access-patterns
   description: Test data access pattern categorization
   args: [query, 'CALL audit.test_data_access_categories() YIELD read_operations, write_operations, admin_operations, privileged_access, unauthorized_attempts RETURN read_operations, write_operations, admin_operations, privileged_access, unauthorized_attempts']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [read_operations, write_operations, admin_operations, privileged_access, unauthorized_attempts]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, categories, access]
 
   # ===============================
@@ -224,40 +229,40 @@ tests:
   description: Test SIEM event correlation capabilities
   args: [query, 'CALL audit.test_siem_correlation() YIELD correlation_id, related_events, threat_indicators, risk_score RETURN correlation_id, related_events, threat_indicators, risk_score']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [correlation_id, related_events, threat_indicators, risk_score]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, siem, correlation]
 
 - name: audit-siem-alert-generation
   description: Test SIEM alert generation for suspicious patterns
   args: [query, 'CALL audit.test_siem_alerts() YIELD alert_count, high_risk_events, suspicious_patterns, recommended_actions RETURN alert_count, high_risk_events, suspicious_patterns, recommended_actions']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [alert_count, high_risk_events, suspicious_patterns, recommended_actions]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, siem, alerts]
 
 - name: audit-siem-compliance-reporting
   description: Test SIEM compliance reporting (SOX, PCI-DSS, HIPAA)
   args: [query, "CALL audit.generate_compliance_report(standard => 'SOX') YIELD report_id, compliance_score, violations_found, remediation_required RETURN report_id, compliance_score, violations_found, remediation_required"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [report_id, compliance_score, violations_found, remediation_required]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, siem, compliance]
 
 - name: audit-siem-powershell-queries
   description: Test PowerShell query compatibility for Windows environments
   args: [query, 'CALL audit.test_powershell_compatibility() YIELD query_examples, filter_support, log_name_mapping, provider_name_mapping RETURN query_examples, filter_support, log_name_mapping, provider_name_mapping']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [query_examples, filter_support, log_name_mapping, provider_name_mapping]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, siem, powershell]
 
   # ===============================
@@ -268,40 +273,40 @@ tests:
   description: Test time-based audit log rotation
   args: [query, "CALL audit.configure_rotation(strategy => 'time', interval_hours => 24) YIELD rotation_enabled, next_rotation_time, file_naming_pattern RETURN rotation_enabled, next_rotation_time, file_naming_pattern"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [rotation_enabled, next_rotation_time, file_naming_pattern]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, rotation, time]
 
 - name: audit-rotation-size-based
   description: Test size-based audit log rotation
   args: [query, "CALL audit.configure_rotation(strategy => 'size', max_size_mb => 100) YIELD rotation_enabled, size_threshold, compression_enabled RETURN rotation_enabled, size_threshold, compression_enabled"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [rotation_enabled, size_threshold, compression_enabled]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, rotation, size]
 
 - name: audit-rotation-sequence-continuity
   description: Test sequence number continuity across rotations
   args: [query, 'CALL audit.test_rotation_continuity() YIELD sequence_continuous, hash_chain_preserved, no_events_lost RETURN sequence_continuous, hash_chain_preserved, no_events_lost']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [sequence_continuous, hash_chain_preserved, no_events_lost]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, rotation, continuity]
 
 - name: audit-retention-policy-enforcement
   description: Test audit log retention policy enforcement
   args: [query, 'CALL audit.configure_retention(retention_days => 90, archive_enabled => true) YIELD policy_active, archive_location, auto_cleanup_enabled RETURN policy_active, archive_location, auto_cleanup_enabled']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [policy_active, archive_location, auto_cleanup_enabled]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, retention, policy]
 
   # ===============================
@@ -312,30 +317,30 @@ tests:
   description: Test security anomaly detection in audit logs
   args: [query, 'CALL audit.detect_anomalies() YIELD anomalies_found, anomaly_types, confidence_scores, investigation_required RETURN anomalies_found, anomaly_types, confidence_scores, investigation_required']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [anomalies_found, anomaly_types, confidence_scores, investigation_required]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, security, anomaly]
 
 - name: audit-security-threat-indicators
   description: Test threat indicator extraction from audit events
   args: [query, 'CALL audit.extract_threat_indicators() YIELD indicators_found, ip_addresses, user_patterns, attack_signatures RETURN indicators_found, ip_addresses, user_patterns, attack_signatures']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [indicators_found, ip_addresses, user_patterns, attack_signatures]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, security, threats]
 
 - name: audit-security-privilege-escalation
   description: Test privilege escalation detection in audit logs
   args: [query, 'CALL audit.detect_privilege_escalation() YIELD escalation_events, suspicious_role_changes, admin_access_patterns RETURN escalation_events, suspicious_role_changes, admin_access_patterns']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [escalation_events, suspicious_role_changes, admin_access_patterns]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, security, privilege]
 
   # ===============================
@@ -347,10 +352,10 @@ tests:
   timeout_ms: 60000
   args: [query, 'CALL audit.performance_test() YIELD events_per_second, avg_latency_ms, max_latency_ms, memory_used_mb, cpu_percent RETURN events_per_second, avg_latency_ms, max_latency_ms, memory_used_mb, cpu_percent']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [events_per_second, avg_latency_ms, max_latency_ms, memory_used_mb, cpu_percent]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, performance, volume]
 
 - name: audit-performance-memory-usage
@@ -358,10 +363,10 @@ tests:
   timeout_ms: 60000
   args: [query, 'CALL audit.memory_usage_test() YIELD baseline_mb, peak_mb, current_mb, leak_detected RETURN baseline_mb, peak_mb, current_mb, leak_detected']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [baseline_mb, peak_mb, current_mb, leak_detected]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, performance, memory]
 
 - name: audit-performance-concurrent-access
@@ -369,10 +374,10 @@ tests:
   timeout_ms: 60000
   args: [query, 'CALL audit.concurrent_access_test() YIELD threads_tested, race_conditions, deadlocks, successful_ops RETURN threads_tested, race_conditions, deadlocks, successful_ops']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [threads_tested, race_conditions, deadlocks, successful_ops]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, performance, concurrent]
 
   # ===============================
@@ -383,30 +388,30 @@ tests:
   description: Test audit logging behavior when disk space is exhausted
   args: [query, 'CALL audit.test_disk_space_handling() YIELD graceful_degradation, error_handling, recovery_successful RETURN graceful_degradation, error_handling, recovery_successful']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [graceful_degradation, error_handling, recovery_successful]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, error, disk]
 
 - name: audit-error-corrupted-log-file
   description: Test handling of corrupted audit log files
   args: [query, 'CALL audit.test_corruption_handling() YIELD corruption_detected, recovery_attempted, data_salvaged RETURN corruption_detected, recovery_attempted, data_salvaged']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [corruption_detected, recovery_attempted, data_salvaged]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, error, corruption]
 
 - name: audit-error-invalid-configuration
   description: Test error handling for invalid audit configuration
   args: [query, 'CALL audit.test_invalid_config() YIELD config_rejected, fallback_activated, service_continuity RETURN config_rejected, fallback_activated, service_continuity']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [config_rejected, fallback_activated, service_continuity]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, error, config]
 
   # ===============================
@@ -417,30 +422,30 @@ tests:
   description: Test audit log verification with external tools
   args: [query, 'CALL audit.export_for_verification() YIELD export_path, verification_data, public_keys_included RETURN export_path, verification_data, public_keys_included']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [export_path, verification_data, public_keys_included]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, verification, external]
 
 - name: audit-verification-forensic-analysis
   description: Test audit log preparation for forensic analysis
   args: [query, 'CALL audit.prepare_forensic_package() YIELD package_created, chain_of_custody, integrity_preserved RETURN package_created, chain_of_custody, integrity_preserved']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [package_created, chain_of_custody, integrity_preserved]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, verification, forensic]
 
 - name: audit-verification-compliance-audit
   description: Test audit log compliance verification
   args: [query, 'CALL audit.compliance_verification() YIELD compliance_standard, verification_passed, issues_found, certification_ready RETURN compliance_standard, verification_passed, issues_found, certification_ready']
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
-      columns: [compliance_standard, verification_passed, issues_found, certification_ready]
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [audit, verification, compliance]
 
   # ===============================

@@ -12,7 +12,6 @@ cli:
     args:
     - --log-level
     - info
-    - --enable-metrics
     env:
       GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
   client:
@@ -24,13 +23,18 @@ tests:
   description: Create comprehensive test dataset for advanced features
   args:
   - query
-  - "CREATE\n  (alice:Person {name: 'Alice', age: 30, department: 'Engineering'}),\n  (bob:Person {name: 'Bob', age: 35, department: 'Sales'}),\n  (carol:Person {name: 'Carol', age: 28, department: 'Marketing'}),\n  (techcorp:Company {name: 'TechCorp', founded: 2010, revenue: 1000000}),\n  (project1:Project {name: 'WebApp', budget: 50000, status: 'active'}),\n  (project2:Project {name: 'MobileApp', budget: 75000, status: 'planning'}),\n  (alice)-[:WORKS_FOR {since: 2020, salary: 75000}]->(techcorp),\n  (bob)-[:WORKS_FOR {since: 2018, salary: 85000}]->(techcorp),\n  (carol)-[:WORKS_FOR {since: 2021, salary: 70000}]->(techcorp),\n  (alice)-[:ASSIGNED_TO {role: 'Lead Developer'}]->(project1),\n  (bob)-[:ASSIGNED_TO {role: 'Product Manager'}]->(project2),\n  (carol)-[:ASSIGNED_TO {role: 'Marketing Lead'}]->(project1)\nRETURN count(*) AS nodes_created\n"
+  - "CREATE\n  (alice:Person {name: 'Alice', age: 30, department: 'Engineering'}),\n  (bob:Person {name: 'Bob', age: 35, department: 'Sales'}),\n  (carol:Person {name: 'Carol', age: 28, department: 'Marketing'}),\n  (techcorp:Company {name: 'TechCorp', founded: 2010, revenue: 1000000}),\n  (project1:Project {name: 'WebApp', budget: 50000, status: 'active'}),\n  (project2:Project {name: 'MobileApp', budget: 75000, status: 'planning'}),\n  (alice)-[:WORKS_FOR {since: 2020, salary: 75000}]->(techcorp),\n  (bob)-[:WORKS_FOR {since: 2018, salary: 85000}]->(techcorp),\n  (carol)-[:WORKS_FOR {since: 2021, salary: 70000}]->(techcorp),\n  (alice)-[:ASSIGNED_TO {role: 'Lead Developer'}]->(project1),\n  (bob)-[:ASSIGNED_TO {role: 'Product Manager'}]->(project2),\n  (carol)-[:ASSIGNED_TO {role: 'Marketing Lead'}]->(project1)\nRETURN alice, bob, carol, techcorp, project1, project2\n"
   expect:
     exit_code: 0
     geode_query:
       row_count: 1
       columns:
-      - nodes_created
+      - alice
+      - bob
+      - carol
+      - techcorp
+      - project1
+      - project2
   tags:
   - setup
   - data
@@ -56,6 +60,8 @@ tests:
   args:
   - backup
   - list
+  - --dir
+  - /tmp
   expect:
     exit_code: 0
     stdout_contains:
@@ -123,6 +129,8 @@ tests:
   - status
 - name: create-migration
   description: Create a new migration
+  env:
+    GEODE_MIGRATION_HMAC_KEY: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
   args:
   - migrate
   - create
@@ -230,8 +238,12 @@ tests:
   description: Test long-running transaction
   args:
   - query
-  - --begin
-  - MATCH (p:Person) SET p.last_updated = timestamp() RETURN count(p) AS updated
+  - --batch
+  - '-'
+  stdin: |
+    BEGIN
+    MATCH (p:Person) SET p.last_updated = timestamp() RETURN count(p) AS updated
+    COMMIT
   expect:
     exit_code: 0
     geode_query:
@@ -245,8 +257,12 @@ tests:
   description: Test transaction rollback
   args:
   - query
-  - --rollback
-  - MATCH (p:Person) RETURN count(p) AS count
+  - --batch
+  - '-'
+  stdin: |
+    BEGIN
+    MATCH (p:Person) RETURN count(p) AS count
+    ROLLBACK
   expect:
     exit_code: 0
     geode_query:
@@ -260,13 +276,15 @@ tests:
   description: Test bulk data loading
   args:
   - query
-  - "CREATE (n1:BulkTest {id: 1, value: 'test_1'}), (n2:BulkTest {id: 2, value: 'test_2'}), (n3:BulkTest {id: 3, value: 'test_3'}) RETURN count(*) AS created"
+  - "CREATE (n1:BulkTest {id: 1, value: 'test_1'}), (n2:BulkTest {id: 2, value: 'test_2'}), (n3:BulkTest {id: 3, value: 'test_3'}) RETURN n1, n2, n3"
   expect:
     exit_code: 0
     geode_query:
       row_count: 1
       columns:
-      - created
+      - n1
+      - n2
+      - n3
   tags:
   - bulk
   - load
@@ -320,16 +338,23 @@ tests:
   - data
 - name: cleanup-backup-files
   description: Clean up backup files
+  # a directory holding no geode backup: cleanup is a dry run that deletes nothing (a shared /tmp holds foreign files whose names vary)
+  setup:
+    files:
+    - path: /tmp/geodetestlab_adv_cleanup/readme.txt
+      content: not a backup
   args:
   - backup
   - cleanup
+  - --dir
+  - /tmp/geodetestlab_adv_cleanup
   - --older-than
   - 1h
   expect:
     exit_code: 0
     stdout_contains:
-    - cleanup
-    - completed
+    - No geode backups in /tmp/geodetestlab_adv_cleanup
+    - nothing to delete
   tags:
   - cleanup
   - backup

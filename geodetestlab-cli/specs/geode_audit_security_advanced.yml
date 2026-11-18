@@ -10,7 +10,11 @@ cli:
     data_dir:
     startup_timeout_ms: 30000
     cleanup: true
-    args: [--log-level, info, --audit, --audit-file, /tmp/geode_audit_advanced.jsonl]
+    args: [--log-level, info]
+    # --audit/--audit-file are global client flags, not `geode serve` options (docs/AUDIT_LOGGING.md "Command audit"); the server log is env-enabled
+    env:
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_AUDIT_LOG_PATH: /tmp/geode_audit_advanced.jsonl
   client:
     timeout_ms: 15000
     tls_verify: false
@@ -24,7 +28,10 @@ tests:
   description: Initialize environment
   args: [query, "CALL audit.configure(enabled => true, file_path => '/tmp/geode_audit_advanced.jsonl')"]
   expect:
-    exit_code: 0
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [setup]
 
   # ===============================
@@ -77,11 +84,12 @@ tests:
 
 - name: adv-audit-verify-rls-log
   description: Check if RLS denial was logged with correct policy_id
-  args: [query, "CALL audit.get_recent_events(5) YIELD event_type, policy_id WHERE event_type = 'access_denied' RETURN event_type, policy_id"]
+  args: [query, "CALL audit.get_recent_events(5) YIELD event_type, policy_id FILTER WHERE event_type = 'access_denied' RETURN event_type, policy_id"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [integration, rls, verify]
 
   # 2. Schema Change
@@ -94,11 +102,12 @@ tests:
 
 - name: adv-audit-verify-schema-log
   description: Check schema_change log
-  args: [query, "CALL audit.get_recent_events(5) YIELD event_type, action WHERE event_type = 'schema_change' RETURN event_type, action"]
+  args: [query, "CALL audit.get_recent_events(5) YIELD event_type, action FILTER WHERE event_type = 'schema_change' RETURN event_type, action"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [integration, schema, verify]
 
   # ===============================

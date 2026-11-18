@@ -95,7 +95,7 @@ tests:
 
 - name: p4-preflight-cleanup
   description: Idempotent pre-flight cleanup before the escalation-denial matrix.
-  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  args: [query, -U, geode, -P, '${secret:admin_password}', --batch, '-']
   stdin: |
     DROP USER IF EXISTS p4_user;
     DROP USER IF EXISTS p4_owner;
@@ -115,7 +115,7 @@ tests:
     Create p4_user with the built-in readonly role — NO admin privileges,
     NO grant/revoke privileges. This is the attacker identity for every
     negative case below.
-  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p4_user SET PASSWORD 'P4User-1234-Strong' ROLE readonly]
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p4_user SET PASSWORD 'P4User 1234 Strong Passphrase' ROLE readonly]
   expect:
     exit_code: 0
     stdout_contains: [p4_user]
@@ -126,7 +126,7 @@ tests:
     Create p4_owner (also readonly, no admin privileges) — the recipient
     of the admin-issued grant that p4_user will later try to revoke
     without owning it.
-  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p4_owner SET PASSWORD 'P4Owner-1234-Strong' ROLE readonly]
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER p4_owner SET PASSWORD 'P4Owner 1234 Strong Passphrase' ROLE readonly]
   expect:
     exit_code: 0
     stdout_contains: [p4_owner]
@@ -152,9 +152,9 @@ tests:
     executed, GQL-level error returned), matching the existing
     pin-verify-user-is-not-admin precedent in
     rbac_custom_role_binding_pin.yml.
-  args: [query, -U, p4_user, -P, P4User-1234-Strong, CREATE USER p4_evil SET PASSWORD 'P4Evil-1234-Strong' ROLE admin]
+  args: [query, -U, p4_user, -P, P4User 1234 Strong Passphrase, CREATE USER p4_evil SET PASSWORD 'P4Evil 1234 Strong Passphrase' ROLE admin]
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42501', Permission denied]
     stdout_not_contains: [created p4_evil]
   tags: [rbac, negative, security, escalation]
@@ -177,9 +177,9 @@ tests:
     KEY NEGATIVE — as p4_user (non-admin), attempt to GRANT READ on
     p4_graph to p4_owner (a privilege p4_user does not itself hold and
     has no authority to bestow on anyone). GRANT is an admin-only DDL op.
-  args: [query, -U, p4_user, -P, P4User-1234-Strong, GRANT READ ON GRAPH p4_graph TO p4_owner]
+  args: [query, -U, p4_user, -P, P4User 1234 Strong Passphrase, GRANT READ ON GRAPH p4_graph TO p4_owner]
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42501', Permission denied]
     stdout_not_contains: [Granted]
   tags: [rbac, negative, security, escalation]
@@ -190,9 +190,9 @@ tests:
     p4_owner. p4_user holds neither WRITE on p4_graph nor any GRANT
     authority; this is the "grant a privilege you don't hold" escalation
     path. Denied via the same admin-only DDL gate as the case above.
-  args: [query, -U, p4_user, -P, P4User-1234-Strong, GRANT WRITE ON GRAPH p4_graph TO p4_owner]
+  args: [query, -U, p4_user, -P, P4User 1234 Strong Passphrase, GRANT WRITE ON GRAPH p4_graph TO p4_owner]
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42501', Permission denied]
     stdout_not_contains: [Granted]
   tags: [rbac, negative, security, escalation]
@@ -202,16 +202,16 @@ tests:
     NEGATIVE — as p4_user, attempt to REVOKE the READ grant that admin
     issued to p4_owner (set up in p4-admin-grants-read-to-owner). p4_user
     has no ownership or authority over that grant; REVOKE is admin-only.
-  args: [query, -U, p4_user, -P, P4User-1234-Strong, REVOKE READ ON GRAPH p4_graph FROM p4_owner]
+  args: [query, -U, p4_user, -P, P4User 1234 Strong Passphrase, REVOKE READ ON GRAPH p4_graph FROM p4_owner]
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42501', Permission denied]
     stdout_not_contains: [Revoked]
   tags: [rbac, negative, security, escalation]
 
 - name: p4-cleanup
   description: Teardown — drop test users and graph.
-  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  args: [query, -U, geode, -P, '${secret:admin_password}', --batch, '-']
   stdin: |
     DROP USER IF EXISTS p4_user;
     DROP USER IF EXISTS p4_owner;

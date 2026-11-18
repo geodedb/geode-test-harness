@@ -12,10 +12,10 @@ cli:
     args:
     - --log-level
     - info
-    - --audit
-    - --audit-file
-    - /tmp/geode-audit.log
+    # --audit/--audit-file are global client flags, not `geode serve` options (docs/AUDIT_LOGGING.md "Command audit")
     env:
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_AUDIT_LOG_PATH: /tmp/geode-audit.log
       GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
       GEODE_DISABLE_AUDIT: '0'
   client:
@@ -30,7 +30,7 @@ secrets:
     source: env
     key: GEODE_TEST_PASSWORD
     required: false
-    default: TestP4ssw0rd123!
+    default: Geode Testp4ssw0rd123 Passphrase
   api_token:
     source: keyring
     service: geodetestlab
@@ -69,7 +69,7 @@ tests:
   - testuser
   - test@example.com
   - --password
-  - TestP4ss123!
+  - Geode Testp4ss123 Passphrase
   expect:
     exit_code: 0
     stdout_contains:
@@ -86,7 +86,7 @@ tests:
   - testuser2
   - test2@example.com
   - --password
-  - TestP4ssw0rd123!
+  - Geode Testp4ssw0rd123 Passphrase
   expect:
     exit_code: 0
     stdout_contains:
@@ -111,7 +111,15 @@ tests:
 - name: user-enable-disable
   description: Test user enable/disable functionality
   setup:
-  - user create bob bob@example.com --password B0bP4ssw!
+  - args:
+    - user
+    - create
+    - bob
+    - bob@example.com
+    - --password
+    - Geode B0bp4ssw Passphrase
+    expect:
+      exit_code: 0
   args:
   - user
   - disable
@@ -198,9 +206,9 @@ tests:
   - --using
   - user_id = current_user_id()
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
-    - '42000'
+    - '"status_class":"42000"'
     - Unsupported policy USING expression
   tags:
   - policy
@@ -216,7 +224,7 @@ tests:
     - audit_test
     - audit@test.com
     - --password
-    - Aud1tP4ss!
+    - Geode Aud1tp4ss Passphrase
     expect:
       exit_code: 0
   args:
@@ -238,26 +246,25 @@ tests:
   - --password
   - '123'
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains:
-    - password
-    - policy
+    - '"status_class":"22000"'
+    - Password too short
   tags:
   - password
   - policy
   - security
 - name: token-based-auth
-  description: Test API token authentication
+  description: A server accepts no session or API token, so --token is refused (docs/USER_AUTH.md, SONNY-6554)
   args:
   - query
   - --token
   - ${secret:api_token}
   - RETURN current_user() AS user
   expect:
-    exit_code: 0
-    stdout_json_assert:
-    - expression: results[0].user
-      not_equals:
+    exit_code: 2
+    stderr_contains:
+    - is not supported by this server
   tags:
   - auth
   - token
