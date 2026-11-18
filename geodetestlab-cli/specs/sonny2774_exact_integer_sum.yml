@@ -1,0 +1,232 @@
+# SONNY-2774: sum() over exact integers continued as a DOUBLE once the running total left i64
+# (silent exact -> approximate). ISO/IEC 39075:2024 20.9 (SUM over an exact numeric type) requires
+# the result to be exact; a total outside the type raises 22003 (numeric value out of range).
+# Now every sum path shares a 128-bit accumulator: a total that fits i64 is exact whatever the
+# intermediate partial sums; one past i64 is 22003 (BREAKING: it was a DOUBLE).
+# Fixture :Big nodes: g=1: [i64max, 1, -2] (total i64max-1); g=2: [5]; g=3: [-i64max, -2] (total
+# below i64min).
+version: '1.0'
+name: SONNY-2774 exact integer sum, 22003 past i64
+description: exact SUM, 22003 on overflow
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-big
+  description: 'Setup: setup-big'
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Big {v: 9223372036854775807, g: 1, h: 1})
+    CREATE (:Big {v: 1, g: 1, h: 2})
+    CREATE (:Big {v: -2, g: 1, h: 3})
+    CREATE (:Big {v: 5, g: 2, h: 4})
+    CREATE (:Big {v: -9223372036854775807, g: 3, h: 5})
+    CREATE (:Big {v: -2, g: 3, h: 6})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: exact-total-fits
+  description: a total that fits i64 is exact (intermediate sum passes i64max)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.g = 1 RETURN sum(b.v) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"s":9223372036854775806}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: exact-total-inline
+  description: same through an inline map
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big {g: 1}) RETURN sum(b.v) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"s":9223372036854775806}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: group-overflow
+  description: a GROUP BY whose group 3 totals below i64min is 22003
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) RETURN b.g AS g, sum(b.v) AS s GROUP BY b.g ORDER BY g
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: group-fits
+  description: groups whose totals fit are exact
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.g < 3 RETURN b.g AS g, sum(b.v) AS s GROUP BY b.g ORDER BY g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"g":1,"s":9223372036854775806},{"g":2,"s":5}]'
+  tags:
+  - regression
+- name: with-group-fits
+  description: WITH GROUP BY exact
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.g < 3 WITH b.g AS g, sum(b.v) AS s GROUP BY g RETURN g, s ORDER BY g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"g":1,"s":9223372036854775806},{"g":2,"s":5}]'
+  tags:
+  - regression
+- name: overflow-positive
+  description: i64max + 1 is 22003
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.g = 1 AND b.v > 0 RETURN sum(b.v) AS s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: overflow-negative
+  description: below i64min is 22003
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big {g: 3}) RETURN sum(b.v) AS s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: overflow-grouped
+  description: grouped overflow is 22003
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.v > 0 RETURN b.g AS g, sum(b.v) AS s GROUP BY b.g
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: overflow-with
+  description: WITH sum overflow is 22003
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.v > 0 WITH sum(b.v) AS s RETURN s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: overflow-distinct
+  description: sum(DISTINCT) overflow is 22003
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.v > 0 RETURN sum(DISTINCT b.v) AS s
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: avg-exact
+  description: avg divides the exact sum (no premature overflow)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.g = 1 AND b.v > 0 RETURN avg(b.v) > 4600000000000000000 AS gt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"gt":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: avg-intermediate
+  description: avg over a total that fits
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Big) WHERE b.g = 1 RETURN avg(b.v) > 3000000000000000000 AS gt
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"gt":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression

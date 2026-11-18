@@ -1,0 +1,325 @@
+# SONNY-2695: on the legacy executor paths a RETURN after SET showed the pre-SET value
+# (`SET n.y2 = 5 RETURN n.y2` returned null). This spec runs the statements over the wire
+# and asserts the RETURN sees the written value, then re-reads to prove it persisted.
+# SONNY-3128 (ORDER BY a property after a write RETURN) is covered by the same write+RETURN path.
+# Fixture: four :Q {k, f?}, four :X {k}, four :Y {k}, eight :Z {k, g, r}:
+#   (Yk)-[:R]->(Qk)-[:R {w: k}]->(Xk); Q0 and Q1 also have f: 1; Zk has g = k/4 and r = 7-k;
+#   (Q0)-[:S]->(Q1) and a self loop (Q3)-[:S]->(Q3).
+version: '1.0'
+name: SONNY-2695 RETURN after SET shows the new value
+description: RETURN after SET/REMOVE/MERGE reads the new values
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-fixture
+  description: Create the Q/X/Y/Z fixture graph
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0})
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1})
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2})
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3})
+    CREATE (:Z {k: 0, g: 0, r: 7})
+    CREATE (:Z {k: 1, g: 0, r: 6})
+    CREATE (:Z {k: 2, g: 0, r: 5})
+    CREATE (:Z {k: 3, g: 0, r: 4})
+    CREATE (:Z {k: 4, g: 1, r: 3})
+    CREATE (:Z {k: 5, g: 1, r: 2})
+    CREATE (:Z {k: 6, g: 1, r: 1})
+    CREATE (:Z {k: 7, g: 1, r: 0})
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b)
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: set-inline
+  description: SET then RETURN the property (inline map match)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 1}) SET z.y2 = 5 RETURN z.y2 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":5}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-where
+  description: SET then RETURN (WHERE match)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k = 1 SET z.y2 = 6 RETURN z.y2 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":6}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-self-ref
+  description: SET from the old value and RETURN both
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 1}) SET z.y2 = z.y2 + 1 RETURN z.y2 AS y, z.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":7,"k":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-hop-end
+  description: SET on the end of a hop and RETURN
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q {k: 1})-[:R]->(x:X) SET x.y2 = 6 RETURN x.y2 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":6}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-rel
+  description: SET a relationship property and RETURN
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q {k: 2})-[r:R]->(x:X) SET r.w2 = 4 RETURN r.w2 AS w
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"w":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-two-hop-middle
+  description: SET the middle node of a two-hop chain
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (y:Y {k: 2})-[:R]->(q:Q)-[:R]->(x:X) SET q.y2 = 3 RETURN q.y2 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-two-vars
+  description: SET on two bound variables and RETURN both
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:Z {k: 3}), (b:Z {k: 4}) SET a.y4 = 7, b.y4 = 8 RETURN a.y4 AS a, b.y4 AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"a":7,"b":8}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-many-rows
+  description: SET on several rows and RETURN the computed values
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k < 2 SET z.y5 = z.k * 2 RETURN z.k AS k, z.y5 AS y ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0,"y":0},{"k":1,"y":2}]'
+  tags:
+  - regression
+- name: set-then-remove-a
+  description: SET a property
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 2}) SET z.y3 = 1 RETURN z.y3 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: remove-return
+  description: REMOVE then RETURN shows null
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 2}) REMOVE z.y3 RETURN z.y3 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":null}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: merge-on-match-set
+  description: MERGE ... ON MATCH SET then RETURN
+  args:
+  - query
+  - '-'
+  stdin: |
+    MERGE (z:Z {k: 5}) ON MATCH SET z.y6 = 9 RETURN z.y6 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":9}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-aggregate
+  description: SET then aggregate RETURN
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k >= 6 SET z.y8 = 1 RETURN count(*) AS c, sum(z.y8) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2,"s":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-then-overflow
+  description: a RETURN error after SET is reported
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 6}) SET z.y7 = 1 RETURN z.y7 + 9223372036854775807 AS y
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: overflow-rolled-back
+  description: the failed statement left no write behind
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 6}) RETURN z.y7 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":null}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: persisted-z
+  description: the earlier SET persisted on the node
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {k: 1}) RETURN z.y2 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":7}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: persisted-x
+  description: the earlier hop SET persisted
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (x:X {k: 1}) RETURN x.y2 AS y
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"y":6}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: set-order-by-prop
+  description: ORDER BY a property after a write RETURN (SONNY-3128)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k < 3 SET z.m = 1 RETURN z.k AS k ORDER BY z.k DESC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":2},{"k":1},{"k":0}]'
+  tags:
+  - regression

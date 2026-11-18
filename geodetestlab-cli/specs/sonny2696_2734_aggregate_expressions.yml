@@ -1,0 +1,874 @@
+# SONNY-2696: aggregates inside expressions in RETURN/WITH items were wrong
+# (`count(*) + 1` -> NULL, `toString(count(*))` -> "1"). SONNY-2734: ungrouped aggregates computed
+# expression arguments wrongly (`sum(n.i * $f)` = 0, `count(CASE ...)` = 25 instead of 9, avg/max NULL,
+# max over dates NULL). Asserted over a real server against 25 :A nodes (i 0..24, g = i%3, s = text of i,
+# d = DATE 2026-01-(i+1), v = i on even i only) and four P-R->Q-S->T chains.
+# Sums: sum(i)=300, count(DISTINCT i%3)=3; per g: g0 has 9 nodes, g1 8, g2 8.
+version: '1.0'
+name: SONNY-2696/2734 aggregates inside expressions and computed aggregate arguments
+description: aggregate expressions and computed arguments
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-data
+  description: Create 25 :A nodes and four P/Q/T chains
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:A {i: 0, g: 0, s: '0', d: DATE '2026-01-01', v: 0})
+    CREATE (:A {i: 1, g: 1, s: '1', d: DATE '2026-01-02'})
+    CREATE (:A {i: 2, g: 2, s: '2', d: DATE '2026-01-03', v: 2})
+    CREATE (:A {i: 3, g: 0, s: '3', d: DATE '2026-01-04'})
+    CREATE (:A {i: 4, g: 1, s: '4', d: DATE '2026-01-05', v: 4})
+    CREATE (:A {i: 5, g: 2, s: '5', d: DATE '2026-01-06'})
+    CREATE (:A {i: 6, g: 0, s: '6', d: DATE '2026-01-07', v: 6})
+    CREATE (:A {i: 7, g: 1, s: '7', d: DATE '2026-01-08'})
+    CREATE (:A {i: 8, g: 2, s: '8', d: DATE '2026-01-09', v: 8})
+    CREATE (:A {i: 9, g: 0, s: '9', d: DATE '2026-01-10'})
+    CREATE (:A {i: 10, g: 1, s: '10', d: DATE '2026-01-11', v: 10})
+    CREATE (:A {i: 11, g: 2, s: '11', d: DATE '2026-01-12'})
+    CREATE (:A {i: 12, g: 0, s: '12', d: DATE '2026-01-13', v: 12})
+    CREATE (:A {i: 13, g: 1, s: '13', d: DATE '2026-01-14'})
+    CREATE (:A {i: 14, g: 2, s: '14', d: DATE '2026-01-15', v: 14})
+    CREATE (:A {i: 15, g: 0, s: '15', d: DATE '2026-01-16'})
+    CREATE (:A {i: 16, g: 1, s: '16', d: DATE '2026-01-17', v: 16})
+    CREATE (:A {i: 17, g: 2, s: '17', d: DATE '2026-01-18'})
+    CREATE (:A {i: 18, g: 0, s: '18', d: DATE '2026-01-19', v: 18})
+    CREATE (:A {i: 19, g: 1, s: '19', d: DATE '2026-01-20'})
+    CREATE (:A {i: 20, g: 2, s: '20', d: DATE '2026-01-21', v: 20})
+    CREATE (:A {i: 21, g: 0, s: '21', d: DATE '2026-01-22'})
+    CREATE (:A {i: 22, g: 1, s: '22', d: DATE '2026-01-23', v: 22})
+    CREATE (:A {i: 23, g: 2, s: '23', d: DATE '2026-01-24'})
+    CREATE (:A {i: 24, g: 0, s: '24', d: DATE '2026-01-25', v: 24})
+    CREATE (:P {k: 0})-[:R]->(:Q {k: 0})-[:S]->(:T {k: 0})
+    CREATE (:P {k: 1})-[:R]->(:Q {k: 1})-[:S]->(:T {k: 1})
+    CREATE (:P {k: 2})-[:R]->(:Q {k: 2})-[:S]->(:T {k: 2})
+    CREATE (:P {k: 3})-[:R]->(:Q {k: 3})-[:S]->(:T {k: 3})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: count-plus-1
+  description: count-plus-1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(*) + 1 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":26}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-plus-0
+  description: count-plus-0
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(*) + 0 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":25}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: tostring-count
+  description: tostring-count
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN toString(count(*)) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":"25"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: sum-div-count
+  description: sum-div-count
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN sum(n.i) / count(*) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":12}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-gt
+  description: count-gt
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(*) > 0 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":true}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: coalesce-max
+  description: coalesce-max
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN coalesce(max(n.i), 0) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":24}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: list-of-aggs
+  description: list-of-aggs
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN [count(*), sum(n.i)] AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":[25,300]}'
+  tags:
+  - regression
+- name: map-of-agg
+  description: map-of-agg
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN {c: count(*)} AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":{"c":25}}'
+  tags:
+  - regression
+- name: case-agg
+  description: case-agg
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN CASE WHEN count(*) > 5 THEN 'many' ELSE 'few' END AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":"many"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-plus-count
+  description: count-plus-count
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(*) + count(*) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":50}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: sum-minus-count
+  description: sum-minus-count
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN sum(n.i) - count(*) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":275}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: two-items
+  description: two-items
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(*) AS c, count(*) + 1 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":25,"x":26}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: string-concat-aggs
+  description: string-concat-aggs
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN toString(count(*)) + '/' + toString(sum(n.i)) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":"25/300"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: size-collect
+  description: size-collect
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN size(collect(n.i + 1)) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":25}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: empty-input
+  description: aggregate expressions over zero rows are one row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) WHERE n.i > 1000 RETURN count(*) + 1 AS x, coalesce(sum(n.i), -1) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":1,"s":-1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: with-count-plus
+  description: with-count-plus
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) WITH count(*) + 1 AS x RETURN x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":26}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: with-tostring
+  description: with-tostring
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) WITH toString(count(*)) AS x RETURN x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":"25"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: with-list
+  description: with-list
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) WITH [count(*), sum(n.i)] AS x RETURN x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":[25,300]}'
+  tags:
+  - regression
+- name: with-group-expr
+  description: WITH key + aggregate expression
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) WITH n.g AS g, count(*) + 1 AS x RETURN g, x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"x":10}'
+    - '{"g":1,"x":9}'
+    - '{"g":2,"x":9}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: with-sum-expr
+  description: with-sum-expr
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) WITH sum(n.i * 2) AS s RETURN s + 1 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":601}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: group-count-plus
+  description: GROUP BY + count(*)+1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, count(*) + 1 AS x GROUP BY n.g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"x":10}'
+    - '{"g":1,"x":9}'
+    - '{"g":2,"x":9}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: group-mixed
+  description: GROUP BY + count(*)*10 + sum
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, count(*) * 10 + sum(n.i) AS x GROUP BY n.g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"x":198}'
+    - '{"g":1,"x":172}'
+    - '{"g":2,"x":180}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: group-tostring
+  description: GROUP BY + toString(count(*))
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, toString(count(*)) AS x GROUP BY n.g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"x":"9"}'
+    - '{"g":1,"x":"8"}'
+    - '{"g":2,"x":"8"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: group-order-by-agg
+  description: GROUP BY ... ORDER BY the aggregate expression alias
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, sum(n.i) + 0 AS x GROUP BY n.g ORDER BY x DESC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"g":0,"x":108},{"g":2,"x":100},{"g":1,"x":92}]'
+  tags:
+  - regression
+- name: group-having-alias
+  description: HAVING over an aggregate expression alias
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, count(*) + 1 AS x GROUP BY n.g HAVING x > 9
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"x":10}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: group-key-expr
+  description: a key expression combined with an aggregate
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, n.g * 100 + count(*) AS x GROUP BY n.g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"x":9}'
+    - '{"g":1,"x":108}'
+    - '{"g":2,"x":208}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: ungrouped-agg-expr
+  description: a column beside an aggregate expression without GROUP BY is 42803
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, count(*) + 1 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42803"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: ungrouped-bare-plus
+  description: n.i + count(*) without GROUP BY is 42803
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.i + count(*) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42803"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: agg-expr-overflow
+  description: integer overflow in an aggregate expression is 22003
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN max(n.i) + 9223372036854775807 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: sum-param-arg
+  description: sum(n.i * $f) with a parameter
+  args:
+  - query
+  - --param
+  - f
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN sum(n.i * $f) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":600}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: sum-lit-arg
+  description: sum-lit-arg
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN sum(n.i * 2) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":600}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-case
+  description: count-case
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(CASE WHEN n.i > 15 THEN 1 END) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":9}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: max-min-neg
+  description: max/min over a computed argument
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN max(n.i * -1) AS hi, min(n.i * -1) AS lo
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"hi":0,"lo":-24}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: max-minus
+  description: max-minus
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN max(n.i - 100) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":-76}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: max-min-dates
+  description: max/min over dates
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN max(n.d) AS hi, min(n.d) AS lo
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"hi":{"type":"DATE","value":"2026-01-25"},"lo":{"type":"DATE","value":"2026-01-01"}}'
+  tags:
+  - regression
+- name: max-min-strings
+  description: max/min over strings
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN max(n.s) AS hi, min(n.s) AS lo
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"hi":"9","lo":"0"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-distinct-mod
+  description: count-distinct-mod
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(DISTINCT n.i % 3) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: sum-toint
+  description: sum-toint
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN sum(toInteger(n.s)) AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"x":300}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: sum-and-count
+  description: sum with a parameter beside count(*)
+  args:
+  - query
+  - --param
+  - f
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN sum(n.i * $f) AS s, count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"s":600,"c":25}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-sum-nullable
+  description: count/sum skip NULL arguments
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(n.v * 2) AS c, sum(n.v * 2) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":13,"s":312}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: empty-aggregates
+  description: computed-argument aggregates over no rows
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) WHERE n.i < 0 RETURN count(n.i * 2) AS c, sum(n.i * 2) AS s, avg(n.i + 1) AS a, min(n.i + 1) AS lo, max(n.i + 1) AS hi
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":0,"s":null,"a":null,"lo":null,"hi":null}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: group-sum-arg
+  description: grouped sum over a computed argument
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, sum(n.i * 2) AS x GROUP BY n.g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"x":216}'
+    - '{"g":1,"x":184}'
+    - '{"g":2,"x":200}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: arg-overflow
+  description: overflow inside an aggregate argument is 22003
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN sum(9223372036854775807 + n.i) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22003"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: arg-div-zero
+  description: division by zero inside an aggregate argument is 22012
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN count(n.i / (n.i - n.i)) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: grouped-arg-div-zero
+  description: same under GROUP BY
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (n:A) RETURN n.g AS g, sum(n.i / (n.g - n.g)) AS x GROUP BY n.g
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: chain-count
+  description: multi-hop ungrouped count(*)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:P)-[:R]->(b:Q)-[:S]->(c:T) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: chain-count-plus
+  description: multi-hop count(*)+1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:P)-[:R]->(b:Q)-[:S]->(c:T) RETURN count(*) + 1 AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":5}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: chain-sum-arg
+  description: multi-hop sum over a computed argument
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:P)-[:R]->(b:Q)-[:S]->(c:T) RETURN sum(a.k * 2) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"s":12}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: hop-sum-two-vars
+  description: one-hop sum of an expression over both ends
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:P)-[:R]->(b:Q) RETURN sum(a.k + b.k) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"s":12}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: hop-tostring-count
+  description: one-hop toString(count(*))
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:P)-[:R]->(b:Q) RETURN toString(count(*)) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"s":"4"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression

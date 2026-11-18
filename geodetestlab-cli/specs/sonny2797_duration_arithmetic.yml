@@ -1,0 +1,662 @@
+# SONNY-2797: GQL defines datetime +/- duration, duration +/- duration and duration * or / number, but the
+# engine returned a type mismatch for all of them. ISO/IEC 39075:2024 20.26 / 20.28 (datetime and duration
+# arithmetic): month and day-time components stay separate, the day is clamped at month end, a fractional
+# number of months is refused (22023), divide by zero is 22012, an overflow is 22003 and instant - instant
+# is a duration. BEHAVIOUR CHANGE: date + PT48H used to return the same date; it is two days later now.
+version: '1.0'
+name: SONNY-2797 datetime/duration arithmetic
+description: datetime and duration arithmetic over the wire
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: dt-plus-month-leap
+  description: datetime('2024-01-31T10:00:00Z') + duration('P1M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-01-31T10:00:00Z') + duration('P1M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMPTZ","value":"2024-02-29T10:00:00Z"}}]'
+  tags:
+  - regression
+- name: dt-plus-month
+  description: datetime('2023-01-31T10:00:00Z') + duration('P1M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2023-01-31T10:00:00Z') + duration('P1M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMPTZ","value":"2023-02-28T10:00:00Z"}}]'
+  tags:
+  - regression
+- name: dt-plus-36h
+  description: datetime('2024-01-01T00:00:00Z') + duration('PT36H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-01-01T00:00:00Z') + duration('PT36H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMPTZ","value":"2024-01-02T12:00:00Z"}}]'
+  tags:
+  - regression
+- name: dur-plus-dt
+  description: duration('PT36H') + datetime('2024-01-01T00:00:00Z')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('PT36H') + datetime('2024-01-01T00:00:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMPTZ","value":"2024-01-02T12:00:00Z"}}]'
+  tags:
+  - regression
+- name: dt-minus-day
+  description: datetime('2024-03-01T00:00:00Z') - duration('P1D')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-03-01T00:00:00Z') - duration('P1D') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMPTZ","value":"2024-02-29T00:00:00Z"}}]'
+  tags:
+  - regression
+- name: dt-minus-mixed
+  description: datetime('2024-03-31T12:00:00Z') - duration('P1M1DT13H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-03-31T12:00:00Z') - duration('P1M1DT13H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMPTZ","value":"2024-02-27T23:00:00Z"}}]'
+  tags:
+  - regression
+- name: dt-before-epoch
+  description: datetime('1969-12-31T23:00:00Z') + duration('PT2H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('1969-12-31T23:00:00Z') + duration('PT2H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMPTZ","value":"1970-01-01T01:00:00Z"}}]'
+  tags:
+  - regression
+- name: timestamp-plus
+  description: timestamp('2024-01-31T10:00:00') + duration('P1M1DT1H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN timestamp('2024-01-31T10:00:00') + duration('P1M1DT1H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMP","value":"2024-03-01T11:00:00"}}]'
+  tags:
+  - regression
+- name: localdatetime-plus
+  description: localdatetime('2024-12-31T23:00:00') + duration('PT1H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN localdatetime('2024-12-31T23:00:00') + duration('PT1H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIMESTAMP","value":"2025-01-01T00:00:00"}}]'
+  tags:
+  - regression
+- name: date-plus-48h
+  description: date('2024-01-01') + duration('PT48H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN date('2024-01-01') + duration('PT48H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"DATE","value":"2024-01-03"}}]'
+  tags:
+  - regression
+- name: date-plus-month
+  description: date('2024-01-31') + duration('P1M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN date('2024-01-31') + duration('P1M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"DATE","value":"2024-02-29"}}]'
+  tags:
+  - regression
+- name: time-plus
+  description: time('23:00:00') + duration('PT2H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN time('23:00:00') + duration('PT2H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIME","value":"01:00:00"}}]'
+  tags:
+  - regression
+- name: time-minus
+  description: time('01:00:00') - duration('PT2H30M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN time('01:00:00') - duration('PT2H30M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"TIME","value":"22:30:00"}}]'
+  tags:
+  - regression
+- name: null-plus
+  description: datetime('2024-01-01T00:00:00Z') + NULL
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-01-01T00:00:00Z') + NULL AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":null}]'
+  tags:
+  - regression
+- name: null-minus
+  description: NULL - duration('P1D')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN NULL - duration('P1D') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":null}]'
+  tags:
+  - regression
+- name: dur-add-months
+  description: duration('P1M') + duration('P2M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1M') + duration('P2M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P3M"}}]'
+  tags:
+  - regression
+- name: dur-add-carry
+  description: duration('P11M') + duration('P2M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P11M') + duration('P2M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P1Y1M"}}]'
+  tags:
+  - regression
+- name: dur-add-time
+  description: duration('PT1H') + duration('PT30M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('PT1H') + duration('PT30M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"PT1H30M"}}]'
+  tags:
+  - regression
+- name: dur-sub
+  description: duration('P1D') - duration('PT1H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1D') - duration('PT1H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"PT23H"}}]'
+  tags:
+  - regression
+- name: dur-add-days
+  description: duration('PT20H') + duration('PT20H')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('PT20H') + duration('PT20H') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P1DT16H"}}]'
+  tags:
+  - regression
+- name: dur-sub-years
+  description: duration('P1Y') - duration('P1M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1Y') - duration('P1M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P11M"}}]'
+  tags:
+  - regression
+- name: dur-keeps-groups
+  description: duration('P1M1D') + duration('P1D')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1M1D') + duration('P1D') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P1M2D"}}]'
+  tags:
+  - regression
+- name: dur-add-null
+  description: duration('P1D') + NULL
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1D') + NULL AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":null}]'
+  tags:
+  - regression
+- name: dur-day-eq-24h
+  description: duration('P1D') + duration('PT24H') = duration('P2D')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1D') + duration('PT24H') = duration('P2D') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":true}]'
+  tags:
+  - regression
+- name: dur-mul-int
+  description: duration('P1M') * 3
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1M') * 3 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P3M"}}]'
+  tags:
+  - regression
+- name: int-mul-dur
+  description: 3 * duration('PT20M')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN 3 * duration('PT20M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"PT1H"}}]'
+  tags:
+  - regression
+- name: dur-mul-mixed
+  description: duration('P1DT1H') * 2
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1DT1H') * 2 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P2DT2H"}}]'
+  tags:
+  - regression
+- name: dur-mul-frac
+  description: duration('P1D') * 1.5
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1D') * 1.5 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P1DT12H"}}]'
+  tags:
+  - regression
+- name: dur-mul-half
+  description: duration('P1D') * 0.5
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1D') * 0.5 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"PT12H"}}]'
+  tags:
+  - regression
+- name: dur-div
+  description: duration('PT1H') / 2
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('PT1H') / 2 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"PT30M"}}]'
+  tags:
+  - regression
+- name: dur-div-year
+  description: duration('P1Y') / 4
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1Y') / 4 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P3M"}}]'
+  tags:
+  - regression
+- name: dur-mul-neg
+  description: duration('P1D') * -1
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1D') * -1 AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P-1D"}}]'
+  tags:
+  - regression
+- name: dur-mul-null
+  description: duration('PT1H') * NULL
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('PT1H') * NULL AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":null}]'
+  tags:
+  - regression
+- name: instant-diff
+  description: datetime('2024-01-02T00:00:00Z') - datetime('2024-01-01T12:00:00Z')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-01-02T00:00:00Z') - datetime('2024-01-01T12:00:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"PT12H"}}]'
+  tags:
+  - regression
+- name: instant-diff-neg
+  description: datetime('2024-01-01T00:00:00Z') - datetime('2024-01-03T06:00:00Z')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-01-01T00:00:00Z') - datetime('2024-01-03T06:00:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P-2DT-6H"}}]'
+  tags:
+  - regression
+- name: timestamp-diff
+  description: timestamp('2024-03-01T00:00:00') - timestamp('2024-02-01T00:00:00')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN timestamp('2024-03-01T00:00:00') - timestamp('2024-02-01T00:00:00') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P29D"}}]'
+  tags:
+  - regression
+- name: date-diff
+  description: date('2024-03-01') - date('2024-02-01')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN date('2024-03-01') - date('2024-02-01') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"P29D"}}]'
+  tags:
+  - regression
+- name: time-diff
+  description: time('10:00:00') - time('08:30:00')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN time('10:00:00') - time('08:30:00') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":{"type":"INTERVAL","value":"PT1H30M"}}]'
+  tags:
+  - regression
+- name: roundtrip
+  description: (datetime('2024-05-17T08:00:00Z') + duration('P3DT4H')) - duration('P3DT4H') = datetime('2024-05-17T08:00:00Z')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN (datetime('2024-05-17T08:00:00Z') + duration('P3DT4H')) - duration('P3DT4H') = datetime('2024-05-17T08:00:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":true}]'
+  tags:
+  - regression
+- name: err-month-plus-day
+  description: duration('P1M') + duration('P1D')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1M') + duration('P1D') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G14"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: err-dt-plus-int
+  description: datetime('2024-01-01T00:00:00Z') + 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-01-01T00:00:00Z') + 1 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: err-div-zero
+  description: duration('PT1H') / 0
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('PT1H') / 0 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: err-fractional-months
+  description: duration('P1M') / 2
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('P1M') / 2 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22023"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: err-mul-overflow
+  description: duration('PT1H') * 9223372036854775807
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN duration('PT1H') * 9223372036854775807 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22015"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: err-dt-overflow
+  description: datetime('2024-01-01T00:00:00Z') + duration('P2147483647D')
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN datetime('2024-01-01T00:00:00Z') + duration('P2147483647D') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22008"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression

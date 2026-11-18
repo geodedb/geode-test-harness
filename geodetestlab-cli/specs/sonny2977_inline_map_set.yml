@@ -1,0 +1,659 @@
+# SONNY-2977 (HIGH, data integrity): `MATCH (p:L {k: v}) [WHERE ...] SET ...` changed only ONE of several
+# matching nodes when the inline map had a single property (a MERGE-style property index held one node per
+# key); an aggregate RETURN changed all of them. Every probe below resets three :ZZProbe nodes
+# (tenant_id 'acme', state 'old', ids 1..3), runs one write statement and asserts that all three
+# changed ('new') through a separate read. Both a literal and a $parameter inline value are used,
+# with and without WHERE, with a per-row RETURN, with an aggregate RETURN and with none.
+version: '1.0'
+name: 'SONNY-2977 MATCH (x {k: v}) SET changes every matching node'
+description: inline single-property map SET changes every matching node
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: reset-lit-param
+  description: Reset to three old nodes of tenant acme and one of solo before lit-param
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-lit-param
+  description: "write: MATCH (p:ZZProbe {tenant_id: $t}) SET p.state = 'new'"
+  args:
+  - query
+  - --param
+  - t
+  - '"acme"'
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: $t}) SET p.state = 'new'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-lit-param
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-lit-param
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-lit-literal
+  description: Reset to three old nodes of tenant acme and one of solo before lit-literal
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-lit-literal
+  description: "write: MATCH (p:ZZProbe {tenant_id: 'acme'}) SET p.state = 'new'"
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'acme'}) SET p.state = 'new'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-lit-literal
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-lit-literal
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-where-param
+  description: Reset to three old nodes of tenant acme and one of solo before where-param
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-where-param
+  description: "write: MATCH (p:ZZProbe {tenant_id: $t}) WHERE p.state = 'old' SET p.state = 'new'"
+  args:
+  - query
+  - --param
+  - t
+  - '"acme"'
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: $t}) WHERE p.state = 'old' SET p.state = 'new'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-where-param
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-where-param
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-return-prop
+  description: Reset to three old nodes of tenant acme and one of solo before return-prop
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-return-prop
+  description: "write: MATCH (p:ZZProbe {tenant_id: $t}) SET p.state = 'new' RETURN p.id"
+  args:
+  - query
+  - --param
+  - t
+  - '"acme"'
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: $t}) SET p.state = 'new' RETURN p.id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"id":1}'
+    - '{"id":2}'
+    - '{"id":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: verify-return-prop
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-return-prop
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-where-return-count
+  description: Reset to three old nodes of tenant acme and one of solo before where-return-count
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-where-return-count
+  description: "write: MATCH (p:ZZProbe {tenant_id: $t}) WHERE p.state = 'old' SET p.state = 'new' RETURN count(p)"
+  args:
+  - query
+  - --param
+  - t
+  - '"acme"'
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: $t}) WHERE p.state = 'old' SET p.state = 'new' RETURN count(p)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"count":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-where-return-count
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-where-return-count
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-return-count
+  description: Reset to three old nodes of tenant acme and one of solo before return-count
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-return-count
+  description: "write: MATCH (p:ZZProbe {tenant_id: $t}) SET p.state = 'new' RETURN count(p)"
+  args:
+  - query
+  - --param
+  - t
+  - '"acme"'
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: $t}) SET p.state = 'new' RETURN count(p)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"count":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-return-count
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-return-count
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-two-prop-map
+  description: Reset to three old nodes of tenant acme and one of solo before two-prop-map
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-two-prop-map
+  description: "write: MATCH (p:ZZProbe {tenant_id: $t, state: $s}) SET p.state = 'new'"
+  args:
+  - query
+  - --param
+  - t
+  - '"acme"'
+  - --param
+  - s
+  - '"old"'
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: $t, state: $s}) SET p.state = 'new'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-two-prop-map
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-two-prop-map
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-two-prop-lit
+  description: Reset to three old nodes of tenant acme and one of solo before two-prop-lit
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-two-prop-lit
+  description: "write: MATCH (p:ZZProbe {tenant_id: $t, state: 'old'}) SET p.state = 'new'"
+  args:
+  - query
+  - --param
+  - t
+  - '"acme"'
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: $t, state: 'old'}) SET p.state = 'new'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-two-prop-lit
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-two-prop-lit
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: reset-where-only
+  description: Reset to three old nodes of tenant acme and one of solo before where-only
+  args:
+  - query
+  - --batch
+  stdin: |
+    MATCH (p:ZZProbe) DETACH DELETE p
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 1})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 2})
+    CREATE (:ZZProbe {tenant_id: 'acme', state: 'old', id: 3})
+    CREATE (:ZZProbe {tenant_id: 'solo', state: 'old', id: 9})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: write-where-only
+  description: "write: MATCH (p:ZZProbe) WHERE p.tenant_id = $t SET p.state = 'new'"
+  args:
+  - query
+  - --param
+  - t
+  - '"acme"'
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe) WHERE p.tenant_id = $t SET p.state = 'new'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: verify-where-only
+  description: all three matching nodes changed, the other tenant did not
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {state: 'new'}) RETURN count(p) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: verify-solo-where-only
+  description: the unrelated node is untouched
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (p:ZZProbe {tenant_id: 'solo'}) RETURN p.state AS st
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"st":"old"}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression

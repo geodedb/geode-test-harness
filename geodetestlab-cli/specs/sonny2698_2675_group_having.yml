@@ -1,0 +1,548 @@
+# SONNY-2698: `WITH ... RETURN ..., agg GROUP BY ...` ran the old per-shape grouping (count>=2
+# HAVING stand-in reachable; `WITH ... WHERE` skipped). SONNY-2675: an aggregate named only in HAVING
+# (`HAVING count(*) > 10`) was evaluated per row, dropping every group. SONNY-2682: ungrouped
+# non-aggregate next to an aggregate is a grouping error (42803). SONNY-2699: a pattern
+# predicate (EXISTS/COUNT) in a grouped HAVING reads the group's key.
+# Asserted over the wire against a real server; expected rows follow ISO/IEC 39075:2024 14.11 (GROUP BY)
+# and the HAVING grouping rules.
+# Fixture: four :Q {k, f?}, four :X {k}, four :Y {k}, eight :Z {k, g, r}:
+#   (Yk)-[:R]->(Qk)-[:R {w: k}]->(Xk); Q0 and Q1 also have f: 1; Zk has g = k/4 and r = 7-k;
+#   (Q0)-[:S]->(Q1) and a self loop (Q3)-[:S]->(Q3).
+version: '1.0'
+name: SONNY-2698/2675/2682/2699 GROUP BY after WITH, HAVING aggregates
+description: WITH/WHERE before GROUP BY, HAVING aggregates and grouping errors
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-fixture
+  description: Create the Q/X/Y/Z fixture graph
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0})
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1})
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2})
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3})
+    CREATE (:Z {k: 0, g: 0, r: 7})
+    CREATE (:Z {k: 1, g: 0, r: 6})
+    CREATE (:Z {k: 2, g: 0, r: 5})
+    CREATE (:Z {k: 3, g: 0, r: 4})
+    CREATE (:Z {k: 4, g: 1, r: 3})
+    CREATE (:Z {k: 5, g: 1, r: 2})
+    CREATE (:Z {k: 6, g: 1, r: 1})
+    CREATE (:Z {k: 7, g: 1, r: 0})
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b)
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: with-where-group
+  description: WITH WHERE before GROUP BY filters the rows grouped
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z WHERE z.k >= 2 RETURN z.g AS g, count(*) AS c GROUP BY z.g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"c":2}'
+    - '{"g":1,"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: having-gt
+  description: HAVING count(*) > 3 keeps the group of four only
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z WHERE z.k >= 2 RETURN z.g AS g, count(*) AS c GROUP BY z.g HAVING count(*) > 3
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":1,"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: having-lt
+  description: HAVING count(*) < 2
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z WHERE z.k >= 3 RETURN z.g AS g, count(*) AS c GROUP BY z.g HAVING count(*) < 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: having-ge
+  description: HAVING count(*) >= 1 keeps both groups
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z WHERE z.k >= 3 RETURN z.g AS g, count(*) AS c GROUP BY z.g HAVING count(*) >= 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"c":1}'
+    - '{"g":1,"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: having-sum
+  description: HAVING sum(...) > 10
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z, z.g AS g WHERE z.k <> 5 RETURN g, sum(z.k) AS s GROUP BY g HAVING sum(z.k) > 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":1,"s":17}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: having-eq-hop
+  description: HAVING count(*) = 1 over a hop
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x:X) WITH q, x WHERE x.k >= 1 RETURN q.f AS f, count(*) AS c GROUP BY q.f HAVING count(*) = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"f":1,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: group-null-key
+  description: a null key forms its own group
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x:X) WITH q, x WHERE x.k >= 1 RETURN q.f AS f, count(*) AS c GROUP BY q.f
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"f":1,"c":1}'
+    - '{"f":null,"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: having-aggregate-only-in-having
+  description: an aggregate named only in HAVING (sum) filters groups
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) OPTIONAL MATCH (q)-[:S]->(t) RETURN q.f AS f, count(t) AS c GROUP BY q.f HAVING sum(q.k) > 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"f":null,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: having-count-star-optional
+  description: HAVING count(*) = 2 over OPTIONAL MATCH
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) OPTIONAL MATCH (q)-[:S]->(t) RETURN q.f AS f, count(t) AS c GROUP BY q.f HAVING count(*) = 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"f":1,"c":1}'
+    - '{"f":null,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: having-after-with
+  description: HAVING sum with a leading WITH
+  args:
+  - query
+  - '-'
+  stdin: |
+    WITH 1 AS one MATCH (z:Z) RETURN z.g AS g, count(*) AS c GROUP BY z.g HAVING sum(z.k) > 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":1,"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: with-group-return
+  description: WITH ... GROUP BY ... RETURN
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z.g AS g, count(*) AS c GROUP BY g RETURN g, c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"c":4}'
+    - '{"g":1,"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: with-group-having-return
+  description: WITH ... GROUP BY ... HAVING ... RETURN
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s GROUP BY g HAVING sum(z.k) > 10 RETURN g, s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":1,"s":22}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: group-by-after-return-with-return
+  description: a second GROUP BY after a WITH-grouped RETURN is a syntax error
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z.g AS g, count(*) AS c GROUP BY g RETURN c, count(*) AS n GROUP BY c
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: ungrouped-column
+  description: non-aggregate column beside an aggregate without GROUP BY is 42803
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) RETURN q.f AS f, count(*) AS c
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42803"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: ungrouped-column-where
+  description: same with WHERE
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WHERE q.k >= 1 RETURN q.f AS f, count(*) AS c
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42803"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: ungrouped-column-limit
+  description: same with LIMIT
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.g AS g, count(*) AS c LIMIT 2
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42803"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: ungrouped-after-with
+  description: same after WITH
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WITH q RETURN q.f AS f, collect(q.k) AS ks
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42803"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: group-by-ok
+  description: the same shape with GROUP BY is fine
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) RETURN q.f AS f, count(*) AS c GROUP BY q.f
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"f":1,"c":2}'
+    - '{"f":null,"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: group-by-two-aggs
+  description: two aggregates per group
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.g AS g, sum(z.k) AS s, count(*) AS c GROUP BY z.g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"s":6,"c":4}'
+    - '{"g":1,"s":22,"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: values-match-group
+  description: VALUES ... MATCH ... GROUP BY
+  args:
+  - query
+  - '-'
+  stdin: |
+    VALUES (1) AS (v) MATCH (q:Q) RETURN q.f AS f, count(*) AS c GROUP BY q.f
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"f":1,"c":2}'
+    - '{"f":null,"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: hop-count-sum
+  description: ungrouped aggregates over a hop are one row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x) RETURN count(*) AS c, sum(x.k) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4,"s":6}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: having-unknown-name
+  description: HAVING on a name nothing binds is refused (SONNY-2736 / 2675)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS g, count(*) AS c GROUP BY z.k HAVING nope > 1
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: having-non-grouped-column
+  description: HAVING on a non-grouped column is 42803
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS g, count(*) AS c GROUP BY z.k HAVING z.zz > 1
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42803"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: nested-aggregate
+  description: nested aggregates are 42803
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN sum(count(*)) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42803"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: having-big-threshold
+  description: an aggregate only in HAVING with a big threshold drops every group (used to drop all rows per row)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k, count(*) AS c GROUP BY z.k HAVING count(*) > 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: having-exists-key
+  description: EXISTS {} in a grouped HAVING reads the group key
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x) RETURN q.k AS k, count(*) AS c GROUP BY q HAVING EXISTS { (q)-[:S]->() }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0,"c":1}'
+    - '{"k":3,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: having-not-exists-key
+  description: NOT EXISTS {} in a grouped HAVING
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x) RETURN q.k AS k, count(*) AS c GROUP BY q HAVING NOT EXISTS { (q)-[:S]->() }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":1,"c":1}'
+    - '{"k":2,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: having-count-subquery
+  description: COUNT {} in a grouped HAVING
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x) RETURN q.k AS k, count(*) AS c GROUP BY q HAVING COUNT { (q)-[:S]->() } = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0,"c":1}'
+    - '{"k":3,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: having-exists-and-agg
+  description: EXISTS {} AND an aggregate in HAVING
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) RETURN q.k AS k, count(*) AS c GROUP BY q HAVING EXISTS { (q)-[:R]->(:X) } AND count(*) = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0,"c":1}'
+    - '{"k":1,"c":1}'
+    - '{"k":2,"c":1}'
+    - '{"k":3,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){4}\]'
+  tags:
+  - regression
+- name: having-count-in-return
+  description: COUNT {} plus an aggregate in a grouped RETURN item
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x) RETURN q.k AS k, count(*) + COUNT { (q)-[:S]->() } AS c GROUP BY q
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0,"c":2}'
+    - '{"k":1,"c":1}'
+    - '{"k":2,"c":1}'
+    - '{"k":3,"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){4}\]'
+  tags:
+  - regression
