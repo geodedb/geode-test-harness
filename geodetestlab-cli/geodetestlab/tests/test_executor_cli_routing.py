@@ -20,7 +20,7 @@ from geodetestlab.lib.executor import _accepts_data_dir, _is_remote_admin_comman
         (["migrate", "create", "add_user"], False),
         (["migrate", "sign"], False),
         (["migrate"], False),
-        (["restore", "x"], True),
+        (["restore", "x"], False),
         (["backup", "create"], True),
         (["backup", "list"], False),
         (["user", "create"], False),
