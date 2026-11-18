@@ -55,9 +55,9 @@ def test_every_server_restart_passes_the_started_args() -> None:
     for call in calls:
         kw = {k.arg: k.value for k in call.keywords}
         assert "server_args" in kw
-        assert isinstance(kw["server_args"], ast.Call) and kw["server_args"].func.id == "_restart_args", ast.dump(
-            kw["server_args"]
-        )
+        arg = kw["server_args"]
+        assert isinstance(arg, ast.Call), ast.dump(arg)
+        assert isinstance(arg.func, ast.Name) and arg.func.id == "_restart_args", ast.dump(arg)
 
 
 def test_restart_server_test_restarts_with_the_provisioned_cert_and_key() -> None:

@@ -3,6 +3,7 @@
 import json
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import yaml
 from typer.testing import CliRunner
@@ -106,7 +107,7 @@ def test_run_dry_run() -> None:
         temp_path.unlink()
 
 
-def _run_spec_text(text: str, *extra: str):
+def _run_spec_text(text: str, *extra: str) -> Any:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
         f.write(text)
         temp_path = Path(f.name)
