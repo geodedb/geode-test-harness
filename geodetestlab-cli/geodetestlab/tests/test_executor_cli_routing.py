@@ -79,6 +79,8 @@ def test_sequential_bash_step_sees_the_admin_password() -> None:
         (["restore", "--server", "127.0.0.1:3141"], True),
         (["restore"], True),
         (["fle", "migrate-encrypt", "t", "S", "f"], True),
+        (["fle", "migrate-encrypt"], False),
+        (["fle", "migrate-encrypt", "default"], False),
         (["fle", "grant-plaintext", "S", "f", "r"], False),
         (["fle", "show-policy", "S"], False),
     ],

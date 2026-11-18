@@ -436,7 +436,13 @@ def _is_remote_admin_command(args: list[str]) -> bool:
     if args[0] == "fle":
         # migrate-encrypt runs in the server (SONNY-6688); the other fle subcommands
         # work on the local data directory.
-        return len(args) > 1 and args[1] == "migrate-encrypt"
+        # Only once its three positionals (tenant, schema, field) are present: with fewer
+        # the CLI answers "migrate-encrypt requires ...", and appended --server/-U flags
+        # would be read as the missing positionals.
+        if len(args) > 1 and args[1] == "migrate-encrypt":
+            positionals = [a for a in args[2:] if not a.startswith("-")]
+            return len(positionals) >= 3
+        return False
 
     return False
 
