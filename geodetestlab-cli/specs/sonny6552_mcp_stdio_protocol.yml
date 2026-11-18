@@ -1,0 +1,185 @@
+version: '1.0'
+name: SONNY-6552 / SONNY-6585 MCP result shapes, error codes and framing over geode mcp --stdio
+description: |
+  SONNY-6552 (geode MCP server) and SONNY-6585 (mcp library) against a real
+  `geode mcp --stdio` session whose endpoint is the managed server, driven by a
+  real JSON-RPC client over newline-delimited stdio, per MCP revision 2025-11-25:
+
+    * resources/list, resources/templates/list and prompts/list return the
+      objects {"resources"}, {"resourceTemplates"}, {"prompts"} (they returned
+      bare arrays); resources/read returns {"contents":[{uri,mimeType,text}]}
+      (it returned {uri,mimeType,text}); a cursor is -32602 (one page);
+    * an unknown prompt is -32602, an unknown resource URI is -32002 (they were
+      answered as success), an unknown tool is -32602 (the library mapped it to
+      -32002) and the error carries the real message and data (handlers could
+      not supply one: "Unknown tool: x", data.uri);
+    * a failed query is an isError result; the computed value of a good query
+      comes back (arguments were freed before use);
+    * a JSON-RPC notification (no id) is never answered, even when it fails
+      (JSON-RPC 2.0 4.1); a string id containing a quote is escaped in the
+      reply (it produced invalid JSON);
+    * SONNY-6484 item 1: `complete` on an empty document lists the starting
+      keywords and `hover` on an unknown word answers {"contents": null} (it
+      answered {}); the LSP tools leaked their recommendation/hover text;
+    * every response is exactly one line (multi-line JSON broke the stdio
+      framing), and `geode mcp` exits 0 at stdin EOF (it exited before the
+      leak report).
+
+  Fixed: SONNY-6552 f5969ae4d/113aedd03 (geode), SONNY-6585 mcp v0.1.23 pinned
+  by 33d907d5b with handler messages by 4594a376a.
+
+  CANARY: REQ=REQ-SONNY-6552-MCP-RESULT-SHAPES; FEATURE="McpServer"; ASPECT=ResultShapesErrorCodesFraming; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6552_mcp_stdio_protocol.yml; OWNER=mcp; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+tests:
+
+- name: mcp-stdio-protocol-conformance
+  description: one real mcp --stdio session checks every result shape, error code, notification and framing rule above
+  type: bash
+  timeout_ms: 180000
+  command: |
+    PY="${GEODETESTLAB_PYTHON:-python3}"
+    "$PY" - <<'PYEOF'
+
+    import json, os, select, subprocess, sys, time
+    G = os.environ.get("GEODE_BINARY", "geode")
+    pw = os.environ.get("GEODE_ADMIN_PASSWORD", "Geode Test Admin Passphrase").replace(" ", "%20")
+    dsn = os.environ["GEODE_SERVER_ADDRESS"] + "?user=geode&pass=" + pw + "&insecure_tls_skip_verify=true"
+    env = dict(os.environ, GEODE_ALLOW_INSECURE_TLS="1")
+    p = subprocess.Popen([G, "mcp", "--stdio", "--no-auth", "--endpoint", dsn], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    lines = []
+    def send(m):
+        p.stdin.write((m if isinstance(m, str) else json.dumps(m)).encode() + b"\n"); p.stdin.flush()
+    def recv(t=10):
+        end = time.time() + t
+        while time.time() < end:
+            if select.select([p.stdout], [], [], 0.2)[0]:
+                l = p.stdout.readline()
+                if l:
+                    s = l.decode().rstrip("\n"); lines.append(s); return s
+                return None
+        return None
+    fails = 0
+    def check(name, ok, detail=""):
+        global fails
+        print(("CHECK_OK " if ok else "CHECK_BAD ") + name + ("" if ok else "  " + str(detail)[:300]))
+        fails += (not ok)
+    def call(i, method, params=None):
+        send({"jsonrpc": "2.0", "id": i, "method": method, "params": params or {}})
+        raw = recv()
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            check(method + " answers one valid JSON line", False, raw); return None
+    r = call(1, "initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})
+    check("initialize", bool(r and r.get("result", {}).get("protocolVersion")), r)
+    send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+
+    r = call(2, "tools/list"); res = (r or {}).get("result")
+    check("tools/list is an object with a tools array", isinstance(res, dict) and isinstance(res.get("tools"), list) and len(res["tools"]) > 0, r)
+    r = call(3, "resources/list"); res = (r or {}).get("result")
+    check("resources/list is {resources:[...]}", isinstance(res, dict) and isinstance(res.get("resources"), list), r)
+    uri = ""
+    if isinstance(res, dict) and res.get("resources"):
+        uri = [x["uri"] for x in res["resources"] if x["uri"].endswith("/stats")][0]
+    r = call(4, "resources/templates/list"); res = (r or {}).get("result")
+    check("resources/templates/list is {resourceTemplates:[...]}", isinstance(res, dict) and isinstance(res.get("resourceTemplates"), list), r)
+    r = call(5, "prompts/list"); res = (r or {}).get("result")
+    check("prompts/list is {prompts:[...]}", isinstance(res, dict) and isinstance(res.get("prompts"), list) and len(res["prompts"]) > 0, r)
+    r = call(6, "resources/read", {"uri": uri}); res = (r or {}).get("result")
+    c = (res or {}).get("contents") if isinstance(res, dict) else None
+    check("resources/read is {contents:[{uri,mimeType,text}]}", isinstance(c, list) and len(c) == 1 and all(k in c[0] for k in ("uri", "mimeType", "text")), r)
+    r = call(7, "prompts/get", {"name": "no_such_prompt_6552"})
+    check("unknown prompt is JSON-RPC -32602", bool(r and r.get("error", {}).get("code") == -32602), r)
+    r = call(8, "resources/read", {"uri": "geode://default/default/no_such_resource_6552"})
+    check("unknown resource URI is JSON-RPC -32002", bool(r and r.get("error", {}).get("code") == -32002), r)
+    check("unknown resource error names the URI", bool(r and "no_such_resource_6552" in json.dumps(r.get("error", {}))), r)
+    r = call(9, "tools/call", {"name": "no_such_tool_6585", "arguments": {}})
+    check("unknown tool is JSON-RPC -32602 (not -32002)", bool(r and r.get("error", {}).get("code") == -32602), r)
+    check("unknown tool error carries the real message", bool(r and "no_such_tool_6585" in r.get("error", {}).get("message", "")), r)
+    r = call(10, "tools/call", {"name": "query", "arguments": {"query": "RETURN 6000 + 552 AS mcp_marker"}})
+    txt = json.dumps(r)
+    check("tools/call query returns content with the computed value and isError false", bool(r and r.get("result", {}).get("isError") is False and "6552" in txt), r)
+    r = call(11, "tools/call", {"name": "query", "arguments": {"query": "THIS IS NOT GQL"}})
+    check("a failed query is an isError result, not a protocol error", bool(r and r.get("result", {}).get("isError") is True), r)
+    r = call(12, "tools/list", {"cursor": "abc"})
+    check("an unknown cursor is -32602", bool(r and r.get("error", {}).get("code") == -32602), r)
+    # SONNY-6484 item 1: the LSP-backed tools on empty / unknown input
+    def tool_text(i, name, args):
+        r = call(i, "tools/call", {"name": name, "arguments": args})
+        try:
+            return r, json.loads(r["result"]["content"][0]["text"])
+        except Exception:
+            return r, None
+    r, t = tool_text(13, "complete", {"query": "", "line": 1, "column": 1})
+    check("complete on an empty document lists the starting keywords", bool(t and any(c.get("label") == "MATCH" for c in t.get("completions", []))), r)
+    r, t = tool_text(14, "hover", {"query": "RETURN zzzz", "line": 1, "column": 9})
+    check("hover on an unknown word answers {contents:null} (it answered {})", t == {"contents": None}, r)
+    r, t = tool_text(15, "hover", {"query": "RETURN count(1)", "line": 1, "column": 9})
+    check("hover on a known keyword carries its documentation", bool(t and "COUNT" in str(t.get("contents"))), r)
+    r, t = tool_text(16, "validate", {"query": "RETURN"})
+    check("validate reports a syntax error as diagnostics", bool(t and t.get("isValid") is False and t.get("diagnostics")), r)
+    # JSON-RPC 2.0 4.1: a notification (no id) gets no response, even when it fails
+    send({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "no_such_tool_6585", "arguments": {}}})
+    send({"jsonrpc": "2.0", "method": "no/such/method", "params": {}})
+    check("failed notifications are not answered", recv(2) is None)
+    # a string id with a quote must be escaped in the reply
+    send('{"jsonrpc":"2.0","id":"a\\"b","method":"no/such/method","params":{}}')
+    raw = recv()
+    try:
+        rr = json.loads(raw); check("a quote in a string id is escaped (valid JSON, id round-trips)", rr.get("id") == 'a"b' and rr.get("error", {}).get("code") == -32601, raw)
+    except Exception:
+        check("a quote in a string id is escaped (valid JSON, id round-trips)", False, raw)
+    # every message the server wrote was exactly one line of JSON
+    check("every response is one JSON message per line", all(json.loads(l) is not None for l in lines))
+    p.stdin.close()
+    try:
+        p.wait(15)
+        check("geode mcp exits 0 when stdin closes", p.returncode == 0, p.returncode)
+    except subprocess.TimeoutExpired:
+        p.kill(); check("geode mcp exits when stdin closes", False, "hung")
+    print("FAILS=%d" % fails)
+    sys.exit(1 if fails else 0)
+    PYEOF
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CHECK_OK initialize
+    - CHECK_OK tools/list is an object with a tools array
+    - CHECK_OK resources/list is {resources:[...]}
+    - CHECK_OK resources/templates/list is {resourceTemplates:[...]}
+    - CHECK_OK prompts/list is {prompts:[...]}
+    - CHECK_OK resources/read is {contents:[{uri,mimeType,text}]}
+    - CHECK_OK unknown prompt is JSON-RPC -32602
+    - CHECK_OK unknown resource URI is JSON-RPC -32002
+    - CHECK_OK unknown tool is JSON-RPC -32602 (not -32002)
+    - CHECK_OK unknown tool error carries the real message
+    - CHECK_OK complete on an empty document lists the starting keywords
+    - CHECK_OK hover on an unknown word answers {contents:null}
+    - CHECK_OK failed notifications are not answered
+    - CHECK_OK a quote in a string id is escaped
+    - CHECK_OK every response is one JSON message per line
+    - CHECK_OK geode mcp exits 0 when stdin closes
+    - FAILS=0
+    stdout_not_contains: [CHECK_BAD]
+  tags: [mcp, stdio, jsonrpc, sonny-6552, sonny-6585, regression]

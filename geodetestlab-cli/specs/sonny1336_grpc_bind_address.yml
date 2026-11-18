@@ -1,0 +1,229 @@
+version: '1.0'
+name: SONNY-1336 --listen-grpc honours its bind address
+description: |
+  SONNY-1336: `geode serve --listen-grpc <addr:port>` parsed the address and used
+  it only in a log line; the gRPC listener bound grpc-zig's default 127.0.0.1, so
+  a container's published gRPC port reached nothing. A port that did not parse
+  silently became 3142, and an address grpc-zig cannot bind (IPv6, a host name)
+  was silently replaced by loopback.
+
+  Fixed behaviour (b7e9807e0), proved here against a real `geode serve` by
+  reading the kernel's socket table (/proc/net/tcp) and dialling the real
+  socket, not just the log:
+    * an explicit IPv4 address (127.0.0.2, 0.0.0.0) is the address bound, and
+      loopback 127.0.0.1 is NOT listening when 127.0.0.2 was asked for;
+    * a port alone binds the --listen (QUIC) address, or 0.0.0.0 with no QUIC
+      listener (QUIC's own port-only default);
+    * the startup banner names the address and port bound;
+    * an address grpc-zig cannot bind (IPv6, host name) or a bad port is refused
+      at startup (exit 2), naming --listen-grpc, and nothing listens.
+
+  The server is managed by the spec (server.enabled: false) because the point is
+  the flags it is started with. Ports are allocated at run time.
+
+  CANARY: REQ=REQ-SONNY-1336-GRPC-BIND; FEATURE="GrpcTransport"; ASPECT=BindAddress; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny1336_grpc_bind_address.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+tests:
+
+- name: explicit-ipv4-address-is-the-address-bound
+  description: --listen-grpc 127.0.0.2:P listens on 127.0.0.2 and not on 127.0.0.1; banner names it
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+    D=$(mktemp -d); trap 'kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -rf "$D"' EXIT
+    read QP GP < <(python3 -c "import socket
+    u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));q=u.getsockname()[1]
+    t=socket.socket();t.bind(('127.0.0.1',0));g=t.getsockname()[1];print(q,g)")
+    export GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    "$BIN" serve --data-dir "$D/data" --log-level info --listen 127.0.0.1:$QP --listen-grpc 127.0.0.2:$GP > "$D/log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 120); do
+      python3 -c "import socket;s=socket.socket();s.settimeout(1);s.connect(('127.0.0.2',$GP))" 2>/dev/null && break
+      kill -0 $PID 2>/dev/null || { echo "server_died"; cat "$D/log"; exit 1; }
+      sleep 0.5
+    done
+    python3 - "$GP" <<'PY'
+    import socket, sys
+    gp = int(sys.argv[1])
+    listeners = []
+    for line in open('/proc/net/tcp').read().splitlines()[1:]:
+        f = line.split()
+        ip_hex, port_hex = f[1].split(':')
+        if f[3] == '0A' and int(port_hex, 16) == gp:
+            b = bytes.fromhex(ip_hex)[::-1]
+            listeners.append('.'.join(str(x) for x in b))
+    print('LISTENERS=' + ','.join(sorted(listeners)))
+    def can(ip):
+        s = socket.socket(); s.settimeout(2)
+        try:
+            s.connect((ip, gp)); return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+    print('DIAL_127_0_0_2=' + str(can('127.0.0.2')))
+    print('DIAL_127_0_0_1=' + str(can('127.0.0.1')))
+    PY
+    grep -q "\"transport\":\"grpc\",\"address\":\"127.0.0.2\",\"port\":$GP" "$D/log" && echo "BANNER_OK" || { echo "BANNER_MISSING"; cat "$D/log"; }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - LISTENERS=127.0.0.2
+    - DIAL_127_0_0_2=True
+    - DIAL_127_0_0_1=False
+    - BANNER_OK
+    stdout_not_contains: [BANNER_MISSING, server_died]
+  tags: [grpc, bind, sonny-1336, regression]
+
+- name: wildcard-address-listens-on-every-interface
+  description: --listen-grpc 0.0.0.0:P is a 0.0.0.0 listener, reachable on loopback
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+    D=$(mktemp -d); trap 'kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -rf "$D"' EXIT
+    read QP GP < <(python3 -c "import socket
+    u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));q=u.getsockname()[1]
+    t=socket.socket();t.bind(('127.0.0.1',0));g=t.getsockname()[1];print(q,g)")
+    export GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    "$BIN" serve --data-dir "$D/data" --log-level info --listen 127.0.0.1:$QP --listen-grpc 0.0.0.0:$GP > "$D/log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 120); do
+      python3 -c "import socket;s=socket.socket();s.settimeout(1);s.connect(('127.0.0.1',$GP))" 2>/dev/null && break
+      kill -0 $PID 2>/dev/null || { echo "server_died"; cat "$D/log"; exit 1; }
+      sleep 0.5
+    done
+    python3 - "$GP" <<'PY'
+    import sys
+    gp = int(sys.argv[1]); out = []
+    for line in open('/proc/net/tcp').read().splitlines()[1:]:
+        f = line.split(); ip_hex, port_hex = f[1].split(':')
+        if f[3] == '0A' and int(port_hex, 16) == gp:
+            out.append('.'.join(str(x) for x in bytes.fromhex(ip_hex)[::-1]))
+    print('LISTENERS=' + ','.join(sorted(out)))
+    PY
+    grep -q "\"transport\":\"grpc\",\"address\":\"0.0.0.0\",\"port\":$GP" "$D/log" && echo "BANNER_OK" || { echo "BANNER_MISSING"; cat "$D/log"; }
+  expect:
+    exit_code: 0
+    stdout_contains: [LISTENERS=0.0.0.0, BANNER_OK]
+    stdout_not_contains: [BANNER_MISSING, server_died]
+  tags: [grpc, bind, sonny-1336, regression]
+
+- name: port-alone-binds-the-quic-listener-address
+  description: --listen-grpc <port> with --listen 127.0.0.3:Q binds 127.0.0.3
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+    D=$(mktemp -d); trap 'kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -rf "$D"' EXIT
+    read QP GP < <(python3 -c "import socket
+    u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));q=u.getsockname()[1]
+    t=socket.socket();t.bind(('127.0.0.1',0));g=t.getsockname()[1];print(q,g)")
+    export GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    "$BIN" serve --data-dir "$D/data" --log-level info --listen 127.0.0.3:$QP --listen-grpc $GP > "$D/log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 120); do
+      python3 -c "import socket;s=socket.socket();s.settimeout(1);s.connect(('127.0.0.3',$GP))" 2>/dev/null && break
+      kill -0 $PID 2>/dev/null || { echo "server_died"; cat "$D/log"; exit 1; }
+      sleep 0.5
+    done
+    python3 - "$GP" <<'PY'
+    import sys
+    gp = int(sys.argv[1]); out = []
+    for line in open('/proc/net/tcp').read().splitlines()[1:]:
+        f = line.split(); ip_hex, port_hex = f[1].split(':')
+        if f[3] == '0A' and int(port_hex, 16) == gp:
+            out.append('.'.join(str(x) for x in bytes.fromhex(ip_hex)[::-1]))
+    print('LISTENERS=' + ','.join(sorted(out)))
+    PY
+  expect:
+    exit_code: 0
+    stdout_contains: [LISTENERS=127.0.0.3]
+    stdout_not_contains: [server_died]
+  tags: [grpc, bind, sonny-1336, regression]
+
+- name: port-alone-without-quic-listener-binds-wildcard
+  description: --listen-grpc <port> alone binds 0.0.0.0, QUIC's own port-only default
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+    D=$(mktemp -d); trap 'kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; rm -rf "$D"' EXIT
+    GP=$(python3 -c "import socket;t=socket.socket();t.bind(('127.0.0.1',0));print(t.getsockname()[1])")
+    export GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    "$BIN" serve --data-dir "$D/data" --log-level info --listen-grpc $GP > "$D/log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 120); do
+      python3 -c "import socket;s=socket.socket();s.settimeout(1);s.connect(('127.0.0.1',$GP))" 2>/dev/null && break
+      kill -0 $PID 2>/dev/null || { echo "server_died"; cat "$D/log"; exit 1; }
+      sleep 0.5
+    done
+    python3 - "$GP" <<'PY'
+    import sys
+    gp = int(sys.argv[1]); out = []
+    for line in open('/proc/net/tcp').read().splitlines()[1:]:
+        f = line.split(); ip_hex, port_hex = f[1].split(':')
+        if f[3] == '0A' and int(port_hex, 16) == gp:
+            out.append('.'.join(str(x) for x in bytes.fromhex(ip_hex)[::-1]))
+    print('LISTENERS=' + ','.join(sorted(out)))
+    PY
+  expect:
+    exit_code: 0
+    stdout_contains: [LISTENERS=0.0.0.0]
+    stdout_not_contains: [server_died]
+  tags: [grpc, bind, sonny-1336, regression]
+
+- name: unbindable-address-or-bad-port-is-refused-at-startup
+  description: IPv6, a host name, a non-numeric port and an out-of-range port exit 2 naming --listen-grpc, and nothing listens
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ADMIN_PASSWORD="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    GP=$(python3 -c "import socket;t=socket.socket();t.bind(('127.0.0.1',0));print(t.getsockname()[1])")
+    FAIL=0
+    for ARG in "[::1]:$GP" "grpc.example.invalid:$GP" "127.0.0.1:${GP}x" "127.0.0.1:70000"; do
+      D=$(mktemp -d)
+      timeout 60 "$BIN" serve --data-dir "$D/data" --log-level info --listen-grpc "$ARG" > "$D/log" 2>&1
+      RC=$?
+      LISTEN=$(python3 -c "
+    gp = $GP; n = 0
+    for line in open('/proc/net/tcp').read().splitlines()[1:]:
+        f = line.split()
+        if f[3] == '0A' and int(f[1].split(':')[1], 16) == gp: n += 1
+    print(n)")
+      if [ "$RC" = "2" ] && grep -qF -- "--listen-grpc" "$D/log" && grep -qF -- "$ARG" "$D/log" && [ "$LISTEN" = "0" ]; then
+        echo "REFUSED_OK $ARG"
+      else
+        echo "REFUSED_BAD $ARG rc=$RC listeners=$LISTEN"; tail -n 8 "$D/log"; FAIL=1
+      fi
+      rm -rf "$D"
+    done
+    exit $FAIL
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'REFUSED_OK [::1]:'
+    - 'REFUSED_OK grpc.example.invalid:'
+    - REFUSED_OK 127.0.0.1:70000
+    stdout_not_contains: [REFUSED_BAD]
+  tags: [grpc, bind, sonny-1336, regression, negative]

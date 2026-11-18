@@ -123,13 +123,7 @@ def untrack_pid(pid: int) -> None:
 
 
 def _kill_geode_processes() -> None:
-    """Kill orphaned geode server processes started by this test run.
-
-    Uses tracked PIDs when available, falling back to pattern-based
-    pkill only for processes matching our temp-dir naming convention.
-    """
-    import subprocess
-
+    """Kill geode server processes explicitly tracked by this test run."""
     # First, kill any PIDs we explicitly tracked
     for pid in list(_tracked_pids):
         try:
@@ -138,15 +132,13 @@ def _kill_geode_processes() -> None:
             pass
         _tracked_pids.discard(pid)
 
-    # Fallback: pattern-based cleanup scoped to our test temp dirs
-    try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "geode serve.*geode-test-"],
-            capture_output=True,
-            timeout=5,
-        )
-    except Exception:
-        pass
+    # No machine-wide pattern pkill here. The old fallback
+    # (`pkill -9 -f "geode serve.*geode-test-"`) ran at the exit of EVERY harness
+    # process and so SIGKILLed the managed servers of every OTHER harness run on the
+    # machine (parallel lanes, CI shards sharing a runner), failing their tests with
+    # "Server died during test (signal 9)" and, when it hit a first boot, leaving a
+    # data directory the next start refuses (AuthChainTampered). A run's own servers
+    # are reaped by server.cleanup_servers() through their tracked process groups.
 
 
 def _kill_child_processes() -> None:
@@ -637,14 +629,18 @@ def run(
 
                 try:
                     spec_obj = load_spec(spec_file)
-                except SpecValidationError as exc:
-                    console_err.print(f"SCHEMA_ERROR in {spec_file}", style="red")
+                except Exception as exc:
+                    console_err.print(f"SCHEMA_ERROR in {spec_file}: {exc}", style="red", markup=False, highlight=False)
                     _record_spec_error(str(spec_file), f"SCHEMA_ERROR: {exc}")
                     total_exit_code = max(total_exit_code, 2)
                     continue
-                except Exception as exc:
-                    console_err.print(f"SCHEMA_ERROR in {spec_file}", style="red")
-                    _record_spec_error(str(spec_file), f"SCHEMA_ERROR: {exc}")
+
+                # A spec that yields no tests must never report green (SONNY-6711); a
+                # spec-level `skip:` directive and a dry run contribute zero by design.
+                if not spec_obj.tests and not getattr(spec_obj, "skip", None) and not dry_run:
+                    message = f"spec defines no tests (an empty or missing 'tests' list): {spec_file}"
+                    console_err.print(f"SCHEMA_ERROR: {message}", style="red", markup=False, highlight=False)
+                    _record_spec_error(str(spec_file), f"SCHEMA_ERROR: {message}")
                     total_exit_code = max(total_exit_code, 2)
                     continue
 

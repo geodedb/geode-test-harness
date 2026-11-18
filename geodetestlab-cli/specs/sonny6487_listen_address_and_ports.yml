@@ -1,0 +1,144 @@
+version: '1.0'
+name: SONNY-6487 / SONNY-6332 / SONNY-6484 listen-address grammar, IPv6, port 0 and the embedded LSP port
+description: |
+  Address handling found while fixing SONNY-6463/6466/6484 and the SONNY-738
+  open-bug sweep, proved against real `geode serve` processes (the spec starts
+  its own servers: the point is the flags and addresses they are started with).
+
+  SONNY-6487 item 2 - nine address splitters split `host:port` on the last colon
+  and ignored brackets; one shared parser (src/client/host_port.zig) replaced them:
+    * `--listen [::1]:P` serves QUIC on the IPv6 loopback and the client dials
+      `[::1]:P`; a bare IPv6 address (`::1`) is refused (an IPv6 address MUST be
+      bracketed, docs/DSN.md), and so is a bad port on the client (`[::1]:x`),
+      instead of being misread as host `:` / port 1 (SONNY-6484 item 1);
+    * a bad `--listen` port (non-numeric, > 65535, empty) refuses to start instead
+      of listening on 0.0.0.0:3141 (BREAKING);
+    * `--listen localhost:P` binds loopback (it bound 0.0.0.0, ignoring the host).
+
+  SONNY-6332 - tests/orchestration collided on fixed ports:
+    * `geode serve --listen 127.0.0.1:0` logged the configured port 0, not the
+      kernel-assigned one; it reports the bound port, so a caller can use port 0
+      and read the real one without a bind-release-bind race;
+    * every `geode serve` opened its embedded LSP listener on fixed TCP 3142 (a
+      second server on the host logged `LSP listener: bind failed`); GEODE_LSP_PORT
+      now moves it (0 disables), and `--lsp-port` still wins over the variable.
+      The production default (3142 with neither set) is unchanged and not asserted
+      here, since another server on this host may legitimately hold it.
+
+  CANARY: REQ=REQ-SONNY-6487-LISTEN-ADDRESS; FEATURE="ServerListen"; ASPECT=AddressGrammarIpv6PortZeroLspPort; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6487_listen_address_and_ports.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+tests:
+- name: serve-listen-port-zero-reports-the-bound-port
+  description: --listen 127.0.0.1:0 reports the port the kernel bound (it logged the configured 0); the socket exists there and a client reaches it
+  type: bash
+  timeout_ms: 180000
+  command: "set -u\nBIN=\"${GEODE_BINARY:-geode}\"\nPW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nexport GEODE_ADMIN_PASSWORD=\"$PW\" GEODE_DISABLE_AUDIT=1 GEODE_ALLOW_INSECURE_TLS=1\nD=$(mktemp -d); PID=\"\"\ntrap '[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null && wait \"$PID\" 2>/dev/null; rm -rf \"$D\"' EXIT\nfreeport() { python3 -c \"import socket;u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));print(u.getsockname()[1])\"; }\nwaitudp() { for i in $(seq 1 120); do ss -uln \"sport = :$1\" | grep -q \":$1\" && return 0; kill -0 \"$PID\" 2>/dev/null || return 1; sleep 0.5; done; return 1; }\nq() { \"$BIN\" query \"$1\" --server \"$2\" --insecure-tls-skip-verify -U geode -P \"$PW\" --format json --timeout 30 2>&1; }\nexport GEODE_LSP_PORT=0\n\"$BIN\" serve --data-dir \"$D/data\" --listen 127.0.0.1:0 --log-level info > \"$D/log\" 2>&1 &\nPID=$!\nfor i in $(seq 1 120); do grep -q '\"transport\":\"quic\".*\"status\":\"listening\"' \"$D/log\" && break; kill -0 $PID 2>/dev/null || { echo server_died; cat \"$D/log\"; exit 1; }; sleep 0.5; done\nP=$(grep -o '\"transport\":\"quic\",\"tls\":\"true\",\"port\":[0-9]*' \"$D/log\" | head -1 | grep -o '[0-9]*$')\necho \"REPORTED_PORT_NONZERO=$([ \"${P:-0}\" -gt 0 ] && echo yes || echo no)\"\nwaitudp \"$P\" && echo \"SOCKET_AT_REPORTED_PORT=yes\" || echo \"SOCKET_AT_REPORTED_PORT=no\"\nq \"RETURN 6300 + 32 AS port_zero_marker\" \"127.0.0.1:$P\" | grep -q 6332 && echo \"CLIENT_REACHES_IT=yes\" || echo \"CLIENT_REACHES_IT=no\"\ngrep -q '\"port\":0[,}]' \"$D/log\" && echo \"BOUND_PORT_LOGGED_NOT_ZERO=no\" || echo \"BOUND_PORT_LOGGED_NOT_ZERO=yes\"\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - REPORTED_PORT_NONZERO=yes
+    - SOCKET_AT_REPORTED_PORT=yes
+    - CLIENT_REACHES_IT=yes
+    - BOUND_PORT_LOGGED_NOT_ZERO=yes
+    stdout_not_contains:
+    - =no
+    - server_died
+  tags:
+  - listen
+  - port-zero
+  - sonny-6332
+  - regression
+- name: embedded-lsp-listener-port-is-configurable-by-env-and-flag
+  description: GEODE_LSP_PORT=0 opens no LSP listener; GEODE_LSP_PORT=<port> moves it; --lsp-port wins over the variable
+  type: bash
+  timeout_ms: 180000
+  command: "set -u\nBIN=\"${GEODE_BINARY:-geode}\"\nPW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nexport GEODE_ADMIN_PASSWORD=\"$PW\" GEODE_DISABLE_AUDIT=1 GEODE_ALLOW_INSECURE_TLS=1\nD=$(mktemp -d); PID=\"\"\ntrap '[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null && wait \"$PID\" 2>/dev/null; rm -rf \"$D\"' EXIT\nfreeport() { python3 -c \"import socket;u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));print(u.getsockname()[1])\"; }\nwaitudp() { for i in $(seq 1 120); do ss -uln \"sport = :$1\" | grep -q \":$1\" && return 0; kill -0 \"$PID\" 2>/dev/null || return 1; sleep 0.5; done; return 1; }\nq() { \"$BIN\" query \"$1\" --server \"$2\" --insecure-tls-skip-verify -U geode -P \"$PW\" --format json --timeout 30 2>&1; }\ntcp_listening() { ss -tln \"sport = :$1\" | grep -q \":$1\"; }\nstart() { rm -rf \"$D/data\"; \"$BIN\" serve --data-dir \"$D/data\" --listen 127.0.0.1:0 --log-level info \"$@\" > \"$D/log\" 2>&1 & PID=$!\n  for i in $(seq 1 120); do grep -q 'QUIC transport listening' \"$D/log\" && return 0; kill -0 $PID 2>/dev/null || return 1; sleep 0.5; done; return 1; }\nstop() { kill $PID 2>/dev/null; wait $PID 2>/dev/null; PID=\"\"; }\nTP() { python3 -c \"import socket;t=socket.socket();t.bind(('127.0.0.1',0));print(t.getsockname()[1])\"; }\n# 1. disabled by GEODE_LSP_PORT=0\nGEODE_LSP_PORT=0 start && { grep -q \"LSP listener disabled\" \"$D/log\" && echo \"ENV_ZERO_DISABLES=yes\" || echo \"ENV_ZERO_DISABLES=no\"; }; stop\n# 2. moved by GEODE_LSP_PORT=<port>\nP1=$(TP)\nGEODE_LSP_PORT=$P1 start && { sleep 1; tcp_listening $P1 && echo \"ENV_PORT_MOVES_LISTENER=yes\" || echo \"ENV_PORT_MOVES_LISTENER=no\"; }; stop\n# 3. --lsp-port beats the variable\nP2=$(TP); P3=$(TP)\nGEODE_LSP_PORT=$P2 start --lsp-port=$P3 && { sleep 1; tcp_listening $P3 && ! tcp_listening $P2 && echo \"FLAG_BEATS_ENV=yes\" || echo \"FLAG_BEATS_ENV=no\"; }; stop\n# 4. two servers on one host with LSP moved/disabled do not collide\nGEODE_LSP_PORT=0 start && A=$PID && PID=\"\"\nGEODE_LSP_PORT=0 start && { grep -q \"bind failed\" \"$D/log\" && echo \"SECOND_SERVER_LSP_COLLIDES=no\" || echo \"SECOND_SERVER_LSP_COLLIDES=yes\"; }\nkill $A 2>/dev/null; wait $A 2>/dev/null\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ENV_ZERO_DISABLES=yes
+    - ENV_PORT_MOVES_LISTENER=yes
+    - FLAG_BEATS_ENV=yes
+    - SECOND_SERVER_LSP_COLLIDES=yes
+    stdout_not_contains:
+    - =no
+    - server_died
+    - REFUSED_BAD
+  tags:
+  - lsp
+  - port
+  - sonny-6332
+  - regression
+- name: listen-address-grammar-bad-ports-and-bare-ipv6-are-refused
+  description: a non-numeric, out-of-range or empty port and a bare IPv6 address refuse to start (exit non-zero, naming --listen); none falls back to 0.0.0.0:3141
+  type: bash
+  timeout_ms: 180000
+  command: "set -u\nBIN=\"${GEODE_BINARY:-geode}\"\nPW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nexport GEODE_ADMIN_PASSWORD=\"$PW\" GEODE_DISABLE_AUDIT=1 GEODE_ALLOW_INSECURE_TLS=1\nD=$(mktemp -d); PID=\"\"\ntrap '[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null && wait \"$PID\" 2>/dev/null; rm -rf \"$D\"' EXIT\nfreeport() { python3 -c \"import socket;u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));print(u.getsockname()[1])\"; }\nwaitudp() { for i in $(seq 1 120); do ss -uln \"sport = :$1\" | grep -q \":$1\" && return 0; kill -0 \"$PID\" 2>/dev/null || return 1; sleep 0.5; done; return 1; }\nq() { \"$BIN\" query \"$1\" --server \"$2\" --insecure-tls-skip-verify -U geode -P \"$PW\" --format json --timeout 30 2>&1; }\nexport GEODE_LSP_PORT=0\nFAIL=0\nfor ARG in \"127.0.0.1:notaport\" \"127.0.0.1:70000\" \"127.0.0.1:\" \"::1\" \"[::1\" \"[::1]x:3141\"; do\n  rm -rf \"$D/data\"\n  timeout 60 \"$BIN\" serve --data-dir \"$D/data\" --listen \"$ARG\" --log-level info > \"$D/log\" 2>&1; RC=$?\n  if [ \"$RC\" != \"0\" ] && [ \"$RC\" != \"124\" ] && grep -qF -- \"--listen\" \"$D/log\" && ! grep -q \"QUIC transport listening\" \"$D/log\"; then\n    echo \"REFUSED_OK $ARG (exit $RC)\"\n  else\n    echo \"REFUSED_BAD $ARG rc=$RC\"; tail -n 5 \"$D/log\"; FAIL=1\n  fi\ndone\nexit $FAIL\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - REFUSED_OK 127.0.0.1:notaport
+    - REFUSED_OK 127.0.0.1:70000
+    - 'REFUSED_OK ::1 '
+    stdout_not_contains:
+    - =no
+    - server_died
+    - REFUSED_BAD
+  tags:
+  - listen
+  - ipv6
+  - sonny-6487
+  - regression
+  - negative
+- name: listen-localhost-binds-loopback-not-the-wildcard
+  description: --listen localhost:P bound 0.0.0.0 (it ignored the host); it now binds a loopback address only
+  type: bash
+  timeout_ms: 180000
+  command: "set -u\nBIN=\"${GEODE_BINARY:-geode}\"\nPW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nexport GEODE_ADMIN_PASSWORD=\"$PW\" GEODE_DISABLE_AUDIT=1 GEODE_ALLOW_INSECURE_TLS=1\nD=$(mktemp -d); PID=\"\"\ntrap '[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null && wait \"$PID\" 2>/dev/null; rm -rf \"$D\"' EXIT\nfreeport() { python3 -c \"import socket;u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));print(u.getsockname()[1])\"; }\nwaitudp() { for i in $(seq 1 120); do ss -uln \"sport = :$1\" | grep -q \":$1\" && return 0; kill -0 \"$PID\" 2>/dev/null || return 1; sleep 0.5; done; return 1; }\nq() { \"$BIN\" query \"$1\" --server \"$2\" --insecure-tls-skip-verify -U geode -P \"$PW\" --format json --timeout 30 2>&1; }\nexport GEODE_LSP_PORT=0\nP=$(freeport)\n\"$BIN\" serve --data-dir \"$D/data\" --listen \"localhost:$P\" --log-level info > \"$D/log\" 2>&1 &\nPID=$!\nwaitudp \"$P\" && echo \"LISTENING=yes\" || { echo \"LISTENING=no\"; cat \"$D/log\"; }\nADDRS=$(ss -uln \"sport = :$P\" | awk 'NR>1{print $4}' | sort | tr '\\n' ' ')\necho \"BOUND_ADDRS=$ADDRS\"\ncase \"$ADDRS\" in *\"0.0.0.0:$P\"*|*\"*:$P\"*|*\"[::]:$P\"*) echo \"LOOPBACK_ONLY=no\";; *) echo \"LOOPBACK_ONLY=yes\";; esac\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - LISTENING=yes
+    - LOOPBACK_ONLY=yes
+    stdout_not_contains:
+    - =no
+    - server_died
+    - REFUSED_BAD
+  tags:
+  - listen
+  - sonny-6487
+  - regression
+- name: ipv6-loopback-listen-and-dial
+  description: --listen [::1]:P serves QUIC on the IPv6 loopback and the CLI dials [::1]:P; bare ::1 and a bad port on the client side are refused, not misread
+  type: bash
+  timeout_ms: 180000
+  command: "set -u\nBIN=\"${GEODE_BINARY:-geode}\"\nPW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nexport GEODE_ADMIN_PASSWORD=\"$PW\" GEODE_DISABLE_AUDIT=1 GEODE_ALLOW_INSECURE_TLS=1\nD=$(mktemp -d); PID=\"\"\ntrap '[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null && wait \"$PID\" 2>/dev/null; rm -rf \"$D\"' EXIT\nfreeport() { python3 -c \"import socket;u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));print(u.getsockname()[1])\"; }\nwaitudp() { for i in $(seq 1 120); do ss -uln \"sport = :$1\" | grep -q \":$1\" && return 0; kill -0 \"$PID\" 2>/dev/null || return 1; sleep 0.5; done; return 1; }\nq() { \"$BIN\" query \"$1\" --server \"$2\" --insecure-tls-skip-verify -U geode -P \"$PW\" --format json --timeout 30 2>&1; }\npython3 -c \"import socket;s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind(('::1',0))\" 2>/dev/null || { echo \"NO_IPV6_LOOPBACK_SKIP\"; echo \"IPV6_SERVED=skip\"; echo \"BARE_IPV6_CLIENT_REFUSED=skip\"; echo \"BAD_CLIENT_PORT_REFUSED=skip\"; exit 0; }\nexport GEODE_LSP_PORT=0\nP=$(python3 -c \"import socket;u=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);u.bind(('::1',0));print(u.getsockname()[1])\")\n\"$BIN\" serve --data-dir \"$D/data\" --listen \"[::1]:$P\" --log-level info > \"$D/log\" 2>&1 &\nPID=$!\nfor i in $(seq 1 120); do ss -uln \"sport = :$P\" | grep -q \"::1\" && break; kill -0 $PID 2>/dev/null || { echo server_died; cat \"$D/log\"; exit 1; }; sleep 0.5; done\nq \"RETURN 6400 + 87 AS v6_marker\" \"[::1]:$P\" | grep -q 6487 && echo \"IPV6_SERVED=yes\" || { echo \"IPV6_SERVED=no\"; q \"RETURN 1\" \"[::1]:$P\" | head -3; }\nOUT=$(q \"RETURN 1\" \"::1\"); echo \"$OUT\" | grep -qiE \"bracket|not a valid|invalid|IPv6\" && echo \"BARE_IPV6_CLIENT_REFUSED=yes\" || { echo \"BARE_IPV6_CLIENT_REFUSED=no\"; echo \"$OUT\" | head -3; }\nOUT=$(q \"RETURN 1\" \"[::1]:notaport\"); echo \"$OUT\" | grep -qiE \"port\" && echo \"BAD_CLIENT_PORT_REFUSED=yes\" || { echo \"BAD_CLIENT_PORT_REFUSED=no\"; echo \"$OUT\" | head -3; }\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - IPV6_SERVED=
+    - BARE_IPV6_CLIENT_REFUSED=
+    - BAD_CLIENT_PORT_REFUSED=
+    stdout_not_contains:
+    - =no
+    - server_died
+    - REFUSED_BAD
+  tags:
+  - listen
+  - ipv6
+  - sonny-6487
+  - sonny-6484
+  - regression

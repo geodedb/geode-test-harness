@@ -106,29 +106,52 @@ def test_run_dry_run() -> None:
         temp_path.unlink()
 
 
-def test_run_empty_spec() -> None:
-    """Test run command with empty test spec."""
-    spec_data = {"name": "empty-test", "tests": []}
-
+def _run_spec_text(text: str, *extra: str):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
-        yaml.dump(spec_data, f)
+        f.write(text)
         temp_path = Path(f.name)
-
     try:
-        runner = CliRunner()
-        result = runner.invoke(app, ["run", "--spec", str(temp_path), "--ci"])
-
-        assert result.exit_code == 0
-
-        # Parse the JSON summary
-        lines = [line for line in result.output.splitlines() if line.strip()]
-        summary_line = lines[-1]
-        summary = json.loads(summary_line)
-
-        assert summary["summary"]["total"] == 0
-
+        result = CliRunner().invoke(app, ["run", "--spec", str(temp_path), "--ci", *extra])
+        return result, (result.output or "") + (getattr(result, "stderr", "") or "")
     finally:
         temp_path.unlink()
+
+
+def test_run_empty_spec_fails() -> None:
+    """A spec that yields 0 tests must fail the run, never report green (SONNY-6711)."""
+    result, output = _run_spec_text("name: empty-test\ntests: []\n")
+
+    assert result.exit_code == 2
+    assert "no tests" in output.lower()
+
+
+def test_run_spec_without_tests_field_fails() -> None:
+    result, output = _run_spec_text("name: no-tests-field\n")
+
+    assert result.exit_code == 2
+    assert "tests" in output.lower()
+
+
+def test_run_skipped_spec_is_not_a_failure() -> None:
+    """A spec-level `skip:` directive contributes zero cases by design."""
+    result, _ = _run_spec_text("name: pending\nskip: not implemented yet\n")
+
+    assert result.exit_code == 0
+
+
+def test_run_dry_run_empty_spec_is_not_a_failure() -> None:
+    result, _ = _run_spec_text("name: empty-test\ntests: []\n", "--dry-run")
+
+    assert result.exit_code == 0
+
+
+def test_run_invalid_yaml_names_the_reason() -> None:
+    """A spec that fails to load must say why, not only SCHEMA_ERROR (SONNY-6711)."""
+    result, output = _run_spec_text("name: x\ntests:\n- name: a\n  query: RETURN 1 AS v: bad\n")
+
+    assert result.exit_code == 2
+    assert "SCHEMA_ERROR" in output
+    assert "Invalid YAML" in output
 
 
 def test_secrets_check_no_secrets() -> None:
