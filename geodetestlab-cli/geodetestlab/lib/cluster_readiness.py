@@ -107,7 +107,7 @@ def wait_for_cluster_ready(
     cluster_state: ClusterState,
     *,
     binary: str,
-    admin_password: str = "GeodeTestPassword123!",
+    admin_password: str = "Geode Test Admin Passphrase",
     deadline_s: float = 60.0,
     poll_interval_s: float = 1.0,
     ca_cert: str | None = None,

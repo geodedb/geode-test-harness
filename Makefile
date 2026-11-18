@@ -33,8 +33,11 @@ GEODE_HOST ?= 127.0.0.1
 GEODE_PORT ?= 3141
 GEODE_GRPC_PORT ?= 50051
 
-# Authentication settings
-GEODE_ADMIN_PASSWORD ?= GeodeTestPassword123!
+# Authentication settings. The default must satisfy geode's passphrase policy
+# (25+ characters, 4+ words, mixed case) or the server forces a reset on first login.
+GEODE_ADMIN_PASSWORD ?= Geode Test Admin Passphrase
+null :=
+space := $(null) $(null)
 GEODE_DEFAULT_PASSWORD ?= $(GEODE_ADMIN_PASSWORD)
 GEODE_USERNAME ?= geode
 
@@ -151,8 +154,8 @@ docker-start:
 	@$(DOCKER) run -d --name $(GEODE_CONTAINER) \
 		-p $(GEODE_PORT):3141/udp \
 		-p $(GEODE_GRPC_PORT):50051/tcp \
-		-e GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD) \
-		-e GEODE_DEFAULT_PASSWORD=$(GEODE_DEFAULT_PASSWORD) \
+		-e "GEODE_ADMIN_PASSWORD=$(GEODE_ADMIN_PASSWORD)" \
+		-e "GEODE_DEFAULT_PASSWORD=$(GEODE_DEFAULT_PASSWORD)" \
 		-e GEODE_DISABLE_AUDIT=1 \
 		$(GEODE_IMAGE) \
 		serve --listen 0.0.0.0:3141 --listen-grpc 0.0.0.0:50051 --log-level info
@@ -571,7 +574,7 @@ test-all-transports: .check-geodetestlab
 # ==============================================================================
 
 # Geode connection DSN for load tests (override as needed)
-LOADTEST_DSN ?= localhost:3141?insecure=true&user=$(GEODE_USERNAME)&pass=$(GEODE_ADMIN_PASSWORD)
+LOADTEST_DSN ?= localhost:3141?insecure=true&user=$(GEODE_USERNAME)&pass=$(subst $(space),%20,$(GEODE_ADMIN_PASSWORD))
 LOADTEST_LEVELS ?= 1,2,4,8,16,32
 LOADTEST_DURATION ?= 5s
 
@@ -596,7 +599,7 @@ test-concurrent-tx-build:
 #   CTX_CONNS   — number of pinned conns running concurrently (default 8)
 #   CTX_ITER    — tx iterations per conn (default 25)
 #   CTX_TIMEOUT — overall test timeout (default 5m)
-CTX_DSN     ?= 127.0.0.1:3141?insecure=true&user=geode&pass=$(GEODE_ADMIN_PASSWORD)&graph=concurrent_tx_test
+CTX_DSN     ?= 127.0.0.1:3141?insecure=true&user=geode&pass=$(subst $(space),%20,$(GEODE_ADMIN_PASSWORD))&graph=concurrent_tx_test
 CTX_CONNS   ?= 8
 CTX_ITER    ?= 25
 CTX_TIMEOUT ?= 5m
@@ -659,7 +662,7 @@ loadtest-python:
 	@echo "Running Python CLI load test..."
 	python3 loadtest/python/loadtest.py \
 		--host $(GEODE_HOST) --port $(GEODE_PORT) \
-		-U $(GEODE_USERNAME) -P $(GEODE_ADMIN_PASSWORD) \
+		-U $(GEODE_USERNAME) -P "$(GEODE_ADMIN_PASSWORD)" \
 		--levels "$(LOADTEST_LEVELS)" \
 		--duration 5 \
 		--output reports/loadtest_python.json

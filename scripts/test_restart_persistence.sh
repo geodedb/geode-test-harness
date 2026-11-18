@@ -16,7 +16,7 @@
 set -euo pipefail
 
 GEODE_BINARY="${GEODE_BINARY:-./zig-out/bin/geode}"
-ADMIN_PASS="${GEODE_ADMIN_PASSWORD:-test_password_123}"
+ADMIN_PASS="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
 DATA_DIR="$(mktemp -d)"
 PORT=$(( (RANDOM % 10000) + 20000 ))
 

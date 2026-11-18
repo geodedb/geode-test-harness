@@ -258,7 +258,7 @@ GEODE_PORT=8443 make docker-start
 - `GEODE_HOST` - Server host (default: 127.0.0.1)
 - `GEODE_PORT` - QUIC server port (default: 3141, UDP)
 - `GEODE_GRPC_PORT` - gRPC server port (default: 50051, TCP)
-- `GEODE_ADMIN_PASSWORD` - Admin password (default: GeodeTestPassword123!)
+- `GEODE_ADMIN_PASSWORD` - Admin password (default: Geode Test Admin Passphrase)
 - `GEODE_USERNAME` - Username (default: geode)
 - `GEODE_VERIFY_SSL` - Enable SSL verification (default: 0)
 
