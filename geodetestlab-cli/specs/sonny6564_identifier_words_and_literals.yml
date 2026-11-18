@@ -1,0 +1,268 @@
+# SONNY-6564: the parser applied ISO/IEC 39075:2024 21.3 backwards: non-reserved words
+# ('type', 'property') were refused as variables in SET and REMOVE while reserved words
+# (MATCH, SELECT) were accepted. Now reserved words are refused as variable, alias and
+# parameter names with a message naming the delimited-identifier escape, non-reserved
+# words work everywhere, and the ISO edge quantifier -[:R]->{1,2} (16.11, optional
+# features G035/G036) is accepted beside *1..2.
+# SONNY-6596: a scientific-notation literal such as 1.5E0 is an APPROXIMATE numeric
+# (ISO 21.2) -> DOUBLE, not an exact decimal; the algorithm guide's CALL ... RETURN
+# ... GROUP BY now parses.
+# Documented deviation kept (SONNY-6564 item 3): PATH, VALUE, COUNT, AVG and TIMESTAMP stay
+# usable as names because Geode's own procedures return those column names.
+
+version: '1.0'
+name: 'SONNY-6564 / SONNY-6596: ISO 21.3 identifier rule, quantified edges, approximate literals'
+description: Non-reserved words are valid variables; reserved words are refused as variables, aliases and parameter names; ISO edge quantifiers; 1.5E0 is approximate; a procedure CALL's RETURN takes GROUP BY
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed-type-node
+  description: a node labelled T
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:IdT {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6564
+  - setup
+- name: non-reserved-type-set
+  description: MATCH (type:T) SET type.x = 1 (non-reserved word as a variable in SET)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (type:IdT) SET type.x = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6564
+- name: non-reserved-property-remove
+  description: REMOVE property.x with a non-reserved variable
+  args:
+  - query
+  - '-'
+  stdin: MATCH (property:IdT) REMOVE property.x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6564
+- name: non-reserved-type-return
+  description: the variable named type reads normally
+  args:
+  - query
+  - '-'
+  stdin: MATCH (type:IdT) RETURN type.k AS k, type.x AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1,"x":null}]'
+  tags:
+  - sonny-6564
+- name: reserved-match-as-variable-refused
+  description: MATCH (match:T) is refused 42000 naming ISO 21.3
+  args:
+  - query
+  - '-'
+  stdin: MATCH (match:IdT) RETURN match
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+    - reserved word
+    - '21.3'
+  tags:
+  - sonny-6564
+  - refusal
+- name: reserved-match-in-return-refused
+  description: RETURN MATCH is refused (it parsed and failed later as out of scope)
+  args:
+  - query
+  - '-'
+  stdin: RETURN MATCH
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+    - reserved word
+  tags:
+  - sonny-6564
+  - refusal
+- name: reserved-select-as-alias-refused
+  description: an alias that is a reserved word is refused
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:IdT) RETURN n.k AS select
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+    - reserved word
+    - alias
+  tags:
+  - sonny-6564
+  - refusal
+- name: reserved-word-delimited-accepted
+  description: the delimited form `select` is accepted as an alias
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:IdT) RETURN n.k AS `select`
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"select":1}]'
+  tags:
+  - sonny-6564
+- name: geode-procedure-column-names-stay-usable
+  description: PATH / VALUE / COUNT / TIMESTAMP remain usable as aliases (documented deviation)
+  args:
+  - query
+  - '-'
+  stdin: RETURN 1 AS value, 2 AS count, 3 AS timestamp
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"value":1,"count":2,"timestamp":3}]'
+  tags:
+  - sonny-6564
+  - sonny-6596
+- name: seed-edge-chain
+  description: R then S chain from A to C
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:IdA {k: 0})-[:R]->(:IdB {k: 1})-[:R]->(:IdC {k: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6564
+  - setup
+- name: iso-edge-quantifier-range
+  description: ISO -[:R]->{1,2} reaches B and C from A (G035/G036)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:IdA)-[:R]->{1,2}(b) RETURN b.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - sonny-6564
+  - quantifier
+- name: iso-edge-quantifier-matches-star-range
+  description: -[:R*1..2]-> answers the same
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:IdA)-[:R*1..2]->(b) RETURN b.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - sonny-6564
+  - quantifier
+- name: iso-edge-quantifier-exact
+  description: '{2} is exactly two hops'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:IdA)-[:R]->{2}(b) RETURN b.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":2}]'
+  tags:
+  - sonny-6564
+  - quantifier
+- name: approximate-literal-is-double
+  description: 1.5E0 is an approximate numeric (DOUBLE), 1.5 stays exact (DECIMAL) (ISO 21.2)
+  args:
+  - query
+  - '-'
+  stdin: RETURN 1.5E0 AS x, 1.5 AS y, 1e3 AS z
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":1.5,"y":"1.5","z":1000}]'
+    - '{"name":"x","type":"DOUBLE"}'
+    - '{"name":"y","type":"DECIMAL"}'
+    - '{"name":"z","type":"DOUBLE"}'
+  tags:
+  - sonny-6596
+- name: approximate-arithmetic-is-binary-float
+  description: 0.1E0 + 0.2E0 is binary floating point; 0.1 + 0.2 is exact decimal
+  args:
+  - query
+  - '-'
+  stdin: RETURN 0.1E0 + 0.2E0 AS a, 0.1 + 0.2 AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"a":0.30000000000000004,"b":"0.3"}]'
+  tags:
+  - sonny-6596
+- name: procedure-return-group-by-parses
+  description: CALL ... YIELD ... RETURN ... GROUP BY parses and groups (algorithm guide examples)
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:GrpLbl {k: 1}), (:GrpLbl {k: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6596
+  - setup
+- name: procedure-return-group-by-runs
+  description: CALL db.labels() RETURN label, count(*) GROUP BY label returns one row per label
+  args:
+  - query
+  - '-'
+  stdin: CALL db.labels() YIELD label RETURN label, count(*) AS c GROUP BY label ORDER BY label LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"rows":\[\{"label":"[^"]+","c":1\}\]'
+  tags:
+  - sonny-6596

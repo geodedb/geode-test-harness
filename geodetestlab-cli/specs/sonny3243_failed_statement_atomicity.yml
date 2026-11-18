@@ -1,0 +1,187 @@
+# SONNY-3243: MATCH (a:Q) WHERE a.i = 0 SET a.u = 1 RETURN 1 AS x UNION ALL
+# MATCH (n:G) WHERE n.i = 5 DELETE n RETURN 2 AS x failed with NodeHasEdges in its second
+# part but the first part's SET persisted; so did a second part failing with 1/0.
+# SONNY-3348: a statement failed by the resource-limit relay (54001 / OOM / budget) kept
+# its writes, so a client that saw the failure and retried double-applied it. The fix is
+# a statement-level undo: a statement that fails for ANY reason (54001, OOM, read budget,
+# type error, 1/0) replays its undo record before the error is returned.
+# The failure injected here is the deterministic one every build can produce - a
+# divide-by-zero or NodeHasEdges raised by a LATER row or part after earlier rows /
+# parts already wrote - which takes the same undo path.
+
+version: '1.0'
+name: 'SONNY-3243 / SONNY-3348: a statement that fails keeps none of its writes'
+description: UNION ALL with write parts, a multi-row SET that fails on a later row, and a failed FOR write leave the store unchanged
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed
+  description: an updatable node, a node with an edge, and three counter rows
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:AtomU {i: 0}), (:AtomHasEdge {i: 5})-[:E]->(:AtomT), (:AtomRow {i: 1}), (:AtomRow {i: 2}), (:AtomRow {i: 3})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3243
+  - setup
+- name: union-delete-with-edges-fails
+  description: the second UNION ALL part fails NodeHasEdges (non-DETACH DELETE of a node with an edge)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:AtomU) WHERE a.i = 0 SET a.u = 1 RETURN 1 AS x UNION ALL MATCH (n:AtomHasEdge) WHERE n.i = 5 DELETE n RETURN 2 AS x
+  expect:
+    exit_code: 1
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"error_code":"[0-9A-Z]{5}"'
+  tags:
+  - sonny-3243
+- name: union-first-part-write-rolled-back
+  description: u was NOT left set by the failed statement
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:AtomU) RETURN a.u AS u
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"u":null}]'
+  tags:
+  - sonny-3243
+- name: union-edge-node-still-present
+  description: the node whose delete failed is still there
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:AtomHasEdge) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-3243
+- name: union-divide-by-zero-fails
+  description: second part raises 22012 division by zero
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:AtomU) SET a.u = 2 RETURN 1 AS x UNION ALL MATCH (n:AtomRow) SET n.d = 1 / 0 RETURN 2 AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - sonny-3243
+- name: union-divide-by-zero-rolled-back
+  description: neither part's write persisted
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:AtomU) RETURN a.u AS u
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"u":null}]'
+  tags:
+  - sonny-3243
+- name: single-statement-failure-on-third-row
+  description: a multi-row SET whose THIRD row divides by zero (i = 3) fails 22012
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:AtomRow) SET n.w = 1 / (n.i - 3)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - sonny-3348
+- name: single-statement-failure-keeps-no-earlier-row
+  description: rows 1 and 2, written before the failure, were undone
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:AtomRow) RETURN n.i AS i, n.w AS w ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1,"w":null},{"i":2,"w":null},{"i":3,"w":null}]'
+  tags:
+  - sonny-3348
+- name: failed-statement-retry-does-not-double-apply
+  description: the corrected statement applies exactly once
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:AtomRow) SET n.w = n.i * 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3348
+- name: retry-applied-once
+  description: w = 10 * i for each row
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:AtomRow) RETURN n.i AS i, n.w AS w ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1,"w":10},{"i":2,"w":20},{"i":3,"w":30}]'
+  tags:
+  - sonny-3348
+- name: for-write-fails-midway
+  description: FOR whose third element fails keeps nothing of the earlier two (SONNY-6466 pin)
+  args:
+  - query
+  - '-'
+  stdin: 'FOR x IN [1, 2, 0] CREATE (:AtomFor {r: 10 / x})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22012"'
+  tags:
+  - sonny-3348
+- name: for-write-nothing-persisted
+  description: no AtomFor node exists
+  args:
+  - query
+  - '-'
+  stdin: MATCH (f:AtomFor) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+  tags:
+  - sonny-3348

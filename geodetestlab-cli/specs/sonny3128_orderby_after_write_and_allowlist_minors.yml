@@ -1,0 +1,200 @@
+# SONNY-3128: MATCH ... SET ... RETURN n ORDER BY n.i (a property access, not an alias)
+# was a parse error; ordering by an alias worked.
+# SONNY-3248 minors (W round-3 re-review): M1 a read-only subquery CALL or FOR inside an IN
+# subquery is a READ (it was refused 0A000 as mutating); M6 MATCH / WITH WHERE treated a
+# non-zero integer as true; M7 over-refusals that write nothing: SET ... DETACH DELETE,
+# DELETE ... RETURN ... ORDER BY ... LIMIT, WITH ... ORDER BY q.i DESC SKIP n DELETE and a
+# UNION of DELETE statements no longer parsed.
+
+version: '1.0'
+name: 'SONNY-3128 / SONNY-3248: ORDER BY n.prop after a write RETURN; write-allowlist minors'
+description: Property access in ORDER BY after a write RETURN; read-only CALL/FOR inside IN subqueries; WHERE truthiness; former over-refusals
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed
+  description: five V nodes
+  args:
+  - query
+  - '-'
+  stdin: "UNWIND [1, 2, 3, 4, 5] AS i CREATE (:OrdV {i: i, s: 'a'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3128
+  - setup
+- name: write-return-order-by-property
+  description: SET ... RETURN n.i ORDER BY n.i DESC (property access after a write RETURN)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:OrdV) SET n.t = 1 RETURN n.i AS k ORDER BY n.i DESC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":5},{"k":4},{"k":3},{"k":2},{"k":1}]'
+  tags:
+  - sonny-3128
+- name: write-return-order-by-alias
+  description: ordering by the alias still works
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:OrdV) SET n.t = 2 RETURN n.i AS k ORDER BY k ASC LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - sonny-3128
+- name: write-return-node-order-by-property
+  description: RETURN n ORDER BY n.i LIMIT 1 after SET (the ticket's exact shape) is accepted
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:OrdV) SET n.t = 3 RETURN n.t AS t ORDER BY n.i LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"t":3}]'
+  tags:
+  - sonny-3128
+- name: in-subquery-with-for-is-a-read
+  description: an IN subquery starting with FOR is a read, not a mutation (M1)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:OrdV) WHERE v.i IN (FOR y IN [1, 2] RETURN y) RETURN v.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1},{"i":2}]'
+  tags:
+  - sonny-3248
+- name: in-subquery-match-is-a-read
+  description: an IN subquery with MATCH inside a read statement
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:OrdV) WHERE v.i IN (MATCH (w:OrdV) WHERE w.i > 3 RETURN w.i) RETURN v.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":4},{"i":5}]'
+  tags:
+  - sonny-3248
+- name: match-where-integer-is-not-true
+  description: MATCH WHERE with a non-boolean integer keeps no row (M6)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:OrdV) WHERE v.i RETURN v.i AS i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3248
+  - truthiness
+- name: with-where-integer-is-not-true
+  description: WITH ... WHERE with a non-boolean integer keeps no row (M6)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:OrdV) WITH v WHERE v.i RETURN v.i AS i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3248
+  - truthiness
+- name: set-then-detach-delete-accepted
+  description: SET ... DETACH DELETE (an over-refusal that writes nothing wrong)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (v:OrdV {i: 5}) SET v.z = 1 DETACH DELETE v'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3248
+- name: set-then-detach-delete-landed
+  description: V5 is gone
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:OrdV) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":4}]'
+  tags:
+  - sonny-3248
+- name: with-order-skip-delete-accepted
+  description: WITH v ORDER BY v.i DESC SKIP 1 DELETE v deletes all but the highest
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:OrdV) WITH v ORDER BY v.i DESC SKIP 1 DELETE v
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-3248
+- name: with-order-skip-delete-landed
+  description: only the highest remains
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:OrdV) RETURN v.i AS i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":4}]'
+  tags:
+  - sonny-3248
+- name: delete-return-order-by-limit-accepted
+  description: DELETE ... RETURN ... ORDER BY ... LIMIT parses and runs
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:OrdV) DELETE v RETURN v.i AS i ORDER BY i LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3248

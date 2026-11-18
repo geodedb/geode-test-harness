@@ -1,0 +1,278 @@
+# SONNY-6637: the two-argument shortestPath() / allShortestPaths() expression forms built a
+# FAKE two-node path with no edges; MATCH ... SET without RETURN answered the matched rows
+# (ISO/IEC 39075:2024 14.1: a statement without a result produces no rows); leading LET
+# definitions could not reference earlier definitions (14.7).
+# SONNY-6613: LET v = 4 RETURN v and UNWIND [3] AS u RETURN u were refused as a statement
+# start (valid ISO); a writing FOR x IN [1, 2] CREATE ... answered one empty row per element;
+# MATCH ... WITH z FOR x IN z.l CREATE ... (ISO 14.8) was refused 0A000; RETURN 1 AS 'x'
+# accepted a single-quoted alias (not an ISO identifier); function arity is decided before
+# execution.
+
+version: '1.0'
+name: 'SONNY-6637 / SONNY-6613: shortestPath(a, b), MATCH SET returns no rows, LET/UNWIND/FOR forms, arity'
+description: shortestPath(a, b) walks the graph; MATCH ... SET without RETURN answers no rows; leading LET/UNWIND/FOR statements; writing FOR answers no rows; arity errors are bind-time
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed-chain
+  description: a path of four nodes k = 1..4
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:SpN {k: 1})-[:E]->(:SpN {k: 2})-[:E]->(:SpN {k: 3})-[:E]->(:SpN {k: 4})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6637
+  - setup
+- name: shortestpath-two-arg-length
+  description: length(shortestPath(a, b)) is the real edge count 3 (was a fabricated 2-node path)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:SpN {k: 1}), (b:SpN {k: 4}) RETURN length(shortestPath(a, b)) AS l'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"l":3}]'
+  tags:
+  - sonny-6637
+- name: shortestpath-two-arg-nodes
+  description: its node list has the 4 real nodes in order
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:SpN {k: 1}), (b:SpN {k: 4}) WITH shortestPath(a, b) AS p RETURN size(nodes(p)) AS n, size(relationships(p)) AS r'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"n":4,"r":3}]'
+  tags:
+  - sonny-6637
+- name: shortestpath-pattern-form
+  description: the pattern form agrees
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH p = shortestPath((a:SpN {k: 1})-[:E*]->(b:SpN {k: 4})) RETURN length(p) AS l'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"l":3}]'
+  tags:
+  - sonny-6637
+- name: match-set-no-return-answers-no-rows
+  description: MATCH ... SET without RETURN answers no rows (it answered the matched rows)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:SpN) SET n.z = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6637
+- name: match-set-no-return-wrote
+  description: the SET did apply
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:SpN) RETURN count(n.z) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":4}]'
+  tags:
+  - sonny-6637
+- name: for-body-set-no-return-no-rows
+  description: a FOR body's MATCH ... SET without RETURN also answers no rows
+  args:
+  - query
+  - '-'
+  stdin: 'FOR x IN [1] MATCH (n:SpN {k: x}) SET n.w = 2'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6637
+- name: leading-let
+  description: LET v = 4 RETURN v starts a statement
+  args:
+  - query
+  - '-'
+  stdin: LET v = 4 RETURN v AS v
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"v":4}]'
+  tags:
+  - sonny-6613
+- name: leading-let-references-earlier
+  description: a LET definition sees the earlier definition of the same LET (ISO 14.7)
+  args:
+  - query
+  - '-'
+  stdin: LET a = 1, b = a + 1 RETURN b AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"b":2}]'
+  tags:
+  - sonny-6637
+- name: leading-unwind
+  description: UNWIND [3] AS u RETURN u starts a statement
+  args:
+  - query
+  - '-'
+  stdin: UNWIND [3] AS u RETURN u
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"u":3}]'
+  tags:
+  - sonny-6613
+- name: writing-for-no-rows
+  description: FOR x IN [1, 2] CREATE ... answers no rows (was one empty row per element)
+  args:
+  - query
+  - '-'
+  stdin: 'FOR x IN [1, 2] CREATE (:SpF {x: x})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6613
+- name: writing-for-created-both
+  description: both elements were created
+  args:
+  - query
+  - '-'
+  stdin: MATCH (f:SpF) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":2}]'
+  tags:
+  - sonny-6613
+- name: seed-list-holder
+  description: a node holding a list
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:SpZ {l: [1, 2]})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6613
+  - setup
+- name: match-with-for-create
+  description: MATCH (z) WITH z FOR x IN z.l CREATE ... (ISO 14.8) runs
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (z:SpZ) WITH z FOR x IN z.l CREATE (:SpFe {x: x})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6613
+- name: match-with-for-create-landed
+  description: one node per list element
+  args:
+  - query
+  - '-'
+  stdin: MATCH (f:SpFe) RETURN f.x AS x ORDER BY x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":1},{"x":2}]'
+  tags:
+  - sonny-6613
+- name: single-quoted-alias-refused
+  description: RETURN 1 AS 'x' is not an ISO identifier and is refused
+  args:
+  - query
+  - '-'
+  stdin: RETURN 1 AS 'x'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - sonny-6613
+- name: function-arity-too-many-refused
+  description: abs(1, 2) is refused 42000 at bind time
+  args:
+  - query
+  - '-'
+  stdin: RETURN abs(1, 2) AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - sonny-6637
+  - arity
+- name: function-arity-too-few-refused
+  description: abs() is refused 42000
+  args:
+  - query
+  - '-'
+  stdin: RETURN abs() AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+  tags:
+  - sonny-6637
+  - arity
+- name: catalogue-functions-callable
+  description: nullif and st_point listed in the function catalogue (SONNY-6613 item 3) run
+  args:
+  - query
+  - '-'
+  stdin: RETURN nullif(1, 1) AS n, nullif(1, 2) AS m
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"n":null,"m":1}]'
+  tags:
+  - sonny-6613
