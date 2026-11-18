@@ -43,3 +43,30 @@ def test_remote_admin_command(args: list[str], remote: bool) -> None:
 )
 def test_accepts_data_dir(args: list[str], ok: bool) -> None:
     assert _accepts_data_dir(args) is ok
+
+
+def test_sequential_bash_step_sees_the_admin_password() -> None:
+    """Cluster runs leave GEODE_ADMIN_PASSWORD out of the shared env; a bash step's
+    client calls still need it (they failed with 'Authentication required')."""
+    from geodetestlab.lib.executor import _run_sequential_test
+    from geodetestlab.lib.runner_types import DEFAULT_ADMIN_PASSWORD
+    from geodetestlab.lib.spec import TestCase
+
+    tc = TestCase.from_dict(
+        {
+            "name": "bash-pw",
+            "type": "sequential",
+            "steps": [{"type": "bash", "command": 'printf "%s" "$GEODE_ADMIN_PASSWORD"'}],
+        }
+    )
+    result = _run_sequential_test(
+        test_case=tc,
+        binary="/usr/bin/geode",
+        env={"GEODE_SERVER_ADDRESS": "127.0.0.1:3141"},
+        secrets={},
+        timeout_ms=5000,
+        data_dir=None,
+        verbose=False,
+    )
+    assert result.passed, result.error
+    assert DEFAULT_ADMIN_PASSWORD in result.output

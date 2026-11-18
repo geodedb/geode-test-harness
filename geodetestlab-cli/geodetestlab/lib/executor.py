@@ -1131,6 +1131,7 @@ def _run_shell_test(
     # bash steps that speak a wire protocol directly (raw gRPC probes) need not
     # guess which python3 has the libraries. Specs fall back to python3.
     test_env.setdefault("GEODETESTLAB_PYTHON", sys.executable)
+    test_env.setdefault("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
     test_env.update(test_case.env)
 
     # Honor per-test timeout_ms if it exceeds the default shell timeout. Long-
@@ -1371,6 +1372,9 @@ def _run_sequential_test(
                         )
                     bash_env = env.copy()
                     bash_env["GEODE_BINARY"] = str(binary)
+                    # Cluster runs do not export the admin password into the shared env; a
+                    # bash step's client calls need it, as in a shell test.
+                    bash_env.setdefault("GEODE_ADMIN_PASSWORD", admin_password)
                     bin_dir = os.path.dirname(os.path.abspath(str(binary)))
                     if bin_dir:
                         bash_env["PATH"] = bin_dir + os.pathsep + bash_env.get("PATH", os.environ.get("PATH", ""))
