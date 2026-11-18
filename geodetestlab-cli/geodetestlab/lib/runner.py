@@ -206,6 +206,17 @@ class ServerState:
     process: subprocess.Popen[str] | None
     port: int
     grpc_port: int | None
+    # The args the server was STARTED with: the spec's own plus the verified-TLS
+    # --cert/--key the runner provisioned. A restart must reuse exactly these
+    # (SONNY-6722): restarting with only the spec's args made the server mint a
+    # fresh self-signed certificate that the client's provisioned CA does not
+    # verify, so every query after a restart hung in the TLS handshake.
+    server_args: list[str] | None = None
+
+
+def _restart_args(server_state: ServerState, spec: TestSpec) -> list[str]:
+    """The server args a restart must pass (see ``ServerState.server_args``)."""
+    return list(server_state.server_args) if server_state.server_args is not None else list(spec.server_args)
 
 
 def _run_pre_server_commands(pre_server: list[str] | None, dry_run: bool, verbose: bool) -> None:
@@ -403,7 +414,7 @@ def _check_and_restart_crashed_server(
                 port=server_state.port,
                 grpc_port=server_state.grpc_port,
                 env=env,
-                server_args=spec.server_args,
+                server_args=_restart_args(server_state, spec),
                 server_timeout_ms=server_timeout_ms,
                 verbose=verbose,
                 server_port=server_port,
@@ -494,7 +505,7 @@ def _recover_hung_server(
                     port=server_state.port,
                     grpc_port=server_state.grpc_port,
                     env=env,
-                    server_args=spec.server_args,
+                    server_args=_restart_args(server_state, spec),
                     server_timeout_ms=server_timeout_ms,
                     verbose=verbose,
                     server_port=server_port,
@@ -549,7 +560,7 @@ def _recover_hung_server(
                         port=server_state.port,
                         grpc_port=server_state.grpc_port,
                         env=env,
-                        server_args=spec.server_args,
+                        server_args=_restart_args(server_state, spec),
                         server_timeout_ms=server_timeout_ms,
                         verbose=verbose,
                         server_port=server_port,
@@ -660,7 +671,7 @@ def _execute_one_test(
                 port=server_state.port,
                 grpc_port=server_state.grpc_port,
                 env=env,
-                server_args=spec.server_args,
+                server_args=_restart_args(server_state, spec),
                 server_timeout_ms=server_timeout_ms,
                 verbose=verbose,
                 server_port=server_port,
@@ -917,6 +928,7 @@ def run_tests(
                 single_server_cert_dir, ca_crt, leaf_crt, leaf_key = provisioned
                 server_args.extend(["--cert", leaf_crt, "--key", leaf_key])
                 env["GEODE_TEST_CA_CERT"] = ca_crt
+        server_state.server_args = list(server_args)
 
         try:
             server_state.process = _start_initial_server(
