@@ -1225,11 +1225,15 @@ def _run_signal_step(step: TestStep, cluster_ctx: ClusterControlContext | None) 
         return False, f"signal step: node {step.target} has no process (already stopped?)"
 
     pid = node.process.pid
+    if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        return False, f"signal step: node {step.target} has no real process id ({pid!r})"
     try:
-        pgid = os.getpgid(pid)
-        from .server import _safe_killpg
+        from .server import signal_process_group
 
-        _safe_killpg(pgid, sig)
+        # The node leads its own group (start_new_session): signal the group.
+        # Otherwise signal the node process alone, never a shared group.
+        if not signal_process_group(pid, sig):
+            os.kill(pid, sig)
     except ProcessLookupError:
         # The process is already gone. SIGKILL/SIGTERM on a dead node is a
         # benign no-op; treat it as success. SIGSTOP/SIGCONT cannot apply.

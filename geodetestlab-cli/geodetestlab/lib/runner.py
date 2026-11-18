@@ -546,13 +546,9 @@ def _recover_hung_server(
                 except (subprocess.TimeoutExpired, Exception):
                     if verbose:
                         print("  Server hung (unresponsive), force-killing and restarting...")
-                    try:
-                        from .server import _safe_killpg
+                    from .server import signal_process_group
 
-                        pgid = os.getpgid(server_state.process.pid)
-                        _safe_killpg(pgid, signal.SIGKILL)
-                    except (OSError, ProcessLookupError):
-                        pass
+                    signal_process_group(server_state.process.pid, signal.SIGKILL)
                     server_state.process.kill()
                     try:
                         server_state.process.wait(timeout=2)
