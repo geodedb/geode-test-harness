@@ -1,0 +1,144 @@
+version: '1.0'
+name: SONNY-6623 online geode.auth.mfa_enable is under the MFA attempt limiter
+description: |
+  Ticket: SONNY-6623 (items 1; the allocation-free session removal and the
+  timeseries wal_dir items are in-process: covered by zig tests; item 3, the
+  offline malformed-code count, is in sonny6619_offline_mfa_enable_limit.yml).
+  Bug: the online `CALL geode.auth.mfa_enable(user, code)` verified TOTP codes with
+  no attempt limit, so the six digits could be guessed through it while
+  `mfa_verify` was limited.
+  Spec proves against the real server: wrong codes through mfa_enable (3) and
+  mfa_verify (2) share ONE count: the sixth attempt, a RIGHT mfa_enable code, is
+  refused with error_code 53400 (locked out) and MFA stays off; for an enrolled
+  user, five malformed codes ("12345", still 22023) through mfa_enable also count,
+  so a right mfa_verify afterwards is 53400.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6623-enable-shares-verify-limit
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+     GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+     start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+     for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+     echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+     ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+     O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+     SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+     [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+
+    enrol el6623
+    for i in 1 2 3; do want "wrong enable $i" "$(q "CALL geode.auth.mfa_enable('el6623', '000000')")" 28000; done
+    for i in 1 2; do want "wrong verify $i" "$(q "CALL geode.auth.mfa_verify('el6623', '000000')")" 28000; done
+    want "right enable after 5 failures" "$(q "CALL geode.auth.mfa_enable('el6623', '$(totp "$SECRET")')")" 53400
+    echo "ONLINE_ENABLE_LIMIT_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [ONLINE_ENABLE_LIMIT_OK]
+  tags: [mfa, online, sonny6623]
+
+- name: sonny6623-malformed-enable-codes-count
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+     GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+     start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+     for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+     echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+     ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+     O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+     SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+     [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+
+    ok "create" "$(q "CREATE USER mf6623 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+    want "malformed, not enrolled" "$(q "CALL geode.auth.mfa_enable('mf6623', '12345')")" 22023
+    enrol2() { O=$(q "CALL geode.auth.mfa_setup('mf6623')"); SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //'); }
+    enrol2; [ -n "$SECRET" ] || { echo "FAIL no secret"; exit 1; }
+    for i in 1 2 3 4 5; do want "malformed $i" "$(q "CALL geode.auth.mfa_enable('mf6623', '12345')")" 22023; done
+    want "right verify after 5 malformed" "$(q "CALL geode.auth.mfa_verify('mf6623', '$(totp "$SECRET")')")" 53400
+    echo "ONLINE_MALFORMED_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [ONLINE_MALFORMED_OK]
+  tags: [mfa, online, sonny6623]

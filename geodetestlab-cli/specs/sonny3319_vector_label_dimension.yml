@@ -1,0 +1,201 @@
+# SONNY-3319: a label SET and a vector SET in the same clause skipped the HNSW dimension check
+# (pre-clause labels were used), so a wrong-dimension vector was accepted; a later failed
+# rebuild then logged an index name it had already freed and the next write segfaulted.
+# (The round 4b-1b follow-up: a label SET also checks the vectors the node already holds.)
+#
+# This spec drives a real server with a 4-dimension HNSW index: every wrong-dimension path is
+# refused with 22000 and writes nothing, the server keeps serving writes, and correct
+# dimensions are accepted.
+
+version: '1.0'
+name: SONNY-3319 label SET + vector dimension check
+description: HNSW dimension check on label SET, same-clause label+vector and CREATE ... SET
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: create-hnsw-index
+  description: 4-dimension HNSW index on VK4b.emb
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX vk4b_idx ON VK4b (emb) USING HNSW WITH (metric = 'l2')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: seed-4d
+  description: A 4-dimension vector
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:VK4b {id: 1, emb: vectorf32('[1.0, 0.0, 0.0, 0.0]')})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: seed-2d-other-label
+  description: A 2-dimension vector under another label
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:VO4b {id: 5, emb: vectorf32('[8.0, 8.0]')})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: label-set-existing-wrong-dim
+  description: SET n:VK4b on a node holding a 2-dimension vector is refused (22000)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:VO4b) SET n:VK4b
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22000"'
+  tags:
+  - storage
+  - sonny738
+- name: create-then-label-wrong-dim
+  description: CREATE ... SET n:VK4b with a 2-dimension vector is refused and creates nothing
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (n:VP4b {id: 3, emb: vectorf32('[9.0, 9.0]')}) SET n:VK4b"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22000"'
+  tags:
+  - storage
+  - sonny738
+- name: label-and-vector-same-clause
+  description: "SET n:VK4b, n.emb = <2 dims> in ONE clause skips no check: refused (the ticket's case)"
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:VO4b) SET n:VK4b, n.emb = vectorf32('[1.0, 2.0]')
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22000"'
+  tags:
+  - storage
+  - sonny738
+- name: nothing-stored
+  description: VO4b kept its label set and its 2-dim vector; no VP4b node; one VK4b node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:VO4b) RETURN labels(n) AS l, size(n.emb) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"l":["VO4b"],"s":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: no-vp4b
+  description: No VP4b node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:VP4b) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: one-vk4b
+  description: Only the original VK4b node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:VK4b) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: server-still-writes
+  description: 'The failed rebuild no longer takes the next write down (it dereferenced a freed index name): a later SET runs'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:VO4b) SET n.q = 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: right-dimension-accepted
+  description: A correct 4-dimension vector is accepted
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:VK4b {id: 2, emb: vectorf32('[0.0, 1.0, 0.0, 0.0]')})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: label-set-right-dim-accepted
+  description: Adding the label with a 4-dimension vector is accepted
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:VQ4b {id: 9, emb: vectorf32('[0.0, 0.0, 1.0, 0.0]')}); MATCH (n:VQ4b) SET n:VK4b"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: three-vk4b
+  description: Three VK4b nodes now
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:VK4b) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+  tags:
+  - storage
+  - sonny738

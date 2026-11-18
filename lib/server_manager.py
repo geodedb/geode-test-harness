@@ -7,18 +7,20 @@ instances for testing purposes. It is shared between different test runners
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import socket
 import subprocess
 import tempfile
 import time
-from typing import Dict, Optional
 
 from .utils import get_free_port
 
+logger = logging.getLogger(__name__)
+
 # Default admin password for testing
-DEFAULT_ADMIN_PASSWORD = "GeodeTestPassword123!"
+DEFAULT_ADMIN_PASSWORD = "Geode Test Admin Passphrase"
 
 
 class ServerManager:
@@ -43,15 +45,15 @@ class ServerManager:
     def __init__(
         self,
         binary_path: str,
-        port: Optional[int] = None,
-        grpc_port: Optional[int] = None,
-        data_dir: Optional[str] = None,
+        port: int | None = None,
+        grpc_port: int | None = None,
+        data_dir: str | None = None,
         startup_timeout_ms: int = 60000,
         cleanup: bool = True,
-        args: Optional[list] = None,
-        env: Optional[Dict[str, str]] = None,
+        args: list | None = None,
+        env: dict[str, str] | None = None,
         verbose: bool = False,
-        admin_password: Optional[str] = None,
+        admin_password: str | None = None,
     ):
         """Initialize the server manager.
 
@@ -88,8 +90,8 @@ class ServerManager:
         self.env = env or {}
         self.verbose = verbose
         self.admin_password = admin_password or DEFAULT_ADMIN_PASSWORD
-        self.process: Optional[subprocess.Popen] = None
-        self._temp_dir: Optional[tempfile.TemporaryDirectory] = None
+        self.process: subprocess.Popen | None = None
+        self._temp_dir: tempfile.TemporaryDirectory | None = None
 
     @property
     def address(self) -> str:
@@ -97,7 +99,7 @@ class ServerManager:
         return f"127.0.0.1:{self.port}"
 
     @property
-    def grpc_address(self) -> Optional[str]:
+    def grpc_address(self) -> str | None:
         """Return the gRPC server address (host:port), or None if gRPC is disabled."""
         return f"127.0.0.1:{self.grpc_port}" if self.grpc_port else None
 
@@ -157,12 +159,12 @@ class ServerManager:
                 stdout=stdout,
                 stderr=stderr,
                 env=server_env,
-                preexec_fn=os.setsid if os.name != "nt" else None,
+                start_new_session=os.name != "nt",
             )
-        except FileNotFoundError:
-            raise RuntimeError(f"Geode binary not found: {self.binary_path}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to start server: {e}")
+        except FileNotFoundError as e:
+            raise RuntimeError(f"Geode binary not found: {self.binary_path}") from e
+        except OSError as e:
+            raise RuntimeError(f"Failed to start server: {e}") from e
 
         # Wait for server to become ready
         server_address = self.address
@@ -194,7 +196,7 @@ class ServerManager:
                                 f"Server process exited with code {self.process.returncode}"
                             )
                         return server_address
-            except (socket.timeout, OSError):
+            except (TimeoutError, OSError):
                 pass
 
             time.sleep(0.1)
@@ -240,8 +242,8 @@ class ServerManager:
                     else:
                         self.process.kill()
                     self.process.wait()
-            except Exception:
-                pass
+            except (OSError, subprocess.SubprocessError):
+                logger.debug("server teardown failed", exc_info=True)
 
             self.process = None
 
@@ -249,8 +251,8 @@ class ServerManager:
         if self.cleanup and self._temp_dir:
             try:
                 self._temp_dir.cleanup()
-            except Exception:
-                pass
+            except OSError:
+                logger.debug("temp dir cleanup failed", exc_info=True)
             self._temp_dir = None
 
     def is_running(self) -> bool:

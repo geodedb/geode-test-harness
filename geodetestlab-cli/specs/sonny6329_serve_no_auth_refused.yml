@@ -1,0 +1,87 @@
+version: '1.0'
+name: SONNY-6329 geode serve --no-auth is refused at startup
+description: |
+  SONNY-6329 item 3: `geode serve --no-auth` outside a Debug build exited,
+  and in a Debug build set `config.enable_auth = false` (which nothing reads),
+  printed "Authentication disabled via --no-auth" and left authentication ON.
+  A flag that claims to disable authentication and does not is misleading.
+  Fixed: the flag is refused at startup in EVERY build mode with a clear
+  message and a non-zero exit, and the server never starts listening.
+
+  (Items 1 and 2 of the ticket - the unlocked user cache and the
+  non-serialized compound policy DDL - are in-process races covered by
+  test-sonny6329-user-cache-and-ddl-serialization; see the coverage file.)
+
+  Black-box proof: run the real `geode serve --no-auth` directly (own
+  throwaway data dir) and observe the exit status and message; then show that
+  the managed server (started WITHOUT the flag) still enforces authentication
+  for credentials: a wrong password is refused and the right one runs. (The
+  harness server sets GEODE_ALLOW_NO_AUTH=1, so an anonymous query is not a
+  valid probe here.)
+
+  CANARY: REQ=REQ-SONNY-6329-NO-AUTH-REFUSED; FEATURE="ServerCli"; ASPECT=NoAuthFlagRefused; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [auth, cli, security, sonny-6329]
+tests:
+
+- name: s6329_serve_no_auth_exits_nonzero_with_message
+  type: bash
+  command: |
+    set -u
+    B="${GEODE_BINARY:-geode}"
+    ROOT="${GEODE_STATE_DIR:-/tmp}/s6329-noauth"
+    rm -rf "$ROOT" && mkdir -p "$ROOT/data"
+    OUT=$(timeout 30 "$B" serve --no-auth --listen 127.0.0.1:0 --data-dir "$ROOT/data" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] || { echo "serve --no-auth exited 0"; echo "$OUT"; exit 1; }
+    [ "$RC" -ne 124 ] || { echo "serve --no-auth kept running (timeout): the flag was accepted"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "not supported" || { echo "no 'not supported' message:"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "authentication cannot be disabled" || { echo "no explanation:"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "Authentication disabled via" && { echo "old misleading banner printed"; exit 1; }
+    echo "no_auth_refused=ok"
+  timeout_ms: 60000
+  expect:
+    exit_code: 0
+    stdout_contains: [no_auth_refused=ok]
+  tags: [auth, cli, sonny-6329]
+
+- name: s6329_managed_server_wrong_password_refused
+  args: [query, -U, geode, -P, definitely not the password, RETURN 1 AS x]
+  expect:
+    exit_code: [1, 2, 3, 4, 5, 6]
+    stdout_not_contains: ['"x":1']
+  tags: [auth, sonny-6329]
+
+- name: s6329_managed_server_right_password_runs
+  args: [query, -U, geode, -P, '${secret:admin_password}', RETURN 1 AS x]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"x":1']
+  tags: [auth, sonny-6329]

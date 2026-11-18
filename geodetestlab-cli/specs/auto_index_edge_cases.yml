@@ -44,8 +44,8 @@ cli:
   binary: ./zig-out/bin/geode
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 30000
     cleanup: true
     args:
@@ -73,7 +73,7 @@ tests:
 
 - name: setup-auto-index-visible
   description: auto_idx_P11_Foo_id must be visible in SHOW INDEXES immediately after creation.
-  query: "SHOW INDEXES"
+  query: SHOW INDEXES
   expected:
     exit_code: 0
     stdout_contains:
@@ -91,7 +91,7 @@ tests:
     This matches the documented eviction behavior in
     auto_index_lifecycle.yml (auto-index removal is a normal, supported
     DROP INDEX target, not a protected/reserved system object).
-  query: "DROP INDEX auto_idx_P11_Foo_id"
+  query: DROP INDEX auto_idx_P11_Foo_id
   expected:
     exit_code: 0
     stdout_contains:
@@ -100,7 +100,7 @@ tests:
 
 - name: drop-auto-index-absent-after-drop
   description: auto_idx_P11_Foo_id must no longer appear in SHOW INDEXES after the DROP above.
-  query: "SHOW INDEXES"
+  query: SHOW INDEXES
   expected:
     exit_code: 0
     stdout_contains:
@@ -113,7 +113,7 @@ tests:
   description: |
     Query by id after the drop must still return the correct node via a
     full label scan (no auto-index required for correctness).
-  query: "MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n.name AS name"
+  query: MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n.name AS name
   expected:
     exit_code: 0
     stdout_contains:
@@ -126,7 +126,7 @@ tests:
     EXPLAIN after the drop must show a (Label)Scan, not IndexSeek — proves
     the query plan genuinely stopped using the dropped index rather than
     silently reusing stale index metadata.
-  query: "EXPLAIN MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n"
+  query: EXPLAIN MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n
   expected:
     exit_code: 0
     stdout_contains:
@@ -149,7 +149,7 @@ tests:
 
 - name: drop-auto-index-rebuilt-visible
   description: auto_idx_P11_Foo_id is visible again in SHOW INDEXES after the rebuild-triggering write.
-  query: "SHOW INDEXES"
+  query: SHOW INDEXES
   expected:
     exit_code: 0
     stdout_contains:
@@ -159,7 +159,7 @@ tests:
 
 - name: drop-auto-index-rebuilt-explain-shows-seek
   description: EXPLAIN shows IndexSeek again once the auto-index has been rebuilt.
-  query: "EXPLAIN MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n"
+  query: EXPLAIN MATCH (n:P11_Foo) WHERE n.id = 1 RETURN n
   expected:
     exit_code: 0
     stdout_contains:
@@ -180,14 +180,12 @@ tests:
     name collision (index_ddl_errors.yml). Issued exactly ONCE per the
     documented double-free-on-repeat crash finding in that spec — do not
     repeat this identical statement against a live server.
-  query: "CREATE INDEX auto_idx_P11_Foo_id ON P11_Foo(id)"
+  query: CREATE INDEX auto_idx_P11_Foo_id ON P11_Foo(id)
+  # geode query exits 1 for any error status (here 42P07).
   expected:
-    exit_code: 0
-    stdout_contains:
-    - '"status_class":"42P07"'
-    - Duplicate index name
-    stdout_not_contains:
-    - '"status_class":"00000"'
+    exit_code: 1
+    stdout_contains: ['"status_class":"42P07"', Duplicate index name]
+    stdout_not_contains: ['"status_class":"00000"']
   tags: [auto-index, edge-case, negative, reserved-name, key-assertion]
 
 - name: reserved-name-collision-index-unchanged
@@ -195,7 +193,7 @@ tests:
     Follow-up proof — the rejected collision attempt must not have altered
     the existing auto-index entry; SHOW INDEXES still lists exactly the
     one auto_idx_P11_Foo_id entry for P11_Foo.
-  query: "SHOW INDEXES"
+  query: SHOW INDEXES
   expected:
     exit_code: 0
     stdout_contains:
@@ -211,7 +209,7 @@ tests:
   description: |
     Baseline proof — P11_NeverWritten has never appeared in SHOW INDEXES
     because no node with that label has ever been created.
-  query: "SHOW INDEXES"
+  query: SHOW INDEXES
   expected:
     exit_code: 0
     stdout_contains:
@@ -225,7 +223,7 @@ tests:
     An id-equality lookup on the never-written label must return a clean
     empty result (status_class 00000, "rows":[]) with exit 0 — no crash,
     no error, exactly zero rows.
-  query: "MATCH (n:P11_NeverWritten) WHERE n.id = 1 RETURN n.name AS name"
+  query: MATCH (n:P11_NeverWritten) WHERE n.id = 1 RETURN n.name AS name
   expected:
     exit_code: 0
     stdout_contains:
@@ -238,7 +236,7 @@ tests:
     Follow-up proof — the read-only query above must NOT have spuriously
     triggered auto-index creation for P11_NeverWritten (auto-index is a
     write-triggered side effect only, per auto_index_lifecycle.yml).
-  query: "SHOW INDEXES"
+  query: SHOW INDEXES
   expected:
     exit_code: 0
     stdout_contains:
@@ -277,7 +275,7 @@ tests:
     auto-index correctly resolves to a multi-row bucket rather than
     silently masking one of the two duplicates. ORDER BY makes the
     two-row result deterministic.
-  query: "MATCH (n:P11_Dup) WHERE n.id = 5 RETURN n.name AS name ORDER BY n.name"
+  query: MATCH (n:P11_Dup) WHERE n.id = 5 RETURN n.name AS name ORDER BY n.name
   expected:
     exit_code: 0
     stdout_contains:
@@ -289,7 +287,7 @@ tests:
 # ---------------------------------------------------------------- cleanup --
 - name: cleanup-drop-remaining-index
   description: Drop the rebuilt P11_Foo auto-index to leave a clean catalog.
-  query: "DROP INDEX IF EXISTS auto_idx_P11_Foo_id"
+  query: DROP INDEX IF EXISTS auto_idx_P11_Foo_id
   expected:
     exit_code: 0
     stdout_contains:
@@ -298,7 +296,7 @@ tests:
 
 - name: cleanup-test-data
   description: Remove all P11 test nodes.
-  query: "MATCH (n) WHERE n.name IN ['first', 'second', 'p11_dup_first', 'p11_dup_second'] DETACH DELETE n"
+  query: MATCH (n) WHERE n.name IN ['first', 'second', 'p11_dup_first', 'p11_dup_second'] DETACH DELETE n
   expected:
     exit_code: 0
   tags: [auto-index, edge-case, cleanup]

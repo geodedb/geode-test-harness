@@ -1,0 +1,102 @@
+version: '1.0'
+name: 'SONNY-3038: CREATE/DROP SCHEMA need the schema permission'
+description: |
+  Ticket: SONNY-3038 (the externally observable low findings).
+  CREATE SCHEMA and DROP SCHEMA were ungated: any authenticated session could create or
+  drop a schema. Fixed (maySchemaDatabase): both need the schema permission on the
+  database, so a readwrite user without a schema grant is refused 42501 (also for DROP
+  SCHEMA of a name that does not exist, so the refusal reveals nothing), and an admin
+  still creates and drops.
+  Proves: readwrite user rw is refused CREATE SCHEMA, DROP SCHEMA of an existing schema
+  and DROP SCHEMA of a missing one (42501); the admin creates the schema, and it is
+  still there after rw's refused DROP; the admin then drops it.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s3038-create-user-rw
+  description: 'rw: a readwrite user with no schema grant.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER rw SET PASSWORD 'Rw Schema Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created rw]
+  tags: [s3038, setup]
+
+- name: s3038-rw-create-refused
+  description: 'readwrite user: CREATE SCHEMA is refused.'
+  args: [query, -U, rw, -P, Rw Schema Passphrase For Testing, CREATE SCHEMA s3038]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+  tags: [s3038]
+
+- name: s3038-no-schema-yet
+  description: 'admin: the refused CREATE created nothing (DROP SCHEMA s3038 finds no schema, 3F000).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP SCHEMA s3038]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"3F000"']
+  tags: [s3038]
+
+- name: s3038-admin-create
+  description: 'admin: CREATE SCHEMA succeeds.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE SCHEMA s3038]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s3038]
+
+- name: s3038-rw-drop-refused
+  description: 'readwrite user: DROP SCHEMA of an existing schema is refused.'
+  args: [query, -U, rw, -P, Rw Schema Passphrase For Testing, DROP SCHEMA s3038]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+  tags: [s3038]
+
+- name: s3038-rw-drop-missing-refused
+  description: 'readwrite user: DROP SCHEMA of a missing schema is refused the same way (no existence oracle).'
+  args: [query, -U, rw, -P, Rw Schema Passphrase For Testing, DROP SCHEMA no_such_3038]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+  tags: [s3038]
+
+- name: s3038-still-there
+  description: "admin: the schema survived rw's refused DROP (CREATE SCHEMA s3038 again is a duplicate, 42P07)."
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE SCHEMA s3038]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42P07"']
+  tags: [s3038]
+
+- name: s3038-admin-drop
+  description: 'admin: DROP SCHEMA succeeds.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', DROP SCHEMA s3038]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s3038]

@@ -1,0 +1,561 @@
+# SONNY-2672, SONNY-2680: windowing of planned reads.
+# SONNY-2672: planned reads applied FILTER/WHERE/GROUP BY/HAVING/DISTINCT AFTER the read's LIMIT
+# cap, so `FILTER ... LIMIT n` returned too few rows. SONNY-2680: a parameterised
+# SKIP/OFFSET/LIMIT ($p) was not applied by the statement and chain windows, so
+# `ORDER BY ... LIMIT $n` returned every row.
+# This spec drives a real server over QUIC with the --param wire path and asserts the windowed
+# rows exactly. A bad window value (negative, null, string) is refused with 22G03.
+# Fixture: four :Q {k, f?}, four :X {k}, four :Y {k}, eight :Z {k, g, r}:
+#   (Yk)-[:R]->(Qk)-[:R {w: k}]->(Xk); Q0 and Q1 also have f: 1; Zk has g = k/4 and r = 7-k;
+#   (Q0)-[:S]->(Q1) and a self loop (Q3)-[:S]->(Q3).
+version: '1.0'
+name: SONNY-2672/2680 FILTER-before-LIMIT and parameterised SKIP/LIMIT
+description: FILTER/WHERE run before the read LIMIT; $params window every path
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-fixture
+  description: Create the Q/X/Y/Z fixture graph
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0})
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1})
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2})
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3})
+    CREATE (:Z {k: 0, g: 0, r: 7})
+    CREATE (:Z {k: 1, g: 0, r: 6})
+    CREATE (:Z {k: 2, g: 0, r: 5})
+    CREATE (:Z {k: 3, g: 0, r: 4})
+    CREATE (:Z {k: 4, g: 1, r: 3})
+    CREATE (:Z {k: 5, g: 1, r: 2})
+    CREATE (:Z {k: 6, g: 1, r: 1})
+    CREATE (:Z {k: 7, g: 1, r: 0})
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b)
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: filter-limit
+  description: FILTER then LIMIT 3 returns the three rows k>=5
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) FILTER z.k >= 5 RETURN z.k AS k LIMIT 3
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":5}'
+    - '{"k":6}'
+    - '{"k":7}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: where-limit
+  description: WHERE then LIMIT 3
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k >= 5 RETURN z.k AS k LIMIT 3
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":5}'
+    - '{"k":6}'
+    - '{"k":7}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){3}\]'
+  tags:
+  - regression
+- name: inline-filter-limit
+  description: inline map + FILTER + LIMIT 5 returns the two rows
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z {g: 1}) FILTER z.k >= 6 RETURN z.k AS k LIMIT 5
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":6}'
+    - '{"k":7}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: filter-order-offset-limit
+  description: FILTER + ORDER BY + OFFSET 2 LIMIT 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) FILTER z.k >= 4 RETURN z.k AS k ORDER BY k OFFSET 2 LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":6}]'
+  tags:
+  - regression
+- name: filter-offset
+  description: FILTER + OFFSET 2 skips two of the four filtered rows (without ORDER BY which two is implementation-dependent, but none of the filtered-out k<4 rows may appear and exactly two remain)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) FILTER z.k >= 4 RETURN z.k AS k OFFSET 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"rows":\[(\{"k":[4-7]\},?){2}\]'
+  tags:
+  - regression
+- name: hop-filter-limit
+  description: one-hop pattern FILTER + LIMIT
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x:X) FILTER x.k >= 2 RETURN x.k AS k LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":2}'
+    - '{"k":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: group-limit
+  description: GROUP BY + LIMIT 2
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k >= 0 RETURN z.g AS g, count(*) AS c GROUP BY z.g LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0,"c":4}'
+    - '{"g":1,"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: distinct-limit
+  description: DISTINCT + LIMIT 2
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k >= 0 RETURN DISTINCT z.g AS g LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":0}'
+    - '{"g":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: with-where-limit
+  description: WITH ... WHERE then LIMIT
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z WHERE z.k >= 6 RETURN z.k AS k LIMIT 3
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":6}'
+    - '{"k":7}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: param-limit
+  description: ORDER BY k LIMIT $l (l=2)
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0},{"k":1}]'
+  tags:
+  - regression
+- name: param-limit-desc
+  description: ORDER BY k DESC LIMIT $l
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k DESC LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":7},{"k":6}]'
+  tags:
+  - regression
+- name: param-skip
+  description: ORDER BY k SKIP $s (s=6)
+  args:
+  - query
+  - --param
+  - s
+  - '6'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k SKIP $s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":6},{"k":7}]'
+  tags:
+  - regression
+- name: param-offset
+  description: ORDER BY k OFFSET $s (s=6)
+  args:
+  - query
+  - --param
+  - s
+  - '6'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k OFFSET $s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":6},{"k":7}]'
+  tags:
+  - regression
+- name: param-skip-limit
+  description: SKIP $s LIMIT $l (1,2)
+  args:
+  - query
+  - --param
+  - s
+  - '1'
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k SKIP $s LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - regression
+- name: param-where-limit
+  description: WHERE + ORDER BY + LIMIT $l
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (z:Z) WHERE z.k >= 2 RETURN z.k AS k ORDER BY k LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":2},{"k":3}]'
+  tags:
+  - regression
+- name: param-skip-past-end
+  description: SKIP $s past the end returns no rows
+  args:
+  - query
+  - --param
+  - s
+  - '9'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k SKIP $s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: param-with-limit
+  description: WITH z LIMIT $l then count
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (z:Z) WITH z LIMIT $l RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: param-limit-zero
+  description: LIMIT $l with l=0 returns no rows
+  args:
+  - query
+  - --param
+  - l
+  - '0'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: param-hop-limit
+  description: one-hop ORDER BY LIMIT $l
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[:R]->(x:X) RETURN x.k AS k ORDER BY k LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0},{"k":1}]'
+  tags:
+  - regression
+- name: param-two-hop-desc
+  description: two-hop ORDER BY DESC LIMIT $l
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (y:Y)-[:R]->(q:Q)-[:R]->(x:X) RETURN x.k AS k ORDER BY k DESC LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":3},{"k":2}]'
+  tags:
+  - regression
+- name: param-group-limit
+  description: GROUP BY ORDER BY LIMIT $l
+  args:
+  - query
+  - --param
+  - l
+  - '1'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.g AS g, count(*) AS c GROUP BY z.g ORDER BY g DESC LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"g":1,"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: param-union-limit
+  description: UNION ... ORDER BY LIMIT $l
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (x:X) RETURN x.k AS k UNION MATCH (y:Y) RETURN y.k AS k ORDER BY k LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0},{"k":1}]'
+  tags:
+  - regression
+- name: param-optional-limit
+  description: OPTIONAL MATCH ORDER BY DESC LIMIT $l
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    MATCH (q:Q) OPTIONAL MATCH (q)-[:S]->(t) RETURN q.k AS q, t.k AS t ORDER BY q DESC LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"q":3,"t":3},{"q":2,"t":null}]'
+  tags:
+  - regression
+- name: subquery-skip
+  description: CALL { } RETURN ... SKIP 1 is applied once
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL { MATCH (x:X) RETURN x.k AS k } RETURN k ORDER BY k SKIP 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2},{"k":3}]'
+  tags:
+  - regression
+- name: subquery-skip-param
+  description: CALL { } RETURN ... SKIP $s is applied once
+  args:
+  - query
+  - --param
+  - s
+  - '1'
+  - '-'
+  stdin: |
+    CALL { MATCH (x:X) RETURN x.k AS k } RETURN k ORDER BY k SKIP $s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2},{"k":3}]'
+  tags:
+  - regression
+- name: subquery-skip-limit-param
+  description: CALL { } ... SKIP $s LIMIT $l
+  args:
+  - query
+  - --param
+  - s
+  - '1'
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    CALL { MATCH (x:X) RETURN x.k AS k } RETURN k ORDER BY k SKIP $s LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":2}]'
+  tags:
+  - regression
+- name: bad-negative
+  description: negative LIMIT parameter is refused
+  args:
+  - query
+  - --param
+  - l
+  - '-1'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k LIMIT $l
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: bad-null
+  description: null LIMIT parameter is refused
+  args:
+  - query
+  - --param
+  - l
+  - 'null'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k LIMIT $l
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: bad-string
+  description: string LIMIT parameter is refused
+  args:
+  - query
+  - --param
+  - l
+  - '"2"'
+  - '-'
+  stdin: |
+    MATCH (z:Z) RETURN z.k AS k ORDER BY k LIMIT $l
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression

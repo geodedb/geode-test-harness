@@ -77,7 +77,7 @@ secrets:
     source: env
     key: GEODE_ADMIN_PASSWORD
     required: false
-    default: GeodeTestPassword123!
+    default: Geode Test Admin Passphrase
 invariants:
 - type: server_running
 fuzz:
@@ -103,8 +103,8 @@ tests:
 - name: p5-create-users
   args: [query, -U, geode, -P, '${secret:admin_password}', '-']
   stdin: |
-    CREATE USER p5_malformed_user SET PASSWORD 'P5-Malformed-1234' ROLE readonly;
-    CREATE USER p5_unknown_attr_user SET PASSWORD 'P5-UnkAttr-1234' ROLE readonly;
+    CREATE USER p5_malformed_user SET PASSWORD 'P5 Malformed 1234 Test Passphrase Value' ROLE readonly;
+    CREATE USER p5_unknown_attr_user SET PASSWORD 'P5 UnkAttr 1234 Test Passphrase Value' ROLE readonly;
   expect: {exit_code: 0}
   tags: [abac, setup]
 
@@ -142,7 +142,7 @@ tests:
     expects the rejection.
   args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY p5_malformed_paren ON GRAPH * FOR WRITE USING current_user() = 'p5_malformed_user' AND (]
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42000', Unsupported policy USING expression]
     stdout_not_contains: ['"status_class":"00000"', Policy created]
   tags: [abac, negative, trip_wire]
@@ -158,10 +158,10 @@ tests:
     compensating control is UNCHANGED — it is still what protects a policy
     retained by the tolerant hydration path — and this assertion still
     proves the missing-validation gap was never a privilege escalation.
-  args: [query, -U, p5_malformed_user, -P, P5-Malformed-1234, '-']
+  args: [query, -U, p5_malformed_user, -P, P5 Malformed 1234 Test Passphrase Value, '-']
   stdin: 'CREATE (n:P5MalformedTest {v: 1}) RETURN n'
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42501', Permission denied]
   tags: [abac, positive, negative]
 
@@ -187,10 +187,10 @@ tests:
     below (relying solely on it, readonly role otherwise) is denied. This
     is the real, asserted contract for unknown-attribute references: a
     silent deny-all, not a compile/runtime error.
-  args: [query, -U, p5_unknown_attr_user, -P, P5-UnkAttr-1234, '-']
+  args: [query, -U, p5_unknown_attr_user, -P, P5 UnkAttr 1234 Test Passphrase Value, '-']
   stdin: 'CREATE (n:P5UnkAttrTest {v: 1}) RETURN n'
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42501', Permission denied]
   tags: [abac, negative]
 
@@ -205,7 +205,7 @@ tests:
     appended); it now asserts the verified-correct rejection.
   args: [query, -U, geode, -P, '${secret:admin_password}', CREATE POLICY p5_valid_baseline ON GRAPH * FOR WRITE USING current_user() = 'p5_someone_else']
   expect:
-    exit_code: 0
+    exit_code: 1
     stdout_contains: ['42710', Duplicate policy name]
     stdout_not_contains: ['"status_class":"00000"', Policy created]
   tags: [abac, negative, known_limitation, trip_wire]
@@ -219,8 +219,8 @@ tests:
     refused rather than silently appended. Formerly this asserted TWO rows.
   command: |
     BIN="${GEODE_BINARY:-geode}"
-    PW="${GEODE_ADMIN_PASSWORD:-GeodeTestPassword123!}"
-    OUT=$("$BIN" query --server "${GEODE_SERVER_ADDRESS}" -U geode -P "$PW" "SHOW POLICIES" 2>&1)
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    OUT=$("$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "SHOW POLICIES" 2>&1)
     echo "$OUT"
     COUNT=$(echo "$OUT" | grep -o 'p5_valid_baseline' | wc -l)
     [ "$COUNT" -eq 1 ] && echo "duplicate_count=ok" || { echo "duplicate_count=FAIL got=$COUNT"; exit 1; }

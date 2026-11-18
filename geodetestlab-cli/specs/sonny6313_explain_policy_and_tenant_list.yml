@@ -1,0 +1,194 @@
+version: '1.0'
+name: SONNY-6313 EXPLAIN POLICY follows the real gates; geode.tenant.list/show are read-only
+description: |
+  SONNY-6313 (1): EXPLAIN POLICY FOR <stmt> derived ONE top-level action with
+  its own classifyAction and always asked about the resource `database`, so
+  after SONNY-2753 (a graph-scoped policy never matches `database`) it told an
+  operator the wrong thing, and it did not know the per-action write gates of
+  SONNY-2781. Fixed: it builds the statement as a program on the SESSION's
+  graph and reports one row per question the real read and write gates ask:
+  the read gate (match_ on graph:<name>) and the write gate's per-action
+  decisions (create / update / delete, or write + schema for DDL), with the
+  resource named `graph:<name>`.
+
+  SONNY-6313 (2): geode.tenant.list and geode.tenant.show were classified as
+  mutating (missing from the read-only procedure list), so a read-only
+  request could not list tenants. Fixed: they are read-only; listing tenants
+  still needs Admin (admin_tenant), so a non-admin is still refused 42501;
+  tenant create is still refused by the read-only floor.
+
+  Black-box proof over the wire. A `readonly` user holding a per-graph
+  GRANT READ on g6313 is the principal whose decisions differ by action:
+  EXPLAIN POLICY FOR ... as that user reports (a) allow for match_ on
+  graph:g6313, (b) `unauthorized` for create / update / delete on
+  graph:g6313 and for the DDL's write + schema, and (c) the real statement
+  gets exactly the verdict EXPLAIN reported (the read runs, the CREATE is
+  refused 42501). For an Admin the same EXPLAINs are all allow and the real
+  statements run. The session's graph decides the resource (a session on the
+  default graph reports graph:default, never the bare word `database`).
+
+  Engine regression: test-sonny6313-explain-policy-gates.
+
+  CANARY: REQ=REQ-SONNY-6313-EXPLAIN-POLICY-GATES; FEATURE="GPS EXPLAIN POLICY"; ASPECT=GateParity; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [auth, security, gps, explain-policy, tenant, sonny-6313]
+tests:
+
+- name: s6313_setup
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE GRAPH g6313
+    CREATE USER ex_reader SET PASSWORD 'Reader Explain Passphrase One' ROLE readonly
+    GRANT READ ON GRAPH g6313 TO ex_reader
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42', '"status_class":"58']
+
+# ----------------------------------------------------- read gate, per graph
+- name: s6313_explain_match_reports_session_graph
+  description: A session bound to g6313 gets a match_ row on graph:g6313 (not on `database`).
+  args: [query, -g, g6313, -U, ex_reader, -P, Reader Explain Passphrase One, EXPLAIN POLICY FOR MATCH (n) RETURN n]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"action":"match_"', '"resource":"graph:g6313"', '"decision":"allow"']
+    stdout_not_contains: ['"resource":"database"']
+
+- name: s6313_explain_match_default_graph_resource
+  description: A session on the default graph reports graph:default.
+  args: [query, -U, geode, -P, '${secret:admin_password}', EXPLAIN POLICY FOR MATCH (n) RETURN n]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"action":"match_"', '"resource":"graph:default"', '"decision":"allow"']
+    stdout_not_contains: ['"resource":"database"']
+
+- name: s6313_real_read_runs_as_explained
+  args: [query, -g, g6313, -U, ex_reader, -P, Reader Explain Passphrase One, MATCH (n) RETURN count(*) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"c":0']
+
+# ---------------------------------------------- write gate, per-action rows
+- name: s6313_explain_create_reports_create_denied
+  description: The write gate asks CREATE on the graph; the reader holds no such privilege.
+  args: [query, -g, g6313, -U, ex_reader, -P, Reader Explain Passphrase One, 'EXPLAIN POLICY FOR CREATE (:W6313 {v: 1})']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"action":"match_"', '"action":"create"', '"resource":"graph:g6313"', '"decision":"unauthorized"']
+    stdout_not_contains: ['"resource":"database"']
+
+- name: s6313_real_create_refused_as_explained
+  args: [query, -g, g6313, -U, ex_reader, -P, Reader Explain Passphrase One, 'CREATE (:W6313 {v: 1})']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6313_explain_set_reports_update
+  args: [query, -g, g6313, -U, ex_reader, -P, Reader Explain Passphrase One, EXPLAIN POLICY FOR MATCH (n:C6313) SET n.v = 2]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"action":"match_"', '"action":"update"', '"resource":"graph:g6313"', '"decision":"unauthorized"']
+    stdout_not_contains: ['"action":"create"', '"action":"delete"']
+
+- name: s6313_explain_delete_reports_delete
+  args: [query, -g, g6313, -U, ex_reader, -P, Reader Explain Passphrase One, EXPLAIN POLICY FOR MATCH (n:C6313) DELETE n]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"action":"match_"', '"action":"delete"', '"resource":"graph:g6313"', '"decision":"unauthorized"']
+    stdout_not_contains: ['"action":"create"', '"action":"update"']
+
+- name: s6313_explain_ddl_reports_write_and_schema
+  args: [query, -g, g6313, -U, ex_reader, -P, Reader Explain Passphrase One, EXPLAIN POLICY FOR CREATE INDEX i6313 FOR (n:C6313) ON (n.v)]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"action":"write"', '"action":"schema"', '"resource":"graph:g6313"', '"decision":"unauthorized"']
+
+- name: s6313_real_ddl_refused_as_explained
+  args: [query, -g, g6313, -U, ex_reader, -P, Reader Explain Passphrase One, CREATE INDEX i6313 FOR (n:C6313) ON (n.v)]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6313_admin_explain_create_allowed
+  description: For an Admin the same statement is allow on the same graph.
+  args: [query, -g, g6313, -U, geode, -P, '${secret:admin_password}', 'EXPLAIN POLICY FOR CREATE (:W6313 {v: 1})']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"action":"create"', '"resource":"graph:g6313"', '"decision":"allow"']
+    stdout_not_contains: ['"decision":"unauthorized"', '"decision":"deny"']
+
+- name: s6313_admin_real_create_runs_as_explained
+  args: [query, -g, g6313, -U, geode, -P, '${secret:admin_password}', 'CREATE (:W6313 {v: 1})']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+# ----------------------------------------------- tenant list / show are reads
+- name: s6313_tenant_create_for_listing
+  args: [query, -U, geode, -P, '${secret:admin_password}', CALL geode.tenant.create('t6313')]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', t6313]
+
+- name: s6313_read_only_admin_lists_tenants
+  description: A read-only request by an Admin can list tenants (was refused as mutating).
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', CALL geode.tenant.list()]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', t6313]
+    stdout_not_contains: [Read-only request, '"status_class":"42501"']
+
+- name: s6313_read_only_admin_shows_tenant
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', CALL geode.tenant.show('t6313')]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', t6313, '"active":true']
+    stdout_not_contains: [Read-only request, '"status_class":"42501"']
+
+- name: s6313_read_only_still_refuses_tenant_create
+  description: Control - the floor still refuses a tenant change.
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', CALL geode.tenant.create('t6313b')]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+
+- name: s6313_non_admin_cannot_list_tenants
+  description: Read-only classification is not an authorization grant - a readonly USER is still refused (admin_tenant).
+  args: [query, -U, ex_reader, -P, Reader Explain Passphrase One, CALL geode.tenant.list()]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [t6313]
+
+- name: s6313_non_admin_read_only_cannot_list_tenants
+  args: [query, --read-only, -U, ex_reader, -P, Reader Explain Passphrase One, CALL geode.tenant.show('t6313')]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [t6313]

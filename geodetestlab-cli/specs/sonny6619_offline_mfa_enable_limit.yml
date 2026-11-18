@@ -1,0 +1,160 @@
+version: '1.0'
+name: SONNY-6619 / SONNY-6623 offline `geode user mfa enable --code` is attempt-limited and counts malformed codes
+description: |
+  Tickets: SONNY-6619 (item 1) and SONNY-6623 (item 3). The SecurityManager state,
+  DROP USER, timeseries WAL fd and online-restart items are in-process; the online
+  lockout-persistence item is in sonny6619_online_mfa_lockout_persists.yml.
+  Bug: offline `mfa enable --code` allowed unlimited guessing (the route
+  SONNY-6614 closed for `mfa-verify`), and refused a malformed code (not six
+  digits) BEFORE counting it.
+  Spec proves on the real binary: wrong codes through `mfa enable` and `mfa-verify`
+  share one counter (3 + 2 = 5), after which a correct code through `mfa enable` is
+  refused with "locked out" and MFA stays disabled; malformed codes ("12345",
+  "abcdef") count too; a right code resets the count.
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 420000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ENABLE_MFA: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+
+tests:
+
+- name: sonny6619-enable-counts-and-locks
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    GEODE_ADMIN_PASSWORD='Offline Mfa Admin Passphrase' "$BIN" auth init --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+    enrol() { # user -> sets SECRET and SETUP_OUT
+     "$BIN" user create "$1" "$1@example.com" --password "Correct Horse Battery Staple 6619" --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL create $1"; exit 1; }
+     SETUP_OUT=$("$BIN" user mfa-setup "$1" --data-dir "$D" 2>&1) || { echo "FAIL mfa-setup $1"; echo "$SETUP_OUT"; exit 1; }
+     SECRET=$(echo "$SETUP_OUT" | sed -n 's/^MFA secret: //p' | head -1)
+     [ -n "$SECRET" ] || { echo "FAIL no secret printed"; echo "$SETUP_OUT"; exit 1; }
+    }
+
+    enrol en6619
+    for i in 1 2 3; do "$BIN" user mfa enable en6619 --code 000000 --data-dir "$D" >/dev/null 2>&1 && { echo "FAIL wrong enable accepted"; exit 1; }; done
+    for i in 1 2; do "$BIN" user mfa-verify en6619 --token 000000 --data-dir "$D" >/dev/null 2>&1 && { echo "FAIL wrong verify accepted"; exit 1; }; done
+    OUT=$("$BIN" user mfa enable en6619 --code "$(totp "$SECRET")" --data-dir "$D" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "locked out" || { echo "FAIL enable after 5 failures rc=$RC"; echo "$OUT"; exit 1; }
+    "$BIN" user show en6619 --data-dir "$D" 2>&1 | grep -q "MFA: disabled (enrolled" || { echo "FAIL MFA turned on despite lockout"; exit 1; }
+    echo "ENABLE_LIMIT_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [ENABLE_LIMIT_OK]
+  tags: [mfa, offline, sonny6619]
+
+- name: sonny6623-malformed-codes-are-counted
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    GEODE_ADMIN_PASSWORD='Offline Mfa Admin Passphrase' "$BIN" auth init --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+    enrol() { # user -> sets SECRET and SETUP_OUT
+     "$BIN" user create "$1" "$1@example.com" --password "Correct Horse Battery Staple 6619" --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL create $1"; exit 1; }
+     SETUP_OUT=$("$BIN" user mfa-setup "$1" --data-dir "$D" 2>&1) || { echo "FAIL mfa-setup $1"; echo "$SETUP_OUT"; exit 1; }
+     SECRET=$(echo "$SETUP_OUT" | sed -n 's/^MFA secret: //p' | head -1)
+     [ -n "$SECRET" ] || { echo "FAIL no secret printed"; echo "$SETUP_OUT"; exit 1; }
+    }
+
+    enrol mf6623
+    for c in 12345 abcdef 1234567 99999 00000; do
+      "$BIN" user mfa enable mf6623 --code "$c" --data-dir "$D" >/dev/null 2>&1 && { echo "FAIL malformed '$c' accepted"; exit 1; }
+    done
+    OUT=$("$BIN" user mfa enable mf6623 --code "$(totp "$SECRET")" --data-dir "$D" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "locked out" || { echo "FAIL five malformed codes were not counted (rc=$RC)"; echo "$OUT"; exit 1; }
+    echo "MALFORMED_COUNTED_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [MALFORMED_COUNTED_OK]
+  tags: [mfa, offline, sonny6623]
+
+- name: sonny6619-right-code-resets-enable-count
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    GEODE_ADMIN_PASSWORD='Offline Mfa Admin Passphrase' "$BIN" auth init --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+    enrol() { # user -> sets SECRET and SETUP_OUT
+     "$BIN" user create "$1" "$1@example.com" --password "Correct Horse Battery Staple 6619" --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL create $1"; exit 1; }
+     SETUP_OUT=$("$BIN" user mfa-setup "$1" --data-dir "$D" 2>&1) || { echo "FAIL mfa-setup $1"; echo "$SETUP_OUT"; exit 1; }
+     SECRET=$(echo "$SETUP_OUT" | sed -n 's/^MFA secret: //p' | head -1)
+     [ -n "$SECRET" ] || { echo "FAIL no secret printed"; echo "$SETUP_OUT"; exit 1; }
+    }
+
+    enrol er6619
+    "$BIN" user mfa enable er6619 --code 000000 --data-dir "$D" >/dev/null 2>&1 && { echo "FAIL wrong accepted"; exit 1; }
+    "$BIN" user mfa enable er6619 --code "$(totp "$SECRET")" --data-dir "$D" 2>&1 | grep -q "MFA enabled for er6619" || { echo "FAIL right code did not enable"; exit 1; }
+    for i in 1 2 3 4; do "$BIN" user mfa-verify er6619 --token 000000 --data-dir "$D" >/dev/null 2>&1 && { echo "FAIL wrong accepted"; exit 1; }; done
+    "$BIN" user mfa-verify er6619 --token "$(totp "$SECRET")" --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL count not reset by the right enable code (locked after 1+4 failures)"; exit 1; }
+    echo "ENABLE_RESET_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [ENABLE_RESET_OK]
+  tags: [mfa, offline, sonny6619]

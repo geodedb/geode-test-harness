@@ -48,7 +48,7 @@ from .server import (
     untrack_server,
 )
 from .spec import TestCase, TestSpec
-from .tls_provision import args_contain_flag, provision_tls_certs
+from .tls_provision import args_contain_flag, client_tls_args, provision_tls_certs
 from .utils import find_geode_binary, get_free_port
 
 # Re-export public API so existing ``from .runner import …`` keeps working.
@@ -206,6 +206,17 @@ class ServerState:
     process: subprocess.Popen[str] | None
     port: int
     grpc_port: int | None
+    # The args the server was STARTED with: the spec's own plus the verified-TLS
+    # --cert/--key the runner provisioned. A restart must reuse exactly these
+    # (SONNY-6722): restarting with only the spec's args made the server mint a
+    # fresh self-signed certificate that the client's provisioned CA does not
+    # verify, so every query after a restart hung in the TLS handshake.
+    server_args: list[str] | None = None
+
+
+def _restart_args(server_state: ServerState, spec: TestSpec) -> list[str]:
+    """The server args a restart must pass (see ``ServerState.server_args``)."""
+    return list(server_state.server_args) if server_state.server_args is not None else list(spec.server_args)
 
 
 def _run_pre_server_commands(pre_server: list[str] | None, dry_run: bool, verbose: bool) -> None:
@@ -403,7 +414,7 @@ def _check_and_restart_crashed_server(
                 port=server_state.port,
                 grpc_port=server_state.grpc_port,
                 env=env,
-                server_args=spec.server_args,
+                server_args=_restart_args(server_state, spec),
                 server_timeout_ms=server_timeout_ms,
                 verbose=verbose,
                 server_port=server_port,
@@ -486,7 +497,9 @@ def _recover_hung_server(
         with lock:
             if server_state.process.poll() is not None:
                 if verbose:
-                    print("  Server died during test, restarting for next test...")
+                    rc = server_state.process.returncode
+                    how = f"signal {-rc}" if rc is not None and rc < 0 else f"exit code {rc}"
+                    print(f"  Server died during test ({how}), restarting for next test...")
                 untrack_server(server_state.process)
                 new_proc, port, grpc_port, restarted = _restart_server(
                     binary=binary,
@@ -494,7 +507,7 @@ def _recover_hung_server(
                     port=server_state.port,
                     grpc_port=server_state.grpc_port,
                     env=env,
-                    server_args=spec.server_args,
+                    server_args=_restart_args(server_state, spec),
                     server_timeout_ms=server_timeout_ms,
                     verbose=verbose,
                     server_port=server_port,
@@ -513,7 +526,10 @@ def _recover_hung_server(
                             "query",
                             "--server",
                             f"127.0.0.1:{server_state.port}",
-                            "--insecure-tls-skip-verify",
+                            # Verified TLS (--ca-cert) when a CA was provisioned: a release
+                            # binary refuses --insecure-tls-skip-verify, which made this probe
+                            # fail against a perfectly healthy server and get it SIGKILLed.
+                            *client_tls_args(env),
                             "-U",
                             "geode",
                             "-P",
@@ -530,13 +546,9 @@ def _recover_hung_server(
                 except (subprocess.TimeoutExpired, Exception):
                     if verbose:
                         print("  Server hung (unresponsive), force-killing and restarting...")
-                    try:
-                        from .server import _safe_killpg
+                    from .server import signal_process_group
 
-                        pgid = os.getpgid(server_state.process.pid)
-                        _safe_killpg(pgid, signal.SIGKILL)
-                    except (OSError, ProcessLookupError):
-                        pass
+                    signal_process_group(server_state.process.pid, signal.SIGKILL)
                     server_state.process.kill()
                     try:
                         server_state.process.wait(timeout=2)
@@ -549,7 +561,7 @@ def _recover_hung_server(
                         port=server_state.port,
                         grpc_port=server_state.grpc_port,
                         env=env,
-                        server_args=spec.server_args,
+                        server_args=_restart_args(server_state, spec),
                         server_timeout_ms=server_timeout_ms,
                         verbose=verbose,
                         server_port=server_port,
@@ -660,7 +672,7 @@ def _execute_one_test(
                 port=server_state.port,
                 grpc_port=server_state.grpc_port,
                 env=env,
-                server_args=spec.server_args,
+                server_args=_restart_args(server_state, spec),
                 server_timeout_ms=server_timeout_ms,
                 verbose=verbose,
                 server_port=server_port,
@@ -891,7 +903,7 @@ def run_tests(
     # An empty spec runs zero tests: skip server provisioning entirely so
     # it completes cleanly (exit 0, total 0) even without a geode binary.
     if spec.mode == "server" and spec.tests:
-        data_dir = Path(tempfile.mkdtemp(prefix="geode-test-"))
+        data_dir = Path(tempfile.mkdtemp(prefix=os.environ.get("GEODETESTLAB_DATA_PREFIX", "geode-test-")))
         server_state.port = server_port or get_free_port()
 
         _run_pre_server_commands(spec.pre_server, dry_run, verbose)
@@ -917,6 +929,7 @@ def run_tests(
                 single_server_cert_dir, ca_crt, leaf_crt, leaf_key = provisioned
                 server_args.extend(["--cert", leaf_crt, "--key", leaf_key])
                 env["GEODE_TEST_CA_CERT"] = ca_crt
+        server_state.server_args = list(server_args)
 
         try:
             server_state.process = _start_initial_server(
@@ -1162,6 +1175,18 @@ def run_tests(
                         cluster_ctx,
                     )
                     _record_result(test_case, result)
+
+        if interrupted and not dry_run:
+            # A SIGINT/SIGTERM stops the loop above; without this the tests it never
+            # ran simply vanished from the summary and the spec reported green.
+            not_run = max(len(spec.tests) - len(summary.results), 0)
+            message = f"run interrupted by a signal: {not_run} of {len(spec.tests)} tests were not run"
+            summary.total += 1
+            summary.failed += 1
+            summary.results.append(
+                TestResult(name="<run interrupted>", passed=False, duration_ms=0.0, error=message),
+            )
+            append_failure(failure_file, spec=spec_path, test_name="<run interrupted>", error=message, output="")
 
         _run_plaintext_checks(spec, data_dir, dry_run, verbose, summary, failure_file, spec_path)
 

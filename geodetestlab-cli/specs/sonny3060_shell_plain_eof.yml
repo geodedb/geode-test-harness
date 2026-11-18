@@ -1,0 +1,126 @@
+version: '1.0'
+name: SONNY-3060 geode shell --plain exits at end of input
+description: |
+  SONNY-3060: `geode shell --plain` looped forever printing prompts when its
+  input reached EOF (a file redirect, a here-doc ending, a closed pipe). In
+  Zig 0.16 end of input is `error.EndOfStream`; runPlainMode's `catch break`
+  only left the inner byte loop, so the outer loop printed the next prompt and
+  read again.
+
+  The shell echoes the statements it reads, so every marker is a COMPUTED value
+  (4000 + 242), which appears in the output only if the statement really ran.
+
+  Fixed (c0b2b2f6c): end of input ends the session with exit status 0, a last
+  line without a trailing newline still runs, and any other read error exits
+  non-zero. Each case drives the real shell binary against the real managed
+  server, with stdin from a pipe / file / here-doc / /dev/null, under a
+  `timeout` so a regression shows up as exit 124 rather than hanging the run.
+  The transcript is capped so a prompt loop cannot fill the disk.
+
+  CANARY: REQ=REQ-SONNY-3060-SHELL-EOF; FEATURE="ShellPlainMode"; ASPECT=EofExitsZero; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny3060_shell_plain_eof.yml; OWNER=cli; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: piped-statement-then-eof-exits-zero
+  description: a statement piped in with no \q, input then closes; shell runs it and exits 0
+  type: bash
+  timeout_ms: 90000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    O=$(mktemp); trap 'rm -f "$O"' EXIT
+    printf 'RETURN 4000 + 242 AS eof_marker;\n' | timeout 40 "${GEODE_BINARY:-geode}" shell --plain \
+      --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1 | head -c 200000 > "$O"
+    echo "RC=${PIPESTATUS[1]}"
+    grep -q "4242" "$O" && echo "ran=yes" || { echo "ran=no"; cat "$O"; }
+  expect:
+    exit_code: 0
+    stdout_contains: [RC=0, ran=yes]
+  tags: [shell, plain-mode, eof, sonny-3060, regression]
+
+- name: last-line-without-trailing-newline-still-runs
+  description: the final line has no newline before EOF; it still executes and the shell exits 0
+  type: bash
+  timeout_ms: 90000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    O=$(mktemp); trap 'rm -f "$O"' EXIT
+    printf 'RETURN 1 AS first_line;\nRETURN 5000 + 151 AS no_newline_tail;' | timeout 40 "${GEODE_BINARY:-geode}" shell --plain \
+      --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1 | head -c 200000 > "$O"
+    echo "RC=${PIPESTATUS[1]}"
+    grep -q "5151" "$O" && echo "tail_ran=yes" || { echo "tail_ran=no"; cat "$O"; }
+  expect:
+    exit_code: 0
+    stdout_contains: [RC=0, tail_ran=yes]
+  tags: [shell, plain-mode, eof, sonny-3060, regression]
+
+- name: file-redirect-and-heredoc-input-end-cleanly
+  description: stdin from a file and from a here-doc (the two reported shapes) both end with exit 0
+  type: bash
+  timeout_ms: 120000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    F=$(mktemp); O=$(mktemp); trap 'rm -f "$F" "$O"' EXIT
+    printf 'RETURN 6000 + 161 AS from_file;\nRETURN 6000 + 162 AS snd;\n' > "$F"
+    timeout 40 "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
+      -U geode -P "$PW" < "$F" 2>&1 | head -c 200000 > "$O"
+    echo "FILE_RC=${PIPESTATUS[0]}"
+    grep -q 6162 "$O" && echo "file_ran=yes" || { echo "file_ran=no"; cat "$O"; }
+    timeout 40 "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
+      -U geode -P "$PW" 2>&1 <<'GQL' | head -c 200000 > "$O"
+    RETURN 7000 + 171 AS from_heredoc;
+    GQL
+    echo "HEREDOC_RC=${PIPESTATUS[0]}"
+    grep -q 7171 "$O" && echo "heredoc_ran=yes" || { echo "heredoc_ran=no"; cat "$O"; }
+  expect:
+    exit_code: 0
+    stdout_contains: [FILE_RC=0, file_ran=yes, HEREDOC_RC=0, heredoc_ran=yes]
+  tags: [shell, plain-mode, eof, sonny-3060, regression]
+
+- name: empty-input-exits-zero-without-prompt-loop
+  description: stdin is /dev/null; the shell exits 0 and prints a bounded number of prompts
+  type: bash
+  timeout_ms: 90000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    O=$(mktemp); trap 'rm -f "$O"' EXIT
+    timeout 40 "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
+      -U geode -P "$PW" < /dev/null 2>&1 | head -c 200000 > "$O"
+    echo "RC=${PIPESTATUS[0]}"
+    echo "BYTES=$(wc -c < "$O")"
+    [ "$(wc -c < "$O")" -lt 20000 ] && echo "output_bounded=yes" || echo "output_bounded=no"
+  expect:
+    exit_code: 0
+    stdout_contains: [RC=0, output_bounded=yes]
+  tags: [shell, plain-mode, eof, sonny-3060, regression]

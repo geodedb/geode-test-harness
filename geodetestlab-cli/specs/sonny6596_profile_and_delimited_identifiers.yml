@@ -1,0 +1,167 @@
+# SONNY-6596 item 2: the version-1 PROFILE payload was synthetic - a CREATE showed
+# NodeScan/Expand operators and time_ns = 10 * (i + 1). A version-1 PROFILE now reports the
+# one operator that really ran (LegacyExecute) with its measured wall-clock time; the planned
+# (version 2) trace names the real operators (LabelScan, Project) with measured rows.
+# SONNY-6596 item 4: ISO/IEC 39075:2024 21.3 <delimited identifier> ::= <double quoted
+# character sequence> | <accent quoted character sequence>; "x" names a variable, alias,
+# label or property wherever the grammar takes a name (it stays a string literal where an
+# expression starts).
+
+version: '1.0'
+name: 'SONNY-6596: measured PROFILE and ISO double-quoted delimited identifiers'
+description: PROFILE reports the operators that ran with measured timings (not a synthetic NodeScan/Expand trace); a double-quoted sequence is a delimited identifier where the grammar takes a name
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed
+  description: a node to read
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:DqT {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6596
+  - setup
+- name: profile-planned-read-real-operators
+  description: PROFILE of a planned read names LabelScan and Project with a measured row count
+  args:
+  - query
+  - '-'
+  stdin: PROFILE MATCH (n:DqT) RETURN n.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"profile_version":2'
+    - '"op":"LabelScan"'
+    - '"op":"Project"'
+    - '"rows":1'
+    stdout_not_contains:
+    - '"op":"NodeScan"'
+  tags:
+  - sonny-6596
+  - profile
+- name: profile-create-is-not-synthetic
+  description: PROFILE CREATE reports the executor that ran, not a fabricated NodeScan/Expand trace
+  args:
+  - query
+  - '-'
+  stdin: 'PROFILE CREATE (:DqProfiled {k: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"profile_version":1'
+    - '"op":"LegacyExecute"'
+    stdout_not_contains:
+    - '"op":"NodeScan"'
+    - '"op":"Expand"'
+    - '"time_ns":10,'
+    - '"time_ns":20,'
+  tags:
+  - sonny-6596
+  - profile
+- name: profile-create-really-executed
+  description: the PROFILE'd CREATE ran once (it writes)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:DqProfiled) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - sonny-6596
+  - profile
+- name: double-quoted-variable
+  description: a double-quoted node variable ("n":L) binds n
+  args:
+  - query
+  - '-'
+  stdin: MATCH ("n":DqT) RETURN n.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1}]'
+  tags:
+  - sonny-6596
+  - delimited-identifier
+- name: double-quoted-property
+  description: n."k" names the property k
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:DqT) RETURN n."k" AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1}]'
+  tags:
+  - sonny-6596
+  - delimited-identifier
+- name: double-quoted-label
+  description: a double-quoted label (n:"DqT")
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:"DqT") RETURN n.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1}]'
+  tags:
+  - sonny-6596
+  - delimited-identifier
+- name: double-quoted-alias-with-space
+  description: an alias "my alias" keeps its space
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:DqT) RETURN n.k AS "my alias"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"my alias":1}]'
+  tags:
+  - sonny-6596
+  - delimited-identifier
+- name: double-quoted-expression-start-is-a-literal
+  description: at the start of an expression "abc" is still a character string literal
+  args:
+  - query
+  - '-'
+  stdin: RETURN "abc" AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"s":"abc"}]'
+  tags:
+  - sonny-6596
+  - delimited-identifier

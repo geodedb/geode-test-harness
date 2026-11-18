@@ -1,0 +1,713 @@
+version: '1.0'
+name: 'SONNY-6280/6277/6323: geode restore writes and verifies the data; backup round-trips cold'
+description: |
+  SONNY-738 sweep, storage lane cluster C. Tickets: SONNY-6280 (geode restore of a
+  local backup file wrote nothing yet printed 'Full backup restore completed'),
+  SONNY-6277 (restored store looked empty: node/edge counts after backup+restore),
+  SONNY-6323 (local backup written twice / no data dir fell back to /tmp).
+
+  What was broken: `geode restore <file>` decoded and verified the archive and then
+  stopped; it never unpacked anything to disk, hard-coded data/restore, and still
+  reported success with exit 0. SONNY-6277 was a test-side miscount (resident caches
+  on a lazily hydrated store), but the user-visible contract it protects is that a
+  backup taken from a live store restores every node, edge and typed property.
+
+  What this spec proves, black-box, against a real `geode serve` and the real CLI:
+    1. A scratch server is seeded (default graph: 3 :Person with int/decimal/bool
+       properties, 2 :City, 3 edges with properties; named graph: 2 :Item, 1 edge)
+       and backed up over the wire with `geode backup create --server` (plain and
+       --compress), then, once stopped, with `backup create --local --data-dir`.
+    2. `geode restore <file> --data-dir <new dir>` restores each of the three,
+       prints per-graph counts and 'Restore completed successfully', and leaves
+       nothing in its working directory (no ./data/restore).
+    3. A NEW `geode serve` started cold on each restored directory answers with
+       exactly the seeded nodes, edges and typed property values in both graphs,
+       and still does after a restart.
+    4. A local backup writes ONLY the --output file (no metadata.json or full_<id>
+       .backup beside it) and `backup create --local` with no data directory is a
+       usage error (exit 2), never a backup of /tmp.
+    5. A truncated, bit-flipped or missing backup, a non-empty target and a
+       missing target all exit non-zero with a named error, print no success line
+       and leave neither a target nor a staging directory behind.
+
+  Run with GEODE_ADMIN_PASSWORD set to a policy-compliant passphrase (this engine
+  refuses the old default seed with a forced reset), e.g.
+    GEODE_ADMIN_PASSWORD='Orbit Lantern Meadow Quartz 2026 Delta!'
+
+  CANARY: REQ=REQ-BACKUP-RESTORE-002; FEATURE="BackupRestore"; ASPECT=CliRestoreRoundTripBlackBox; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6280_cli_restore_roundtrip.yml; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true  # scratch servers + on-disk backup files; not meaningful to promote to multi-node
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+
+tests:
+- name: seed-server-and-take-three-backups
+  description: |
+    Seeds a scratch server (default + named graph), takes a plain and a --compress
+    backup over the wire while the store is open, stops the server, then takes a
+    `--local` backup of its data directory. The local backup must leave ONLY the
+    --output file in its directory (SONNY-6323 item 1: it used to write full_<id>
+    .backup + metadata.json beside it and copy).
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    seed() {
+      q "INSERT (:Person {name:'Alice', age:30, score:1.5, active:true})" >/dev/null
+      q "INSERT (:Person {name:'Bob', age:25, score:2.25, active:false})" >/dev/null
+      q "INSERT (:Person {name:'Carol', age:41, score:3.0, active:true})" >/dev/null
+      q "INSERT (:City {name:'Oslo'})" >/dev/null
+      q "INSERT (:City {name:'Lima'})" >/dev/null
+      q "MATCH (a:Person {name:'Alice'}), (c:City {name:'Oslo'}) CREATE (a)-[:LIVES_IN {since: 2019}]->(c)" >/dev/null
+      q "MATCH (a:Person {name:'Bob'}), (c:City {name:'Lima'}) CREATE (a)-[:LIVES_IN {since: 2021}]->(c)" >/dev/null
+      q "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Carol'}) CREATE (a)-[:KNOWS {weight: 0.75}]->(b)" >/dev/null
+      q "CREATE GRAPH sonny6280" >/dev/null
+      q "USE GRAPH sonny6280 INSERT (:Item {sku:'A-1', qty:7})" >/dev/null
+      q "USE GRAPH sonny6280 INSERT (:Item {sku:'B-2', qty:9})" >/dev/null
+      q "USE GRAPH sonny6280 MATCH (a:Item {sku:'A-1'}), (b:Item {sku:'B-2'}) CREATE (a)-[:PAIRS {rank:1}]->(b)" >/dev/null
+    }
+    # exactly the seed, read through ordinary queries (nodes, edges, typed values)
+    check_data() {
+      local tag="$1" got
+      got=$(cnt "MATCH (n) RETURN count(n) AS c");                   [ "$got" = 5 ] || fail "$tag: default graph nodes=$got want 5"
+      got=$(cnt "MATCH ()-[e]->() RETURN count(e) AS c");            [ "$got" = 3 ] || fail "$tag: default graph edges=$got want 3"
+      got=$(cnt "MATCH (n:Person) RETURN count(n) AS c");            [ "$got" = 3 ] || fail "$tag: Person=$got want 3"
+      q "MATCH (p:Person {name:'Alice'}) RETURN p.age AS age, p.score AS score, p.active AS active" | grep -qF '"rows":[{"age":30,"score":"1.5","active":true}]' || fail "$tag: Alice properties"
+      q "MATCH (p:Person {name:'Bob'}) RETURN p.age AS age, p.score AS score, p.active AS active" | grep -qF '"rows":[{"age":25,"score":"2.25","active":false}]' || fail "$tag: Bob properties"
+      got=$(cnt "MATCH (:Person {name:'Alice'})-[e:LIVES_IN]->(:City {name:'Oslo'}) RETURN e.since AS c"); [ "$got" = 2019 ] || fail "$tag: edge property since=$got want 2019"
+      got=$(cnt "USE GRAPH sonny6280 MATCH (n) RETURN count(n) AS c"); [ "$got" = 2 ] || fail "$tag: named graph nodes=$got want 2"
+      got=$(cnt "USE GRAPH sonny6280 MATCH (:Item {sku:'A-1', qty:7})-[e:PAIRS {rank:1}]->(:Item {sku:'B-2', qty:9}) RETURN count(e) AS c"); [ "$got" = 1 ] || fail "$tag: named graph edge=$got want 1"
+    }
+    # restore <backup> into <dir>, then open it cold twice (restart in between)
+    restore_and_serve() {
+      local file="$1" dir="$2" tag="$3" out
+      out=$(cd "$W/cwd" && "$BIN" restore "$file" --data-dir "$dir" --hmac-key-file "$W/src/.geode_hmac_key" --yes 2>&1); local rc=$?
+      [ "$rc" = 0 ] || { echo "$out" | tail -20; fail "$tag: restore rc=$rc"; }
+      echo "$out" | grep -q "Restore completed successfully" || fail "$tag: no success line"
+      echo "$out" | grep -q "graph 'default': 5 nodes, 3 edges" || fail "$tag: restore did not report default graph counts"
+      echo "$out" | grep -q "graph 'sonny6280': 2 nodes, 1 edges" || fail "$tag: restore did not report named graph counts"
+      [ -z "$(ls -A "$W/cwd")" ] || fail "$tag: restore wrote into its working directory: $(ls -A "$W/cwd")"
+      start_server "$dir" "$W/$tag.1.log" || fail "$tag: server on restored dir"
+      check_data "$tag cold"
+      stop_server
+      start_server "$dir" "$W/$tag.2.log" || fail "$tag: server restart on restored dir"
+      check_data "$tag restart"
+      stop_server
+      echo "ROUNDTRIP_${tag}_OK"
+    }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX); KEEP=1
+    echo "$W" > /tmp/sonnyC_6280.path
+    mkdir -p "$W/cwd" "$W/localout"
+    start_server "$W/src" "$W/src.log" || exit 1
+    seed
+    check_data "source"
+    bk --output "$W/server.backup" | grep -q "Backup created successfully" || fail "server backup"
+    bk --output "$W/server.gz.backup" --compress | grep -q "Backup created successfully" || fail "compressed server backup"
+    stop_server
+    "$BIN" backup info "$W/server.backup" 2>&1 | grep -q "compression:   none" || fail "plain backup info"
+    "$BIN" backup info "$W/server.gz.backup" 2>&1 | grep -qi "compression:   gzip" || { "$BIN" backup info "$W/server.gz.backup"; fail "compressed backup info"; }
+    OUT=$("$BIN" backup create --local --data-dir "$W/src" --output "$W/localout/local.backup" 2>&1); RC=$?
+    [ "$RC" = 0 ] || { echo "$OUT" | tail; fail "local backup rc=$RC"; }
+    LS=$(ls -A "$W/localout")
+    [ "$LS" = "local.backup" ] || fail "local backup left extra files beside --output: [$LS]"
+    [ -s "$W/localout/local.backup" ] || fail "local backup is empty"
+    echo "BACKUPS_TAKEN local_dir_only_has_output"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - BACKUPS_TAKEN local_dir_only_has_output
+  tags: [backup, restore, sonny-6280, sonny-6323, sonny-6277]
+
+- name: restore-server-plain-backup-then-serve-cold
+  description: |
+    Restores server.backup with the real CLI into a new directory, then serves it with a
+    NEW geode on that directory and reads every seeded node, edge and typed
+    property back (twice, with a restart between). Before SONNY-6280 the restore
+    printed success and wrote nothing, so the cold server would see no data.
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    seed() {
+      q "INSERT (:Person {name:'Alice', age:30, score:1.5, active:true})" >/dev/null
+      q "INSERT (:Person {name:'Bob', age:25, score:2.25, active:false})" >/dev/null
+      q "INSERT (:Person {name:'Carol', age:41, score:3.0, active:true})" >/dev/null
+      q "INSERT (:City {name:'Oslo'})" >/dev/null
+      q "INSERT (:City {name:'Lima'})" >/dev/null
+      q "MATCH (a:Person {name:'Alice'}), (c:City {name:'Oslo'}) CREATE (a)-[:LIVES_IN {since: 2019}]->(c)" >/dev/null
+      q "MATCH (a:Person {name:'Bob'}), (c:City {name:'Lima'}) CREATE (a)-[:LIVES_IN {since: 2021}]->(c)" >/dev/null
+      q "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Carol'}) CREATE (a)-[:KNOWS {weight: 0.75}]->(b)" >/dev/null
+      q "CREATE GRAPH sonny6280" >/dev/null
+      q "USE GRAPH sonny6280 INSERT (:Item {sku:'A-1', qty:7})" >/dev/null
+      q "USE GRAPH sonny6280 INSERT (:Item {sku:'B-2', qty:9})" >/dev/null
+      q "USE GRAPH sonny6280 MATCH (a:Item {sku:'A-1'}), (b:Item {sku:'B-2'}) CREATE (a)-[:PAIRS {rank:1}]->(b)" >/dev/null
+    }
+    # exactly the seed, read through ordinary queries (nodes, edges, typed values)
+    check_data() {
+      local tag="$1" got
+      got=$(cnt "MATCH (n) RETURN count(n) AS c");                   [ "$got" = 5 ] || fail "$tag: default graph nodes=$got want 5"
+      got=$(cnt "MATCH ()-[e]->() RETURN count(e) AS c");            [ "$got" = 3 ] || fail "$tag: default graph edges=$got want 3"
+      got=$(cnt "MATCH (n:Person) RETURN count(n) AS c");            [ "$got" = 3 ] || fail "$tag: Person=$got want 3"
+      q "MATCH (p:Person {name:'Alice'}) RETURN p.age AS age, p.score AS score, p.active AS active" | grep -qF '"rows":[{"age":30,"score":"1.5","active":true}]' || fail "$tag: Alice properties"
+      q "MATCH (p:Person {name:'Bob'}) RETURN p.age AS age, p.score AS score, p.active AS active" | grep -qF '"rows":[{"age":25,"score":"2.25","active":false}]' || fail "$tag: Bob properties"
+      got=$(cnt "MATCH (:Person {name:'Alice'})-[e:LIVES_IN]->(:City {name:'Oslo'}) RETURN e.since AS c"); [ "$got" = 2019 ] || fail "$tag: edge property since=$got want 2019"
+      got=$(cnt "USE GRAPH sonny6280 MATCH (n) RETURN count(n) AS c"); [ "$got" = 2 ] || fail "$tag: named graph nodes=$got want 2"
+      got=$(cnt "USE GRAPH sonny6280 MATCH (:Item {sku:'A-1', qty:7})-[e:PAIRS {rank:1}]->(:Item {sku:'B-2', qty:9}) RETURN count(e) AS c"); [ "$got" = 1 ] || fail "$tag: named graph edge=$got want 1"
+    }
+    # restore <backup> into <dir>, then open it cold twice (restart in between)
+    restore_and_serve() {
+      local file="$1" dir="$2" tag="$3" out
+      out=$(cd "$W/cwd" && "$BIN" restore "$file" --data-dir "$dir" --hmac-key-file "$W/src/.geode_hmac_key" --yes 2>&1); local rc=$?
+      [ "$rc" = 0 ] || { echo "$out" | tail -20; fail "$tag: restore rc=$rc"; }
+      echo "$out" | grep -q "Restore completed successfully" || fail "$tag: no success line"
+      echo "$out" | grep -q "graph 'default': 5 nodes, 3 edges" || fail "$tag: restore did not report default graph counts"
+      echo "$out" | grep -q "graph 'sonny6280': 2 nodes, 1 edges" || fail "$tag: restore did not report named graph counts"
+      [ -z "$(ls -A "$W/cwd")" ] || fail "$tag: restore wrote into its working directory: $(ls -A "$W/cwd")"
+      start_server "$dir" "$W/$tag.1.log" || fail "$tag: server on restored dir"
+      check_data "$tag cold"
+      stop_server
+      start_server "$dir" "$W/$tag.2.log" || fail "$tag: server restart on restored dir"
+      check_data "$tag restart"
+      stop_server
+      echo "ROUNDTRIP_${tag}_OK"
+    }
+
+    W=$(cat /tmp/sonnyC_6280.path); KEEP=1
+    restore_and_serve "$W/server.backup" "$W/restored_SERVER_PLAIN" SERVER_PLAIN
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ROUNDTRIP_SERVER_PLAIN_OK
+  tags: [backup, restore, sonny-6280, sonny-6277]
+
+- name: restore-server-gzip-backup-then-serve-cold
+  description: |
+    Restores server.gz.backup with the real CLI into a new directory, then serves it with a
+    NEW geode on that directory and reads every seeded node, edge and typed
+    property back (twice, with a restart between). Before SONNY-6280 the restore
+    printed success and wrote nothing, so the cold server would see no data.
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    seed() {
+      q "INSERT (:Person {name:'Alice', age:30, score:1.5, active:true})" >/dev/null
+      q "INSERT (:Person {name:'Bob', age:25, score:2.25, active:false})" >/dev/null
+      q "INSERT (:Person {name:'Carol', age:41, score:3.0, active:true})" >/dev/null
+      q "INSERT (:City {name:'Oslo'})" >/dev/null
+      q "INSERT (:City {name:'Lima'})" >/dev/null
+      q "MATCH (a:Person {name:'Alice'}), (c:City {name:'Oslo'}) CREATE (a)-[:LIVES_IN {since: 2019}]->(c)" >/dev/null
+      q "MATCH (a:Person {name:'Bob'}), (c:City {name:'Lima'}) CREATE (a)-[:LIVES_IN {since: 2021}]->(c)" >/dev/null
+      q "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Carol'}) CREATE (a)-[:KNOWS {weight: 0.75}]->(b)" >/dev/null
+      q "CREATE GRAPH sonny6280" >/dev/null
+      q "USE GRAPH sonny6280 INSERT (:Item {sku:'A-1', qty:7})" >/dev/null
+      q "USE GRAPH sonny6280 INSERT (:Item {sku:'B-2', qty:9})" >/dev/null
+      q "USE GRAPH sonny6280 MATCH (a:Item {sku:'A-1'}), (b:Item {sku:'B-2'}) CREATE (a)-[:PAIRS {rank:1}]->(b)" >/dev/null
+    }
+    # exactly the seed, read through ordinary queries (nodes, edges, typed values)
+    check_data() {
+      local tag="$1" got
+      got=$(cnt "MATCH (n) RETURN count(n) AS c");                   [ "$got" = 5 ] || fail "$tag: default graph nodes=$got want 5"
+      got=$(cnt "MATCH ()-[e]->() RETURN count(e) AS c");            [ "$got" = 3 ] || fail "$tag: default graph edges=$got want 3"
+      got=$(cnt "MATCH (n:Person) RETURN count(n) AS c");            [ "$got" = 3 ] || fail "$tag: Person=$got want 3"
+      q "MATCH (p:Person {name:'Alice'}) RETURN p.age AS age, p.score AS score, p.active AS active" | grep -qF '"rows":[{"age":30,"score":"1.5","active":true}]' || fail "$tag: Alice properties"
+      q "MATCH (p:Person {name:'Bob'}) RETURN p.age AS age, p.score AS score, p.active AS active" | grep -qF '"rows":[{"age":25,"score":"2.25","active":false}]' || fail "$tag: Bob properties"
+      got=$(cnt "MATCH (:Person {name:'Alice'})-[e:LIVES_IN]->(:City {name:'Oslo'}) RETURN e.since AS c"); [ "$got" = 2019 ] || fail "$tag: edge property since=$got want 2019"
+      got=$(cnt "USE GRAPH sonny6280 MATCH (n) RETURN count(n) AS c"); [ "$got" = 2 ] || fail "$tag: named graph nodes=$got want 2"
+      got=$(cnt "USE GRAPH sonny6280 MATCH (:Item {sku:'A-1', qty:7})-[e:PAIRS {rank:1}]->(:Item {sku:'B-2', qty:9}) RETURN count(e) AS c"); [ "$got" = 1 ] || fail "$tag: named graph edge=$got want 1"
+    }
+    # restore <backup> into <dir>, then open it cold twice (restart in between)
+    restore_and_serve() {
+      local file="$1" dir="$2" tag="$3" out
+      out=$(cd "$W/cwd" && "$BIN" restore "$file" --data-dir "$dir" --hmac-key-file "$W/src/.geode_hmac_key" --yes 2>&1); local rc=$?
+      [ "$rc" = 0 ] || { echo "$out" | tail -20; fail "$tag: restore rc=$rc"; }
+      echo "$out" | grep -q "Restore completed successfully" || fail "$tag: no success line"
+      echo "$out" | grep -q "graph 'default': 5 nodes, 3 edges" || fail "$tag: restore did not report default graph counts"
+      echo "$out" | grep -q "graph 'sonny6280': 2 nodes, 1 edges" || fail "$tag: restore did not report named graph counts"
+      [ -z "$(ls -A "$W/cwd")" ] || fail "$tag: restore wrote into its working directory: $(ls -A "$W/cwd")"
+      start_server "$dir" "$W/$tag.1.log" || fail "$tag: server on restored dir"
+      check_data "$tag cold"
+      stop_server
+      start_server "$dir" "$W/$tag.2.log" || fail "$tag: server restart on restored dir"
+      check_data "$tag restart"
+      stop_server
+      echo "ROUNDTRIP_${tag}_OK"
+    }
+
+    W=$(cat /tmp/sonnyC_6280.path); KEEP=1
+    restore_and_serve "$W/server.gz.backup" "$W/restored_SERVER_GZIP" SERVER_GZIP
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ROUNDTRIP_SERVER_GZIP_OK
+  tags: [backup, restore, sonny-6280, sonny-6277]
+
+- name: restore-local-backup-then-serve-cold
+  description: |
+    Restores localout/local.backup with the real CLI into a new directory, then serves it with a
+    NEW geode on that directory and reads every seeded node, edge and typed
+    property back (twice, with a restart between). Before SONNY-6280 the restore
+    printed success and wrote nothing, so the cold server would see no data.
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    seed() {
+      q "INSERT (:Person {name:'Alice', age:30, score:1.5, active:true})" >/dev/null
+      q "INSERT (:Person {name:'Bob', age:25, score:2.25, active:false})" >/dev/null
+      q "INSERT (:Person {name:'Carol', age:41, score:3.0, active:true})" >/dev/null
+      q "INSERT (:City {name:'Oslo'})" >/dev/null
+      q "INSERT (:City {name:'Lima'})" >/dev/null
+      q "MATCH (a:Person {name:'Alice'}), (c:City {name:'Oslo'}) CREATE (a)-[:LIVES_IN {since: 2019}]->(c)" >/dev/null
+      q "MATCH (a:Person {name:'Bob'}), (c:City {name:'Lima'}) CREATE (a)-[:LIVES_IN {since: 2021}]->(c)" >/dev/null
+      q "MATCH (a:Person {name:'Alice'}), (b:Person {name:'Carol'}) CREATE (a)-[:KNOWS {weight: 0.75}]->(b)" >/dev/null
+      q "CREATE GRAPH sonny6280" >/dev/null
+      q "USE GRAPH sonny6280 INSERT (:Item {sku:'A-1', qty:7})" >/dev/null
+      q "USE GRAPH sonny6280 INSERT (:Item {sku:'B-2', qty:9})" >/dev/null
+      q "USE GRAPH sonny6280 MATCH (a:Item {sku:'A-1'}), (b:Item {sku:'B-2'}) CREATE (a)-[:PAIRS {rank:1}]->(b)" >/dev/null
+    }
+    # exactly the seed, read through ordinary queries (nodes, edges, typed values)
+    check_data() {
+      local tag="$1" got
+      got=$(cnt "MATCH (n) RETURN count(n) AS c");                   [ "$got" = 5 ] || fail "$tag: default graph nodes=$got want 5"
+      got=$(cnt "MATCH ()-[e]->() RETURN count(e) AS c");            [ "$got" = 3 ] || fail "$tag: default graph edges=$got want 3"
+      got=$(cnt "MATCH (n:Person) RETURN count(n) AS c");            [ "$got" = 3 ] || fail "$tag: Person=$got want 3"
+      q "MATCH (p:Person {name:'Alice'}) RETURN p.age AS age, p.score AS score, p.active AS active" | grep -qF '"rows":[{"age":30,"score":"1.5","active":true}]' || fail "$tag: Alice properties"
+      q "MATCH (p:Person {name:'Bob'}) RETURN p.age AS age, p.score AS score, p.active AS active" | grep -qF '"rows":[{"age":25,"score":"2.25","active":false}]' || fail "$tag: Bob properties"
+      got=$(cnt "MATCH (:Person {name:'Alice'})-[e:LIVES_IN]->(:City {name:'Oslo'}) RETURN e.since AS c"); [ "$got" = 2019 ] || fail "$tag: edge property since=$got want 2019"
+      got=$(cnt "USE GRAPH sonny6280 MATCH (n) RETURN count(n) AS c"); [ "$got" = 2 ] || fail "$tag: named graph nodes=$got want 2"
+      got=$(cnt "USE GRAPH sonny6280 MATCH (:Item {sku:'A-1', qty:7})-[e:PAIRS {rank:1}]->(:Item {sku:'B-2', qty:9}) RETURN count(e) AS c"); [ "$got" = 1 ] || fail "$tag: named graph edge=$got want 1"
+    }
+    # restore <backup> into <dir>, then open it cold twice (restart in between)
+    restore_and_serve() {
+      local file="$1" dir="$2" tag="$3" out
+      out=$(cd "$W/cwd" && "$BIN" restore "$file" --data-dir "$dir" --hmac-key-file "$W/src/.geode_hmac_key" --yes 2>&1); local rc=$?
+      [ "$rc" = 0 ] || { echo "$out" | tail -20; fail "$tag: restore rc=$rc"; }
+      echo "$out" | grep -q "Restore completed successfully" || fail "$tag: no success line"
+      echo "$out" | grep -q "graph 'default': 5 nodes, 3 edges" || fail "$tag: restore did not report default graph counts"
+      echo "$out" | grep -q "graph 'sonny6280': 2 nodes, 1 edges" || fail "$tag: restore did not report named graph counts"
+      [ -z "$(ls -A "$W/cwd")" ] || fail "$tag: restore wrote into its working directory: $(ls -A "$W/cwd")"
+      start_server "$dir" "$W/$tag.1.log" || fail "$tag: server on restored dir"
+      check_data "$tag cold"
+      stop_server
+      start_server "$dir" "$W/$tag.2.log" || fail "$tag: server restart on restored dir"
+      check_data "$tag restart"
+      stop_server
+      echo "ROUNDTRIP_${tag}_OK"
+    }
+
+    W=$(cat /tmp/sonnyC_6280.path); KEEP=1
+    restore_and_serve "$W/localout/local.backup" "$W/restored_LOCAL" LOCAL
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ROUNDTRIP_LOCAL_OK
+  tags: [backup, restore, sonny-6280, sonny-6277]
+
+- name: restore-failures-exit-nonzero-and-leave-nothing
+  description: |
+    SONNY-6280 failure contract: a truncated, bit-flipped or missing backup, a
+    non-empty target, a missing target and an unknown option each exit non-zero
+    with a named error and NO success line, and leave no target directory, no
+    staging directory and nothing in the working directory. A non-empty target is
+    refused without touching its contents.
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(cat /tmp/sonnyC_6280.path); KEEP=1
+    KEY="$W/src/.geode_hmac_key"
+    SIZE=$(stat -c%s "$W/server.backup")
+    head -c $((SIZE / 2)) "$W/server.backup" > "$W/trunc.backup"
+    cp "$W/server.backup" "$W/flip.backup"
+    python3 -I - "$W/flip.backup" <<'PYEOF'
+    import sys
+    p = sys.argv[1]
+    b = bytearray(open(p, "rb").read())
+    b[len(b) // 2] ^= 0xFF
+    open(p, "wb").write(b)
+    PYEOF
+    expect_fail() { # <tag> <rc> <needle> -- args...
+      local tag="$1" want="$2" needle="$3"; shift 4
+      local out rc
+      out=$(cd "$W/cwd" && "$BIN" restore "$@" 2>&1); rc=$?
+      [ "$rc" = "$want" ] || { echo "$out" | tail -8; fail "$tag: rc=$rc want $want"; }
+      echo "$out" | grep -q "Restore completed" && fail "$tag: printed a success line"
+      echo "$out" | grep -q "$needle" || { echo "$out" | tail -8; fail "$tag: no '$needle'"; }
+      echo "FAIL_OK_$tag"
+    }
+    expect_fail TRUNCATED 1 InvalidBackupFile -- "$W/trunc.backup" --data-dir "$W/t1" --hmac-key-file "$KEY" --yes
+    expect_fail BITFLIP 1 BackupChecksumMismatch -- "$W/flip.backup" --data-dir "$W/t2" --hmac-key-file "$KEY" --yes
+    expect_fail MISSING 1 BackupFileNotFound -- "$W/none.backup" --data-dir "$W/t3" --hmac-key-file "$KEY" --yes
+    mkdir -p "$W/nonempty" && echo keep > "$W/nonempty/keep.txt"
+    expect_fail NONEMPTY 1 RestoreTargetNotEmpty -- "$W/server.backup" --data-dir "$W/nonempty" --hmac-key-file "$KEY" --yes
+    [ "$(ls -A "$W/nonempty")" = "keep.txt" ] || fail "non-empty target was modified"
+    [ "$(cat "$W/nonempty/keep.txt")" = keep ] || fail "non-empty target file changed"
+    OUT=$(cd "$W/cwd" && env -u GEODE_DATA_DIR "$BIN" restore "$W/server.backup" --hmac-key-file "$KEY" --yes 2>&1); RC=$?
+    [ "$RC" = 2 ] || { echo "$OUT" | tail -5; fail "no target: rc=$RC want 2"; }
+    echo "$OUT" | grep -q "Restore completed" && fail "no target printed success"
+    echo "FAIL_OK_NO_TARGET"
+    OUT=$(cd "$W/cwd" && "$BIN" restore "$W/server.backup" --data-dir "$W/t4" --no-such-flag 2>&1); RC=$?
+    [ "$RC" = 2 ] || { echo "$OUT" | tail -5; fail "unknown option rc=$RC want 2"; }
+    echo "FAIL_OK_UNKNOWN_OPTION"
+    for d in t1 t2 t3 t4; do [ -e "$W/$d" ] && fail "failed restore left $d"; done
+    LEFT=$(ls -A "$W" | grep -E 'restoring|staging|\.tmp|\.restore' || true)
+    [ -z "$LEFT" ] || fail "staging leftovers: $LEFT"
+    [ -z "$(ls -A "$W/cwd")" ] || fail "working directory not empty: $(ls -A "$W/cwd")"
+    echo "ALL_RESTORE_FAILURES_CLEAN"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - FAIL_OK_TRUNCATED
+    - FAIL_OK_BITFLIP
+    - FAIL_OK_MISSING
+    - FAIL_OK_NONEMPTY
+    - FAIL_OK_NO_TARGET
+    - FAIL_OK_UNKNOWN_OPTION
+    - ALL_RESTORE_FAILURES_CLEAN
+  tags: [backup, restore, sonny-6280, negative]
+
+- name: local-backup-without-data-dir-is-a-usage-error
+  description: |
+    SONNY-6323 item 2: createFullBackup used to fall back to /tmp as the data
+    directory when neither --data-dir nor GEODE_DATA_DIR was given. It must refuse
+    (exit 2, naming --data-dir) and write nothing. A missing --output directory is
+    refused up front (exit 2) rather than after the work.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX)
+    mkdir -p "$W/cwd"
+    OUT=$(cd "$W/cwd" && env -u GEODE_DATA_DIR "$BIN" backup create --local --output "$W/x.backup" 2>&1); RC=$?
+    [ "$RC" = 2 ] || { echo "$OUT"; fail "no data dir: rc=$RC want 2"; }
+    echo "$OUT" | grep -q -- "--data-dir" || { echo "$OUT"; fail "message does not name --data-dir"; }
+    [ -e "$W/x.backup" ] && fail "a backup was written without a data dir"
+    mkdir -p "$W/d"
+    OUT=$("$BIN" backup create --local --data-dir "$W/d" --output "$W/nodir/x.backup" 2>&1); RC=$?
+    [ "$RC" = 2 ] || { echo "$OUT"; fail "missing output dir: rc=$RC want 2"; }
+    echo "$OUT" | grep -q "does not exist" || { echo "$OUT"; fail "missing output dir message"; }
+    [ -e "$W/nodir" ] && fail "missing output dir was created"
+    echo "LOCAL_BACKUP_REFUSALS_OK"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - LOCAL_BACKUP_REFUSALS_OK
+  tags: [backup, sonny-6323, negative]
+
+- name: cleanup-fixture
+  description: |
+    Removes the fixture directory shared by the steps above.
+  type: bash
+  timeout_ms: 30000
+  command: |2
+
+    W=$(cat /tmp/sonnyC_6280.path 2>/dev/null || true)
+    case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac
+    rm -f /tmp/sonnyC_6280.path
+    echo "FIXTURE_REMOVED"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - FIXTURE_REMOVED
+  tags: [cleanup]

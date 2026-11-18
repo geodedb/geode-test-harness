@@ -33,7 +33,7 @@ cli:
     - --log-level
     - warn
     - --enable-tde
-    - --enable-wal-encryption
+    # SONNY-6422/6442: --enable-wal-encryption was removed; the WAL is encrypted by the engine under GEODE_TDE_KEY
     - --tde-provider
     - MockKms
     env:
@@ -43,7 +43,7 @@ cli:
     format: json
 env:
   GEODE_TDE_KEY: aaaaaaaaaaaaaaaa00000000000000000000000000000000aaaaaaaaaaaaaaaa
-  GEODE_WAL_KEY: bbbbbbbbbbbbbbbb11111111111111111111111111111111bbbbbbbbbbbbbbbb
+  # SONNY-6422: GEODE_WAL_KEY removed (server refuses it); the WAL is encrypted by GEODE_TDE_KEY
   GEODE_TDE_ENABLED: 'true'
   GEODE_WAL_ENCRYPTION_ENABLED: 'true'
 
@@ -91,12 +91,16 @@ tests:
     The authentication tag on the envelope key must reject this.
     Accepts exit_code 1 (error) or 0 (no KEK enforcement yet — logged as gap).
     The primary oracle is absence of sentinel in the resulting data directory.
-  args:
-  - restore
-  - /tmp/tde-envelope-backup-keka.geode
-  - --yes
-  env:
-    GEODE_TDE_KEY: cccccccccccccccc99999999999999999999999999999999cccccccccccccccc
+  # SONNY-6325/5077: `geode restore <file>` is an offline restore into an empty --data-dir
+  # (docs: `geode restore --help`); the harness's --server flag is refused, so run it as bash.
+  type: bash
+  command: |
+    D=$(mktemp -d)
+    GEODE_TDE_KEY=cccccccccccccccc99999999999999999999999999999999cccccccccccccccc \
+      "${GEODE_BINARY}" restore /tmp/tde-envelope-backup-keka.geode --data-dir "${D}/restored" --yes
+    rc=$?
+    rm -rf "${D}"
+    exit ${rc}
   expect:
     exit_code:
     - 0

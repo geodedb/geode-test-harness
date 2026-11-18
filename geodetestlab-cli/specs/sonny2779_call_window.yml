@@ -1,0 +1,250 @@
+# SONNY-2779: a procedure CALL's OFFSET/LIMIT/SKIP leaked the rows they dropped, an OFFSET at or
+# past the end returned EVERY row instead of none, and `YIELD x AS y` / `MATCH ... CALL ... YIELD`
+# lost the column. This spec drives `CALL db.labels()` over the wire and asserts the window
+# and the column names exactly.
+# Fixture: four :Q {k, f?}, four :X {k}, four :Y {k}, eight :Z {k, g, r}:
+#   (Yk)-[:R]->(Qk)-[:R {w: k}]->(Xk); Q0 and Q1 also have f: 1; Zk has g = k/4 and r = 7-k;
+#   (Q0)-[:S]->(Q1) and a self loop (Q3)-[:S]->(Q3).
+version: '1.0'
+name: SONNY-2779 CALL ... YIELD windows, renames and joins
+description: CALL db.labels() YIELD windows rows once; AS renames; MATCH...CALL joins
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-fixture
+  description: Create the Q/X/Y/Z fixture graph
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0})
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1})
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2})
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3})
+    CREATE (:Z {k: 0, g: 0, r: 7})
+    CREATE (:Z {k: 1, g: 0, r: 6})
+    CREATE (:Z {k: 2, g: 0, r: 5})
+    CREATE (:Z {k: 3, g: 0, r: 4})
+    CREATE (:Z {k: 4, g: 1, r: 3})
+    CREATE (:Z {k: 5, g: 1, r: 2})
+    CREATE (:Z {k: 6, g: 1, r: 1})
+    CREATE (:Z {k: 7, g: 1, r: 0})
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b)
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: limit
+  description: ORDER BY label DESC LIMIT 2
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label ORDER BY label DESC LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"Z"},{"label":"Y"}]'
+  tags:
+  - regression
+- name: limit-offset
+  description: LIMIT 3 OFFSET 1
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label ORDER BY label DESC LIMIT 3 OFFSET 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"Y"},{"label":"X"},{"label":"Q"}]'
+  tags:
+  - regression
+- name: skip-limit
+  description: SKIP 1 LIMIT 2
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label ORDER BY label DESC SKIP 1 LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"Y"},{"label":"X"}]'
+  tags:
+  - regression
+- name: offset-past-end-ordered
+  description: OFFSET 10 past the end returns no rows (used to return every row)
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label ORDER BY label DESC OFFSET 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: offset-past-end
+  description: OFFSET 10 without ORDER BY returns no rows
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label OFFSET 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: skip-past-end
+  description: SKIP 10 returns no rows
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label SKIP 10
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: limit-zero
+  description: LIMIT 0 returns no rows
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label LIMIT 0
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - regression
+- name: limit-param
+  description: LIMIT $l
+  args:
+  - query
+  - --param
+  - l
+  - '2'
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label ORDER BY label DESC LIMIT $l
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"label":"Z"},{"label":"Y"}]'
+  tags:
+  - regression
+- name: yield-as
+  description: YIELD label AS l keeps the renamed column
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label AS l RETURN l ORDER BY l DESC LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"l":"Z"}]'
+    - '"name":"l"'
+    stdout_not_contains:
+    - '"name":"label"'
+  tags:
+  - regression
+- name: yield-as-return-as
+  description: YIELD label AS l RETURN l AS m names the column m
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label AS l RETURN l AS m ORDER BY m DESC LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"m":"Z"}]'
+    - '"name":"m"'
+    stdout_not_contains:
+    - '"name":"l"'
+    - '"name":"label"'
+  tags:
+  - regression
+- name: return-projection
+  description: a CALL honours its RETURN projection
+  args:
+  - query
+  - '-'
+  stdin: |
+    CALL db.labels() YIELD label RETURN label AS x, 1 AS one ORDER BY x DESC LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"x":"Z","one":1}]'
+  tags:
+  - regression
+- name: match-call
+  description: MATCH ... CALL ... YIELD joins the matched row with each yielded row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q {k: 0}) CALL db.labels() YIELD label RETURN q.k AS k, label ORDER BY label DESC LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0,"label":"Z"}]'
+  tags:
+  - regression
+- name: match-where-call
+  description: MATCH WHERE CALL joins every matched row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WHERE q.k < 2 CALL db.labels() YIELD label RETURN q.k AS k, label ORDER BY label DESC, k LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0,"label":"Z"},{"k":1,"label":"Z"}]'
+  tags:
+  - regression

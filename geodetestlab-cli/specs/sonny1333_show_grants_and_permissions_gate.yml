@@ -1,0 +1,213 @@
+version: '1.0'
+name: SONNY-1333 / 6269 / 6345 SHOW GRANTS, SHOW PERMISSIONS Admin gate, GRANT of a missing user
+description: |
+  SONNY-1333: GRANT answered "Granted ..." even when the persistence callback
+  failed, and there was no SHOW GRANTS that listed the stored per-graph
+  grants (SHOW GRANTS FOR listed only GPS policies, FOR was required, and any
+  caller could list any user). Fixed: SHOW GRANTS [FOR <user>] lists one row
+  per graph the user holds grants on (read from the stored records); your own
+  grants need only authentication, another user's need Admin (42501).
+  The persistence-failure half (a GRANT whose save fails answers 58030 and
+  grants nothing) needs a fault injection and is covered in-process by
+  test-sonny1333-grant-persist-show-grants.
+
+  SONNY-6269: SHOW PERMISSIONS FOR <user> / geode.auth.user_permissions did
+  not enforce the Admin requirement the docs state: any authenticated user
+  could list another user's permissions. Fixed: another user's = Admin only
+  (42501), your own = authentication only, with or without FOR.
+
+  SONNY-6345 (item 3): GRANT / REVOKE of a user that does not exist reported
+  success as a 00000 status row. Fixed: an error (42002 for an Admin).
+  (The offline auth CLI half of SONNY-6345 is in sonny6345_auth_cli_offline.yml.)
+
+  Everything is driven over the wire as real users against a real server;
+  the grant rows are asserted after a GRANT, a second GRANT on the same graph,
+  and a REVOKE, so the read-back proves the stored state.
+
+  Engine regressions: test-sonny1333-grant-persist-show-grants,
+  test-sonny6269-permissions-admin-gate, test-sonny6345-auth-cli-and-grant.
+
+  CANARY: REQ=REQ-SONNY-1333-SHOW-GRANTS; FEATURE="SHOW GRANTS / SHOW PERMISSIONS"; ASPECT=AdminGate; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [auth, security, grants, sonny-1333, sonny-6269, sonny-6345]
+tests:
+
+- name: s1333_setup
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE GRAPH g1333a
+    CREATE GRAPH g1333b
+    CREATE USER gl_alice SET PASSWORD 'Alice Grants Passphrase One' ROLE readwrite
+    CREATE USER gl_bob SET PASSWORD 'Bobby Grants Passphrase One' ROLE readwrite
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42']
+
+- name: s1333_grants
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    GRANT READ ON GRAPH g1333a TO gl_alice
+    GRANT WRITE ON GRAPH g1333a TO gl_alice
+    GRANT READ ON GRAPH g1333b TO gl_bob
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42', '"status_class":"58']
+
+- name: s1333_admin_show_grants_for_alice
+  description: Admin lists alice's stored grants - her graph, not bob's.
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRANTS FOR gl_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', g1333a, read, write]
+    stdout_not_contains: [g1333b]
+
+- name: s1333_alice_show_grants_own_no_for
+  description: A non-admin lists her own grants with plain SHOW GRANTS (FOR is optional).
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, SHOW GRANTS]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', g1333a]
+    stdout_not_contains: [g1333b, '"status_class":"42501"']
+
+- name: s1333_alice_show_grants_own_with_for
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, SHOW GRANTS FOR gl_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', g1333a]
+    stdout_not_contains: [g1333b, '"status_class":"42501"']
+
+- name: s1333_alice_cannot_show_bobs_grants
+  description: A non-admin may not list another user's grants - 42501.
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, SHOW GRANTS FOR gl_bob]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [g1333b, '"status_class":"00000"']
+
+- name: s1333_alice_cannot_grant_list_bob_proc
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, CALL geode.auth.grant_list('gl_bob')]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: [g1333b]
+
+- name: s1333_bob_show_grants_own
+  args: [query, -U, gl_bob, -P, Bobby Grants Passphrase One, SHOW GRANTS]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', g1333b]
+    stdout_not_contains: [g1333a]
+
+- name: s1333_revoke_write_then_readback
+  description: After REVOKE WRITE the stored grant shows what is left (read only).
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE WRITE ON GRAPH g1333a FROM gl_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s1333_show_grants_after_revoke
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, SHOW GRANTS]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', g1333a, read]
+    stdout_not_contains: [write]
+
+- name: s1333_revoke_read_then_no_rows
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE READ ON GRAPH g1333a FROM gl_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s1333_show_grants_none_left
+  description: A user with no grant has no grant row for the graph.
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, SHOW GRANTS]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: [g1333a, g1333b]
+
+# ---------------------------------------------------------------- SONNY-6269
+- name: s6269_alice_cannot_show_permissions_for_bob
+  description: SHOW PERMISSIONS FOR another user needs Admin - a non-admin is refused 42501.
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, SHOW PERMISSIONS FOR gl_bob]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6269_alice_cannot_user_permissions_proc_for_bob
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, CALL geode.auth.user_permissions('gl_bob')]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6269_alice_lists_own_permissions_with_for
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, SHOW PERMISSIONS FOR gl_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42501"']
+
+- name: s6269_alice_lists_own_permissions_without_for
+  args: [query, -U, gl_alice, -P, Alice Grants Passphrase One, SHOW PERMISSIONS]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42501"']
+
+- name: s6269_admin_lists_any_users_permissions
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW PERMISSIONS FOR gl_bob]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42501"']
+
+# ---------------------------------------------------------------- SONNY-6345
+- name: s6345_grant_missing_user_is_error
+  description: GRANT of a user that does not exist is an error (42002), not a 00000 status row.
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT READ ON GRAPH g1333a TO gl_ghost_6345]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42002"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6345_revoke_missing_user_is_error
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE READ ON GRAPH g1333a FROM gl_ghost_6345]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42002"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6345_grant_proc_missing_user_is_error
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.auth.grant('READ', 'gl_ghost_6345', 'g1333a')"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42002"']
+    stdout_not_contains: ['"status_class":"00000"']

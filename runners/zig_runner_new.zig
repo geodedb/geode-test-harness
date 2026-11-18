@@ -127,7 +127,7 @@ const QueryResult = struct {
 
 // Default admin credentials for testing
 const DEFAULT_USERNAME = "geode";
-const DEFAULT_PASSWORD = "GeodeTestPassword123!";
+const DEFAULT_PASSWORD = "Geode Test Admin Passphrase";
 
 const TransportType = enum {
     quic,

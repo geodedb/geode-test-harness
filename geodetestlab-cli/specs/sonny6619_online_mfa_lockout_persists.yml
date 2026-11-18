@@ -1,0 +1,90 @@
+version: '1.0'
+name: SONNY-6619 the server-side MFA lockout is stored and survives a restart
+description: |
+  Ticket: SONNY-6619 (item 2; items 1 and 5 are in sonny6619_offline_mfa_enable_limit.yml
+  / zig tests, items 3 and 4 are SecurityManager in-process state).
+  Bug: the server's MFA attempt counter and lockout lived in memory only: five
+  wrong `mfa_verify` codes locked the user out, and a server restart cleared the
+  lockout, restoring unlimited guessing.
+  Spec proves against a real `geode serve` started and restarted by the spec on
+  one data directory: after five wrong mfa_verify codes (28000), a right code is
+  53400 (locked out); after stopping and restarting the server the right code is
+  STILL 53400.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6619-lockout-survives-restart
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+     GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+     start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+     for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+     echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+     ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+     O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+     SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+     [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+
+    ok "create" "$(q "CREATE USER lo6619 SET PASSWORD 'Correct Horse Battery Staple 6619'")"
+    O=$(q "CALL geode.auth.mfa_setup('lo6619')"); SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+    [ -n "$SECRET" ] || { echo "FAIL no secret"; echo "$O"; exit 1; }
+    for i in 1 2 3 4 5; do want "wrong $i" "$(q "CALL geode.auth.mfa_verify('lo6619', '000000')")" 28000; done
+    want "right after lockout" "$(q "CALL geode.auth.mfa_verify('lo6619', '$(totp "$SECRET")')")" 53400
+    stop; start
+    want "right after restart" "$(q "CALL geode.auth.mfa_verify('lo6619', '$(totp "$SECRET")')")" 53400
+    stop
+    echo "LOCKOUT_RESTART_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [LOCKOUT_RESTART_OK]
+  tags: [mfa, online, sonny6619]

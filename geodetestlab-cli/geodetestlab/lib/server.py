@@ -33,12 +33,47 @@ def _safe_killpg(pgid: int, sig: int) -> None:
     exactly what happened on GitLab runners, where the non-interactive
     job shell shares one process group with everything it runs.
     """
+    # Group 1 is init's, and on a systemd host the user manager sits in it:
+    # killpg(1, SIGTERM) tears down the whole login session. A MagicMock's pid
+    # indexes as 1, so a faked process reached exactly that. Never signal a
+    # group <= 1 or a value that is not a real int.
+    if type(pgid) is not int or pgid <= 1:
+        return
     try:
         if pgid == os.getpgid(0):
             return
     except OSError:
         return
     os.killpg(pgid, sig)
+
+
+def signal_process_group(pid: object, sig: int) -> bool:
+    """Signal the process group a harness-spawned server leads; True if sent.
+
+    Servers are spawned with ``start_new_session=True``, so a server the harness
+    may signal by group LEADS its group (pgid == pid). A pid that is not a real
+    int (a MagicMock indexes as 1), is <= 1, is us, or does not lead its own
+    group (it shares someone else's, possibly ours or init's) is refused; the
+    caller falls back to signalling the process itself.
+    """
+    if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        return False
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return False
+    if pgid != pid:
+        return False
+    try:
+        if pgid == os.getpgid(0):
+            return False
+    except OSError:
+        return False
+    try:
+        os.killpg(pgid, sig)
+    except OSError:
+        return False
+    return True
 
 
 class ServerError(Exception):
@@ -51,13 +86,9 @@ def cleanup_servers() -> None:
         try:
             if process.poll() is None:  # Still running
                 # Kill the entire process group first (for servers started with start_new_session)
-                try:
-                    pgid = os.getpgid(process.pid)
-                    _safe_killpg(pgid, signal.SIGTERM)
+                if signal_process_group(process.pid, signal.SIGTERM):
                     time.sleep(0.5)
-                    _safe_killpg(pgid, signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    pass
+                    signal_process_group(process.pid, signal.SIGKILL)
                 # Then kill the process directly as fallback
                 process.terminate()
                 try:
@@ -73,21 +104,80 @@ def cleanup_servers() -> None:
     _active_servers.clear()
 
 
+def _is_geode_test_server(pid: int) -> bool:
+    """True only for a real ``<binary> serve ...`` process using a geode-test- dir.
+
+    ``pgrep -f`` matches any command line containing the pattern text, including
+    shells whose command merely mentions it (an agent's or CI job's ``sh -c``).
+    Require argv[1] == "serve" and a ``geode-test-`` path in the arguments.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = [a.decode(errors="replace") for a in fh.read().split(b"\0") if a]
+    except OSError:
+        return False
+    if len(argv) < 2 or argv[1] != "serve":
+        return False
+    if os.path.basename(argv[0]) in ("sh", "bash", "zsh", "dash", "env", "timeout"):
+        return False
+    return any("geode-test-" in a for a in argv[2:])
+
+
+def _is_orphaned(pid: int) -> bool:
+    """True when ``pid``'s parent is gone (init or a user-session subreaper).
+
+    A server still owned by a live harness process belongs to a live run and
+    must not be touched by another run's cleanup.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        if ppid <= 1:
+            return True
+        with open(f"/proc/{ppid}/comm", encoding="utf-8") as fh:
+            return fh.read().strip() in ("systemd", "init")
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def kill_orphaned_test_servers(sig: int = signal.SIGTERM) -> None:
+    """Signal geode servers in a ``geode-test-`` temp dir whose parent is gone.
+
+    The previous implementation ran ``pkill -f "geode serve.*geode-test-"``,
+    which killed EVERY harness-managed server on the machine, including those
+    of other runs that are still going (a spec on a busy shared host saw its
+    server die with SIGKILL as soon as another run started or finished).
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "geode serve.*geode-test-"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except Exception:
+        return
+    for token in out.split():
+        try:
+            pid = int(token)
+        except ValueError:
+            continue
+        if pid <= 1 or pid == os.getpid() or not _is_geode_test_server(pid) or not _is_orphaned(pid):
+            continue
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
 def kill_stale_servers() -> None:
     """Kill any stale Geode servers from previous test runs.
 
     Uses a scoped pattern that only matches servers started with a
     ``geode-test-`` temp directory to avoid killing unrelated processes.
     """
-    try:
-        subprocess.run(
-            ["pkill", "-f", "geode serve.*geode-test-"],
-            capture_output=True,
-            timeout=5,
-        )
-        time.sleep(0.5)  # Give processes time to terminate
-    except Exception:
-        pass
+    kill_orphaned_test_servers(signal.SIGTERM)
+    time.sleep(0.5)  # Give processes time to terminate
 
 
 # Register cleanup handler
@@ -240,18 +330,9 @@ def stop_server(process: subprocess.Popen[str], verbose: bool = False) -> None:
         _active_servers.remove(process)
 
     try:
-        # Try to get the process group ID (server was started with start_new_session=True)
-        try:
-            pgid = os.getpgid(process.pid)
-        except (OSError, ProcessLookupError):
-            pgid = None
-
-        # Try graceful termination of process group first
-        if pgid:
-            try:
-                _safe_killpg(pgid, signal.SIGTERM)
-            except (OSError, ProcessLookupError):
-                pass
+        # Graceful termination of the group the server leads (it was started with
+        # start_new_session=True); refused for anything that is not such a leader.
+        signal_process_group(process.pid, signal.SIGTERM)
 
         # Also terminate the main process
         process.terminate()
@@ -273,12 +354,8 @@ def stop_server(process: subprocess.Popen[str], verbose: bool = False) -> None:
         except subprocess.TimeoutExpired:
             if verbose:
                 print("Force killing server...")
-            # Force kill the entire process group
-            if pgid:
-                try:
-                    _safe_killpg(pgid, signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    pass
+            # Force kill the group the server leads
+            signal_process_group(process.pid, signal.SIGKILL)
             process.kill()
             try:
                 process.wait(timeout=2)

@@ -1,0 +1,533 @@
+# SONNY-3358 (with SONNY-2846): UNIQUE constraints were not enforced on the CREATE, MERGE and
+# SET write paths (nor the bulk/batch fast paths).
+#
+# This spec drives a real server: after CREATE CONSTRAINT ... IS UNIQUE, a duplicate through
+# CREATE (single, multi-node, self-duplicating), SET, SET label, MERGE (extra property,
+# ON CREATE SET) and the /*+BATCH*/ MERGE fast path is refused with 23505 and writes nothing;
+# null/absent values, other types, a swap and an unconstrained label are allowed; numeric
+# (1.0 = 1, 1.50 = 1.5) and Unicode NFC/NFD equality are honoured; composite constraints work;
+# the constraint survives a SIGKILL + restart.
+
+version: '1.0'
+name: SONNY-3358 UNIQUE constraints enforced on every write path
+description: UNIQUE constraint enforcement
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: false
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: create-constraint
+  description: UNIQUE constraint on :P(id)
+  args:
+  - query
+  - '-'
+  stdin: CREATE CONSTRAINT p_id FOR (n:P) REQUIRE n.id IS UNIQUE
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: create-first
+  description: First holder of id 1
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P {id: 1, name: 'first'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: create-duplicate
+  description: CREATE of a second id 1 violates (23505)
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P {id: 1, name: 'second'})"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: create-batch-atomic
+  description: A multi-node CREATE whose last node violates writes none of them
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:P {id: 50}), (:P {id: 51}), (:P {id: 1})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: create-batch-nothing
+  description: Neither 50 nor 51 exists; id 1 still held once
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: create-self-duplicate
+  description: Two new nodes with the same value in one CREATE violate
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:P {id: 7}), (:P {id: 7})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: nulls-and-absent-never-conflict
+  description: Absent and null values never conflict
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P {name: 'no id a'}); CREATE (:P {name: 'no id b'}); CREATE (:P {id: null})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: numeric-equal-violates
+  description: '1.0 equals 1: violates'
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:P {id: 1.0})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: different-type-allowed
+  description: "'1' is a string: allowed"
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P {id: '1'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: decimal-allowed
+  description: 1.5 is a new value
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:P {id: 1.5})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: decimal-scale-violates
+  description: '1.50 equals 1.5: violates'
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:P {id: 1.50})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: create-second-value
+  description: id 2
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:P {id: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: set-duplicate
+  description: SET n.id = 1 on the node holding 2 violates
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:P {id: 2}) SET n.id = 1'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: set-duplicate-unchanged
+  description: The node still holds 2
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:P {id: 2}) RETURN count(n) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: create-third-value
+  description: id 3
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:P {id: 3})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: set-swap-allowed
+  description: Swapping two values in one SET is not a violation
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:P {id: 2}), (b:P {id: 3}) SET a.id = 3, b.id = 2'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: swap-applied
+  description: Both values still held once
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) WHERE n.id IN [2, 3] RETURN n.id AS id ORDER BY id
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"id":2},{"id":3}]'
+  tags:
+  - storage
+  - sonny738
+- name: seed-q
+  description: A :Q node with id 1
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Q {id: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: label-set-violates
+  description: SET n:P onto the :Q node with id 1 violates
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:Q {id: 1}) SET n:P'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: label-set-nothing
+  description: The node did not gain the label
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Q:P) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-existing-ok
+  description: MERGE of an existing value matches
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:P {id: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-new-ok
+  description: MERGE of a new value creates
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:P {id: 4})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-extra-prop-violates
+  description: "MERGE (n:P {id: 1, name: 'other'}) does not match (name differs) and would duplicate id 1: violates"
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:P {id: 1, name: 'other'})"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-on-create-set-violates
+  description: ON CREATE SET n.id = 1 on a fresh node violates
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:P {code: 'z'}) ON CREATE SET n.id = 1"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-on-create-nothing
+  description: No node with code z
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:P {code: 'z'}) RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: batch-merge-ok
+  description: The /*+BATCH*/ MERGE fast path with fresh values
+  args:
+  - query
+  - '-'
+  stdin: '/*+BATCH*/MERGE (n:P {id: 30}); MERGE (n:P {id: 31})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: batch-merge-violates
+  description: The batch fast path enforces it too
+  args:
+  - query
+  - '-'
+  stdin: "/*+BATCH*/MERGE (n:P {code: 'b'}) ON CREATE SET n.id = 30; MERGE (n:P {code: 'c'})"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: batch-merge-nothing
+  description: No node with code b
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:P {code: 'b'}) RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: delete-then-recreate
+  description: Deleting the holder frees the value
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:P {id: 4}) DELETE n; CREATE (:P {id: 4})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: composite-constraint
+  description: Composite UNIQUE (a, b) on :R
+  args:
+  - query
+  - '-'
+  stdin: CREATE CONSTRAINT r_ab ON :R ASSERT (a, b) IS UNIQUE
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: composite-distinct-ok
+  description: Distinct tuples coexist
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:R {a: 1, b: 1}); CREATE (:R {a: 1, b: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: composite-duplicate-violates
+  description: A repeated tuple violates
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:R {a: 1, b: 1})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: unicode-distinct-ok
+  description: "'e' and 'é' are different values"
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P {id: 'e'}); CREATE (:P {id: 'é'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: unicode-nfc-violates
+  description: "NFD 'e'+U+0301 equals NFC 'é': violates"
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P {id: 'é'})"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738
+- name: unconstrained-label-free
+  description: A label without a constraint takes duplicates
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Free3358 {id: 1}); CREATE (:Free3358 {id: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: unconstrained-two
+  description: Two Free3358 nodes exist
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:Free3358 {id: 1}) RETURN count(n) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: sigkill
+  description: 'SIGKILL + restart: the constraint is durable'
+  type: bash
+  command: |-
+    set -e
+    [ -n "${GEODE_DATA_DIR}" ] || { echo "GEODE_DATA_DIR unset"; exit 1; }
+    BN="$(basename "${GEODE_BINARY:-geode}")"
+    pkill -9 -f "$BN serve.*--data-dir ${GEODE_DATA_DIR} " || true
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags:
+  - storage
+  - sonny738
+  - crash
+- name: after-crash-still-enforced
+  description: The constraint still refuses a duplicate after the crash
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:P {id: 1})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+  tags:
+  - storage
+  - sonny738

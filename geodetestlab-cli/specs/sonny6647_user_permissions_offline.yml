@@ -1,0 +1,102 @@
+version: '1.0'
+name: SONNY-6647 geode user permissions lists the role and real grants (offline CLI)
+description: |
+  SONNY-6647 item 2: `geode user permissions <user>` listed EVERY stored
+  Permission record whoever's (records no authorization path reads), and for a
+  user with none printed "read" (or, for a superuser, "admin, read, write,
+  query"), for a user that does not exist too. Fixed: it prints the user's
+  role and the GraphGrant records the server enforces, grouped by graph, and
+  refuses a user that does not exist (exit 1).
+
+  The old offline `geode grant` stored the inert Permission records before
+  SONNY-6586; they can no longer be produced by a current binary (only a
+  pre-fix store carries them), so `geode auth prune-legacy-permissions` is
+  exercised here on its no-op path ("No legacy permission records", chain
+  still verifies). The pruning of existing records is covered in-process:
+  test-sonny6647-user-permissions.
+
+  Real binary against a throwaway data dir under GEODE_STATE_DIR, run with a
+  scratch HOME and no server on that dir.
+
+  Engine regression: test-sonny6647-user-permissions.
+
+  CANARY: REQ=REQ-SONNY-6647-USER-PERMISSIONS; FEATURE="OfflineAuthStoreSafety"; ASPECT=PermissionsAreGraphGrants; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [auth, cli, offline, grants, sonny-6647]
+tests:
+
+- name: s6647_offline_permissions_role_and_grants
+  type: bash
+  command: |
+    set -u
+    B="${GEODE_BINARY:-geode}"
+    ROOT="${GEODE_STATE_DIR:-/tmp}/s6647-perms"
+    rm -rf "$ROOT" && mkdir -p "$ROOT/home"
+    D="$ROOT/data"
+    P='Correct Horse Battery Staple One'
+    run() { env -u GEODE_DATA_DIR HOME="$ROOT/home" "$@" 2>&1; }
+    run env GEODE_ADMIN_PASSWORD="$P" "$B" auth init --data-dir "$D" >/dev/null || { echo "auth init failed"; exit 1; }
+    run "$B" user create alice alice@example.com --password "$P" --role readonly --data-dir "$D" >/dev/null || { echo "user create failed"; exit 1; }
+
+    # no grants: role, an explicit "no per-graph grants", no invented privileges
+    OUT=$(run "$B" user permissions alice --data-dir "$D")
+    echo "$OUT" | grep -q "Role: readonly" || { echo "no role line:"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "no per-graph grants" || { echo "no 'no per-graph grants':"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -qiE '(^|[ ,:])(read:legacy|query)([ ,]|$)' && { echo "invented privileges:"; echo "$OUT"; exit 1; }
+
+    run "$B" grant READ --graph g6647 --to alice --data-dir "$D" >/dev/null || { echo "grant READ failed"; exit 1; }
+    run "$B" grant SCHEMA --graph g6647 --to alice --data-dir "$D" >/dev/null || { echo "grant SCHEMA failed"; exit 1; }
+    run "$B" grant WRITE --graph h6647 --to alice --data-dir "$D" >/dev/null || { echo "grant WRITE failed"; exit 1; }
+    OUT=$(run "$B" user permissions alice --data-dir "$D")
+    echo "$OUT" | grep -q "g6647: READ, SCHEMA" || { echo "missing g6647 grants:"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "h6647: WRITE" || { echo "missing h6647 grant:"; echo "$OUT"; exit 1; }
+
+    # another user's grants are not alice's
+    OUT=$(run "$B" user permissions geode --data-dir "$D")
+    echo "$OUT" | grep -q "Role: admin" || { echo "geode role:"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "no per-graph grants" || { echo "geode grants:"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "g6647" && { echo "alice's grant shown for geode:"; echo "$OUT"; exit 1; }
+
+    # a user that does not exist is refused (exit non-zero), not "read"
+    OUT=$(run "$B" user permissions nobody6647 --data-dir "$D"); RC=$?
+    [ "$RC" -ne 0 ] || { echo "unknown user exited 0:"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "does not exist" || { echo "no 'does not exist':"; echo "$OUT"; exit 1; }
+
+    # nothing legacy to prune on a fresh store; the chain still verifies
+    OUT=$(run "$B" auth prune-legacy-permissions --dry-run --data-dir "$D")
+    echo "$OUT" | grep -q "No legacy permission records" || { echo "prune dry-run:"; echo "$OUT"; exit 1; }
+    OUT=$(run "$B" auth verify --data-dir "$D")
+    echo "$OUT" | grep -q "integrity OK" || { echo "verify:"; echo "$OUT"; exit 1; }
+    echo "offline_permissions=ok"
+  timeout_ms: 240000
+  expect:
+    exit_code: 0
+    stdout_contains: [offline_permissions=ok]
+  tags: [auth, cli, sonny-6647]

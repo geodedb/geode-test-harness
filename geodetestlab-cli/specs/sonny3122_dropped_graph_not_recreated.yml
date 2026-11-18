@@ -1,0 +1,127 @@
+version: '1.0'
+name: SONNY-3122 a session on a dropped graph does not re-create it on its next write
+description: |
+  SONNY-3122 (SECURITY): materializeGraphForWriteLock (ENG-3914 RC-3)
+  created any graph the adapter did not have when a write lock found none, so
+  a session left on a graph that was DROPPED brought it back on its next
+  write - bypassing the schema permission that only CREATE GRAPH requires.
+  Fixed: a write to a graph that no longer exists fails with GraphNotFound
+  (GQLSTATUS 3F000 "Graph does not exist") and creates nothing; only
+  CREATE GRAPH (and a HELLO that binds a graph) creates one.
+
+  Black-box proof with ONE real session held open across the drop: `geode
+  query --batch` runs its statements over a single connection (one HELLO), so
+  `-g g3122` binds the session to g3122, a statement in the batch drops g3122,
+  and the NEXT statements of the same session write to it. (A second
+  concurrent session cannot be sequenced from the CLI: --batch reads stdin to
+  EOF first, and a fresh HELLO for an unknown graph legitimately binds/creates
+  it, which is why the drop is issued from inside the session.)
+    - after the drop, CREATE and MERGE in the same session fail 3F000;
+    - the graph is NOT re-created: SHOW GRAPHS (new session, as Admin) does
+      not list it, also after a server restart;
+    - controls: the same session's write BEFORE the drop works, a write to
+      the default graph from a fresh session works, and CREATE GRAPH of the
+      same name afterwards gives a new, empty, writable graph.
+
+  Engine regression: test-sonny3122-dropped-graph-not-recreated (also
+  test-sonny6472-dropped-graph-writes for the bulk fast paths).
+
+  CANARY: REQ=REQ-SONNY-3122-DROPPED-GRAPH-NOT-RECREATED; FEATURE="DROP GRAPH"; ASPECT=WriteAfterDrop; STATUS=TESTED; TEST=self; OWNER=storage; UPDATED=2026-11-17
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [storage, graph, drop-graph, security, sonny-3122]
+tests:
+
+- name: s3122_create_graph
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH g3122]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s3122_session_writes_then_drops_its_graph_then_writes_again
+  description: >
+    One session bound to g3122: a write (works), DROP GRAPH g3122, then a
+    CREATE and a MERGE into the graph that is gone. Both must be 3F000
+    errors: 4 statements run, exactly 2 fail (the write before the drop and
+    the DROP succeed).
+  args: [query, --batch, -g, g3122, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:Before3122 {v: 1})
+    DROP GRAPH g3122
+    CREATE (:After3122 {v: 2})
+    MERGE (:After3122 {v: 3})
+  expect:
+    exit_code: [0, 1]
+    stdout_contains: ['"status_class":"3F000"', Graph does not exist, 2 failed]
+    stdout_not_contains: [3 failed, 4 failed]
+
+- name: s3122_graph_not_recreated
+  description: KEY ASSERTION - the dropped graph is not listed again (the write used to bring it back).
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRAPHS]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', default]
+    stdout_not_contains: [g3122]
+
+- name: s3122_control_default_graph_write_works
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'CREATE (n:Ctl3122 {v: 1}) RETURN n.v AS v']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"v":1']
+
+- name: s3122_restart_server
+  command: echo 'restart checkpoint'
+  restart_server: true
+  expect:
+    exit_code: 0
+
+- name: s3122_graph_still_absent_after_restart
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRAPHS]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', default]
+    stdout_not_contains: [g3122]
+
+- name: s3122_create_graph_again_gives_empty_writable_graph
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE GRAPH g3122
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s3122_recreated_graph_empty
+  args: [query, -g, g3122, -U, geode, -P, '${secret:admin_password}', MATCH (n) RETURN count(*) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"c":0']
+    stdout_not_contains: ['"c":1', '"c":2']
+
+- name: s3122_recreated_graph_writable
+  args: [query, -g, g3122, -U, geode, -P, '${secret:admin_password}', 'CREATE (n:Again3122 {v: 9}) RETURN n.v AS v']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"v":9']

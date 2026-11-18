@@ -1,0 +1,146 @@
+version: '1.0'
+name: SONNY-6466 FOR is one atomic statement; range() has an exclusive end
+description: |
+  SONNY-6466 items 2 and 3.
+
+  Item 2 - a FOR statement whose body writes commits once per element, so a
+  failure at element N could leave elements 1..N-1 committed. ISO/IEC 39075:2024
+  4.9.3 (Conditions): an exception condition causes the execution of the
+  GQL-request to have no effect other than raising it; 14.8 <for statement>
+  makes the write that follows part of the same request. So a failing element
+  must leave the graph as it was, durably. Geode already behaved so through the
+  statement undo record; pinned by test-sonny6466-for-statement-atomicity.
+  Proved here over the real wire: a FOR ... CREATE that divides by zero at the
+  third element leaves no node (control: the same FOR with no zero writes all),
+  a FOR ... MATCH ... SET that fails at the third element leaves the property
+  unchanged, and both survive a server restart (what is durable, not just the
+  in-memory store).
+
+  Item 3 - `range(1, 1500)` yields 1,499 elements: the end is exclusive. Geode's
+  documented contract (a Geode extension - ISO GQL has no range(), openCypher's
+  is inclusive) is an exclusive end; this pins the documented behaviour.
+
+  CANARY: REQ=REQ-SONNY-6466-FOR-ATOMICITY; FEATURE="ForStatement"; ASPECT=StatementAtomicityAndRange; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6466_for_atomicity_and_range.yml; OWNER=engine; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+tests:
+- name: for-without-failing-element-writes-every-element
+  description: 'control: FOR i IN [1,2,5] CREATE writes three nodes'
+  args:
+  - query
+  - '-'
+  stdin: 'FOR i IN [1, 2, 5] CREATE (:F6466Ok {v: 10 / i})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+- name: control-count-is-three
+  description: the control FOR wrote exactly three nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:F6466Ok) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":3}]'
+- name: for-create-failing-at-third-element-is-an-error
+  description: division by zero at the third element raises 22012
+  args:
+  - query
+  - '-'
+  stdin: 'FOR i IN [1, 2, 0, 4] CREATE (:F6466 {v: 10 / i})'
+  expect:
+    exit_code: &id001
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_contains:
+    - '22012'
+- name: failed-for-create-leaves-no-node
+  description: elements 1 and 2 were rolled back with the failing statement
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:F6466) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+- name: seed-node-for-set-case
+  description: one node with v = 100
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:F6466Set {k: 1, v: 100})'
+  expect:
+    exit_code: 0
+- name: for-set-failing-at-third-element-is-an-error
+  description: the SET body fails at the zero divisor on the third element
+  args:
+  - query
+  - '-'
+  stdin: 'FOR i IN [1, 2, 0] MATCH (n:F6466Set {k: 1}) SET n.v = n.v + 10 / i'
+  expect:
+    exit_code: *id001
+    stdout_contains:
+    - '22012'
+- name: failed-for-set-leaves-the-property-unchanged
+  description: elements 1 and 2 added 10 and 5; none of it is visible
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:F6466Set {k: 1}) RETURN n.v AS v'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"v":100}]'
+- name: restart-for-durability-check
+  description: restart the server on the same data directory
+  type: bash
+  command: echo 'Server restart triggered by test framework'
+  restart_server: true
+  expect:
+    exit_code: 0
+- name: after-restart-failed-for-left-nothing-durable
+  description: no F6466 node, F6466Set.v still 100, the control three nodes present
+  type: bash
+  timeout_ms: 60000
+  command: "PW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nq() { \"${GEODE_BINARY:-geode}\" query \"$1\" --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" --format json 2>&1; }\nq \"MATCH (n:F6466) RETURN count(n) AS c\" | grep -o '\"rows\":\\[[^]]*\\]' | sed 's/^/FAILED_CREATE=/'\nq \"MATCH (n:F6466Set {k: 1}) RETURN n.v AS v\" | grep -o '\"rows\":\\[[^]]*\\]' | sed 's/^/FAILED_SET=/'\nq \"MATCH (n:F6466Ok) RETURN count(n) AS c\" | grep -o '\"rows\":\\[[^]]*\\]' | sed 's/^/CONTROL=/'\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - FAILED_CREATE="rows":[{"c":0}]
+    - FAILED_SET="rows":[{"v":100}]
+    - CONTROL="rows":[{"c":3}]
+- name: range-end-is-exclusive
+  description: range(1, 4) is [1, 2, 3] and range(1, 1500) has 1,499 elements (documented Geode extension)
+  args:
+  - query
+  - '-'
+  stdin: RETURN range(1, 4) AS r, size(range(1, 1500)) AS n, size(range(5, 5)) AS empty
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"r":[1,2,3]'
+    - '"n":1499'
+    - '"empty":0'

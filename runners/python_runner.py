@@ -5,16 +5,19 @@ Python client test runner.
 Executes test specifications using the Geode Python client library.
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
+import logging
 import os
 import statistics
 import sys
 import time
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import yaml
 
@@ -22,18 +25,46 @@ import yaml
 _GEODE_CLIENT_AVAILABLE = False
 try:
     # First try the installed package
-    from geode_client import Client, Connection
+    from geode_client import Client, Connection, GeodeError, TransportError
+
     _GEODE_CLIENT_AVAILABLE = True
 except ImportError:
     # Try adding Python client from external repo sibling directory
     sys.path.insert(0, str(Path(__file__).parent.parent.parent / "geode-client-python"))
     try:
-        from geode_client import Client, Connection
+        from geode_client import Client, Connection, GeodeError, TransportError
+
         _GEODE_CLIENT_AVAILABLE = True
     except ImportError:
         # Client not available - will report error at runtime
         Client = None
         Connection = None
+        GeodeError = None
+        TransportError = None
+
+logger = logging.getLogger(__name__)
+
+
+class RunnerError(Exception):
+    """A test step could not run (missing connection, malformed step)."""
+
+
+# What a failing step may raise: client/transport errors, I/O, timeouts, and the
+# lookup/type errors a malformed spec produces. Anything else is a runner bug and
+# propagates instead of being reported as a test error.
+_STEP_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    asyncio.TimeoutError,
+    RuntimeError,
+    LookupError,
+    ValueError,
+    TypeError,
+    AttributeError,
+    RunnerError,
+    *(e for e in (GeodeError, TransportError) if e is not None),
+)
+# Closing an already-broken connection may fail in the same ways.
+_CLOSE_ERRORS = _STEP_ERRORS
 
 
 class DecimalEncoder(json.JSONEncoder):
@@ -51,25 +82,32 @@ class PythonTestRunner:
 
     # Default admin credentials for testing
     DEFAULT_USERNAME = "geode"
-    DEFAULT_PASSWORD = "GeodeTestPassword123!"
+    DEFAULT_PASSWORD = "Geode Test Admin Passphrase"
 
     def __init__(
         self,
         server: str,
         verbose: bool = False,
         transport: str = "quic",
-        username: Optional[str] = None,
-        password: Optional[str] = None,
+        username: str | None = None,
+        password: str | None = None,
     ):
         host, port = server.split(":")
 
         # Get credentials from environment or use defaults
-        self.username = username or os.environ.get("GEODE_USERNAME", self.DEFAULT_USERNAME)
-        self.password = password or os.environ.get("GEODE_ADMIN_PASSWORD", self.DEFAULT_PASSWORD)
+        self.username = username or os.environ.get(
+            "GEODE_USERNAME", self.DEFAULT_USERNAME
+        )
+        self.password = password or os.environ.get(
+            "GEODE_ADMIN_PASSWORD", self.DEFAULT_PASSWORD
+        )
 
         # Determine transport type
         from geode_client import TransportType
-        transport_type = TransportType.GRPC if transport.lower() == "grpc" else TransportType.QUIC
+
+        transport_type = (
+            TransportType.GRPC if transport.lower() == "grpc" else TransportType.QUIC
+        )
 
         # TLS Configuration:
         # - skip_verify=True: Required for test harness since Geode server uses
@@ -85,29 +123,35 @@ class PythonTestRunner:
         )
         self.verbose = verbose
         self.transport = transport
-        self.connection: Optional[Connection] = None
-        self.connections: Dict[str, Connection] = {}  # Connection registry for multi-connection tests
+        self.connection: Connection | None = None
+        self.connections: dict[
+            str, Connection
+        ] = {}  # Connection registry for multi-connection tests
 
     async def setup(self):
         """Setup runner."""
-        pass
 
     async def teardown(self):
         """Cleanup runner."""
         if self.connection:
             try:
                 await self.connection.close()
-            except Exception:
-                pass  # Ignore connection close errors during teardown
+            except _CLOSE_ERRORS:
+                logger.debug(
+                    "ignoring connection close error during teardown", exc_info=True
+                )
         # Close all pooled connections
         for conn_id, conn in list(self.connections.items()):
             try:
                 await conn.close()
-            except Exception:
-                pass  # Ignore connection close errors during teardown
+            except _CLOSE_ERRORS:
+                logger.debug(
+                    "ignoring pooled connection close error during teardown",
+                    exc_info=True,
+                )
         self.connections.clear()
 
-    def _get_connection(self, connection_id: Optional[str] = None) -> Optional[Connection]:
+    def _get_connection(self, connection_id: str | None = None) -> Connection | None:
         """Get connection by ID or return default connection."""
         if connection_id and connection_id in self.connections:
             return self.connections[connection_id]
@@ -123,8 +167,10 @@ class PythonTestRunner:
         if connection_id in self.connections:
             try:
                 await self.connections[connection_id].close()
-            except Exception:
-                pass  # Ignore connection close errors during pool release
+            except _CLOSE_ERRORS:
+                logger.debug(
+                    "ignoring connection close error during pool release", exc_info=True
+                )
             del self.connections[connection_id]
 
     async def connect(self):
@@ -139,13 +185,16 @@ class PythonTestRunner:
             self.connection = None
 
     async def run_query(
-        self, query: str, params: Optional[Dict[str, Any]] = None, connection_id: Optional[str] = None
-    ) -> Dict[str, Any]:
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+        connection_id: str | None = None,
+    ) -> dict[str, Any]:
         """Execute a query on specified or default connection."""
         conn = self._get_connection(connection_id)
         if not conn:
             if connection_id:
-                raise Exception(f"Connection '{connection_id}' not found")
+                raise RunnerError(f"Connection '{connection_id}' not found")
             await self.connect()
             conn = self.connection
 
@@ -166,31 +215,35 @@ class PythonTestRunner:
             ],
         }
 
-    async def begin_transaction(self, connection_id: Optional[str] = None):
+    async def begin_transaction(self, connection_id: str | None = None):
         """Begin transaction on specified or default connection."""
         conn = self._get_connection(connection_id)
         if not conn:
             if connection_id:
-                raise Exception(f"Connection '{connection_id}' not found")
+                raise RunnerError(f"Connection '{connection_id}' not found")
             await self.connect()
             conn = self.connection
         await conn.begin()
 
-    async def commit_transaction(self, connection_id: Optional[str] = None):
+    async def commit_transaction(self, connection_id: str | None = None):
         """Commit transaction on specified or default connection."""
         conn = self._get_connection(connection_id)
         if not conn:
-            raise Exception(f"No active connection{' for ' + connection_id if connection_id else ''}")
+            raise RunnerError(
+                f"No active connection{' for ' + connection_id if connection_id else ''}"
+            )
         await conn.commit()
 
-    async def rollback_transaction(self, connection_id: Optional[str] = None):
+    async def rollback_transaction(self, connection_id: str | None = None):
         """Rollback transaction on specified or default connection."""
         conn = self._get_connection(connection_id)
         if not conn:
-            raise Exception(f"No active connection{' for ' + connection_id if connection_id else ''}")
+            raise RunnerError(
+                f"No active connection{' for ' + connection_id if connection_id else ''}"
+            )
         await conn.rollback()
 
-    async def run_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
+    async def run_test(self, test: dict[str, Any]) -> dict[str, Any]:
         """Run a single test."""
         # Check if this is a benchmark test
         benchmark = test.get("benchmark")
@@ -199,7 +252,9 @@ class PythonTestRunner:
 
         return await self._run_single_test(test)
 
-    async def _run_benchmark_test(self, test: Dict[str, Any], benchmark: Dict[str, Any]) -> Dict[str, Any]:
+    async def _run_benchmark_test(
+        self, test: dict[str, Any], benchmark: dict[str, Any]
+    ) -> dict[str, Any]:
         """Run a benchmark test with multiple iterations."""
         iterations = benchmark.get("iterations", 10)
         max_avg_latency_ms = benchmark.get("max_avg_latency_ms")
@@ -218,10 +273,12 @@ class PythonTestRunner:
                 latencies.append(latency_ms)
 
                 if result.get("status") != "passed":
-                    errors.append(f"Iteration {i+1}: {result.get('error', 'Unknown error')}")
-            except Exception as e:
+                    errors.append(
+                        f"Iteration {i + 1}: {result.get('error', 'Unknown error')}"
+                    )
+            except _STEP_ERRORS as e:
                 latencies.append((time.time() - start) * 1000)
-                errors.append(f"Iteration {i+1}: {str(e)}")
+                errors.append(f"Iteration {i + 1}: {e!s}")
 
         total_time_ms = (time.time() - start_total) * 1000
 
@@ -247,11 +304,17 @@ class PythonTestRunner:
         # Check thresholds
         failures = []
         if max_avg_latency_ms and avg_latency > max_avg_latency_ms:
-            failures.append(f"Average latency {avg_latency:.2f}ms exceeds max {max_avg_latency_ms}ms")
+            failures.append(
+                f"Average latency {avg_latency:.2f}ms exceeds max {max_avg_latency_ms}ms"
+            )
         if max_p95_latency_ms and p95_latency > max_p95_latency_ms:
-            failures.append(f"P95 latency {p95_latency:.2f}ms exceeds max {max_p95_latency_ms}ms")
+            failures.append(
+                f"P95 latency {p95_latency:.2f}ms exceeds max {max_p95_latency_ms}ms"
+            )
         if max_total_time_ms and total_time_ms > max_total_time_ms:
-            failures.append(f"Total time {total_time_ms:.2f}ms exceeds max {max_total_time_ms}ms")
+            failures.append(
+                f"Total time {total_time_ms:.2f}ms exceeds max {max_total_time_ms}ms"
+            )
 
         if failures:
             return {
@@ -269,14 +332,12 @@ class PythonTestRunner:
 
         return {"status": "passed", "benchmark": benchmark_result}
 
-    async def _run_single_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
+    async def _run_single_test(self, test: dict[str, Any]) -> dict[str, Any]:
         """Run a single test iteration."""
         try:
             # Simple query test
             if "query" in test:
-                result = await self.run_query(
-                    test["query"], test.get("params", {})
-                )
+                result = await self.run_query(test["query"], test.get("params", {}))
 
                 # Validate expectations
                 expect = test.get("expect", {})
@@ -288,13 +349,14 @@ class PythonTestRunner:
                         "result": result,
                     }
 
-                if "columns" in expect:
-                    if set(result["columns"]) != set(expect["columns"]):
-                        return {
-                            "status": "failed",
-                            "error": f"Expected columns {expect['columns']}, got {result['columns']}",
-                            "result": result,
-                        }
+                if "columns" in expect and set(result["columns"]) != set(
+                    expect["columns"]
+                ):
+                    return {
+                        "status": "failed",
+                        "error": f"Expected columns {expect['columns']}, got {result['columns']}",
+                        "result": result,
+                    }
 
                 if "values" in expect and len(expect["values"]) > 0:
                     for i, expected_row in enumerate(expect["values"]):
@@ -356,13 +418,15 @@ class PythonTestRunner:
 
                         # Check expectations
                         expect = step.get("expect", {})
-                        if "rows" in expect and result["rows"] != expect["rows"]:
-                            if not step.get("expect_error", False):
-                                return {
-                                    "status": "failed",
-                                    "error": f"Step query: Expected {expect['rows']} rows, got {result['rows']}",
-                                    "results": results,
-                                }
+                        rows_mismatch = (
+                            "rows" in expect and result["rows"] != expect["rows"]
+                        )
+                        if rows_mismatch and not step.get("expect_error", False):
+                            return {
+                                "status": "failed",
+                                "error": f"Step query: Expected {expect['rows']} rows, got {result['rows']}",
+                                "results": results,
+                            }
                     elif step_type == "begin":
                         await self.begin_transaction(connection_id)
                     elif step_type == "commit":
@@ -381,7 +445,7 @@ class PythonTestRunner:
                     "error": "Test must have 'query' or 'steps'",
                 }
 
-        except Exception as e:
+        except _STEP_ERRORS as e:
             # Check if error was expected
             if test.get("expect_error", False) or any(
                 step.get("expect_error", False) for step in test.get("steps", [])
@@ -390,7 +454,7 @@ class PythonTestRunner:
 
             return {"status": "error", "error": str(e)}
 
-    async def run_spec(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+    async def run_spec(self, spec: dict[str, Any]) -> dict[str, Any]:
         """Run entire test specification."""
         results = []
 
@@ -399,7 +463,7 @@ class PythonTestRunner:
             try:
                 if setup_step["type"] == "query":
                     await self.run_query(setup_step["text"])
-            except Exception as e:
+            except _STEP_ERRORS as e:
                 print(f"Setup failed: {e}", file=sys.stderr)
                 return {"status": "error", "error": f"Setup failed: {e}"}
 
@@ -421,7 +485,7 @@ class PythonTestRunner:
             try:
                 if cleanup_step["type"] == "query":
                     await self.run_query(cleanup_step["text"])
-            except Exception as e:
+            except _STEP_ERRORS as e:
                 print(f"Cleanup warning: {e}", file=sys.stderr)
 
         # Calculate summary
@@ -446,11 +510,15 @@ async def main():
     parser = argparse.ArgumentParser(description="Python client test runner")
     parser.add_argument("--spec", required=True, type=Path, help="Test specification")
     parser.add_argument(
-        "--server", default="localhost:3141", help="Server address (default: localhost:3141)"
+        "--server",
+        default="localhost:3141",
+        help="Server address (default: localhost:3141)",
     )
     parser.add_argument(
-        "--transport", default="quic", choices=["quic", "grpc"],
-        help="Transport protocol (default: quic)"
+        "--transport",
+        default="quic",
+        choices=["quic", "grpc"],
+        help="Transport protocol (default: quic)",
     )
     parser.add_argument("--json", action="store_true", help="Output JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
@@ -465,17 +533,27 @@ async def main():
             "Or clone from: git@gitlab.com:devnw/geode/geode-client-python.git"
         )
         if args.json:
-            print(json.dumps({
-                "error": error_msg,
-                "summary": {"total": 0, "passed": 0, "failed": 0, "skipped": 0, "errors": 1}
-            }))
+            print(
+                json.dumps(
+                    {
+                        "error": error_msg,
+                        "summary": {
+                            "total": 0,
+                            "passed": 0,
+                            "failed": 0,
+                            "skipped": 0,
+                            "errors": 1,
+                        },
+                    }
+                )
+            )
         else:
             print(f"Error: {error_msg}", file=sys.stderr)
         sys.exit(1)
 
     # Load spec
-    with open(args.spec) as f:
-        spec = yaml.safe_load(f)
+    spec_text = await asyncio.to_thread(args.spec.read_text)
+    spec = yaml.safe_load(spec_text)
 
     # Run tests
     runner = PythonTestRunner(args.server, args.verbose, transport=args.transport)
@@ -493,11 +571,17 @@ async def main():
 
         sys.exit(0)
 
-    except Exception as e:
+    except _STEP_ERRORS as e:
         # Ensure we always output valid JSON even when runner crashes
         error_result = {
-            "summary": {"total": 0, "passed": 0, "failed": 0, "errors": 1, "skipped": 0},
-            "results": []
+            "summary": {
+                "total": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 1,
+                "skipped": 0,
+            },
+            "results": [],
         }
         if args.json:
             print(json.dumps(error_result, indent=2))

@@ -1,0 +1,88 @@
+version: '1.0'
+name: SONNY-6550 geode CLI applies geode-client-zig DSN rules (percent-decoding, strict forms)
+description: |
+  Ticket: SONNY-6550 (geode-client-zig DSN userinfo split at the first '@',
+  lenient percent-decoding, port 0 accepted; geode pinned v0.3.17 and applies the
+  rules on every client path).
+  Spec proves on the real binary: `geode query --dsn` percent-decodes the
+  password in the userinfo (a %21 is '!') and the graph path (`/g%5F6550` binds
+  graph g_6550, listed by SHOW GRAPHS, not the raw text), refuses a malformed
+  percent-escape (`%G0`) with exit != 0 without printing the secret, and refuses
+  a DSN naming port 0.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6550-percent-decoding
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    PWE=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$PW")
+    OUT=$(HOME="$H" "$BIN" query --dsn "quic://geode:$PWE@$ADDR/g%5F6550?insecure=true" --no-saved-session --timeout 10 "SHOW GRAPHS" 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && echo "$OUT" | grep -q "g_6550" && ! echo "$OUT" | grep -q "g%5F6550" || { echo "FAIL graph path decode rc=$RC"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -qF "$PW" && { echo "FAIL password printed"; exit 1; }
+    OUT=$(HOME="$H" "$BIN" query --dsn "quic://geode:s3cret%G0pw@$ADDR?insecure=true" --no-saved-session --timeout 10 "RETURN 1" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && ! echo "$OUT" | grep -q "s3cret" || { echo "FAIL malformed percent-escape rc=$RC"; echo "$OUT"; exit 1; }
+    OUT=$(HOME="$H" "$BIN" query --dsn "quic://geode:$PWE@127.0.0.1:0?insecure=true" --no-saved-session --timeout 5 "RETURN 1" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] || { echo "FAIL port 0 accepted"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -qF "$PW" && { echo "FAIL password printed on port 0 refusal"; exit 1; }
+    echo "PERCENT_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [PERCENT_OK]
+  tags: [cli, dsn, sonny6550]

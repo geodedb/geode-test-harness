@@ -1,0 +1,947 @@
+# Full-text index maintenance on every write path, across restarts (SONNY-6591),
+# and after REMOVE n:L / SET that replaces or drops indexed text (SONNY-6421).
+#
+# SONNY-6591 (the bugs): after `CREATE INDEX ... USING fulltext`, a CREATE of a
+# matching node was not indexed -- `CALL geode.fts.search` returned no row --
+# because (1) the QUIC write fast path for a single-statement
+# `CREATE (n:L {k: v})` with no RETURN never ran the fulltext maintenance hook,
+# and (2) after a restart the in-memory label -> index registry was empty, so
+# no write of any kind (CREATE, SET, MERGE, DELETE, REMOVE) reached an index
+# that was still searchable.
+#
+# SONNY-6421 (the bugs): REMOVE n:L left the node's entry in L's fulltext
+# index; a SET that replaced an indexed text value (SET n.p = ..., or
+# SET n = {map}) left the old words findable (a stale hit).
+#
+# This spec drives a real `geode serve` over QUIC. Every step's assertion is a
+# search by a word unique to one write path, so each result is exactly one row
+# (the node written by that path) or no row (the word was replaced / removed /
+# deleted). Rows are counted with a regex over the single-line JSON result.
+# Rounds:
+#   a: every write path on a fresh server;
+#   SIGKILL (no checkpoint) + restart: every round-a word still resolves
+#      exactly as before, then writes of every path run again;
+#   graceful restart (shutdown checkpoint): ditto.
+# Fulltext indexes live in the default graph (docs/FULLTEXT_SEARCH.md "Graph
+# scope"), so the spec works there.
+#
+# Not covered here (not observable black-box, covered by the zig step
+# `zig build test-sonny6421-index-maintenance`): the vector-index undo repair
+# vs a background rebuild, the IndexOnEncryptedField message text and the
+# engine-less setNodeProperty refusal.
+#
+# CANARY: REQ=REQ-SONNY-6591-FTS-WRITE-PATHS; FEATURE="FullText"; ASPECT=WirePathMatrix; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6591_fts_write_paths.yml; OWNER=storage; UPDATED=2026-11-17
+
+version: '1.0'
+name: Fulltext index maintenance on every write path, before and after restarts (SONNY-6591, SONNY-6421)
+description: Every node write path keeps a fulltext index current; SET/REMOVE n:L leave no stale entries; survives SIGKILL and graceful restarts
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: create-index
+  description: Fulltext index on Doc.body in the default graph (nothing indexed yet)
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX ft_6591 FOR (d:Doc) ON (d.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - setup
+- name: a-fast-create
+  description: 'QUIC fast path: single-statement CREATE with no RETURN (was: never indexed)'
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {tag: 'a-fast', body: 'quokka alpharound'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-fast-create-found
+  description: the fast-path node is searchable right away
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'quokka')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+  - key
+- name: a-exec-create
+  description: executor CREATE (has a RETURN, so not the fast path)
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (d:Doc {tag: 'a-exec', body: 'wombat alpharound'}) RETURN d.tag"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-exec-create-found
+  description: the executor-created node is searchable
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'wombat')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-shared-word-two-rows
+  description: a word on both nodes finds both (two rows)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'alpharound')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\},\{"node":\d+,"score":[^}]*\}\],"additional'
+    stdout_not_contains:
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-merge-create
+  description: MERGE ... ON CREATE SET creates an indexed node
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:Doc {tag: 'a-merge'}) ON CREATE SET n.body = 'ferret mergeword'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-merge-create-found
+  description: the MERGE-created node is searchable
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'ferret')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-set-replace
+  description: SET n.body = <new text> on the fast-path node (SONNY-6421 item 2)
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'a-fast'}) SET n.body = 'platypus replaced'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-set-replace-new
+  description: the new words are found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'platypus')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-set-replace-old-gone
+  description: 'the old word is NOT findable (was: stale hit)'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'quokka')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+  - key
+- name: a-set-map-drop
+  description: SET n = {map} that drops the indexed property (SONNY-6421 item 3)
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'a-exec'}) SET n = {tag: 'a-exec'}"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-set-map-drop-gone
+  description: "the dropped property's words are gone (was: stale hit)"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'wombat')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+  - key
+- name: a-set-map-keep
+  description: SET n = {map} that sets the indexed text again keeps it findable
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'a-merge'}) SET n = {tag: 'a-merge', body: 'ferret remapped'}"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-set-map-keep-found
+  description: the re-set text is found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'remapped')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-remove-label-setup
+  description: a node that will lose the label
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {tag: 'a-unlabel', body: 'narwhal sealabel'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-remove-label-before
+  description: found while it carries :Doc
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'narwhal')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-remove-label
+  description: REMOVE n:Doc (SONNY-6421 item 1)
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'a-unlabel'}) REMOVE n:Doc"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-remove-label-gone
+  description: "after REMOVE n:Doc the node is not in Doc's index (was: stale hit)"
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'narwhal')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+  - key
+- name: a-delete-setup
+  description: a node that will be deleted
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {tag: 'a-del', body: 'lemur delword'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-delete-before
+  description: found before DELETE
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'lemur')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-delete
+  description: DETACH DELETE the node
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'a-del'}) DETACH DELETE n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: a-delete-gone
+  description: gone after DELETE
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'lemur')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-a
+- name: sigkill-restart
+  description: SIGKILL (no checkpoint) then restart on the same data dir
+  type: bash
+  command: |
+    set -e
+    pkill -9 -f "serve .*--data-dir ${GEODE_DATA_DIR}"
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - restart
+  - crash
+- name: k-platypus
+  description: 'after the crash: replaced text still found once'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'platypus')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-sigkill
+- name: k-quokka
+  description: 'after the crash: the replaced word is still gone'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'quokka')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-sigkill
+- name: k-wombat
+  description: 'after the crash: dropped property still gone'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'wombat')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-sigkill
+- name: k-remapped
+  description: 'after the crash: re-set text found'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'remapped')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-sigkill
+- name: k-narwhal
+  description: 'after the crash: un-labelled node still not indexed'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'narwhal')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-sigkill
+- name: k-lemur
+  description: 'after the crash: deleted node still gone'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'lemur')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-sigkill
+- name: b-fast-create
+  description: 'after restart: fast-path CREATE (was: not indexed after a restart)'
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {tag: 'b-fast', body: 'axolotl betaround'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+- name: b-fast-create-found
+  description: the post-restart fast-path node is found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'axolotl')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+  - key
+- name: b-exec-create
+  description: 'after restart: executor CREATE'
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (d:Doc {tag: 'b-exec', body: 'gecko betaround'}) RETURN d.tag"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+- name: b-exec-create-found
+  description: the post-restart executor node is found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'gecko')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+  - key
+- name: b-merge-create
+  description: 'after restart: MERGE ON CREATE SET'
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:Doc {tag: 'b-merge'}) ON CREATE SET n.body = 'stoat mergeword'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+- name: b-merge-create-found
+  description: the post-restart MERGE node is found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'stoat')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+  - key
+- name: b-set-replace
+  description: 'after restart: SET replaces the text of a node written BEFORE the crash'
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'a-fast'}) SET n.body = 'capybara afterwards'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+- name: b-set-replace-new
+  description: the new word is found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'capybara')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+  - key
+- name: b-set-replace-old-gone
+  description: the previous text (platypus) is no longer found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'platypus')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+  - key
+- name: b-remove-label
+  description: 'after restart: REMOVE n:Doc on a node written before the crash'
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'a-merge'}) REMOVE n:Doc"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+- name: b-remove-label-gone
+  description: that node's words leave the index
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'remapped')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+  - key
+- name: b-delete
+  description: 'after restart: DETACH DELETE a node written before the crash'
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'b-merge'}) DETACH DELETE n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+- name: b-delete-gone
+  description: gone from the index
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'stoat')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-b
+  - key
+- name: graceful-restart
+  description: Graceful stop (shutdown checkpoint) and restart
+  type: bash
+  command: |
+    echo GRACEFUL_RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GRACEFUL_RESTART
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - restart
+- name: g-axolotl
+  description: 'after the graceful restart: round-b node still found'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'axolotl')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-graceful
+- name: g-capybara
+  description: 'after the graceful restart: replaced text found'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'capybara')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-graceful
+- name: g-stoat
+  description: 'after the graceful restart: deleted node gone'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'stoat')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-graceful
+- name: g-remapped
+  description: 'after the graceful restart: un-labelled node gone'
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'remapped')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - after-graceful
+- name: c-fast-create
+  description: 'after the graceful restart: fast-path CREATE'
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Doc {tag: 'c-fast', body: 'tapir gammaround'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-c
+- name: c-fast-create-found
+  description: found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'tapir')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"rows":[]'
+    stdout_regex:
+    - '"rows":\[\{"node":\d+,"score":[^}]*\}\],"additional'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-c
+  - key
+- name: c-delete
+  description: 'after the graceful restart: DELETE a node written before it'
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:Doc {tag: 'b-fast'}) DETACH DELETE n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-c
+- name: c-delete-gone
+  description: gone from the index
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_6591', 'axolotl')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - round-c
+  - key
+- name: drop-index
+  description: Drop the fulltext index (default graph)
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX ft_6591
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6591
+  - sonny6421
+  - teardown

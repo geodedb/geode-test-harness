@@ -1,0 +1,416 @@
+# DROP INDEX is durable: a dropped index stays dropped after a crash (SONNY-2795).
+#
+# The bug: DROP INDEX removed the catalog row in memory and never saved the
+# catalog, and did not take the catalog lock. A restart brought the dropped
+# index back (a durability bug), and the drop raced readers of the index list
+# during writes (a memory-safety bug). Two sibling defects in the ticket are
+# in-process only and are covered by `zig build test-sonny2795-drop-index-catalog`:
+# the process-global index manager adopting a per-request allocator, and an
+# in-memory (no data directory) session sharing /tmp/geode_catalog.dat -- the
+# server always has a data directory, so neither is reachable through
+# `geode serve`.
+#
+# What this spec proves, black-box against `geode serve`:
+#   * an index DROPped in the default graph and one DROPped in a named graph
+#     are both still gone after a SIGKILL (no shutdown checkpoint) + restart,
+#     while an index that was not dropped is still there (control);
+#   * a resurrected index would make the next CREATE INDEX of the same name
+#     fail 42P07; it succeeds, and survives a second drop + SIGKILL;
+#   * a fulltext index drop is durable too (search of it no longer resolves);
+#   * DROP INDEX racing SHOW INDEXES / CREATE INDEX from other connections
+#     leaves the server alive and the catalog consistent (a smoke for the
+#     missing catalog lock; the lock itself is proven by the zig step).
+#
+# CANARY: REQ=REQ-SONNY-2795-DROP-INDEX-DURABLE; FEATURE="IndexCatalog"; ASPECT=DropDurability; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny2795_drop_index_durability.yml; OWNER=storage; UPDATED=2026-11-17
+
+version: '1.0'
+name: DROP INDEX is durable across a crash and safe against concurrent readers (SONNY-2795)
+description: A dropped index (default and named graph, btree and fulltext) stays dropped after SIGKILL + restart
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: create-graph
+  description: Create a named graph
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g_dur_2795
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - setup
+- name: default-create-keep
+  description: 'default graph: ix_keep (never dropped)'
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX ix_keep FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - setup
+- name: default-create-gone
+  description: 'default graph: ix_gone (will be dropped)'
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX ix_gone FOR (n:Item) ON (n.v)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - setup
+- name: default-create-ft
+  description: 'default graph: ft_gone, a fulltext index (will be dropped)'
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX ft_gone FOR (d:Doc) ON (d.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - setup
+- name: named-create-keep
+  description: 'named graph: ix_keep_n (never dropped)'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_dur_2795; CREATE INDEX ix_keep_n FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - setup
+- name: named-create-gone
+  description: 'named graph: ix_gone_n (will be dropped)'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_dur_2795; CREATE INDEX ix_gone_n FOR (n:Item) ON (n.v)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - setup
+- name: default-drop-gone
+  description: DROP INDEX ix_gone in the default graph
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX ix_gone
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+- name: default-drop-ft
+  description: DROP INDEX ft_gone (fulltext) in the default graph
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX ft_gone
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+- name: named-drop-gone
+  description: DROP INDEX ix_gone_n in the named graph
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_dur_2795; DROP INDEX ix_gone_n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+- name: sigkill-restart-1
+  description: SIGKILL (no checkpoint, so no shutdown save of the catalog) then restart
+  type: bash
+  command: |
+    set -e
+    pkill -9 -f "serve .*--data-dir ${GEODE_DATA_DIR}"
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - crash
+  - restart
+- name: default-show-after-crash
+  description: 'default graph: ix_keep is still there, the dropped ix_gone and ft_gone did not come back'
+  args:
+  - query
+  - '-'
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_keep"'
+    stdout_not_contains:
+    - ix_gone
+    - ft_gone
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - key
+- name: named-show-after-crash
+  description: 'named graph: ix_keep_n is still there, ix_gone_n did not come back'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_dur_2795; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_keep_n"'
+    stdout_not_contains:
+    - ix_gone_n
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - key
+- name: fts-search-after-crash
+  description: the dropped fulltext index is not resolvable (it was not re-armed by the catalog)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('ft_gone', 'anything')
+  expect:
+    exit_code: 1
+    stdout_regex:
+    - '"status_class":"(?!00000)'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+- name: default-recreate-gone
+  description: re-creating ix_gone succeeds (a resurrected row would be 42P07)
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX ix_gone FOR (n:Item) ON (n.v)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - 42P07
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - key
+- name: named-recreate-gone
+  description: re-creating ix_gone_n in the named graph succeeds
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_dur_2795; CREATE INDEX ix_gone_n FOR (n:Item) ON (n.v)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - key
+- name: default-drop-gone-again
+  description: drop the re-created ix_gone
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX ix_gone
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+- name: named-drop-gone-again
+  description: drop the re-created ix_gone_n
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_dur_2795; DROP INDEX ix_gone_n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+- name: sigkill-restart-2
+  description: SIGKILL again
+  type: bash
+  command: |
+    set -e
+    pkill -9 -f "serve .*--data-dir ${GEODE_DATA_DIR}"
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - crash
+  - restart
+- name: default-show-after-crash-2
+  description: still gone after the second crash
+  args:
+  - query
+  - '-'
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_keep"'
+    stdout_not_contains:
+    - ix_gone
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - key
+- name: named-show-after-crash-2
+  description: still gone in the named graph after the second crash
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_dur_2795; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_keep_n"'
+    stdout_not_contains:
+    - ix_gone_n
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - key
+- name: drop-races-readers-smoke
+  description: 'DROP INDEX / CREATE INDEX loop racing SHOW INDEXES readers and node writes from other connections: no crash, no hang (the drop took no catalog lock)'
+  type: bash
+  command: |
+    set -u
+    G="${GEODE_BINARY:-geode}"
+    Q() { "$G" query "$1" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "${GEODE_ADMIN_PASSWORD}" >/dev/null 2>&1; }
+    ( for i in $(seq 1 15); do Q "CREATE INDEX ix_race FOR (n:Race) ON (n.k)"; Q "DROP INDEX IF EXISTS ix_race"; done ) &
+    P1=$!
+    ( for i in $(seq 1 30); do Q "SHOW INDEXES"; done ) &
+    P2=$!
+    ( for i in $(seq 1 30); do Q "CREATE (:Race {k: $i})"; done ) &
+    P3=$!
+    wait $P1 $P2 $P3
+    Q "DROP INDEX IF EXISTS ix_race"
+    "$G" query "SHOW INDEXES" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "${GEODE_ADMIN_PASSWORD}" | grep -c ix_keep
+    echo RACE_DONE
+  timeout_ms: 240000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - RACE_DONE
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - race
+- name: alive-after-race
+  description: server alive; ix_race is not left in the catalog; ix_keep intact
+  args:
+  - query
+  - '-'
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_keep"'
+    stdout_not_contains:
+    - ix_race
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - race
+- name: teardown-graph
+  description: Drop the named graph
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH g_dur_2795
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny2795
+  - durability
+  - teardown

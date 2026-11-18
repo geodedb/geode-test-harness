@@ -1,0 +1,89 @@
+version: '1.0'
+name: geode query refuses an implicit unverified TLS connection in a release build (SONNY-6453)
+description: |
+  SONNY-6453 item 4: one rule for a CLI connection with no trust material (no
+  --ca-cert, no client certificate, no --insecure-tls-skip-verify). `geode
+  auth` already refused it under production posture (a release build, or
+  GEODE_ENV=production); `geode query`, `geode shell` and the REPL connected
+  unverified anyway with only a warning.
+
+  Black-box proof against a real server whose certificate is signed by the
+  harness CA, with the shipped (ReleaseSafe) binary:
+    * `geode query --server ADDR` with no trust material is refused before any
+      packet is sent: exit 1, "refusing to connect without TLS certificate
+      verification", error ImplicitInsecureTlsRefused; the query is not run.
+    * (`geode shell` and the REPL are interactive only - `geode shell` refuses
+      non-interactive stdin - so their share of the rule is covered in-process.)
+    * `--insecure-tls-skip-verify` is refused too under production posture.
+    * Control: the same query with `--ca-cert <harness CA>` runs and returns 1.
+
+  CANARY: REQ=REQ-SEC-CLI-NO-CA-DEFAULT-001; FEATURE="InsecureTlsFlagGate"; ASPECT=ImplicitNoCaDefault; STATUS=TESTED; OWNER=security; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: query_without_trust_material_is_refused_and_does_not_run
+  type: bash
+  timeout_ms: 60000
+  command: |
+    out=$("${GEODE_BINARY}" query --server "${GEODE_SERVER_ADDRESS}" -U geode -P "${GEODE_ADMIN_PASSWORD}" "RETURN 1 AS x" 2>&1); rc=$?
+    echo "rc=${rc}"
+    echo "${out}"
+    [ "${rc}" = 1 ] || exit 1
+    echo "${out}" | grep -q "refusing to connect without TLS certificate verification" || exit 1
+    echo "${out}" | grep -q "ImplicitInsecureTlsRefused" || exit 1
+    echo "${out}" | grep -q '"x":1' && exit 1
+    echo refused_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - refused_ok
+  tags: [cli, tls, sonny-6453]
+
+- name: skip_verify_flag_is_refused_under_production_posture
+  type: bash
+  timeout_ms: 60000
+  command: |
+    out=$("${GEODE_BINARY}" query --server "${GEODE_SERVER_ADDRESS}" --insecure-tls-skip-verify -U geode -P "${GEODE_ADMIN_PASSWORD}" "RETURN 1 AS x" 2>&1); rc=$?
+    echo "rc=${rc} ${out:0:200}"
+    [ "${rc}" = 1 ] || exit 1
+    echo "${out}" | grep -q "refusing --insecure-tls-skip-verify" || exit 1
+    echo skip_verify_refused_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - skip_verify_refused_ok
+  tags: [cli, tls, sonny-6453]
+
+- name: control_with_ca_cert_runs
+  type: bash
+  timeout_ms: 60000
+  command: |
+    out=$("${GEODE_BINARY}" query --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "${GEODE_ADMIN_PASSWORD}" "RETURN 1 AS x" 2>&1); rc=$?
+    [ "${rc}" = 0 ] || { echo "rc=${rc} ${out}"; exit 1; }
+    echo "${out}" | grep -q '"x":1' || exit 1
+    echo control_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - control_ok
+  tags: [cli, tls, sonny-6453, control]

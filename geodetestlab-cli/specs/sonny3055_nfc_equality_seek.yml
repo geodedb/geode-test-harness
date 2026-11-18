@@ -1,0 +1,177 @@
+# SONNY-3055: = NFC-normalizes non-ASCII strings, but the planned WHERE seek hashed the raw
+# bytes, so WHERE n.s = 'é' (precomposed U+00E9) could miss a stored decomposed 'é'
+# (U+0065 U+0301) that = treats as equal, or the reverse: seek and filter disagreed and rows
+# went missing. Fixed by normalising the key to NFC when building and probing (ISO/IEC 39075:2024
+# 22.? character string comparison is on the normalised form; the related ordering fixes are
+# SONNY-6489 / 6499).
+#
+# The fixture stores three nodes: s = U+0065 U+0301 (decomposed, NFD), s = U+00E9
+# (precomposed, NFC) and s = 'e' (a control that must never match). The two accented spellings
+# are written with their literal code points in this file.
+
+version: '1.0'
+name: 'SONNY-3055: the planned WHERE seek agrees with = on NFC/NFD-equal strings'
+description: A string property seek, an indexed seek, an inline-map seek, IN and ORDER BY treat NFC and NFD forms of the same text as equal
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: seed
+  description: NFD, NFC and plain-e nodes
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:NfcN {i: 1, s: 'é'}), (:NfcN {i: 2, s: 'é'}), (:NfcN {i: 3, s: 'e'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3055
+  - setup
+- name: literals-are-distinct-bytes-but-equal
+  description: the two literals differ in bytes yet = answers true (equality is NFC-normalised)
+  args:
+  - query
+  - '-'
+  stdin: RETURN 'é' = 'é' AS eq
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"eq":true}]'
+  tags:
+  - sonny-3055
+- name: scan-nfc-probe-finds-both
+  description: (no index) WHERE s = NFC finds the NFC and the NFD node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NfcN) WHERE n.s = 'é' RETURN n.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1},{"i":2}]'
+  tags:
+  - sonny-3055
+- name: create-index
+  description: an index over the string property
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX nfc_n_s FOR (n:NfcN) ON (n.s)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-3055
+  - setup
+- name: indexed-nfc-probe-finds-both
+  description: (indexed) WHERE s = NFC finds both spellings, matching the = filter
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NfcN) WHERE n.s = 'é' RETURN n.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1},{"i":2}]'
+  tags:
+  - sonny-3055
+- name: indexed-nfd-probe-finds-both
+  description: (indexed) WHERE s = NFD finds both spellings (was the reverse miss)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NfcN) WHERE n.s = 'é' RETURN n.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1},{"i":2}]'
+  tags:
+  - sonny-3055
+- name: inline-map-seek-nfd-probe
+  description: 'an inline property map {s: NFD} seeks the same rows'
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:NfcN {s: 'é'}) RETURN n.i AS i ORDER BY i"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1},{"i":2}]'
+  tags:
+  - sonny-3055
+- name: in-list-nfc-probe
+  description: s IN [NFC] agrees
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NfcN) WHERE n.s IN ['é'] RETURN n.i AS i ORDER BY i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":1},{"i":2}]'
+  tags:
+  - sonny-3055
+- name: control-plain-e-excluded
+  description: the plain 'e' node is never returned for an accented probe
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NfcN) WHERE n.s = 'é' RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":2}]'
+  tags:
+  - sonny-3055
+- name: plain-e-probe-finds-only-plain-e
+  description: WHERE s = 'e' returns only node 3
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NfcN) WHERE n.s = 'e' RETURN n.i AS i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":3}]'
+  tags:
+  - sonny-3055
+- name: order-by-groups-equal-forms
+  description: ORDER BY puts the plain e first and treats the two accented forms as equal (ties by i)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:NfcN) RETURN n.i AS i ORDER BY n.s, n.i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":3},{"i":1},{"i":2}]'
+  tags:
+  - sonny-3055
+  - sonny-6489

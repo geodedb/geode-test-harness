@@ -1,0 +1,119 @@
+version: '1.0'
+name: SONNY-6345 offline auth CLI data dir and vacuous verify
+description: |
+  SONNY-6345 items 1 and 2 (item 3, GRANT of a missing user, is in
+  sonny1333_show_grants_and_permissions_gate.yml):
+
+  1. `geode auth verify|init|reseal` and the user/role CLI defaulted to
+     GEODE_DATA_DIR else ./data (later /var/lib/geode), NOT the server's
+     resolved per-user default directory, so they inspected a different store
+     than the server uses. Fixed: with no --data-dir and no GEODE_DATA_DIR
+     they use the server's default (<HOME>/.local/state/geode when HOME is set
+     and XDG_STATE_HOME is not).
+  2. `geode auth verify` on a directory with no security graph CREATED
+     __geode_security and reported "0 records, integrity OK" with exit 0.
+     Fixed: it creates nothing, exits non-zero and says there is "no auth
+     state"; a data dir that does not exist is not created either.
+
+  All offline against throwaway directories under GEODE_STATE_DIR with a
+  scratch HOME; no server interaction (the server block only satisfies the
+  harness lifecycle).
+
+  Engine regression: test-sonny6345-auth-cli-and-grant.
+
+  CANARY: REQ=REQ-SONNY-6345-AUTH-CLI; FEATURE="AuthCLI"; ASPECT=DefaultDataDirAndVacuousVerify; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [auth, cli, offline, sonny-6345]
+tests:
+
+- name: s6345_verify_empty_dir_refuses_and_creates_nothing
+  type: bash
+  command: |
+    set -u
+    B="${GEODE_BINARY:-geode}"
+    ROOT="${GEODE_STATE_DIR:-/tmp}/s6345-empty"
+    rm -rf "$ROOT" && mkdir -p "$ROOT/home" "$ROOT/empty"
+    OUT=$(env -u GEODE_DATA_DIR HOME="$ROOT/home" "$B" auth verify --data-dir "$ROOT/empty" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] || { echo "verify exited 0 on an empty dir:"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "no auth state" || { echo "missing 'no auth state':"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "integrity OK" && { echo "vacuous 'integrity OK'"; exit 1; }
+    [ -z "$(ls -A "$ROOT/empty")" ] || { echo "verify created state in the dir:"; ls -la "$ROOT/empty"; exit 1; }
+    echo "vacuous_verify_refused=ok"
+  timeout_ms: 60000
+  expect:
+    exit_code: 0
+    stdout_contains: [vacuous_verify_refused=ok]
+  tags: [auth, cli, sonny-6345]
+
+- name: s6345_verify_missing_dir_not_created
+  type: bash
+  command: |
+    set -u
+    B="${GEODE_BINARY:-geode}"
+    ROOT="${GEODE_STATE_DIR:-/tmp}/s6345-missing"
+    rm -rf "$ROOT" && mkdir -p "$ROOT/home"
+    OUT=$(env -u GEODE_DATA_DIR HOME="$ROOT/home" "$B" auth verify --data-dir "$ROOT/home/not-there" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] || { echo "verify exited 0 on a missing dir"; exit 1; }
+    echo "$OUT" | grep -q "no auth state" || { echo "missing 'no auth state':"; echo "$OUT"; exit 1; }
+    [ ! -e "$ROOT/home/not-there" ] || { echo "verify created the missing dir"; exit 1; }
+    echo "missing_dir_untouched=ok"
+  timeout_ms: 60000
+  expect:
+    exit_code: 0
+    stdout_contains: [missing_dir_untouched=ok]
+  tags: [auth, cli, sonny-6345]
+
+- name: s6345_default_data_dir_is_the_servers
+  description: With no --data-dir and no GEODE_DATA_DIR the CLI resolves the server's per-user default directory (names it, creates nothing on verify), init bootstraps there, verify then finds it.
+  type: bash
+  command: |
+    set -u
+    B="${GEODE_BINARY:-geode}"
+    ROOT="${GEODE_STATE_DIR:-/tmp}/s6345-default"
+    rm -rf "$ROOT" && mkdir -p "$ROOT/home"
+    DEF="$ROOT/home/.local/state/geode"
+    run() { env -u GEODE_DATA_DIR -u XDG_STATE_HOME HOME="$ROOT/home" "$@"; }
+    OUT=$(run "$B" auth verify 2>&1); RC=$?
+    [ "$RC" -ne 0 ] || { echo "verify exited 0 with nothing there"; exit 1; }
+    echo "$OUT" | grep -qF "$DEF" || { echo "refusal does not name the server default $DEF:"; echo "$OUT"; exit 1; }
+    [ ! -e "$DEF" ] || { echo "verify created the default dir"; exit 1; }
+    OUT=$(run env GEODE_ADMIN_PASSWORD='Correct Horse Battery Staple' "$B" auth init 2>&1); RC=$?
+    [ "$RC" -eq 0 ] || { echo "init rc=$RC"; echo "$OUT"; exit 1; }
+    [ -d "$DEF" ] || { echo "init did not bootstrap into $DEF"; ls -laR "$ROOT/home"; exit 1; }
+    OUT=$(run "$B" auth verify 2>&1); RC=$?
+    [ "$RC" -eq 0 ] || { echo "verify rc=$RC"; echo "$OUT"; exit 1; }
+    echo "$OUT" | grep -q "integrity OK" || { echo "no 'integrity OK':"; echo "$OUT"; exit 1; }
+    echo "default_dir=ok"
+  timeout_ms: 90000
+  expect:
+    exit_code: 0
+    stdout_contains: [default_dir=ok]
+  tags: [auth, cli, sonny-6345]

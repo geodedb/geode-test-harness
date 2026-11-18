@@ -1,0 +1,369 @@
+version: '1.0'
+name: 'SONNY-6425: a WHERE / FILTER / HAVING keeps a row only when the condition is True'
+description: |
+  Ticket: SONNY-6425 (item 1; the other items are in-process or cluster-only, see the
+  coverage file).
+  Every single-node WHERE / FILTER / HAVING site took a non-zero integer as true. ISO/IEC
+  39075:2024 19.1 GR2 and 16.13 GR2b keep a row only when the search condition is True, so
+  a condition that evaluates to the integer 1 (or a string) keeps no row, and a write behind
+  it (MATCH ... WHERE n.a SET ...) writes nothing.
+  Fixture: W nodes (k 1, a 1, z 0, s 'x') -R {w: 1}-> (k 2, a 2, z 0, s 'y').
+  Proves on an admin session and a row-level-security session (bob): the twelve
+  non-boolean conditions (WHERE, FILTER, WITH ... WHERE, relationship WHERE, comma
+  pattern, HAVING) return no row (count 0), the boolean controls still return their rows,
+  and WHERE n.a SET n.t = 1 changes nothing.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s6425-create-user-bob
+  description: 'bob: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER bob SET PASSWORD 'Bob Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created bob]
+  tags: [s6425, setup]
+
+- name: s6425-seed
+  description: Seed the W nodes.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:W {k: 1, a: 1, z: 0, s: 'x'})-[:R {w: 1}]->(:W {k: 2, a: 2, z: 0, s: 'y'})
+  expect:
+    exit_code: 0
+  tags: [s6425, setup]
+
+- name: s6425-deny
+  description: Deny bob an unrelated label so his session is a row-level-security session.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('default', 'Hidden', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [deny policy added]
+  tags: [s6425, setup]
+
+- name: s6425-where-prop-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.a RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.a RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-prop-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.a RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WHERE n.a RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-count-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.a RETURN count(n) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.a RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":0}]']
+  tags: [s6425]
+
+- name: s6425-where-count-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.a RETURN count(n) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WHERE n.a RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":0}]']
+  tags: [s6425]
+
+- name: s6425-where-order-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.a RETURN n.k AS k ORDER BY k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.a RETURN n.k AS k ORDER BY k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-order-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.a RETURN n.k AS k ORDER BY k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WHERE n.a RETURN n.k AS k ORDER BY k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-limit-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.a RETURN n.k AS k LIMIT 5'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.a RETURN n.k AS k LIMIT 5]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-limit-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.a RETURN n.k AS k LIMIT 5'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WHERE n.a RETURN n.k AS k LIMIT 5]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-propmap-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W {k: 1}) WHERE n.a RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (n:W {k: 1}) WHERE n.a RETURN n.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-propmap-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W {k: 1}) WHERE n.a RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (n:W {k: 1}) WHERE n.a RETURN n.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-string-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.s RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.s RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-where-string-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W) WHERE n.s RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WHERE n.s RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-filter-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W) FILTER n.a RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) FILTER n.a RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-filter-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W) FILTER n.a RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) FILTER n.a RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-rel-where-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W)-[r:R]->(m:W) WHERE r.w RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (n:W)-[r:R]->(m:W) WHERE r.w RETURN n.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-rel-where-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W)-[r:R]->(m:W) WHERE r.w RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (n:W)-[r:R]->(m:W) WHERE r.w RETURN n.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-hop-where-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W)-[r:R]->(m:W) WHERE n.a RETURN m.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (n:W)-[r:R]->(m:W) WHERE n.a RETURN m.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-hop-where-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W)-[r:R]->(m:W) WHERE n.a RETURN m.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (n:W)-[r:R]->(m:W) WHERE n.a RETURN m.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-comma-where-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W), (m:W) WHERE n.a RETURN n.k AS nk, m.k AS mk'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (n:W), (m:W) WHERE n.a RETURN n.k AS nk, m.k AS mk']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-comma-where-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W), (m:W) WHERE n.a RETURN n.k AS nk, m.k AS mk'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (n:W), (m:W) WHERE n.a RETURN n.k AS nk, m.k AS mk']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-with-where-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W) WITH n WHERE n.a RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WITH n WHERE n.a RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-with-where-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W) WITH n WHERE n.a RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WITH n WHERE n.a RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-having-admin
+  description: 'SONNY-6425 [admin]: a non-boolean search condition keeps no row: MATCH (n:W) RETURN n.k AS k, count(*) AS c GROUP BY n.k HAVING c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (n:W) RETURN n.k AS k, count(*) AS c GROUP BY n.k HAVING c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-having-bob
+  description: 'SONNY-6425 [bob]: a non-boolean search condition keeps no row: MATCH (n:W) RETURN n.k AS k, count(*) AS c GROUP BY n.k HAVING c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (n:W) RETURN n.k AS k, count(*) AS c GROUP BY n.k HAVING c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]
+
+- name: s6425-ctl-eq-admin
+  description: 'SONNY-6425 control [admin]: a boolean condition still keeps its rows: MATCH (n:W) WHERE n.a = 1 RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.a = 1 RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":1}]']
+  tags: [s6425]
+
+- name: s6425-ctl-eq-bob
+  description: 'SONNY-6425 control [bob]: a boolean condition still keeps its rows: MATCH (n:W) WHERE n.a = 1 RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WHERE n.a = 1 RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":1}]']
+  tags: [s6425]
+
+- name: s6425-ctl-gt-admin
+  description: 'SONNY-6425 control [admin]: a boolean condition still keeps its rows: MATCH (n:W) WHERE n.a > 0 RETURN n.k AS k ORDER BY k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.a > 0 RETURN n.k AS k ORDER BY k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":1},{"k":2}]']
+  tags: [s6425]
+
+- name: s6425-ctl-gt-bob
+  description: 'SONNY-6425 control [bob]: a boolean condition still keeps its rows: MATCH (n:W) WHERE n.a > 0 RETURN n.k AS k ORDER BY k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WHERE n.a > 0 RETURN n.k AS k ORDER BY k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":1},{"k":2}]']
+  tags: [s6425]
+
+- name: s6425-ctl-filter-admin
+  description: 'SONNY-6425 control [admin]: a boolean condition still keeps its rows: MATCH (n:W) FILTER n.a = 2 RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) FILTER n.a = 2 RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":2}]']
+  tags: [s6425]
+
+- name: s6425-ctl-filter-bob
+  description: 'SONNY-6425 control [bob]: a boolean condition still keeps its rows: MATCH (n:W) FILTER n.a = 2 RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) FILTER n.a = 2 RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":2}]']
+  tags: [s6425]
+
+- name: s6425-ctl-rel-admin
+  description: 'SONNY-6425 control [admin]: a boolean condition still keeps its rows: MATCH (n:W)-[r:R]->(m:W) WHERE r.w = 1 RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (n:W)-[r:R]->(m:W) WHERE r.w = 1 RETURN n.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":1}]']
+  tags: [s6425]
+
+- name: s6425-ctl-rel-bob
+  description: 'SONNY-6425 control [bob]: a boolean condition still keeps its rows: MATCH (n:W)-[r:R]->(m:W) WHERE r.w = 1 RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (n:W)-[r:R]->(m:W) WHERE r.w = 1 RETURN n.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":1}]']
+  tags: [s6425]
+
+- name: s6425-ctl-having-admin
+  description: 'SONNY-6425 control [admin]: a boolean condition still keeps its rows: MATCH (n:W) RETURN n.k AS k, count(*) AS c GROUP BY n.k HAVING c = 1 ORDER BY k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (n:W) RETURN n.k AS k, count(*) AS c GROUP BY n.k HAVING c = 1 ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":1,"c":1},{"k":2,"c":1}]']
+  tags: [s6425]
+
+- name: s6425-ctl-having-bob
+  description: 'SONNY-6425 control [bob]: a boolean condition still keeps its rows: MATCH (n:W) RETURN n.k AS k, count(*) AS c GROUP BY n.k HAVING c = 1 ORDER BY k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (n:W) RETURN n.k AS k, count(*) AS c GROUP BY n.k HAVING c = 1 ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":1,"c":1},{"k":2,"c":1}]']
+  tags: [s6425]
+
+- name: s6425-ctl-bool-admin
+  description: 'SONNY-6425 control [admin]: a boolean condition still keeps its rows: MATCH (n:W) WHERE n.a > 0 AND n.z = 0 RETURN count(n) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.a > 0 AND n.z = 0 RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":2}]']
+  tags: [s6425]
+
+- name: s6425-ctl-bool-bob
+  description: 'SONNY-6425 control [bob]: a boolean condition still keeps its rows: MATCH (n:W) WHERE n.a > 0 AND n.z = 0 RETURN count(n) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (n:W) WHERE n.a > 0 AND n.z = 0 RETURN count(n) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":2}]']
+  tags: [s6425]
+
+- name: s6425-set-nonbool
+  description: A write behind a non-boolean WHERE writes nothing.
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.a SET n.t = 1]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s6425]
+
+- name: s6425-set-nonbool-verify
+  description: No row was written by the non-boolean WHERE ... SET.
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:W) WHERE n.t = 1 RETURN n.k AS k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s6425]

@@ -9,9 +9,11 @@ from __future__ import annotations
 import logging
 import os
 import re
+import secrets
 import shlex
 import signal as _signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -184,7 +186,7 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
         password = flags.get("--password", "")
         role = flags.get("--role", "user")
         if "--generate-password" in flags:
-            password = "auto_generated_password_placeholder"
+            password = _generated_passphrase()
         return f"CALL geode.auth.user_create('{esc(username)}', '{esc(password)}', '{esc(email)}', '{esc(role)}')"
     elif subcmd == "user" and action == "import":
         # Migration import of a PRE-COMPUTED password hash (no plaintext).
@@ -221,13 +223,13 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
         old_pw = flags.get("--old-password", "")
         new_pw = flags.get("--new-password", "")
         if "--generate-password" in flags:
-            new_pw = "auto_generated_password_placeholder"
+            new_pw = _generated_passphrase()
         return f"CALL geode.auth.user_change_password('{esc(username)}', '{esc(old_pw)}', '{esc(new_pw)}')"
     elif subcmd == "user" and action == "reset-password":
         username = positionals[0] if positionals else ""
         new_pw = flags.get("--new-password", "")
         if "--generate-password" in flags:
-            new_pw = "auto_generated_password_placeholder"
+            new_pw = _generated_passphrase()
         return f"CALL geode.auth.user_reset_password('{esc(username)}', '{esc(new_pw)}')"
     elif subcmd == "user" and action == "mfa":
         # Nested: user mfa enable/disable <username> [--code <code>]
@@ -396,6 +398,23 @@ def _resolve_server_address(env: dict[str, str]) -> tuple[str, bool]:
     return server_addr, use_grpc
 
 
+_PASSPHRASE_WORDS = (
+    "amber", "basalt", "cedar", "dune", "ember", "fjord", "garnet", "harbor",
+    "iris", "juniper", "kelp", "lagoon", "marble", "nimbus", "onyx", "prairie",
+)  # fmt: skip
+
+
+def _generated_passphrase() -> str:
+    """A fresh random passphrase that satisfies geode's password policy.
+
+    Stands in for the password `--generate-password` makes the CLI generate when
+    a user command is sent to the server as a CALL. Random per call, never a fixed
+    value; 5 words + 2 digits (20+ characters, 3+ words, upper and lower case).
+    """
+    words = [secrets.choice(_PASSPHRASE_WORDS) for _ in range(5)]
+    return f"{words[0].capitalize()} {' '.join(words[1:])} {secrets.randbelow(100):02d}"
+
+
 def _is_remote_admin_command(args: list[str]) -> bool:
     """Return True for CLI commands that execute against the live server."""
     if not args:
@@ -404,7 +423,38 @@ def _is_remote_admin_command(args: list[str]) -> bool:
     if args[0] == "backup" and len(args) > 1 and args[1] == "create":
         return True
 
-    return args[0] in {"restore", "migrate"}
+    if args[0] == "migrate":
+        # Only `migrate run|up` talk to a server; status, create and sign work on
+        # the migrations directory and reject --server/--user/--password.
+        return len(args) > 1 and args[1] in {"run", "up"}
+
+    if args[0] == "restore":
+        # `restore <backup_file> --data-dir <dir>` is offline and refuses --server;
+        # only `restore --server ...` (no backup file) asks a server to restore.
+        return len(args) == 1 or args[1].startswith("-")
+
+    if args[0] == "fle":
+        # migrate-encrypt runs in the server (SONNY-6688); the other fle subcommands
+        # work on the local data directory.
+        # Only once its three positionals (tenant, schema, field) are present: with fewer
+        # the CLI answers "migrate-encrypt requires ...", and appended --server/-U flags
+        # would be read as the missing positionals.
+        if len(args) > 1 and args[1] == "migrate-encrypt":
+            positionals = [a for a in args[2:] if not a.startswith("-")]
+            return len(positionals) >= 3
+        return False
+
+    return False
+
+
+# Local commands whose argument parser has no --data-dir option (geode rejects it).
+_NO_DATA_DIR_COMMANDS = {"session", "authn"}
+_NO_DATA_DIR_SUBCOMMANDS = {("auth", "validate"), ("auth", "logout")}
+
+
+def _accepts_data_dir(args: list[str]) -> bool:
+    """False for local subcommands that reject --data-dir."""
+    return bool(args) and args[0] not in _NO_DATA_DIR_COMMANDS and tuple(args[:2]) not in _NO_DATA_DIR_SUBCOMMANDS
 
 
 def _convert_grpc_auth_login_probe(binary: str, args: list[str], server_addr: str, timeout_ms: int) -> list[str] | None:
@@ -553,9 +603,9 @@ def _build_cli_command(
         if "query" in command_str and "-U" not in command_str and "-P" not in command_str:
             command_str = command_str.strip()
             if command_str.endswith(" -"):
-                command_str = command_str[:-2] + f" -U geode -P {admin_password} -"
+                command_str = command_str[:-2] + f" -U geode -P {shlex.quote(admin_password)} -"
             else:
-                command_str += f" -U geode -P {admin_password}"
+                command_str += f" -U geode -P {shlex.quote(admin_password)}"
 
         if "query" in command_str and "--timeout" not in command_str:
             cli_timeout = max(timeout_ms // 1000, 30)
@@ -664,7 +714,7 @@ def _build_cli_command(
                 if "--insecure-tls-skip-verify" not in cmd and "--insecure" not in cmd and "--ca-cert" not in cmd:
                     env["GEODE_ALLOW_INSECURE_TLS"] = "1"
                     cmd.append("--insecure-tls-skip-verify")
-            elif "--data-dir" not in args and data_dir:
+            elif "--data-dir" not in args and data_dir and _accepts_data_dir(args):
                 cmd.extend(["--data-dir", str(data_dir)])
         elif args and _is_remote_admin_command(args):
             if use_grpc:
@@ -759,6 +809,10 @@ def _execute_and_check(
     """Execute the command and check expectations."""
     test_env = env.copy()
     test_env.update(test_case.env)
+    # `geode fle grant-plaintext|show-*` work on the data directory and read it from
+    # GEODE_DATA_DIR (SONNY-6274); the managed server's directory is the one under test.
+    if data_dir and len(cmd) > 2 and cmd[1] == "fle" and cmd[2] != "migrate-encrypt":
+        test_env.setdefault("GEODE_DATA_DIR", str(data_dir))
     # Expose the reconciled client-TLS posture to bash/command steps so specs can
     # connect to the provisioned server without hardcoding --insecure (which a
     # release binary refuses). Resolves to "--ca-cert <ca>" when a CA was
@@ -1112,6 +1166,11 @@ def _run_shell_test(
     # a CA was provisioned (release-safe), else "--insecure-tls-skip-verify".
     # Specs reference $GEODE_CLIENT_TLS instead of hardcoding the insecure flag.
     test_env.setdefault("GEODE_CLIENT_TLS", " ".join(client_tls_args(test_env)))
+    # The interpreter running the harness (its venv carries grpcio/protobuf), so
+    # bash steps that speak a wire protocol directly (raw gRPC probes) need not
+    # guess which python3 has the libraries. Specs fall back to python3.
+    test_env.setdefault("GEODETESTLAB_PYTHON", sys.executable)
+    test_env.setdefault("GEODE_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD)
     test_env.update(test_case.env)
 
     # Honor per-test timeout_ms if it exceeds the default shell timeout. Long-
@@ -1220,11 +1279,15 @@ def _run_signal_step(step: TestStep, cluster_ctx: ClusterControlContext | None) 
         return False, f"signal step: node {step.target} has no process (already stopped?)"
 
     pid = node.process.pid
+    if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        return False, f"signal step: node {step.target} has no real process id ({pid!r})"
     try:
-        pgid = os.getpgid(pid)
-        from .server import _safe_killpg
+        from .server import signal_process_group
 
-        _safe_killpg(pgid, sig)
+        # The node leads its own group (start_new_session): signal the group.
+        # Otherwise signal the node process alone, never a shared group.
+        if not signal_process_group(pid, sig):
+            os.kill(pid, sig)
     except ProcessLookupError:
         # The process is already gone. SIGKILL/SIGTERM on a dead node is a
         # benign no-op; treat it as success. SIGSTOP/SIGCONT cannot apply.
@@ -1330,6 +1393,68 @@ def _run_sequential_test(
                             error="\n".join(errors),
                         )
                     outputs.append(f"Step {i + 1}: restart_node — {message}")
+
+                elif step.step_type == "bash":
+                    # Run a shell command against the live (cluster) servers.
+                    # Same environment as a shell test: GEODE_BINARY, the
+                    # reconciled client-TLS flags and, in cluster mode,
+                    # GEODE_CLUSTER_PORTS / GEODE_CLUSTER_SIZE. The step fails
+                    # on a non-zero exit or an unmet stdout_contains.
+                    if not step.command:
+                        errors.append(f"Step {i + 1} failed: bash step missing 'command'")
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs),
+                            error="\n".join(errors),
+                        )
+                    bash_env = env.copy()
+                    bash_env["GEODE_BINARY"] = str(binary)
+                    # Cluster runs do not export the admin password into the shared env; a
+                    # bash step's client calls need it, as in a shell test.
+                    bash_env.setdefault("GEODE_ADMIN_PASSWORD", admin_password)
+                    bin_dir = os.path.dirname(os.path.abspath(str(binary)))
+                    if bin_dir:
+                        bash_env["PATH"] = bin_dir + os.pathsep + bash_env.get("PATH", os.environ.get("PATH", ""))
+                    bash_env.setdefault("GEODE_CLIENT_TLS", " ".join(client_tls_args(bash_env)))
+                    try:
+                        bash_result = subprocess.run(
+                            ["bash", "-c", step.command],
+                            env=bash_env,
+                            capture_output=True,
+                            text=True,
+                            timeout=max(step.timeout_ms, 1) / 1000.0,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        errors.append(
+                            f"Step {i + 1} failed: bash step timed out after {step.timeout_ms}ms"
+                            + timeout_output_excerpt(exc)
+                        )
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs),
+                            error="\n".join(errors),
+                        )
+                    bash_failure = ""
+                    if bash_result.returncode != 0:
+                        bash_failure = f"exit code {bash_result.returncode}"
+                    if step.gql_expected and not bash_failure:
+                        for needle in _as_list(step.gql_expected.get("stdout_contains")):
+                            if needle not in bash_result.stdout:
+                                bash_failure = f"stdout missing {needle!r}"
+                    if bash_failure and not step.allow_failure:
+                        errors.append(f"Step {i + 1} failed: bash {bash_failure}")
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs) + "\n" + bash_result.stdout + bash_result.stderr[-2000:],
+                            error="\n".join(errors),
+                        )
+                    outputs.append(f"Step {i + 1}: bash OK :: {bash_result.stdout.strip()[-300:]}")
 
                 elif step.step_type == "http":
                     # Execute HTTP step
@@ -1470,6 +1595,16 @@ def _run_sequential_test(
 
                     suffix = " (allow_failure)" if step_failed else ""
                     outputs.append(f"Step {i + 1}: GQL OK{suffix} :: {result.stdout.strip()[:160]}")
+
+                else:
+                    errors.append(f"Step {i + 1} failed: unknown step type {step.step_type!r}")
+                    return TestResult(
+                        name=test_case.name,
+                        passed=False,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        output="\n".join(outputs),
+                        error="\n".join(errors),
+                    )
 
         finally:
             if _owned_seq:

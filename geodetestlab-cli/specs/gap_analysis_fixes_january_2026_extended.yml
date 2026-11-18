@@ -3,13 +3,13 @@ name: Gap Analysis Fixes Extended Tests (January 2026)
 description: 'Tests for GAP-0020 through GAP-0025 implementations: constraints, PITR, multi-tenancy, FLE rewriting, TDE page storage'
 cli:
   binary: /usr/local/bin/geode
-  working_dir: null
+  working_dir:
   env:
     GEODE_LOG_LEVEL: info
   server:
     enabled: true
-    port: null
-    data_dir: null
+    port:
+    data_dir:
     startup_timeout_ms: 60000
     cleanup: true
     args:
@@ -55,7 +55,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: DROP CONSTRAINT unique_person_email IF EXISTS
+  stdin: DROP CONSTRAINT IF EXISTS unique_person_email
   expect:
     exit_code: 0
   tags:
@@ -67,7 +67,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums
+  stdin: WITH RECURSIVE nums AS (RETURN 1 AS n UNION ALL UNWIND nums AS prev WHERE prev.n < 5 RETURN prev.n + 1 AS n) RETURN nums
   expect:
     exit_code: 0
   tags:
@@ -91,7 +91,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: MATCH p = SHORTEST (a:Person)-[:KNOWS*]->(b:Person) WHERE a.name = 'Alice' AND b.name = 'Bob' RETURN length(p) AS distance
+  stdin: MATCH p = shortestPath((a:Person)-[:KNOWS*]->(b:Person)) WHERE a.name = 'Alice' AND b.name = 'Bob' RETURN length(p) AS distance
   expect:
     exit_code: 0
   tags:
@@ -115,8 +115,10 @@ tests:
   - query
   - '-'
   stdin: SESSION SET tenant_id = 'tenant_001'
+  # docs/GQL_COMPLIANCE.md: there is no SESSION SET tenant_id statement (SESSION SET GRAPH only); the tenant is bound by the authenticated principal. geode query exits 1 on a parse error.
   expect:
-    exit_code: 0
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
   tags:
   - multi-tenancy
   - session
@@ -126,7 +128,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: 'CREATE (n:TenantTest {tenant: ''default'', name: ''test_node''}) RETURN n.name AS name'
+  stdin: "CREATE (n:TenantTest {tenant: 'default', name: 'test_node'}) RETURN n.name AS name"
   expect:
     exit_code: 0
     stdout_contains:
@@ -140,7 +142,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: 'CREATE (n:SecureRecord {ssn: ''123-45-6789'', name: ''Test User''}) RETURN n.name AS name'
+  stdin: "CREATE (n:SecureRecord {ssn: '123-45-6789', name: 'Test User'}) RETURN n.name AS name"
   expect:
     exit_code: 0
     stdout_contains:
@@ -167,8 +169,10 @@ tests:
   - query
   - '-'
   stdin: CALL db.encryption.status()
+  # There is no db.encryption.status procedure; an unknown procedure is 42002 and geode query exits 1.
   expect:
-    exit_code: 0
+    exit_code: 1
+    stdout_contains: ['"status_class":"42002"', Unknown procedure]
   tags:
   - tde
   - encryption
@@ -178,7 +182,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: 'CREATE (n:StorageTest {id: 12345, data: ''encrypted_content''}) RETURN n.id AS id, n.data AS data'
+  stdin: "CREATE (n:StorageTest {id: 12345, data: 'encrypted_content'}) RETURN n.id AS id, n.data AS `data`"
   expect:
     exit_code: 0
     stdout_contains:
@@ -193,7 +197,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: MATCH (n:StorageTest) WHERE n.id = 12345 RETURN n.data AS data
+  stdin: MATCH (n:StorageTest) WHERE n.id = 12345 RETURN n.data AS `data`
   expect:
     exit_code: 0
     stdout_contains:
@@ -207,7 +211,7 @@ tests:
   args:
   - query
   - '-'
-  stdin: 'CREATE (n:ConstraintedNode {unique_id: ''int_test_001'', value: 100}) RETURN n.unique_id AS id'
+  stdin: "CREATE (n:ConstraintedNode {unique_id: 'int_test_001', value: 100}) RETURN n.unique_id AS id"
   expect:
     exit_code: 0
     stdout_contains:

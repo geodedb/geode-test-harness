@@ -1,0 +1,385 @@
+version: '1.0'
+name: 'SONNY-6492 crash loop: first query after SIGKILL restart is never corruption'
+description: |
+  SONNY-6492 (first query after a SIGKILL restart answered 58000 DataCorruption
+  in 2 of ~31 runs; the hydration live-count check raced writers),
+  SONNY-6597 (a healthy graph intermittently quarantined as 58000 DataCorruption
+  after a restart; hydration scan read pages a checkpoint was still writing, from
+  the older disk image), SONNY-6632 (flushAll did not wait for in-flight writes
+  before the checkpoint truncated the WAL; a re-dirtied frame flush could land
+  out of order) and SONNY-6473 (recovery replayed batched page images in log
+  order, not LSN order).
+
+  These are timing races, so the spec is a loop. Each of 4 cycles runs four
+  concurrent writer clients (each one acknowledged CREATE after another through
+  a real `geode query`) against a server whose persistence tick is 300 ms (so
+  checkpoints overlap the writers and, after the restart, the hydration), then
+  SIGKILLs the server in the middle of the writes (no shutdown), restarts it on
+  the same data dir and verifies, on the FIRST queries the restarted server
+  sees:
+    * none answers an error (no 58000 DataCorruption / GraphQuarantined),
+    * every write a client had been ACKNOWLEDGED before the kill is present
+      (acknowledged is a subset of present: a write in flight at the kill may or
+      may not be there, an acknowledged one must be), and
+    * labeled, unlabeled and property reads agree on the counts.
+  The assertion is deterministic on a correct binary; a racy binary fails some
+  cycle with a corruption answer or a lost acknowledged write.
+
+  CANARY: REQ=REQ-SONNY-6492-CRASH-LOOP; FEATURE="CrashRecovery"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny6492_crash_loop_first_query.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '300'
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+tests:
+- name: seed
+  description: A graph with committed data present before the first cycle.
+  query: 'UNWIND range(1, 51) AS i CREATE (:Seed6492 {i: i})'
+  expected:
+    exit_code: 0
+
+- name: cycle1-writers-then-sigkill
+  description: Four concurrent acknowledged writers, SIGKILL mid-writes, restart.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    ACK="${GEODE_DATA_DIR}.ack1"; rm -rf "$ACK"; mkdir -p "$ACK"
+    for w in 1 2 3 4; do
+      (
+        k=1
+        while true; do
+          if "${GEODE_BINARY:-geode}" query "CREATE (:Cv6492 {cycle: 1, w: $w, k: $k})" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+            echo "$k" >> "$ACK/w$w"
+          fi
+          k=$((k+1))
+        done
+      ) &
+    done
+    sleep 7
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    kill $(jobs -p) 2>/dev/null || true
+    wait 2>/dev/null || true
+    total=$(cat "$ACK"/w* 2>/dev/null | wc -l)
+    [ "$total" -gt 0 ] || { echo NO_ACKNOWLEDGED_WRITES; exit 1; }
+    echo "KILLED_MID_WRITES_ACKED_$total"
+  timeout_ms: 120000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILLED_MID_WRITES_ACKED_
+
+- name: cycle1-first-query-unlabeled-count
+  description: 'The first query after the restart: the unlabeled scan (it reads the engine directly) answers, no corruption.'
+  query: MATCH (n) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+
+- name: cycle1-labeled-seed-count
+  description: 'The label index agrees: the 50 seed nodes.'
+  query: MATCH (n:Seed6492) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":50'
+
+- name: cycle1-every-acknowledged-write-present
+  description: Every write acknowledged before the kill is present.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    export ACK="${GEODE_DATA_DIR}.ack1"
+    OUT=$("${GEODE_BINARY:-geode}" query "MATCH (n:Cv6492) WHERE n.cycle = 1 RETURN n.w AS w, n.k AS k" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --format json 2>&1) || { echo "$OUT" | head -c 600; echo FIRST_READ_FAILED; exit 1; }
+    printf '%s' "$OUT" | python3 -I -c '
+    import json, sys, os, glob
+    raw = sys.stdin.read()
+    doc = json.loads(raw[raw.index("{"):])
+    present = {(r["w"], r["k"]) for r in doc["rows"]}
+    ack = os.environ["ACK"]
+    missing = []
+    n = 0
+    for f in glob.glob(ack + "/w*"):
+        w = int(os.path.basename(f)[1:])
+        for line in open(f):
+            n += 1
+            if (w, int(line)) not in present:
+                missing.append((w, int(line)))
+    if missing:
+        print("LOST_ACKED_WRITES", len(missing), missing[:5]); sys.exit(1)
+    print("ACKED_%d_ALL_PRESENT_OF_%d" % (n, len(present)))
+    '
+    rm -rf "$ACK"
+  timeout_ms: 90000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - ALL_PRESENT_OF_
+
+- name: cycle2-writers-then-sigkill
+  description: Four concurrent acknowledged writers, SIGKILL mid-writes, restart.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    ACK="${GEODE_DATA_DIR}.ack2"; rm -rf "$ACK"; mkdir -p "$ACK"
+    for w in 1 2 3 4; do
+      (
+        k=1
+        while true; do
+          if "${GEODE_BINARY:-geode}" query "CREATE (:Cv6492 {cycle: 2, w: $w, k: $k})" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+            echo "$k" >> "$ACK/w$w"
+          fi
+          k=$((k+1))
+        done
+      ) &
+    done
+    sleep 7
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    kill $(jobs -p) 2>/dev/null || true
+    wait 2>/dev/null || true
+    total=$(cat "$ACK"/w* 2>/dev/null | wc -l)
+    [ "$total" -gt 0 ] || { echo NO_ACKNOWLEDGED_WRITES; exit 1; }
+    echo "KILLED_MID_WRITES_ACKED_$total"
+  timeout_ms: 120000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILLED_MID_WRITES_ACKED_
+
+- name: cycle2-first-query-unlabeled-count
+  description: 'The first query after the restart: the unlabeled scan (it reads the engine directly) answers, no corruption.'
+  query: MATCH (n) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+
+- name: cycle2-labeled-seed-count
+  description: 'The label index agrees: the 50 seed nodes.'
+  query: MATCH (n:Seed6492) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":50'
+
+- name: cycle2-every-acknowledged-write-present
+  description: Every write acknowledged before the kill is present.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    export ACK="${GEODE_DATA_DIR}.ack2"
+    OUT=$("${GEODE_BINARY:-geode}" query "MATCH (n:Cv6492) WHERE n.cycle = 2 RETURN n.w AS w, n.k AS k" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --format json 2>&1) || { echo "$OUT" | head -c 600; echo FIRST_READ_FAILED; exit 1; }
+    printf '%s' "$OUT" | python3 -I -c '
+    import json, sys, os, glob
+    raw = sys.stdin.read()
+    doc = json.loads(raw[raw.index("{"):])
+    present = {(r["w"], r["k"]) for r in doc["rows"]}
+    ack = os.environ["ACK"]
+    missing = []
+    n = 0
+    for f in glob.glob(ack + "/w*"):
+        w = int(os.path.basename(f)[1:])
+        for line in open(f):
+            n += 1
+            if (w, int(line)) not in present:
+                missing.append((w, int(line)))
+    if missing:
+        print("LOST_ACKED_WRITES", len(missing), missing[:5]); sys.exit(1)
+    print("ACKED_%d_ALL_PRESENT_OF_%d" % (n, len(present)))
+    '
+    rm -rf "$ACK"
+  timeout_ms: 90000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - ALL_PRESENT_OF_
+
+- name: cycle3-writers-then-sigkill
+  description: Four concurrent acknowledged writers, SIGKILL mid-writes, restart.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    ACK="${GEODE_DATA_DIR}.ack3"; rm -rf "$ACK"; mkdir -p "$ACK"
+    for w in 1 2 3 4; do
+      (
+        k=1
+        while true; do
+          if "${GEODE_BINARY:-geode}" query "CREATE (:Cv6492 {cycle: 3, w: $w, k: $k})" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+            echo "$k" >> "$ACK/w$w"
+          fi
+          k=$((k+1))
+        done
+      ) &
+    done
+    sleep 7
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    kill $(jobs -p) 2>/dev/null || true
+    wait 2>/dev/null || true
+    total=$(cat "$ACK"/w* 2>/dev/null | wc -l)
+    [ "$total" -gt 0 ] || { echo NO_ACKNOWLEDGED_WRITES; exit 1; }
+    echo "KILLED_MID_WRITES_ACKED_$total"
+  timeout_ms: 120000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILLED_MID_WRITES_ACKED_
+
+- name: cycle3-first-query-unlabeled-count
+  description: 'The first query after the restart: the unlabeled scan (it reads the engine directly) answers, no corruption.'
+  query: MATCH (n) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+
+- name: cycle3-labeled-seed-count
+  description: 'The label index agrees: the 50 seed nodes.'
+  query: MATCH (n:Seed6492) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":50'
+
+- name: cycle3-every-acknowledged-write-present
+  description: Every write acknowledged before the kill is present.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    export ACK="${GEODE_DATA_DIR}.ack3"
+    OUT=$("${GEODE_BINARY:-geode}" query "MATCH (n:Cv6492) WHERE n.cycle = 3 RETURN n.w AS w, n.k AS k" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --format json 2>&1) || { echo "$OUT" | head -c 600; echo FIRST_READ_FAILED; exit 1; }
+    printf '%s' "$OUT" | python3 -I -c '
+    import json, sys, os, glob
+    raw = sys.stdin.read()
+    doc = json.loads(raw[raw.index("{"):])
+    present = {(r["w"], r["k"]) for r in doc["rows"]}
+    ack = os.environ["ACK"]
+    missing = []
+    n = 0
+    for f in glob.glob(ack + "/w*"):
+        w = int(os.path.basename(f)[1:])
+        for line in open(f):
+            n += 1
+            if (w, int(line)) not in present:
+                missing.append((w, int(line)))
+    if missing:
+        print("LOST_ACKED_WRITES", len(missing), missing[:5]); sys.exit(1)
+    print("ACKED_%d_ALL_PRESENT_OF_%d" % (n, len(present)))
+    '
+    rm -rf "$ACK"
+  timeout_ms: 90000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - ALL_PRESENT_OF_
+
+- name: cycle4-writers-then-sigkill
+  description: Four concurrent acknowledged writers, SIGKILL mid-writes, restart.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    ACK="${GEODE_DATA_DIR}.ack4"; rm -rf "$ACK"; mkdir -p "$ACK"
+    for w in 1 2 3 4; do
+      (
+        k=1
+        while true; do
+          if "${GEODE_BINARY:-geode}" query "CREATE (:Cv6492 {cycle: 4, w: $w, k: $k})" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" >/dev/null 2>&1; then
+            echo "$k" >> "$ACK/w$w"
+          fi
+          k=$((k+1))
+        done
+      ) &
+    done
+    sleep 7
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    kill $(jobs -p) 2>/dev/null || true
+    wait 2>/dev/null || true
+    total=$(cat "$ACK"/w* 2>/dev/null | wc -l)
+    [ "$total" -gt 0 ] || { echo NO_ACKNOWLEDGED_WRITES; exit 1; }
+    echo "KILLED_MID_WRITES_ACKED_$total"
+  timeout_ms: 120000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILLED_MID_WRITES_ACKED_
+
+- name: cycle4-first-query-unlabeled-count
+  description: 'The first query after the restart: the unlabeled scan (it reads the engine directly) answers, no corruption.'
+  query: MATCH (n) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+
+- name: cycle4-labeled-seed-count
+  description: 'The label index agrees: the 50 seed nodes.'
+  query: MATCH (n:Seed6492) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":50'
+
+- name: cycle4-every-acknowledged-write-present
+  description: Every write acknowledged before the kill is present.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    export ACK="${GEODE_DATA_DIR}.ack4"
+    OUT=$("${GEODE_BINARY:-geode}" query "MATCH (n:Cv6492) WHERE n.cycle = 4 RETURN n.w AS w, n.k AS k" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" --format json 2>&1) || { echo "$OUT" | head -c 600; echo FIRST_READ_FAILED; exit 1; }
+    printf '%s' "$OUT" | python3 -I -c '
+    import json, sys, os, glob
+    raw = sys.stdin.read()
+    doc = json.loads(raw[raw.index("{"):])
+    present = {(r["w"], r["k"]) for r in doc["rows"]}
+    ack = os.environ["ACK"]
+    missing = []
+    n = 0
+    for f in glob.glob(ack + "/w*"):
+        w = int(os.path.basename(f)[1:])
+        for line in open(f):
+            n += 1
+            if (w, int(line)) not in present:
+                missing.append((w, int(line)))
+    if missing:
+        print("LOST_ACKED_WRITES", len(missing), missing[:5]); sys.exit(1)
+    print("ACKED_%d_ALL_PRESENT_OF_%d" % (n, len(present)))
+    '
+    rm -rf "$ACK"
+  timeout_ms: 90000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - ALL_PRESENT_OF_

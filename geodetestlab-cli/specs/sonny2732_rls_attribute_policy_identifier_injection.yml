@@ -1,0 +1,119 @@
+version: '1.0'
+name: 'SONNY-2732: add_attribute_policy refuses non-identifier arguments (no fail-open policy)'
+description: |
+  Ticket: SONNY-2732 (security).
+  geode.rls.add_attribute_policy pasted its row_property and attribute_key arguments into the
+  policy text (row.<prop> = principal.attribute.<key>), so a property of
+  "x = 'a' OR TRUE OR row.y" compiled into a policy that admits every row: an admin (or a
+  caller able to reach the procedure) could install a fail-open policy. Fixed: both
+  arguments must be plain identifiers ([A-Za-z_][A-Za-z0-9_]*, at most 128 bytes);
+  anything else is refused and no policy is installed.
+  Proves: an injecting row_property and an injecting attribute_key are refused with a
+  non-success status, no policy is installed (policy_count stays 0 and a restricted user is
+  not widened), and a plain identifier pair still installs and restricts.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s2732-create-user-alice
+  description: 'alice: a readwrite user with department engineering.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER alice SET PASSWORD 'Alice Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created alice]
+  tags: [s2732, setup]
+
+- name: s2732-attr-alice
+  description: 'alice: department engineering.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER alice SET ATTRIBUTE department = 'engineering']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s2732, setup]
+
+- name: s2732-seed
+  description: Seed rows.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:Doc {s: 'eng1', dept: 'engineering'});
+    CREATE (:Doc {s: 'sales1', dept: 'sales'})
+  expect:
+    exit_code: 0
+  tags: [s2732, setup]
+
+- name: s2732-count-before
+  description: policy_count is 0 before.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CALL geode.rls.policy_count()]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s2732]
+
+- name: s2732-inject-property
+  description: The injecting row_property is refused.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_attribute_policy('default', 'Doc', \"x = 'a' OR TRUE OR row.y\", 'department')"]
+  expect:
+    exit_code: 1
+  tags: [s2732]
+
+- name: s2732-inject-key
+  description: The injecting attribute_key is refused.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_attribute_policy('default', 'Doc', 'dept', \"x = 'a' OR TRUE OR row.y\")"]
+  expect:
+    exit_code: 1
+  tags: [s2732]
+
+- name: s2732-inject-semicolon
+  description: A property with a space and quote is refused.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_attribute_policy('default', 'Doc', 'dept OR 1=1', 'department')"]
+  expect:
+    exit_code: 1
+  tags: [s2732]
+
+- name: s2732-count-after
+  description: No policy was installed by any refused call.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CALL geode.rls.policy_count()]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"count":1', '"count":2', '"count":3']
+  tags: [s2732]
+
+- name: s2732-valid
+  description: A plain identifier pair installs.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_attribute_policy('default', 'Doc', 'dept', 'department')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [attribute policy added]
+  tags: [s2732]
+
+- name: s2732-valid-restricts
+  description: alice is restricted to her department by the valid policy only (the refused ones did not widen it).
+  args: [query, -U, alice, -P, Alice Query Passphrase For Testing, MATCH (d:Doc) RETURN d.s AS s ORDER BY s]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"eng1"}]']
+  tags: [s2732]

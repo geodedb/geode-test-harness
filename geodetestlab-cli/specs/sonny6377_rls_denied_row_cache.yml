@@ -1,0 +1,128 @@
+version: '1.0'
+name: "SONNY-6377: one RLS-denied row does not deny the table's other rows"
+description: |
+  Ticket: SONNY-6377 item 3 (security).
+  RLSEngine.checkRowAccess cached its per-row verdict under (graph, table, user,
+  operation), a key with no row in it, and returned a cached deny before evaluating: once
+  one row was denied to a user, EVERY later row of that table was denied until the entry
+  expired (fail closed, but wrong results). A row-level decision is not cached now.
+  Fixture: Doc rows created in the order sales1, eng1, sales2, eng2 (the first row is
+  one alice may not see); attribute policy Doc.dept = principal attribute department;
+  alice has department engineering, bob has sales.
+  Proves: alice reads exactly eng1 and eng2 (not none, which the cached deny produced),
+  bob exactly sales1 and sales2, the admin all four, repeatedly in one session.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s6377-create-user-bob
+  description: 'bob: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER bob SET PASSWORD 'Bob Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created bob]
+  tags: [s6377, setup]
+
+- name: s6377-create-user-alice
+  description: 'alice: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER alice SET PASSWORD 'Alice Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created alice]
+  tags: [s6377, setup]
+
+- name: s6377-attr-alice
+  description: 'alice: department engineering.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER alice SET ATTRIBUTE department = 'engineering']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s6377, setup]
+
+- name: s6377-attr-bob
+  description: 'bob: department sales.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER bob SET ATTRIBUTE department = 'sales']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s6377, setup]
+
+- name: s6377-seed
+  description: Seed the Doc rows; the first is one alice may not see.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:Doc {s: 'sales1', dept: 'sales'});
+    CREATE (:Doc {s: 'eng1', dept: 'engineering'});
+    CREATE (:Doc {s: 'sales2', dept: 'sales'});
+    CREATE (:Doc {s: 'eng2', dept: 'engineering'})
+  expect:
+    exit_code: 0
+  tags: [s6377, setup]
+
+- name: s6377-policy
+  description: Attribute policy Doc.dept = principal attribute department.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_attribute_policy('default', 'Doc', 'dept', 'department')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [attribute policy added]
+  tags: [s6377, setup]
+
+- name: s6377-alice
+  description: alice reads exactly her department's rows, past the denied first row.
+  args: [query, -U, alice, -P, Alice Query Passphrase For Testing, MATCH (d:Doc) RETURN d.s AS s ORDER BY s]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"eng1"},{"s":"eng2"}]']
+  tags: [s6377]
+
+- name: s6377-bob
+  description: bob reads exactly his department's rows.
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (d:Doc) RETURN d.s AS s ORDER BY s]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"sales1"},{"s":"sales2"}]']
+  tags: [s6377]
+
+- name: s6377-admin
+  description: the admin reads all four.
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (d:Doc) RETURN d.s AS s ORDER BY s]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"eng1"},{"s":"eng2"},{"s":"sales1"},{"s":"sales2"}]']
+  tags: [s6377]
+
+- name: s6377-alice-repeated
+  description: 'alice, one session, the same read three times: every answer is the same two rows.'
+  args: [query, --batch, -U, alice, -P, Alice Query Passphrase For Testing, '-']
+  stdin: |
+    MATCH (d:Doc) RETURN d.s AS s ORDER BY s
+    MATCH (d:Doc) RETURN d.s AS s ORDER BY s
+    MATCH (d:Doc) RETURN d.s AS s ORDER BY s
+  expect:
+    exit_code: 0
+    stdout_regex: ['(?s)("rows":\[\{"s":"eng1"\},\{"s":"eng2"\}\].*){3}']
+    stdout_not_contains: [sales]
+  tags: [s6377]

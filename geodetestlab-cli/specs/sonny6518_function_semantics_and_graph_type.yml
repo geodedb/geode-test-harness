@@ -1,0 +1,246 @@
+# SONNY-6518: the function dispatcher turned unknown errors into NULL; toFloat returned a
+# DECIMAL; toString returned '' / NULL for wrong types; toInteger and toBoolean returned NULL
+# for wrong types; substring / left / right counted bytes; ISO/IEC 39075:2024 19.1 GR 1
+# (function evaluation) raises an exception condition for an argument the function does not
+# accept, and 20.? CAST maps a text that is not a valid literal to 22018.
+# SONNY-6517: CREATE GRAPH TYPE T AS { x STRING } was rejected because the field type check
+# accepted only an identifier token.
+
+version: '1.0'
+name: 'SONNY-6518 / SONNY-6517: conversion functions follow CAST, characters not bytes, graph type STRING fields'
+description: toFloat/toInteger/toBoolean/toString answer as CAST; substring/left/right count characters; wrong-type arguments raise instead of NULL; CREATE GRAPH TYPE accepts STRING
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --lsp-port=0
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+tests:
+- name: tofloat-is-double
+  description: toFloat returns a DOUBLE (was DECIMAL)
+  args:
+  - query
+  - '-'
+  stdin: RETURN toFloat('2.5') AS f, toFloat(3) AS g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"f":2.5,"g":3}]'
+    - '{"name":"f","type":"DOUBLE"}'
+    - '{"name":"g","type":"DOUBLE"}'
+  tags:
+  - sonny-6518
+- name: tointeger-from-text
+  description: toInteger('7') is 7, toInteger(2.9) truncates
+  args:
+  - query
+  - '-'
+  stdin: RETURN toInteger('7') AS i, toInteger(2.9) AS j
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":7,"j":2}]'
+  tags:
+  - sonny-6518
+- name: tointeger-bad-text-raises-22018
+  description: toInteger('abc') raises 22018 (invalid character value for cast), not NULL
+  args:
+  - query
+  - '-'
+  stdin: RETURN toInteger('abc') AS i
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22018"'
+  tags:
+  - sonny-6518
+- name: tofloat-bad-text-raises-22018
+  description: toFloat('x') raises 22018
+  args:
+  - query
+  - '-'
+  stdin: RETURN toFloat('x') AS f
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22018"'
+  tags:
+  - sonny-6518
+- name: toboolean-bad-text-raises-22018
+  description: toBoolean('x') raises 22018
+  args:
+  - query
+  - '-'
+  stdin: RETURN toBoolean('x') AS b
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22018"'
+  tags:
+  - sonny-6518
+- name: toboolean-valid
+  description: toBoolean('true') is true
+  args:
+  - query
+  - '-'
+  stdin: RETURN toBoolean('true') AS b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"b":true}]'
+  tags:
+  - sonny-6518
+- name: tostring-of-scalars
+  description: toString converts a number and a decimal
+  args:
+  - query
+  - '-'
+  stdin: RETURN toString(12) AS i, toString(1.5) AS d
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"i":"12","d":"1.5"}]'
+  tags:
+  - sonny-6518
+- name: tostring-of-list-raises-22g03
+  description: toString of a list raises 22G03 (was '' or NULL)
+  args:
+  - query
+  - '-'
+  stdin: RETURN toString([1]) AS l
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - sonny-6518
+- name: null-propagates-through-conversions
+  description: NULL in -> NULL out
+  args:
+  - query
+  - '-'
+  stdin: RETURN toString(null) AS s, toInteger(null) AS i
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"s":null,"i":null}]'
+  tags:
+  - sonny-6518
+- name: substring-counts-characters
+  description: substring('héllo', 2, 3) is 'éll' (characters, not bytes)
+  args:
+  - query
+  - '-'
+  stdin: RETURN substring('héllo', 2, 3) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"s":"éll"}]'
+  tags:
+  - sonny-6518
+- name: left-right-count-characters
+  description: left / right take characters
+  args:
+  - query
+  - '-'
+  stdin: RETURN left('héllo', 2) AS l, right('héllo', 2) AS r
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"l":"hé","r":"lo"}]'
+  tags:
+  - sonny-6518
+- name: substring-start-is-one-based
+  description: substring('hello', 2, 3) is 'ell' (start position 1-based)
+  args:
+  - query
+  - '-'
+  stdin: RETURN substring('hello', 2, 3) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"s":"ell"}]'
+  tags:
+  - sonny-6518
+- name: wrong-type-argument-raises
+  description: trim(5) raises 22G03 (was swallowed to NULL)
+  args:
+  - query
+  - '-'
+  stdin: RETURN trim(5) AS t
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - sonny-6518
+- name: ceil-wrong-type-raises
+  description: ceil('a') raises 22G03
+  args:
+  - query
+  - '-'
+  stdin: RETURN ceil('a') AS t
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - sonny-6518
+- name: floor-wrong-type-raises
+  description: floor('a') raises 22G03
+  args:
+  - query
+  - '-'
+  stdin: RETURN floor('a') AS t
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G03"'
+  tags:
+  - sonny-6518
+- name: graph-type-string-field
+  description: CREATE GRAPH TYPE with a STRING field is accepted (SONNY-6517)
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH TYPE Sonny6517Str AS { x STRING }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6517
+- name: graph-type-all-scalar-fields
+  description: STRING, INTEGER, BOOLEAN, FLOAT and DATE field types are accepted
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH TYPE Sonny6517All AS { x STRING, y INTEGER, z BOOLEAN, w FLOAT, d DATE }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[]'
+  tags:
+  - sonny-6517

@@ -1,0 +1,147 @@
+version: '1.0'
+name: SONNY-3232 / SONNY-6475 large QUIC requests are answered or refused promptly
+description: |
+  SONNY-3232: a QUIC request of about 1 MiB was never answered (the client hung
+  to its timeout) and a request over the 16 MiB maximum message was ended with
+  no reply, so the client blocked writing for 60 s with nothing to say why.
+  SONNY-6475: a transfer past the 10 MiB stream receive window crawled (16 MiB
+  took ~168 s) because the receiver re-sorted every buffered out-of-order
+  segment for each packet (quic v0.1.51).
+
+  Fixed behaviour proved over the real wire with `geode query -` against the
+  managed server:
+    * 1 MiB, 4 MiB and 12 MiB (past the 10 MiB stream window, under the 16 MiB
+      cap) string-literal requests are answered with their exact length, inside
+      a generous bound;
+    * a request over the 16 MiB maximum is refused promptly: a raw QUIC client
+      (aioquic, ALPN geode/1) declaring a framed message of 16 MiB + 1 byte gets
+      SQLSTATE 54000 on its stream and the connection closed with application
+      error message_too_large (0x47450002) within seconds, not a silent 60 s
+      stall, and the server still answers a small query afterwards.
+
+  CANARY: REQ=REQ-SONNY-3232-QUIC-LARGE-REQUEST; FEATURE="QuicTransport"; ASPECT=LargeRequest; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny3232_quic_large_request.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: one-four-and-twelve-mib-requests-are-answered-exactly
+  description: size() of a 1 MiB, 4 MiB and 12 MiB string literal comes back exact, each under 60 s
+  type: bash
+  timeout_ms: 300000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    FAIL=0
+    for MIB in 1 4 12; do
+      N=$((MIB * 1024 * 1024))
+      python3 -c "import sys; sys.stdout.write(\"RETURN size('\" + 'a' * $N + \"') AS n;\")" > "$D/q$MIB.gql"
+      T0=$(date +%s)
+      timeout 120 "${GEODE_BINARY:-geode}" query --file "$D/q$MIB.gql" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
+        -U geode -P "$PW" --format json --timeout 100 > "$D/out$MIB" 2>&1; RC=$?
+      EL=$(( $(date +%s) - T0 ))
+      if [ "$RC" = "0" ] && grep -q "\"n\":$N\b\|\"n\": $N\b\|\[$N\]" "$D/out$MIB" && [ "$EL" -lt 60 ]; then
+        echo "ANSWERED_${MIB}MIB_OK in ${EL}s"
+      else
+        echo "ANSWERED_${MIB}MIB_BAD rc=$RC elapsed=${EL}s"; head -c 600 "$D/out$MIB"; FAIL=1
+      fi
+    done
+    exit $FAIL
+  expect:
+    exit_code: 0
+    stdout_contains: [ANSWERED_1MIB_OK, ANSWERED_4MIB_OK, ANSWERED_12MIB_OK]
+    stdout_not_contains: [_BAD]
+  tags: [quic, large-request, sonny-3232, sonny-6475, regression]
+
+- name: request-over-sixteen-mib-is-refused-promptly-and-server-survives
+  description: a raw QUIC client declaring a 16 MiB + 1 message gets 54000 and a close with app error message_too_large within seconds; the server then answers a small query
+  type: bash
+  timeout_ms: 180000
+  command: |
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    PY="${GEODETESTLAB_PYTHON:-python3}"
+    PORT="${GEODE_SERVER_ADDRESS##*:}"
+    # A real QUIC client (aioquic, ALPN geode/1) frames a message the server's way - a
+    # 4-byte big-endian length - declaring one byte over the 16 MiB maximum, then keeps
+    # uploading like a client mid-request. (The geode CLI cannot be used here: its file
+    # limit is exactly 16 MiB and it only learns of the close at its own timeout.)
+    OUT=$("$PY" - "$PORT" $((16 * 1024 * 1024 + 1)) <<'PYEOF'
+    import asyncio, ssl, struct, sys, time
+    from aioquic.asyncio import connect
+    from aioquic.asyncio.protocol import QuicConnectionProtocol
+    from aioquic.quic.configuration import QuicConfiguration
+    from aioquic.quic.events import ConnectionTerminated, StreamDataReceived
+
+    class P(QuicConnectionProtocol):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k); self.closed = asyncio.get_event_loop().create_future(); self.data = b""; self.err = None
+        def quic_event_received(self, ev):
+            if isinstance(ev, StreamDataReceived): self.data += ev.data
+            if isinstance(ev, ConnectionTerminated):
+                self.err = ev.error_code
+                if not self.closed.done(): self.closed.set_result(ev)
+
+    async def main(port, declared):
+        cfg = QuicConfiguration(is_client=True, alpn_protocols=["geode/1"]); cfg.verify_mode = ssl.CERT_NONE
+        t0 = time.time()
+        async with connect("127.0.0.1", port, configuration=cfg, create_protocol=P) as c:
+            sid = c._quic.get_next_available_stream_id()
+            c._quic.send_stream_data(sid, struct.pack(">I", declared) + b"\0" * 65536, end_stream=False)
+            c.transmit()
+            sent = 65536
+            # keep writing like a client mid-upload, until the server closes
+            while not c.closed.done() and time.time() - t0 < 40:
+                c._quic.send_stream_data(sid, b"\0" * 262144, end_stream=False); c.transmit(); sent += 262144
+                await asyncio.sleep(0.05)
+                if sent > 64 * 1024 * 1024: break
+            try:
+                await asyncio.wait_for(c.closed, 5)
+            except Exception:
+                pass
+            print("elapsed=%.1f closed=%s error_code=%s reply54000=%s" % (time.time() - t0, c.closed.done(), hex(c.err) if c.err is not None else None, b"54000" in c.data))
+
+    asyncio.run(main(int(sys.argv[1]), int(sys.argv[2])))
+    PYEOF
+    )
+    echo "$OUT"
+    echo "$OUT" | grep -q "closed=True" && echo "closed=yes" || echo "closed=no"
+    echo "$OUT" | grep -q "error_code=0x47450002" && echo "message_too_large_code=yes" || echo "message_too_large_code=no"
+    echo "$OUT" | grep -q "reply54000=True" && echo "answered_54000=yes" || echo "answered_54000=no"
+    EL=$(echo "$OUT" | sed -n 's/.*elapsed=\([0-9.]*\).*/\1/p')
+    python3 -c "import sys; sys.exit(0 if float('${EL:-999}') < 20 else 1)" && echo "prompt=yes" || echo "prompt=no"
+    timeout 60 "${GEODE_BINARY:-geode}" query "RETURN 31337 AS alive" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} \
+      -U geode -P "$PW" --format json --timeout 30 2>&1 | grep -q 31337 && echo "server_alive=yes" || echo "server_alive=no"
+  expect:
+    exit_code: 0
+    stdout_contains: [closed=yes, message_too_large_code=yes, answered_54000=yes, prompt=yes, server_alive=yes]
+  tags: [quic, large-request, sonny-3232, regression, negative]

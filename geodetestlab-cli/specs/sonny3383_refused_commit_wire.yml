@@ -1,0 +1,139 @@
+version: '1.0'
+name: 'SONNY-3383: a refused COMMIT is an error (40000) on the wire and keeps nothing (engine half of the Go driver contract)'
+description: |
+  SONNY-3383. geode-client-go's Tx.Commit() ignored CommitResponse.success: the
+  server answers COMMIT of a transaction that already failed with success=false
+  and SQLSTATE 40000 (40003 if the rollback was incomplete), and the driver
+  returned nil, telling the caller a rolled-back transaction had committed
+  (silent data loss).
+
+  Scope, stated honestly: the defect is in the Go driver (tx.go finish()), a
+  separate repository; the geodetestlab CLI cannot drive Tx.Commit(), so the
+  driver half has no spec here. This spec pins the ENGINE half of the contract
+  the driver must read, black-box over the real wire with the real CLI on ONE
+  connection (`geode query --batch` sends every line over a single connection):
+    * after a statement fails inside START TRANSACTION, further statements are
+      refused with 25P02 (the message says COMMIT will fail with 40000);
+    * COMMIT of that transaction is an ERROR (status_class/error_code 40000,
+      'COMMIT did not commit it'), never a success status, and the batch exits
+      non-zero;
+    * nothing the transaction wrote is visible afterwards (read on a new
+      connection);
+    * ROLLBACK of an aborted transaction succeeds, and a healthy transaction
+      commits and is durable (count 1), so the 40000 is not a blanket refusal.
+
+  Run with GEODE_ADMIN_PASSWORD set to a policy-compliant passphrase, e.g.
+    GEODE_ADMIN_PASSWORD='Orbit Lantern Meadow Quartz 2026 Delta!'
+
+  CANARY: REQ=REQ-TXN-COMMIT-REFUSED-001; FEATURE="TransactionManagement"; ASPECT=RefusedCommitIsAnError; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny3383_refused_commit_wire.yml; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true  # scratch servers + on-disk backup files; not meaningful to promote to multi-node
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+
+tests:
+- name: refused-commit-is-an-error-on-the-wire-and-keeps-nothing
+  description: |
+    Aborted transaction: 25P02 for later statements, COMMIT answers 40000, nothing kept; healthy transaction commits.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX)
+    start_server "$W/data" "$W/s.log" || exit 1
+    batch() { # <out file> lines...
+      local out="$1"; shift
+      printf '%s\n' "$@" | timeout 90 "$BIN" query --batch --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" > "$out" 2>/dev/null
+    }
+    statuses() { python3 -I - "$1" <<'PYEND'
+    import json, sys
+    codes = []
+    for ln in open(sys.argv[1]):
+        ln = ln.strip()
+        if ln.startswith("{"):
+            d = json.loads(ln)
+            codes.append(d.get("error_code") or d.get("status_class"))
+    print(",".join(codes))
+    PYEND
+    }
+    batch "$W/o1.txt" "START TRANSACTION" "INSERT (:T {id: 1})" "RETURN 1/0 AS x" "INSERT (:T {id: 2})" "COMMIT"; RC=$?
+    [ "$RC" != 0 ] || fail "batch with a failed transaction exited 0"
+    GOT=$(statuses "$W/o1.txt")
+    [ "$GOT" = "00000,00000,22012,25P02,40000" ] || { cat "$W/o1.txt" | cut -c1-200; fail "status sequence '$GOT'"; }
+    grep -q "COMMIT did not commit it" "$W/o1.txt" || fail "COMMIT error text"
+    grep -q "COMMIT fails with 40000" "$W/o1.txt" || fail "25P02 text does not say COMMIT fails with 40000"
+    [ "$(cnt "MATCH (n:T) RETURN count(n) AS c")" = 0 ] || fail "an aborted transaction left rows behind"
+    echo "REFUSED_COMMIT_IS_40000_AND_KEEPS_NOTHING"
+    batch "$W/o2.txt" "START TRANSACTION" "INSERT (:T {id: 3})" "RETURN 1/0 AS x" "ROLLBACK"; RC=$?
+    GOT=$(statuses "$W/o2.txt")
+    [ "$GOT" = "00000,00000,22012,00000" ] || { cut -c1-200 "$W/o2.txt"; fail "rollback sequence '$GOT'"; }
+    [ "$(cnt "MATCH (n:T) RETURN count(n) AS c")" = 0 ] || fail "rolled-back transaction left rows"
+    echo "ROLLBACK_OF_ABORTED_TRANSACTION_OK"
+    batch "$W/o3.txt" "START TRANSACTION" "INSERT (:T {id: 4})" "COMMIT"; RC=$?
+    [ "$RC" = 0 ] || { cut -c1-200 "$W/o3.txt"; fail "healthy transaction rc=$RC"; }
+    GOT=$(statuses "$W/o3.txt")
+    [ "$GOT" = "00000,00000,00000" ] || { cut -c1-200 "$W/o3.txt"; fail "healthy sequence '$GOT'"; }
+    [ "$(cnt "MATCH (n:T) RETURN count(n) AS c")" = 1 ] || fail "healthy transaction not durable"
+    echo "HEALTHY_TRANSACTION_COMMITS"
+    stop_server
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - REFUSED_COMMIT_IS_40000_AND_KEEPS_NOTHING
+    - ROLLBACK_OF_ABORTED_TRANSACTION_OK
+    - HEALTHY_TRANSACTION_COMMITS
+  tags: [transaction, wire, sonny-3383]

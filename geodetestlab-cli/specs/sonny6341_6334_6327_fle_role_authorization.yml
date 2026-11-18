@@ -1,0 +1,451 @@
+version: '1.0'
+name: FLE plaintext authorization — held roles only, Admin-only administration, online revoke, durable across restart (SONNY-6341, SONNY-6334, SONNY-6327, SONNY-6324)
+description: |
+  SONNY-6341 (SECURITY): the FLE role used for plaintext decisions was whatever the
+  client named in HELLO (`geode query --role X`); any principal GPS lets decrypt
+  (every Admin) could name any FLE role and read every field listed for it.
+  Fixed model: a session acts only under an FLE role its authenticated user HOLDS
+  (`CALL geode.fle.grantRole(user, role)` / `revokeRole`, Admin only, audited,
+  durable in __geode_security). Naming an unheld role reads `[REDACTED]`.
+
+  SONNY-6334 (SECURITY): geode.fle.configureField / grantPlaintext / revokePlaintext
+  were gated by the GPS write action, so a ReadWrite user could grant itself
+  plaintext. They are Admin only now (42501).
+
+  SONNY-6327 (4): there was no online `CALL geode.fle.revokePlaintext`; it exists
+  now and takes effect on the next read. SONNY-6324: a catalog change that cannot
+  be persisted must not be silently lost — the revoke must survive a restart.
+
+  Black-box: a real server (FLE via GEODE_MASTER_KEY), real `geode query --role`
+  clients, a real restart on the same data dir, and an on-disk scan proving the
+  secret value is never at rest in plaintext.
+
+  CANARY: REQ=REQ-SONNY-6341-6334-FLE-ROLE-BLACKBOX; FEATURE="FLE"; ASPECT=PlaintextAuthorization; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+    Execution note: the server is a private scratch server started by the first step (own port and
+    data dir under /tmp/sonny738-crypto-*, outside the harness-managed lifecycle), so these steps are not
+    affected by concurrent harness runs on a shared machine.
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+invariants: []
+tests:
+- name: scratch-server-start
+  description: Starts a private geode server (own data dir and port, outside the harness-managed lifecycle) for the steps below.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    ST="/tmp/sonny738-crypto-6341"
+    rm -rf "$ST"; mkdir -p "$ST"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    cat > "$ST/env.sh" <<'ENVEOF'
+    export GEODE_ALLOW_INSECURE_TLS=1
+    export ST="/tmp/sonny738-crypto-6341"
+    export D="$ST/data"
+    export GEODE_DATA_DIR="$D"
+    export GEODE_CLIENT_TLS="--insecure-tls-skip-verify"
+    export ADMINPW="Sonny Harness Admin Passphrase 738"
+    SRV_ENV=(
+      'GEODE_ADMIN_PASSWORD=Sonny Harness Admin Passphrase 738'
+      GEODE_ALLOW_TEST_AUDIT_KEYS=1
+      GEODE_LSP_PORT=0
+      GEODE_MASTER_KEY=sonny6341-fle-master-key-0123456789abcdef
+    )
+    SRV_ARGS=()
+    gq_as() { local u="$1" p="$2"; shift 2; "$GEODE_BINARY" query -U "$u" -P "$p" "$@" --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS; }
+    gq() { gq_as geode "$ADMINPW" "$@"; }
+    start_srv() {
+      env "${SRV_ENV[@]}" setsid nohup "$GEODE_BINARY" serve --listen "$GEODE_SERVER_ADDRESS" --data-dir "$D" --log-level warn "${SRV_ARGS[@]}" </dev/null >>"$ST/server.log" 2>&1 &
+      echo $! > "$ST/pid"
+      local i
+      for i in $(seq 1 400); do
+        gq "RETURN 1 AS x" >/dev/null 2>&1 && return 0
+        kill -0 "$(cat "$ST/pid")" 2>/dev/null || { echo "SERVER_EXITED"; tail -20 "$ST/server.log"; return 1; }
+        sleep 0.5
+      done
+      echo "SERVER_NOT_READY"; tail -20 "$ST/server.log"; return 1
+    }
+    stop_srv() {
+      [ -f "$ST/pid" ] || return 0
+      local p; p=$(cat "$ST/pid")
+      kill "$p" 2>/dev/null
+      local i; for i in $(seq 1 200); do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+      kill -9 "$p" 2>/dev/null; rm -f "$ST/pid"
+    }
+    restart_srv() { stop_srv; start_srv; }
+    ENVEOF
+    echo "export GEODE_SERVER_ADDRESS=127.0.0.1:$PORT" >> "$ST/env.sh"
+    . "$ST/env.sh"
+    mkdir -p "$D"
+    start_srv && echo "SCRATCH_SERVER_READY"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+  tags:
+  - setup
+- name: setup-configure-field-visibility-admin
+  description: Admin configures Person.ssn as encrypted with visibility ['admin'] (the documented FLE example)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - configured
+  tags:
+  - fle
+  - setup
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.configureField('"'"'Person'"'"', '"'"'ssn'"'"', { algorithm: '"'"'AES-256-GCM'"'"', visibility: ['"'"'admin'"'"'] }) RETURN '"'"'configured'"'"' AS status'
+  timeout_ms: 300000
+- name: setup-create-users
+  description: a read-only reader and a read-write user
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - setup
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' - <<'GQLEOF'
+    CREATE USER pii_reader SET PASSWORD 'Pii Reader Six Three Four One' ROLE readonly;
+    CREATE USER rw_writer SET PASSWORD 'Rw Writer Six Three Three Four' ROLE readwrite;
+    GQLEOF
+  timeout_ms: 300000
+- name: setup-create-row
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - P001
+  tags:
+  - fle
+  - setup
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (p:Person {user_id: '"'"'P001'"'"', ssn: '"'"'SSN-6341-SECRET-123'"'"', city: '"'"'Denver'"'"'}) RETURN p.user_id AS id'
+  timeout_ms: 300000
+- name: secret-not-on-disk
+  description: the plaintext secret is never at rest (FLE), excluding journals/side logs like sibling FLE specs
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    grep -r -a -l '--exclude=*.jsonl' --exclude-dir=timeseries --exclude-dir=fts --exclude-dir=wal SSN-6341-SECRET-123 "$D"
+  expect:
+    exit_code: 1
+  tags:
+  - fle
+  - scan
+  - critical
+  type: bash
+  timeout_ms: 300000
+- name: admin-naming-ungranted-role-is-redacted
+  description: KEY NEGATIVE (SONNY-6341) — Admin naming FLE role 'admin' it was never granted reads [REDACTED]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '[REDACTED]'
+    stdout_not_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6341
+  - negative
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role admin 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn'
+  timeout_ms: 300000
+- name: admin-grants-itself-the-role
+  description: Admin grants itself FLE role 'admin' (documented migration step, Admin only)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - granted
+  tags:
+  - fle
+  - sonny-6341
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.grantRole('"'"'geode'"'"', '"'"'admin'"'"') RETURN '"'"'granted'"'"' AS status'
+  timeout_ms: 300000
+- name: held-role-reads-plaintext
+  description: POSITIVE — after the grant the SAME query under --role admin returns the plaintext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6341
+  - positive
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role admin 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn'
+  timeout_ms: 300000
+- name: no-role-still-redacted
+  description: without --role there is no FLE role, so the value stays redacted even for a role holder
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6341
+  - negative
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn'
+  timeout_ms: 300000
+- name: reader-naming-role-it-does-not-hold-sees-row-not-value
+  description: a read-only user naming the listed role reads the row (city) but never the encrypted value
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - Denver
+    stdout_not_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6341
+  - negative
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as pii_reader 'Pii Reader Six Three Four One' --role admin 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn, p.city AS city'
+  timeout_ms: 300000
+- name: non-admin-cannot-grant-role
+  description: grantRole is Admin only — a read-only user is refused with 42501
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42501'
+    stdout_not_contains:
+    - granted
+  tags:
+  - fle
+  - sonny-6341
+  - authz
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as pii_reader 'Pii Reader Six Three Four One' 'CALL geode.fle.grantRole('"'"'pii_reader'"'"', '"'"'admin'"'"') RETURN '"'"'granted'"'"' AS status'
+  timeout_ms: 300000
+- name: readwrite-cannot-grant-plaintext-to-itself
+  description: SONNY-6334 (1) — a ReadWrite user cannot CALL geode.fle.grantPlaintext (42501)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42501'
+    stdout_not_contains:
+    - granted
+  tags:
+  - fle
+  - sonny-6334
+  - authz
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as rw_writer 'Rw Writer Six Three Three Four' 'CALL geode.fle.grantPlaintext('"'"'Person'"'"', '"'"'ssn'"'"', '"'"'readwrite'"'"') RETURN '"'"'granted'"'"' AS status'
+  timeout_ms: 300000
+- name: readwrite-cannot-reconfigure-field
+  description: SONNY-6334 (1) — a ReadWrite user cannot reconfigure the field (42501)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42501'
+    stdout_not_contains:
+    - configured
+  tags:
+  - fle
+  - sonny-6334
+  - authz
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as rw_writer 'Rw Writer Six Three Three Four' 'CALL geode.fle.configureField('"'"'Person'"'"', '"'"'ssn'"'"', { algorithm: '"'"'AES-256-GCM'"'"', visibility: ['"'"'readwrite'"'"'] }) RETURN '"'"'configured'"'"' AS status'
+  timeout_ms: 300000
+- name: readwrite-cannot-revoke-plaintext
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42501'
+    stdout_not_contains:
+    - revoked
+  tags:
+  - fle
+  - sonny-6334
+  - authz
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as rw_writer 'Rw Writer Six Three Three Four' 'CALL geode.fle.revokePlaintext('"'"'Person'"'"', '"'"'ssn'"'"', '"'"'admin'"'"') RETURN '"'"'revoked'"'"' AS status'
+  timeout_ms: 300000
+- name: online-grant-plaintext-to-analyst
+  description: Admin lists role 'analyst' for the field and holds it
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - sonny-6327
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' - <<'GQLEOF'
+    CALL geode.fle.grantPlaintext('Person', 'ssn', 'analyst');
+    CALL geode.fle.grantRole('geode', 'analyst');
+    GQLEOF
+  timeout_ms: 300000
+- name: analyst-reads-plaintext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6327
+  - positive
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role analyst 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn'
+  timeout_ms: 300000
+- name: online-revoke-plaintext
+  description: SONNY-6327 (4) — CALL geode.fle.revokePlaintext exists online
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - revoked
+  tags:
+  - fle
+  - sonny-6327
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.revokePlaintext('"'"'Person'"'"', '"'"'ssn'"'"', '"'"'analyst'"'"') RETURN '"'"'revoked'"'"' AS status'
+  timeout_ms: 300000
+- name: analyst-redacted-after-revoke-next-read
+  description: the revoke takes effect on the very next read, no restart
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '[REDACTED]'
+    stdout_not_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6327
+  - negative
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role analyst 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn'
+  timeout_ms: 300000
+- name: restart-server
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    echo restarting
+    restart_srv && echo restarted
+  expect:
+    exit_code: 0
+  tags:
+  - fle
+  - restart
+  timeout_ms: 300000
+- name: role-grant-survives-restart
+  description: "SONNY-6341 — the grantRole is durable (sealed in __geode_security): still reads plaintext as 'admin'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6341
+  - restart
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role admin 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn'
+  timeout_ms: 300000
+- name: revoked-plaintext-stays-revoked-after-restart
+  description: SONNY-6324 — a revoked reader must not regain plaintext after restart
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '[REDACTED]'
+    stdout_not_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6324
+  - restart
+  - critical
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role analyst 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn'
+  timeout_ms: 300000
+- name: revoke-role-takes-effect-next-request
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - revoked
+  tags:
+  - fle
+  - sonny-6341
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.fle.revokeRole('"'"'geode'"'"', '"'"'admin'"'"') RETURN '"'"'revoked'"'"' AS status'
+  timeout_ms: 300000
+- name: role-revoked-redacted
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '[REDACTED]'
+    stdout_not_contains:
+    - SSN-6341-SECRET-123
+  tags:
+  - fle
+  - sonny-6341
+  - negative
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' --role admin 'MATCH (p:Person {user_id:'"'"'P001'"'"'}) RETURN p.ssn AS ssn'
+  timeout_ms: 300000
+- name: scratch-server-stop
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6341/env.sh"
+    stop_srv; rm -rf "$ST"; echo SCRATCH_SERVER_STOPPED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags:
+  - teardown
+tags:
+- fle
+- security
+- sonny-738
+- critical

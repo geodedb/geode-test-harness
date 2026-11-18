@@ -1,0 +1,112 @@
+version: '1.0'
+name: IPv6 serve and dial, and no widening of a port-only gRPC bind (SONNY-6494)
+description: |
+  SONNY-6494 items 5 and 6 (with SONNY-6487):
+    * the CLI (geode-client-zig) could not reach an IPv6 server: it bound an
+      IPv4-only endpoint and dialled `[::1]:port` unbracketed, so `geode query
+      --server [::1]:PORT` could never connect;
+    * a port-only `--listen-grpc <port>` bound 0.0.0.0 while QUIC listened on
+      the IPv6 loopback, i.e. a wider listener than the one the operator chose;
+      it is now refused.
+
+  Black-box proof on hand-rolled scratch servers (a fresh mktemp data dir, a
+  throw-away CA and a leaf certificate valid for ::1 and 127.0.0.1):
+    1. `geode serve --listen [::1]:P` starts, and `geode query --server
+       [::1]:P --ca-cert CA "RETURN 1 AS x"` returns x = 1 over the IPv6
+       loopback (verified TLS);
+    2. `geode serve --listen [::1]:P --listen-grpc P2` (port-only gRPC next to
+       an IPv6 QUIC listener) refuses to start with a non-zero exit instead of
+       silently listening on 0.0.0.0:P2, and nothing is left bound on P2.
+  Skips with a message (exit 0, "ipv6_unavailable") on a host with no IPv6
+  loopback.
+
+  CANARY: REQ=REQ-SONNY-6494-IPV6-LISTEN; FEATURE="IPv6 transport"; ASPECT=ServeAndDial; STATUS=TESTED; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: ipv6_loopback_serve_and_query
+  type: bash
+  timeout_ms: 180000
+  command: |
+    python3 -c 'import socket;s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind(("::1",0))' 2>/dev/null || { echo ipv6_unavailable; exit 0; }
+    unset GEODE_DATA_DIR
+    D=/tmp/s6494v6.$$.$RANDOM; mkdir -p "${D}"
+    PID=""
+    cleanup() { [ -n "${PID}" ] && kill -9 "${PID}" 2>/dev/null; rm -rf "${D}"; }
+    trap cleanup EXIT
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/ca.key" 2>/dev/null
+    openssl req -x509 -new -sha256 -key "${D}/ca.key" -days 1 -subj "/CN=s6494-ca" -addext basicConstraints=critical,CA:TRUE -out "${D}/ca.crt" 2>/dev/null
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/leaf.key" 2>/dev/null
+    openssl req -new -sha256 -key "${D}/leaf.key" -subj "/CN=geode" -out "${D}/leaf.csr" 2>/dev/null
+    printf 'subjectAltName=IP:::1,IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth,clientAuth\n' > "${D}/leaf.ext"
+    openssl x509 -req -sha256 -in "${D}/leaf.csr" -CA "${D}/ca.crt" -CAkey "${D}/ca.key" -CAcreateserial -days 1 -extfile "${D}/leaf.ext" -out "${D}/leaf.crt" 2>/dev/null
+    PORT=$(python3 -c 'import socket;s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind(("::1",0));print(s.getsockname()[1])')
+    mkdir -p "${D}/data"
+    "${GEODE_BINARY}" serve --listen "[::1]:${PORT}" --data-dir "${D}/data" --cert "${D}/leaf.crt" --key "${D}/leaf.key" --log-level warn > "${D}/server.log" 2>&1 &
+    PID=$!
+    ok=0
+    for i in $(seq 1 60); do
+      out=$("${GEODE_BINARY}" query --server "[::1]:${PORT}" --ca-cert "${D}/ca.crt" -U geode -P "${GEODE_ADMIN_PASSWORD}" --timeout 5 "RETURN 1 AS x" 2>&1)
+      if echo "${out}" | grep -q '"x":1'; then ok=1; break; fi
+      kill -0 "${PID}" 2>/dev/null || { echo "server died: $(tail -5 ${D}/server.log)"; exit 1; }
+      sleep 1
+    done
+    [ "${ok}" = 1 ] || { echo "no answer over [::1]:${PORT}: ${out:0:300}"; tail -5 "${D}/server.log"; exit 1; }
+    echo ipv6_query_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ipv6_query_ok
+  tags: [transport, ipv6, sonny-6494]
+
+- name: port_only_grpc_next_to_ipv6_quic_is_refused
+  type: bash
+  timeout_ms: 120000
+  command: |
+    python3 -c 'import socket;s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind(("::1",0))' 2>/dev/null || { echo ipv6_unavailable_ok; exit 0; }
+    unset GEODE_DATA_DIR
+    D=/tmp/s6494g.$$.$RANDOM; mkdir -p "${D}"
+    PID=""
+    cleanup() { [ -n "${PID}" ] && kill -9 "${PID}" 2>/dev/null; rm -rf "${D}"; }
+    trap cleanup EXIT
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/leaf.key" 2>/dev/null
+    openssl req -x509 -new -sha256 -key "${D}/leaf.key" -days 1 -subj "/CN=geode" -addext "subjectAltName=IP:::1,IP:127.0.0.1,DNS:localhost" -out "${D}/leaf.crt" 2>/dev/null
+    PORT=$(python3 -c 'import socket;s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM);s.bind(("::1",0));print(s.getsockname()[1])')
+    GPORT=$(python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    mkdir -p "${D}/data"
+    "${GEODE_BINARY}" serve --listen "[::1]:${PORT}" --listen-grpc "${GPORT}" --data-dir "${D}/data" --cert "${D}/leaf.crt" --key "${D}/leaf.key" --log-level warn > "${D}/server.log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 40); do kill -0 "${PID}" 2>/dev/null || break; sleep 0.5; done
+    if kill -0 "${PID}" 2>/dev/null; then echo "server is still running: it must refuse the widening gRPC bind"; tail -5 "${D}/server.log"; exit 1; fi
+    wait "${PID}"; rc=$?
+    PID=""
+    echo "server exit code ${rc}"
+    [ "${rc}" != 0 ] || { echo "exit code 0"; exit 1; }
+    python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(("127.0.0.1",int(sys.argv[1]))) != 0 else 1)' "${GPORT}" || { echo "gRPC port is listening"; exit 1; }
+    grep -q "gRPC listener binds IPv4 only" "${D}/server.log" || { echo "refusal does not say why: $(tail -3 ${D}/server.log | cut -c1-300)"; exit 1; }
+    echo widening_grpc_refused_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - widening_grpc_refused_ok
+  tags: [transport, ipv6, grpc, sonny-6494]

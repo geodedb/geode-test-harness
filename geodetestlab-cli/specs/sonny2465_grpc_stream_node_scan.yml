@@ -1,0 +1,66 @@
+version: '1.0'
+name: SONNY-2465 gRPC streaming Execute delivers every row of a node-scan read
+description: |
+  SONNY-2465: gRPC streaming /Execute sent the schema frame and then ZERO rows
+  whenever the node-scan fast path served the statement. handleExecuteStreaming
+  drained only the executor's result (`active_result_values`); a statement served
+  from `node_scan_stream` left the session holding an `active_node_scan_stream` and
+  no executor result, so the drain answered `.no_result` and the stream ended after
+  the schema. Only the legacy Pull handler served node-scan streams. Latent over a
+  real server (the gRPC RLS gate kept every session off the fast path) but one
+  aligned gate away from losing every row of `MATCH (n:L) RETURN n.p`.
+
+  Fixed (b9dbce373 test, bface4dfb fix): the streaming drain pages node-scan streams
+  as Pull does. The in-process unit test (test-sonny2465-grpc-stream-node-scan)
+  engages the fast path and is the only RED/GREEN proof; over a real server the
+  gRPC gate keeps every session off it, so this spec cannot fail on the old
+  binary. It is the wire-level GUARD of the user-visible contract the bug would
+  break the moment that gate is aligned: through a real gRPC client (grpcio over
+  TLS; the geode CLI's gRPC client is plaintext-only and cannot reach a release
+  server's TLS-only listener) a node scan of 300 rows (two and a half 128-row
+  pages) streams whole - schema first, then every row exactly once, the last page
+  final - a second scan on the same session works, LIMIT crosses a page boundary,
+  and QUIC agrees.
+
+  CANARY: REQ=REQ-SONNY-2465-GRPC-NODE-SCAN-STREAM; FEATURE="GrpcTransport"; ASPECT=NodeScanRowsDelivered; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny2465_grpc_stream_node_scan.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+tests:
+- name: grpc-streaming-execute-delivers-every-node-scan-row
+  description: 'a real gRPC client (grpcio, TLS) runs MATCH (n:P) RETURN n.i over streaming /Execute against a real geode serve: all 300 rows in more than one page, each once, a second scan works, LIMIT crosses a page boundary, and QUIC agrees'
+  type: bash
+  timeout_ms: 300000
+  command: "set -u\nBIN=\"${GEODE_BINARY:-geode}\"\nPY=\"${GEODETESTLAB_PYTHON:-python3}\"\nPW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nexport GEODE_ADMIN_PASSWORD=\"$PW\" GEODE_LSP_PORT=0 GEODE_DISABLE_AUDIT=1 GEODE_ALLOW_INSECURE_TLS=1\nD=$(mktemp -d); PID=\"\"\ntrap '[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null && wait \"$PID\" 2>/dev/null; rm -rf \"$D\"' EXIT\nread QP GP < <(python3 -c \"import socket\nu=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));q=u.getsockname()[1]\nt=socket.socket();t.bind(('127.0.0.1',0));g=t.getsockname()[1];print(q,g)\")\n\"$BIN\" serve --data-dir \"$D/data\" --log-level warn --listen 127.0.0.1:$QP --listen-grpc 127.0.0.1:$GP > \"$D/log\" 2>&1 &\nPID=$!\nfor i in $(seq 1 120); do\n  python3 -c \"import socket;s=socket.socket();s.settimeout(1);s.connect(('127.0.0.1',$GP))\" 2>/dev/null && break\n  kill -0 $PID 2>/dev/null || { echo server_died; cat \"$D/log\"; exit 1; }\n  sleep 0.5\ndone\n\"$PY\" - \"$GP\" <<'PYEOF'\nimport grpc, ssl, sys, os\ndef varint(n):\n    out = b\"\"\n    while True:\n        b = n & 0x7F; n >>= 7\n        if n: out += bytes([b | 0x80])\n        else: return out + bytes([b])\ndef ld(f, d):\n    if isinstance(d, str): d = d.encode()\n    return varint(f << 3 | 2) + varint(len(d)) + d\ndef parse(buf):\n    out = {}; i = 0\n    def rv():\n        nonlocal i\n        v = 0; sh = 0\n        while True:\n            b = buf[i]; i += 1; v |= (b & 0x7F) << sh; sh += 7\n            if not b & 0x80: return v\n    while i < len(buf):\n        key = rv(); f, wt = key >> 3, key & 7\n        if wt == 0: v = rv()\n        elif wt == 2:\n            n = rv(); v = buf[i:i+n]; i += n\n        elif wt == 1: v = buf[i:i+8]; i += 8\n        elif wt == 5: v = buf[i:i+4]; i += 4\n        else: raise ValueError(wt)\n        out.setdefault(f, []).append(v)\n    return out\n\ngp = int(sys.argv[1]); pw = os.environ.get(\"GEODE_ADMIN_PASSWORD\", \"Geode Test Admin Passphrase\")\npem = ssl.get_server_certificate((\"127.0.0.1\", gp)).encode()\nch = grpc.secure_channel(\"127.0.0.1:%d\" % gp, grpc.ssl_channel_credentials(root_certificates=pem), options=[(\"grpc.ssl_target_name_override\", \"localhost\")])\nident = lambda x: x\nhs = ch.unary_unary(\"/geode.GeodeService/Handshake\", request_serializer=ident, response_deserializer=ident)\nex = ch.unary_stream(\"/geode.GeodeService/Execute\", request_serializer=ident, response_deserializer=ident)\nfails = 0\ndef check(name, ok, detail=\"\"):\n    global fails\n    print((\"CHECK_OK \" if ok else \"CHECK_BAD \") + name + (\"\" if ok else \"  \" + str(detail)[:300])); fails += (not ok)\nr = parse(hs(ld(1, \"geode\") + ld(2, pw) + ld(4, \"g2465\") + ld(5, \"1\") + ld(6, \"min\"), timeout=30))\ncheck(\"gRPC Handshake succeeds\", r.get(1, [0])[0] == 1, r)\nsess = r[2][0].decode()\ndef run(q):\n    vals = []; frames = 0; schema = False; final = False; err = None; pages = 0\n    for raw in ex(ld(1, sess) + ld(2, q), timeout=120):\n        m = parse(raw); frames += 1\n        if 2 in m: schema = True\n        if 4 in m: err = m[4][0]\n        if 3 in m:\n            pages += 1; pg = parse(m[3][0])\n            for row in pg.get(1, []):\n                v = parse(parse(row)[1][0])\n                vals.append(parse(v[2][0]).get(1, [0])[0] if 2 in v else None)\n            final = bool(pg.get(2, [0])[0])\n    return dict(vals=vals, frames=frames, schema=schema, final=final, err=err, pages=pages)\nw = run(\"FOR i IN range(0, 300) CREATE (:P {i: i})\")\ncheck(\"seed: 300 nodes created over gRPC\", w[\"err\"] is None, w)\na = run(\"MATCH (n:P) RETURN n.i\")\ncheck(\"streaming Execute sends the schema and the data pages (it sent the schema and zero rows)\", a[\"schema\"] and len(a[\"vals\"]) > 0, a[\"frames\"])\ncheck(\"all 300 rows arrive, none lost\", len(a[\"vals\"]) == 300, len(a[\"vals\"]))\ncheck(\"every value exactly once (0..299, sum 44850)\", sorted(a[\"vals\"]) == list(range(300)) and sum(a[\"vals\"]) == 44850, a[\"vals\"][:10])\ncheck(\"more than one page is streamed (300 rows exceed one 128-row page) and the last is final\", a[\"pages\"] > 1 and a[\"final\"], (a[\"pages\"], a[\"final\"]))\nb = run(\"MATCH (n:P) RETURN n.i\")\ncheck(\"a second scan on the same session works (the first stream was released)\", sorted(b[\"vals\"]) == list(range(300)), len(b[\"vals\"]))\nc = run(\"MATCH (n:P) RETURN n.i LIMIT 130\")\ncheck(\"LIMIT 130 streams exactly 130 rows across a page boundary\", len(c[\"vals\"]) == 130 and c[\"err\"] is None, len(c[\"vals\"]))\nd = run(\"MATCH (n:P) RETURN count(n) AS c\")\ncheck(\"count(n) over gRPC agrees\", d[\"vals\"] == [300], d[\"vals\"])\nprint(\"FAILS=%d\" % fails)\nsys.exit(1 if fails else 0)\nPYEOF\nRC=$?\n# the same rows over QUIC, from the real CLI\nOUT=$(\"$BIN\" query \"MATCH (n:P) RETURN count(n) AS c, sum(n.i) AS s\" --server 127.0.0.1:$QP --insecure-tls-skip-verify -U geode -P \"$PW\" --format json 2>&1)\necho \"$OUT\" | grep -q '\"rows\":\\[{\"c\":300,\"s\":44850}\\]' && echo \"CHECK_OK the same 300 rows are visible over QUIC\" || { echo \"CHECK_BAD QUIC sees a different set\"; echo \"$OUT\" | tail -2; RC=1; }\nexit $RC\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CHECK_OK gRPC Handshake succeeds
+    - CHECK_OK all 300 rows arrive, none lost
+    - CHECK_OK every value exactly once
+    - CHECK_OK more than one page is streamed
+    - CHECK_OK a second scan on the same session works
+    - CHECK_OK LIMIT 130 streams exactly 130 rows
+    - CHECK_OK the same 300 rows are visible over QUIC
+    - FAILS=0
+    stdout_not_contains:
+    - CHECK_BAD
+    - server_died
+    - Traceback
+  tags:
+  - grpc
+  - streaming
+  - node-scan
+  - sonny-2465
+  - regression

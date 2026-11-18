@@ -1,0 +1,203 @@
+# SONNY-2978 (with SONNY-2979 / SONNY-6472): a change committing its own engine transaction
+# inside a Geode transaction survives a SIGKILL
+#
+# Bug (DATA LOSS): graph-storage batches an engine transaction's WAL page images
+# until it commits; recovery replays the log in order. Inside a Geode
+# `START TRANSACTION ... COMMIT` program a REMOVE of a property, a DELETE of a
+# node or relationship, a label SET or REMOVE and an edge-property REMOVE each
+# committed their own engine transaction on the node's shard; when that was the
+# session transaction's shard the program's earlier (older) page images of the
+# same pages were logged AFTER the change's, so after a crash the change was
+# undone: a removed property, deleted node/relationship or removed label came
+# back and a label set was lost.
+#
+# Fixed behaviour: those changes join the session engine transaction (or commit
+# without holding the shard's WAL batch), so after SIGKILL + restart the
+# committed result is what recovery shows.
+#
+# What this spec proves: against a real server node with the persistence tick and
+# checkpoint triggers disabled (what the restart sees is the WAL's), each of the
+# six shapes is run as ONE `START TRANSACTION; <64 creates>; <change>; COMMIT`
+# message; the result is asserted, the node is SIGKILLed (no shutdown, no
+# checkpoint) and restarted on the same data directory, and the SAME counts are
+# asserted again. 64 nodes per case so every one of the 16 shards, the session
+# transaction's included, holds several. The harness's independent 2-node
+# cluster mode is used only for its signal / restart_node steps; the nodes are
+# standalone servers.
+
+version: '1.0'
+name: SONNY-2978 a committed change inside a transaction survives SIGKILL
+description: REMOVE, DELETE, label SET/REMOVE, relationship DELETE and edge-property REMOVE inside START TRANSACTION survive a SIGKILL and restart (SONNY-2978)
+cluster:
+  nodes: 2
+  independent: true
+  target_node: '0'
+  startup_timeout_ms: 90000
+  shared_args:
+  - --log-level
+  - warn
+  - --persist-interval
+  - '86400000'
+  shared_env:
+    GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+    GEODE_CHECKPOINT_INTERVAL_MS: '86400000'
+    GEODE_CHECKPOINT_OPS: '1000000000'
+cli:
+  binary: ./zig-out/bin/geode
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s2978-committed-change-survives-sigkill
+  description: 'Six change shapes inside one START TRANSACTION message: result before the kill equals result after SIGKILL + restart'
+  type: sequential
+  steps:
+  - type: gql
+    query: 'START TRANSACTION; CREATE (:Rp {i: 0, p: 1}); CREATE (:Rp {i: 1, p: 1}); CREATE (:Rp {i: 2, p: 1}); CREATE (:Rp {i: 3, p: 1}); CREATE (:Rp {i: 4, p: 1}); CREATE (:Rp {i: 5, p: 1}); CREATE (:Rp {i: 6, p: 1}); CREATE (:Rp {i: 7, p: 1}); CREATE (:Rp {i: 8, p: 1}); CREATE (:Rp {i: 9, p: 1}); CREATE (:Rp {i: 10, p: 1}); CREATE (:Rp {i: 11, p: 1}); CREATE (:Rp {i: 12, p: 1}); CREATE (:Rp {i: 13, p: 1}); CREATE (:Rp {i: 14, p: 1}); CREATE (:Rp {i: 15, p: 1}); CREATE (:Rp {i: 16, p: 1}); CREATE (:Rp {i: 17, p: 1}); CREATE (:Rp {i: 18, p: 1}); CREATE (:Rp {i: 19, p: 1}); CREATE (:Rp {i: 20, p: 1}); CREATE (:Rp {i: 21, p: 1}); CREATE (:Rp {i: 22, p: 1}); CREATE (:Rp {i: 23, p: 1}); CREATE (:Rp {i: 24, p: 1}); CREATE (:Rp {i: 25, p: 1}); CREATE (:Rp {i: 26, p: 1}); CREATE (:Rp {i: 27, p: 1}); CREATE (:Rp {i: 28, p: 1}); CREATE (:Rp {i: 29, p: 1}); CREATE (:Rp {i: 30, p: 1}); CREATE (:Rp {i: 31, p: 1}); CREATE (:Rp {i: 32, p: 1}); CREATE (:Rp {i: 33, p: 1}); CREATE (:Rp {i: 34, p: 1}); CREATE (:Rp {i: 35, p: 1}); CREATE (:Rp {i: 36, p: 1}); CREATE (:Rp {i: 37, p: 1}); CREATE (:Rp {i: 38, p: 1}); CREATE (:Rp {i: 39, p: 1}); CREATE (:Rp {i: 40, p: 1}); CREATE (:Rp {i: 41, p: 1}); CREATE (:Rp {i: 42, p: 1}); CREATE (:Rp {i: 43, p: 1}); CREATE (:Rp {i: 44, p: 1}); CREATE (:Rp {i: 45, p: 1}); CREATE (:Rp {i: 46, p: 1}); CREATE (:Rp {i: 47, p: 1}); CREATE (:Rp {i: 48, p: 1}); CREATE (:Rp {i: 49, p: 1}); CREATE (:Rp {i: 50, p: 1}); CREATE (:Rp {i: 51, p: 1}); CREATE (:Rp {i: 52, p: 1}); CREATE (:Rp {i: 53, p: 1}); CREATE (:Rp {i: 54, p: 1}); CREATE (:Rp {i: 55, p: 1}); CREATE (:Rp {i: 56, p: 1}); CREATE (:Rp {i: 57, p: 1}); CREATE (:Rp {i: 58, p: 1}); CREATE (:Rp {i: 59, p: 1}); CREATE (:Rp {i: 60, p: 1}); CREATE (:Rp {i: 61, p: 1}); CREATE (:Rp {i: 62, p: 1}); CREATE (:Rp {i: 63, p: 1}); MATCH (n:Rp) REMOVE n.p; COMMIT'
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+  - type: gql
+    query: 'START TRANSACTION; CREATE (:Dn {i: 0}); CREATE (:Dn {i: 1}); CREATE (:Dn {i: 2}); CREATE (:Dn {i: 3}); CREATE (:Dn {i: 4}); CREATE (:Dn {i: 5}); CREATE (:Dn {i: 6}); CREATE (:Dn {i: 7}); CREATE (:Dn {i: 8}); CREATE (:Dn {i: 9}); CREATE (:Dn {i: 10}); CREATE (:Dn {i: 11}); CREATE (:Dn {i: 12}); CREATE (:Dn {i: 13}); CREATE (:Dn {i: 14}); CREATE (:Dn {i: 15}); CREATE (:Dn {i: 16}); CREATE (:Dn {i: 17}); CREATE (:Dn {i: 18}); CREATE (:Dn {i: 19}); CREATE (:Dn {i: 20}); CREATE (:Dn {i: 21}); CREATE (:Dn {i: 22}); CREATE (:Dn {i: 23}); CREATE (:Dn {i: 24}); CREATE (:Dn {i: 25}); CREATE (:Dn {i: 26}); CREATE (:Dn {i: 27}); CREATE (:Dn {i: 28}); CREATE (:Dn {i: 29}); CREATE (:Dn {i: 30}); CREATE (:Dn {i: 31}); CREATE (:Dn {i: 32}); CREATE (:Dn {i: 33}); CREATE (:Dn {i: 34}); CREATE (:Dn {i: 35}); CREATE (:Dn {i: 36}); CREATE (:Dn {i: 37}); CREATE (:Dn {i: 38}); CREATE (:Dn {i: 39}); CREATE (:Dn {i: 40}); CREATE (:Dn {i: 41}); CREATE (:Dn {i: 42}); CREATE (:Dn {i: 43}); CREATE (:Dn {i: 44}); CREATE (:Dn {i: 45}); CREATE (:Dn {i: 46}); CREATE (:Dn {i: 47}); CREATE (:Dn {i: 48}); CREATE (:Dn {i: 49}); CREATE (:Dn {i: 50}); CREATE (:Dn {i: 51}); CREATE (:Dn {i: 52}); CREATE (:Dn {i: 53}); CREATE (:Dn {i: 54}); CREATE (:Dn {i: 55}); CREATE (:Dn {i: 56}); CREATE (:Dn {i: 57}); CREATE (:Dn {i: 58}); CREATE (:Dn {i: 59}); CREATE (:Dn {i: 60}); CREATE (:Dn {i: 61}); CREATE (:Dn {i: 62}); CREATE (:Dn {i: 63}); MATCH (n:Dn) DELETE n; COMMIT'
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+  - type: gql
+    query: 'START TRANSACTION; CREATE (:Sl {i: 0}); CREATE (:Sl {i: 1}); CREATE (:Sl {i: 2}); CREATE (:Sl {i: 3}); CREATE (:Sl {i: 4}); CREATE (:Sl {i: 5}); CREATE (:Sl {i: 6}); CREATE (:Sl {i: 7}); CREATE (:Sl {i: 8}); CREATE (:Sl {i: 9}); CREATE (:Sl {i: 10}); CREATE (:Sl {i: 11}); CREATE (:Sl {i: 12}); CREATE (:Sl {i: 13}); CREATE (:Sl {i: 14}); CREATE (:Sl {i: 15}); CREATE (:Sl {i: 16}); CREATE (:Sl {i: 17}); CREATE (:Sl {i: 18}); CREATE (:Sl {i: 19}); CREATE (:Sl {i: 20}); CREATE (:Sl {i: 21}); CREATE (:Sl {i: 22}); CREATE (:Sl {i: 23}); CREATE (:Sl {i: 24}); CREATE (:Sl {i: 25}); CREATE (:Sl {i: 26}); CREATE (:Sl {i: 27}); CREATE (:Sl {i: 28}); CREATE (:Sl {i: 29}); CREATE (:Sl {i: 30}); CREATE (:Sl {i: 31}); CREATE (:Sl {i: 32}); CREATE (:Sl {i: 33}); CREATE (:Sl {i: 34}); CREATE (:Sl {i: 35}); CREATE (:Sl {i: 36}); CREATE (:Sl {i: 37}); CREATE (:Sl {i: 38}); CREATE (:Sl {i: 39}); CREATE (:Sl {i: 40}); CREATE (:Sl {i: 41}); CREATE (:Sl {i: 42}); CREATE (:Sl {i: 43}); CREATE (:Sl {i: 44}); CREATE (:Sl {i: 45}); CREATE (:Sl {i: 46}); CREATE (:Sl {i: 47}); CREATE (:Sl {i: 48}); CREATE (:Sl {i: 49}); CREATE (:Sl {i: 50}); CREATE (:Sl {i: 51}); CREATE (:Sl {i: 52}); CREATE (:Sl {i: 53}); CREATE (:Sl {i: 54}); CREATE (:Sl {i: 55}); CREATE (:Sl {i: 56}); CREATE (:Sl {i: 57}); CREATE (:Sl {i: 58}); CREATE (:Sl {i: 59}); CREATE (:Sl {i: 60}); CREATE (:Sl {i: 61}); CREATE (:Sl {i: 62}); CREATE (:Sl {i: 63}); MATCH (n:Sl) SET n:Sl2; COMMIT'
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+  - type: gql
+    query: 'START TRANSACTION; CREATE (:Rl:Rl2 {i: 0}); CREATE (:Rl:Rl2 {i: 1}); CREATE (:Rl:Rl2 {i: 2}); CREATE (:Rl:Rl2 {i: 3}); CREATE (:Rl:Rl2 {i: 4}); CREATE (:Rl:Rl2 {i: 5}); CREATE (:Rl:Rl2 {i: 6}); CREATE (:Rl:Rl2 {i: 7}); CREATE (:Rl:Rl2 {i: 8}); CREATE (:Rl:Rl2 {i: 9}); CREATE (:Rl:Rl2 {i: 10}); CREATE (:Rl:Rl2 {i: 11}); CREATE (:Rl:Rl2 {i: 12}); CREATE (:Rl:Rl2 {i: 13}); CREATE (:Rl:Rl2 {i: 14}); CREATE (:Rl:Rl2 {i: 15}); CREATE (:Rl:Rl2 {i: 16}); CREATE (:Rl:Rl2 {i: 17}); CREATE (:Rl:Rl2 {i: 18}); CREATE (:Rl:Rl2 {i: 19}); CREATE (:Rl:Rl2 {i: 20}); CREATE (:Rl:Rl2 {i: 21}); CREATE (:Rl:Rl2 {i: 22}); CREATE (:Rl:Rl2 {i: 23}); CREATE (:Rl:Rl2 {i: 24}); CREATE (:Rl:Rl2 {i: 25}); CREATE (:Rl:Rl2 {i: 26}); CREATE (:Rl:Rl2 {i: 27}); CREATE (:Rl:Rl2 {i: 28}); CREATE (:Rl:Rl2 {i: 29}); CREATE (:Rl:Rl2 {i: 30}); CREATE (:Rl:Rl2 {i: 31}); CREATE (:Rl:Rl2 {i: 32}); CREATE (:Rl:Rl2 {i: 33}); CREATE (:Rl:Rl2 {i: 34}); CREATE (:Rl:Rl2 {i: 35}); CREATE (:Rl:Rl2 {i: 36}); CREATE (:Rl:Rl2 {i: 37}); CREATE (:Rl:Rl2 {i: 38}); CREATE (:Rl:Rl2 {i: 39}); CREATE (:Rl:Rl2 {i: 40}); CREATE (:Rl:Rl2 {i: 41}); CREATE (:Rl:Rl2 {i: 42}); CREATE (:Rl:Rl2 {i: 43}); CREATE (:Rl:Rl2 {i: 44}); CREATE (:Rl:Rl2 {i: 45}); CREATE (:Rl:Rl2 {i: 46}); CREATE (:Rl:Rl2 {i: 47}); CREATE (:Rl:Rl2 {i: 48}); CREATE (:Rl:Rl2 {i: 49}); CREATE (:Rl:Rl2 {i: 50}); CREATE (:Rl:Rl2 {i: 51}); CREATE (:Rl:Rl2 {i: 52}); CREATE (:Rl:Rl2 {i: 53}); CREATE (:Rl:Rl2 {i: 54}); CREATE (:Rl:Rl2 {i: 55}); CREATE (:Rl:Rl2 {i: 56}); CREATE (:Rl:Rl2 {i: 57}); CREATE (:Rl:Rl2 {i: 58}); CREATE (:Rl:Rl2 {i: 59}); CREATE (:Rl:Rl2 {i: 60}); CREATE (:Rl:Rl2 {i: 61}); CREATE (:Rl:Rl2 {i: 62}); CREATE (:Rl:Rl2 {i: 63}); MATCH (n:Rl) REMOVE n:Rl2; COMMIT'
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+  - type: gql
+    query: 'START TRANSACTION; CREATE (:De {i: 0})-[:DE]->(:De2); CREATE (:De {i: 1})-[:DE]->(:De2); CREATE (:De {i: 2})-[:DE]->(:De2); CREATE (:De {i: 3})-[:DE]->(:De2); CREATE (:De {i: 4})-[:DE]->(:De2); CREATE (:De {i: 5})-[:DE]->(:De2); CREATE (:De {i: 6})-[:DE]->(:De2); CREATE (:De {i: 7})-[:DE]->(:De2); CREATE (:De {i: 8})-[:DE]->(:De2); CREATE (:De {i: 9})-[:DE]->(:De2); CREATE (:De {i: 10})-[:DE]->(:De2); CREATE (:De {i: 11})-[:DE]->(:De2); CREATE (:De {i: 12})-[:DE]->(:De2); CREATE (:De {i: 13})-[:DE]->(:De2); CREATE (:De {i: 14})-[:DE]->(:De2); CREATE (:De {i: 15})-[:DE]->(:De2); CREATE (:De {i: 16})-[:DE]->(:De2); CREATE (:De {i: 17})-[:DE]->(:De2); CREATE (:De {i: 18})-[:DE]->(:De2); CREATE (:De {i: 19})-[:DE]->(:De2); CREATE (:De {i: 20})-[:DE]->(:De2); CREATE (:De {i: 21})-[:DE]->(:De2); CREATE (:De {i: 22})-[:DE]->(:De2); CREATE (:De {i: 23})-[:DE]->(:De2); CREATE (:De {i: 24})-[:DE]->(:De2); CREATE (:De {i: 25})-[:DE]->(:De2); CREATE (:De {i: 26})-[:DE]->(:De2); CREATE (:De {i: 27})-[:DE]->(:De2); CREATE (:De {i: 28})-[:DE]->(:De2); CREATE (:De {i: 29})-[:DE]->(:De2); CREATE (:De {i: 30})-[:DE]->(:De2); CREATE (:De {i: 31})-[:DE]->(:De2); CREATE (:De {i: 32})-[:DE]->(:De2); CREATE (:De {i: 33})-[:DE]->(:De2); CREATE (:De {i: 34})-[:DE]->(:De2); CREATE (:De {i: 35})-[:DE]->(:De2); CREATE (:De {i: 36})-[:DE]->(:De2); CREATE (:De {i: 37})-[:DE]->(:De2); CREATE (:De {i: 38})-[:DE]->(:De2); CREATE (:De {i: 39})-[:DE]->(:De2); CREATE (:De {i: 40})-[:DE]->(:De2); CREATE (:De {i: 41})-[:DE]->(:De2); CREATE (:De {i: 42})-[:DE]->(:De2); CREATE (:De {i: 43})-[:DE]->(:De2); CREATE (:De {i: 44})-[:DE]->(:De2); CREATE (:De {i: 45})-[:DE]->(:De2); CREATE (:De {i: 46})-[:DE]->(:De2); CREATE (:De {i: 47})-[:DE]->(:De2); CREATE (:De {i: 48})-[:DE]->(:De2); CREATE (:De {i: 49})-[:DE]->(:De2); CREATE (:De {i: 50})-[:DE]->(:De2); CREATE (:De {i: 51})-[:DE]->(:De2); CREATE (:De {i: 52})-[:DE]->(:De2); CREATE (:De {i: 53})-[:DE]->(:De2); CREATE (:De {i: 54})-[:DE]->(:De2); CREATE (:De {i: 55})-[:DE]->(:De2); CREATE (:De {i: 56})-[:DE]->(:De2); CREATE (:De {i: 57})-[:DE]->(:De2); CREATE (:De {i: 58})-[:DE]->(:De2); CREATE (:De {i: 59})-[:DE]->(:De2); CREATE (:De {i: 60})-[:DE]->(:De2); CREATE (:De {i: 61})-[:DE]->(:De2); CREATE (:De {i: 62})-[:DE]->(:De2); CREATE (:De {i: 63})-[:DE]->(:De2); MATCH (:De)-[e:DE]->() DELETE e; COMMIT'
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+  - type: gql
+    query: 'START TRANSACTION; CREATE (:Re {i: 0})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 1})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 2})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 3})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 4})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 5})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 6})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 7})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 8})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 9})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 10})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 11})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 12})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 13})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 14})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 15})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 16})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 17})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 18})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 19})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 20})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 21})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 22})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 23})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 24})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 25})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 26})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 27})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 28})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 29})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 30})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 31})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 32})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 33})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 34})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 35})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 36})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 37})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 38})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 39})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 40})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 41})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 42})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 43})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 44})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 45})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 46})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 47})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 48})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 49})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 50})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 51})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 52})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 53})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 54})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 55})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 56})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 57})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 58})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 59})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 60})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 61})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 62})-[:RE {q: 1}]->(:Re2); CREATE (:Re {i: 63})-[:RE {q: 1}]->(:Re2); MATCH (:Re)-[e:RE]->() REMOVE e.q; COMMIT'
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+  - type: gql
+    query: MATCH (n:Rp) WHERE n.p IS NOT NULL RETURN count(n) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: gql
+    query: MATCH (n:Dn) RETURN count(n) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: gql
+    query: MATCH (n:Sl2) RETURN count(n) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":64'
+  - type: gql
+    query: MATCH (n:Rl2) RETURN count(n) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: gql
+    query: MATCH (:De)-[e:DE]->() RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: gql
+    query: MATCH (:Re)-[e:RE]->() WHERE e.q IS NOT NULL RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: signal
+    target: node:0
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 1500
+  - type: restart_node
+    target: node:0
+  - type: wait
+    wait_ms: 3000
+  - type: gql
+    query: MATCH (n:Rp) WHERE n.p IS NOT NULL RETURN count(n) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: gql
+    query: MATCH (n:Dn) RETURN count(n) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: gql
+    query: MATCH (n:Sl2) RETURN count(n) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":64'
+  - type: gql
+    query: MATCH (n:Rl2) RETURN count(n) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: gql
+    query: MATCH (:De)-[e:DE]->() RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  - type: gql
+    query: MATCH (:Re)-[e:RE]->() WHERE e.q IS NOT NULL RETURN count(e) AS c
+    target: node:0
+    timeout_ms: 120000
+    expect:
+      status_class: '00000'
+      stdout_contains:
+      - '"c":0'
+  tags:
+  - storage
+  - wal
+  - crash-recovery
+  - transactions
+  - sonny2978
+  - sonny2979

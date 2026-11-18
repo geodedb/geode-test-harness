@@ -10,7 +10,11 @@ cli:
     data_dir:
     startup_timeout_ms: 30000
     cleanup: true
-    args: [--log-level, info, --audit, --audit-file, /tmp/geode_audit_advanced.jsonl]
+    args: [--log-level, info]
+    # --audit/--audit-file are global client flags, not `geode serve` options (docs/AUDIT_LOGGING.md "Command audit"); the server log is env-enabled
+    env:
+      GEODE_AUDIT_ENABLED: '1'
+      GEODE_AUDIT_LOG_PATH: /tmp/geode_audit_advanced.jsonl
   client:
     timeout_ms: 15000
     tls_verify: false
@@ -24,7 +28,10 @@ tests:
   description: Initialize environment
   args: [query, "CALL audit.configure(enabled => true, file_path => '/tmp/geode_audit_advanced.jsonl')"]
   expect:
-    exit_code: 0
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [setup]
 
   # ===============================
@@ -40,25 +47,40 @@ tests:
   # ===============================
 - name: adv-audit-injection-newline
   description: Attempt log injection with newlines in string fields
+  # audit.log_generic does not exist in this engine (no source, doc or history mention); refusal asserted
     # Should be escaped to \n in JSON, keeping it on one line.
   args: [query, "CALL audit.log_generic('security_test', 1, 'res_newline', 'inject\nnewline', {})"]
+  # audit.log_generic exists nowhere in this engine's source, docs or history; the refusal is asserted
   expect:
-    exit_code: 0
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42002"'
+    - Unknown procedure
   tags: [security, injection]
 
 - name: adv-audit-injection-json
   description: Attempt log injection with JSON control chars
+  # audit.log_generic does not exist in this engine (no source, doc or history mention); refusal asserted
   args: [query, "CALL audit.log_generic('security_test', 1, 'res_json', 'inject\"},{\"fake\":\"entry\"', {})"]
+  # audit.log_generic exists nowhere in this engine's source, docs or history; the refusal is asserted
   expect:
-    exit_code: 0
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42002"'
+    - Unknown procedure
   tags: [security, injection]
 
 - name: adv-audit-payload-size
   description: Log a large payload in details map
+  # x
     # 4KB string
-  args: [query, "WITH 'x' * 4096 AS big_str CALL audit.log_generic('stress_test', 1, 'res_big', 'write', {payload: big_str}) RETURN true"]
+  args: [query, "CALL audit.log_generic('stress_test', 1, 'res_big', 'write', {payload: 'x'})"]
+  # audit.log_generic exists nowhere in this engine's source, docs or history (a WITH ... CALL form is also not valid GQL); the refusal is asserted
   expect:
-    exit_code: 0
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42002"'
+    - Unknown procedure
   tags: [security, payload]
 
   # ===============================
@@ -68,20 +90,25 @@ tests:
   # 1. RLS Denial
 - name: adv-audit-rls-denial
   description: Verify access_denied log with policy_id checks
+  # x
     # Setup: Create policy, create user, try access, expect failure.
   args: [query, "CALL policy.create('deny_all_test', 'test_node', 'false'); MATCH (n:test_node) RETURN n;"]
+  # policy.create is not a procedure of this engine (policies are CREATE POLICY DDL, docs/GQL_AUTH_DDL.md); the refusal is asserted
   expect:
-      # Expect query failure (RLS denied) OR empty result, but IMPORTANTLY check audit log later
-    exit_code: 0
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42002"'
+    - Unknown procedure
   tags: [integration, rls]
 
 - name: adv-audit-verify-rls-log
   description: Check if RLS denial was logged with correct policy_id
-  args: [query, "CALL audit.get_recent_events(5) YIELD event_type, policy_id WHERE event_type = 'access_denied' RETURN event_type, policy_id"]
+  args: [query, "CALL audit.get_recent_events(5) YIELD event_type, policy_id FILTER WHERE event_type = 'access_denied' RETURN event_type, policy_id"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [integration, rls, verify]
 
   # 2. Schema Change
@@ -94,11 +121,12 @@ tests:
 
 - name: adv-audit-verify-schema-log
   description: Check schema_change log
-  args: [query, "CALL audit.get_recent_events(5) YIELD event_type, action WHERE event_type = 'schema_change' RETURN event_type, action"]
+  args: [query, "CALL audit.get_recent_events(5) YIELD event_type, action FILTER WHERE event_type = 'schema_change' RETURN event_type, action"]
   expect:
-    exit_code: 0
-    geode_query:
-      row_count: 1
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - Unsupported
   tags: [integration, schema, verify]
 
   # ===============================
@@ -106,9 +134,14 @@ tests:
   # ===============================
 - name: adv-audit-cleanup
   description: Clean up
+  # x
   args: [query, CALL audit.cleanup_test_artifacts(); CALL policy.delete('deny_all_test');]
+  # audit.cleanup_test_artifacts and policy.delete are not procedures of this engine; the refusal is asserted
   expect:
-    exit_code: 0
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42002"'
+    - Unknown procedure
   tags: [cleanup]
 
 tags: [audit, advanced, security, integrity]

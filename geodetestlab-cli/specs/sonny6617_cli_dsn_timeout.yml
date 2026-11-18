@@ -1,0 +1,74 @@
+version: '1.0'
+name: geode query honours the DSN connect_timeout (SONNY-6617)
+description: |
+  SONNY-6617 item 2: `geode query` and `geode shell` ignored a timeout carried
+  in the DSN (src/cli/main.zig said it "has no effect") although the client
+  library applies it, so a connection to an unresponsive server always waited
+  the 30 s --timeout default.
+
+  Black-box proof: a UDP socket is bound on loopback and never answers (a
+  black-holed QUIC endpoint: the handshake cannot complete). `geode query
+  --dsn "127.0.0.1:<port>?connect_timeout=N"` must give up after N seconds,
+  not 30, and say so: exit code 1, "connection to the server timed out after N
+  seconds". Two different values (2 and 5) show the DSN value, not a constant,
+  is what is applied. Trust material is passed (the managed server's CA) so the
+  run reaches the network instead of being refused up front.
+
+  CANARY: REQ=REQ-SONNY-6617-CLI-DSN-TIMEOUT; FEATURE="DSN parameters"; ASPECT=CliAppliesDsnTimeout; STATUS=TESTED; OWNER=cli; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: dsn_connect_timeout_bounds_a_blackholed_connection
+  type: bash
+  timeout_ms: 120000
+  command: |
+    PORT=$(python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    python3 -c '
+    import socket, sys, time
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+    time.sleep(90)' "${PORT}" &
+    BH=$!
+    trap 'kill ${BH} 2>/dev/null' EXIT
+    sleep 0.5
+    for T in 2 5; do
+      S0=$(date +%s.%N)
+      out=$("${GEODE_BINARY}" query --dsn "127.0.0.1:${PORT}?connect_timeout=${T}" ${GEODE_CLIENT_TLS} \
+            -U geode -P "${GEODE_ADMIN_PASSWORD}" "RETURN 1 AS x" 2>&1); rc=$?
+      E0=$(date +%s.%N)
+      python3 - "${T}" "${rc}" "$S0" "$E0" "${out}" <<'PY' || exit 1
+    import sys
+    t, rc, s0, e0, out = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), sys.argv[5]
+    el = e0 - s0
+    assert rc == 1, f"connect_timeout={t}: exit code {rc}, output {out!r}"
+    assert f"timed out after {t} seconds" in out, f"connect_timeout={t}: {out!r}"
+    assert t - 0.5 <= el <= t + 8, f"connect_timeout={t}: took {el:.2f}s (the 30 s default would be wrong)"
+    print(f"dsn_timeout_ok t={t} elapsed={el:.2f}")
+    PY
+    done
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - dsn_timeout_ok t=2
+    - dsn_timeout_ok t=5
+  tags: [cli, dsn, timeout, sonny-6617]

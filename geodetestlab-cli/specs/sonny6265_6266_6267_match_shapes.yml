@@ -1,0 +1,471 @@
+# SONNY-6265: the end node's inline property map was ignored behind an unlabelled start node
+# (`MATCH (a)<-[:R]-(b:V {k: 4})` returned 9 rows instead of 1). SONNY-6266: persisted planned reads lost
+# undirected and relationship-property hop matches (`MATCH (a)<-[{w: 2}]-(b)` returned 0). SONNY-6267: the ISO
+# abbreviated edge patterns `-`, `->`, `<-`, `<->` and `<-[ ]->` did not parse (`<--` is not ISO and stays
+# refused). ISO/IEC 39075:2024 16.7 (abbreviated edge patterns). The server is persisted, so the planned
+# (storage) read path is the one exercised.
+# Fixture: four :Q {k, f?}, four :X {k}, four :Y {k}, eight :Z {k, g, r}:
+#   (Yk)-[:R]->(Qk)-[:R {w: k}]->(Xk); Q0 and Q1 also have f: 1; (Q0)-[:S]->(Q1) and a self loop (Q3)-[:S]->(Q3).
+version: '1.0'
+name: SONNY-6265/6266/6267 MATCH pattern shapes
+description: end-node inline maps, reversed relationship properties, abbreviated edge patterns
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-fixture
+  description: Create the Q/X/Y/Z fixture graph
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0})
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1})
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2})
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3})
+    CREATE (:Z {k: 0, g: 0, r: 7})
+    CREATE (:Z {k: 1, g: 0, r: 6})
+    CREATE (:Z {k: 2, g: 0, r: 5})
+    CREATE (:Z {k: 3, g: 0, r: 4})
+    CREATE (:Z {k: 4, g: 1, r: 3})
+    CREATE (:Z {k: 5, g: 1, r: 2})
+    CREATE (:Z {k: 6, g: 1, r: 1})
+    CREATE (:Z {k: 7, g: 1, r: 0})
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b)
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: 6265-end-map-count
+  description: end node inline map behind an unlabelled start counts one
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a)<-[:R]-(b:Q {k: 1}) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6265-end-map-row
+  description: end node inline map selects the right start
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a)<-[:R]-(b:Q {k: 1}) RETURN a.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6265-unlabelled-end
+  description: unlabelled end with only an inline map
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a)<-[:R]-(b {k: 2}) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6265-forward
+  description: forward direction with a labelled end map
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a)-[:R]->(b:X {k: 3}) RETURN a.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6265-undirected
+  description: undirected with a labelled end map
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a)-[r]-(b:Y {k: 0}) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-rel-map-reverse
+  description: reversed pattern with a relationship property map
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a)<-[{w: 2}]-(b) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-rel-map-labelled
+  description: reversed pattern with labelled end
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (x:X)<-[{w: 2}]-(q) RETURN q.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-rel-where-reverse
+  description: reversed pattern with WHERE on the relationship
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (x:X)<-[r:R]-(q) WHERE r.w <= 1 RETURN x.k AS k, count(*) AS c GROUP BY x.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0,"c":1}'
+    - '{"k":1,"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){2}\]'
+  tags:
+  - regression
+- name: 6266-rel-project-reverse
+  description: relationship property of a reversed hop
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (x:X {k: 1})<-[r]-(q) RETURN r.w AS w
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"w":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-undirected-where
+  description: undirected hop with WHERE on the relationship
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (x:X)-[r]-(q) WHERE r.w >= 2 RETURN x.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":2},{"k":3}]'
+  tags:
+  - regression
+- name: 6266-undirected-map
+  description: undirected hop with a relationship map
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (x:X)-[:R {w: 3}]-(q) RETURN q.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-undirected-q
+  description: undirected from Q
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q)-[r:R {w: 3}]-(o) RETURN q.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-undirected-o
+  description: undirected to X with WHERE
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (o)-[r:R]-(x:X) WHERE r.w = 0 RETURN o.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-set-rel-prop
+  description: SET a relationship property on :S edges
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:Q)-[r:S]->(b:Q) SET r.w = 5 RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-reverse-after-set
+  description: reverse match by the written property
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Q)<-[:S {w: 5}]-(a) RETURN b.k AS k ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":1},{"k":3}]'
+  tags:
+  - regression
+- name: 6266-project-after-set
+  description: reverse hop projects the written property
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Q {k: 1})<-[r:S]-(a) RETURN r.w AS w
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"w":5}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6266-undirected-after-set
+  description: undirected WHERE on the written property
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (b:Q {k: 1})-[r]-(a) WHERE r.w = 5 RETURN a.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-in-abbrev
+  description: a<-(b)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:Q {k: 0})<-(b) RETURN b.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-out-abbrev
+  description: a->(b)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:Q {k: 0})->(b) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-any-abbrev
+  description: a-(b)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:Q {k: 0})-(b) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-chain-abbrev
+  description: y-(q)-(x)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (y:Y {k: 1})-(q)-(x:X) RETURN x.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-both-abbrev
+  description: a<->(b)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:Q {k: 0})<->(b) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-both-bracket
+  description: a<-[r]->(b)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:Q {k: 0})<-[r]->(b) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-both-typed
+  description: a<-[:R]->(b)
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a:Q {k: 0})<-[:R]->(b) RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-exists-abbrev
+  description: abbreviated edge inside EXISTS {}
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WHERE EXISTS { (q)-(:Y) } RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: 6267-double-dash-refused
+  description: <-- is not ISO and is a syntax error
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (a)<--(b) RETURN count(*) AS c
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression

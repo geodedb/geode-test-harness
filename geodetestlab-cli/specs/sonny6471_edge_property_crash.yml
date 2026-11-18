@@ -1,0 +1,139 @@
+version: '1.0'
+name: SONNY-6471 relationship properties survive a SIGKILL
+description: |
+  SONNY-6471 (DATA LOSS): relationship properties set by a single
+  CREATE / MERGE / SET statement were lost after `kill -9`. A relationship's
+  property chain head lives in the adjacency entries; the adapter rewrote
+  those heads without logging the pages in the engine transaction, so the WAL
+  held the property pages but nothing pointing at them and the relationship
+  came back WITHOUT its properties. Related: SONNY-6492 item 1 (first query
+  after the SIGKILL restart answered DataCorruption in 2 of ~31 runs), so the
+  post-restart reads below are the first queries the restarted server sees
+  and every one must succeed.
+
+  The spec writes relationships with properties through every statement shape
+  that sets, adds or removes a relationship property (CREATE with inline
+  properties, MERGE, MATCH..SET, SET +=, REMOVE), between endpoints spread over the
+  engine's 16 shards, SIGKILLs the
+  server (no shutdown, no checkpoint; --persist-interval is huge so the
+  committed state lives only in the WAL), restarts on the same data dir, and
+  reads every relationship back through an outgoing match, an incoming match
+  and an unlabeled relationship scan, with its property values.
+
+  CANARY: REQ=REQ-SONNY-6471-EDGE-PROP-CRASH; FEATURE="TransactionManagement"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny6471_edge_property_crash.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+  client:
+    timeout_ms: 120000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+default_timeout_ms: 120000
+
+tests:
+- name: seed-endpoints
+  description: 8 source and 8 destination nodes from ONE statement (the engine spreads node slots over its 16 shards, so the relationships below mix same-shard and cross-shard endpoints). range() ends exclusive in Geode, hence 1..9.
+  query: 'UNWIND range(1, 9) AS i CREATE (:S6471 {i: i}), (:D6471 {i: i})'
+  expected:
+    exit_code: 0
+
+- name: create-with-inline-props
+  description: Relationship properties set in the single CREATE statement that creates the relationship (the ticket's headline shape).
+  query: "MATCH (s:S6471), (d:D6471) WHERE d.i = s.i CREATE (s)-[:CREATE_R {w: s.i * 10, tag: 'c'}]->(d)"
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"relationships_created":8'
+
+- name: merge-with-props
+  description: MERGE of a relationship with inline properties.
+  query: "MATCH (s:S6471), (d:D6471) WHERE d.i = s.i + 1 MERGE (s)-[:MERGE_R {w: s.i * 100, tag: 'm'}]->(d)"
+  expected:
+    exit_code: 0
+
+- name: set-property-on-existing
+  description: SET adds a second property to an existing relationship's chain (the chain head moves).
+  query: MATCH (:S6471)-[r:CREATE_R]->(:D6471) SET r.extra = 7
+  expected:
+    exit_code: 0
+
+- name: set-overwrite-and-remove
+  description: Overwrite one property and remove another.
+  query: MATCH (:S6471)-[r:MERGE_R]->(:D6471) SET r.w = r.w + 1 REMOVE r.tag
+  expected:
+    exit_code: 0
+
+- name: pre-crash-baseline
+  description: The reads the post-restart steps repeat, before the crash.
+  query: MATCH (:S6471)-[r:CREATE_R]->(:D6471) WHERE r.extra = 7 AND r.tag = 'c' RETURN count(r) AS c, sum(r.w) AS w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":8'
+    - '"w":360'
+
+- name: sigkill-and-restart
+  description: SIGKILL the managed server by its data dir (no checkpoint) and restart on the same data dir.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo KILLED
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILLED
+
+- name: after-kill-outgoing-create-props
+  description: The first query after the restart. Every CREATE-d relationship has both properties.
+  query: MATCH (:S6471)-[r:CREATE_R]->(:D6471) WHERE r.extra = 7 AND r.tag = 'c' RETURN count(r) AS c, sum(r.w) AS w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":8'
+    - '"w":360'
+
+- name: after-kill-incoming-create-props
+  description: Incoming-side match of the same relationships.
+  query: MATCH (:D6471)<-[r:CREATE_R]-(:S6471) WHERE r.tag = 'c' RETURN count(r) AS c, sum(r.w) AS w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":8'
+    - '"w":360'
+
+- name: after-kill-merge-props
+  description: MERGE-d relationships kept the overwritten w and lost the removed tag.
+  query: MATCH (:S6471)-[r:MERGE_R]->(:D6471) WHERE r.tag IS NULL RETURN count(r) AS c, sum(r.w) AS w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":7'
+    - '"w":2807'
+
+- name: after-kill-unlabeled-relationship-scan
+  description: An unlabeled relationship scan sees all 15 relationships.
+  query: MATCH ()-[r]->() RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":15'

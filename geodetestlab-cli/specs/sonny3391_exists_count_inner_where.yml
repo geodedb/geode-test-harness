@@ -1,0 +1,183 @@
+# SONNY-3391: `EXISTS { (a:G)-[:R]->(b:X) WHERE b.j = 2 }` and `COUNT { ... }` over a relationship whose start is
+# not bound evaluated their WHERE without the pattern's own variables (they read NULL), so a WHERE on them
+# matched nothing. ISO/IEC 39075:2024 19.4 (EXISTS / COUNT predicates): the inner WHERE sees the pattern's
+# variables. Also the bound-start forms (SONNY-3184).
+# Fixture: four :Q {k, f?}, four :X {k}, four :Y {k}, eight :Z {k, g, r}:
+#   (Yk)-[:R]->(Qk)-[:R {w: k}]->(Xk); (Q0)-[:S]->(Q1) and a self loop (Q3)-[:S]->(Q3).
+version: '1.0'
+name: SONNY-3391 EXISTS/COUNT over an unbound relationship binds its variables in WHERE
+description: subquery inner WHERE sees the pattern variables
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+tests:
+- name: setup-fixture
+  description: Create the Q/X/Y/Z fixture graph
+  args:
+  - query
+  - --batch
+  stdin: |
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0})
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1})
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2})
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3})
+    CREATE (:Z {k: 0, g: 0, r: 7})
+    CREATE (:Z {k: 1, g: 0, r: 6})
+    CREATE (:Z {k: 2, g: 0, r: 5})
+    CREATE (:Z {k: 3, g: 0, r: 4})
+    CREATE (:Z {k: 4, g: 1, r: 3})
+    CREATE (:Z {k: 5, g: 1, r: 2})
+    CREATE (:Z {k: 6, g: 1, r: 1})
+    CREATE (:Z {k: 7, g: 1, r: 0})
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b)
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - '"error"'
+    - '"status_class":"4'
+    - '"status_class":"2'
+  tags:
+  - setup
+- name: exists-unbound-start
+  description: EXISTS over an unbound-start hop with WHERE on the end
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WHERE EXISTS { (a:Q)-[:S]->(b:Q) WHERE b.k = 3 } RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":4}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: exists-unbound-start-none
+  description: EXISTS whose WHERE matches nothing keeps no row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WHERE EXISTS { (a:Q)-[:S]->(b:Q) WHERE b.k = 2 } RETURN count(*) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":0}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-unbound-start
+  description: COUNT over an unbound-start hop with WHERE on the end
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q {k: 0}) RETURN COUNT { (a:Q)-[:S]->(b) WHERE b.k = 1 } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":1}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-unbound-start-rel
+  description: COUNT with WHERE on the relationship variable
+  args:
+  - query
+  - '-'
+  stdin: |
+    RETURN COUNT { (a:Q)-[r:R]->(b) WHERE r.w >= 2 } AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"c":2}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: exists-bound-where
+  description: bound start, WHERE on the end
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WHERE EXISTS { (q)-[:S]->(t) WHERE t.k = 1 } RETURN q.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: exists-match-form
+  description: EXISTS { MATCH ... WHERE }
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WHERE EXISTS { MATCH (q)-[:S]->(t) WHERE t.k = 1 } RETURN q.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":0}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: exists-outer-ref
+  description: inner WHERE referencing the outer variable
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) WHERE EXISTS { (q)-[:S]->(t) WHERE t.k = q.k } RETURN q.k AS k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '{"k":3}'
+    stdout_regex:
+    - '"rows":\[(\{[^{}]*\},?){1}\]'
+  tags:
+  - regression
+- name: count-per-row
+  description: COUNT with inner WHERE per outer row
+  args:
+  - query
+  - '-'
+  stdin: |
+    MATCH (q:Q) RETURN q.k AS k, COUNT { (q)-[:S]->(t) WHERE t.k >= 1 } AS c ORDER BY k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"k":0,"c":1},{"k":1,"c":0},{"k":2,"c":0},{"k":3,"c":1}]'
+  tags:
+  - regression

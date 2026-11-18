@@ -1,0 +1,192 @@
+version: '1.0'
+name: SONNY-6383 query residuals - CALL { } WITH ... RETURN, WITH's GROUP BY, comprehension aggregates
+description: |
+  SONNY-6383 items 2-4 (found during SONNY-2698/2699/6351), proved over the real
+  wire against the managed server:
+
+    2. The statement-level `CALL { } WITH ... RETURN` mini-parser accepted no
+       GROUP BY, ORDER BY, SKIP / OFFSET or LIMIT after the RETURN. It is a full
+       RETURN now.
+    3. A RETURN that mixes an aggregate with a plain item is refused when the
+       only GROUP BY belongs to the WITH (validateGroupBy accepted it, grouping
+       the RETURN by the WITH's keys): `... WITH g, count(*) AS c GROUP BY g
+       RETURN g, sum(c) AS s` is a grouping error 42803; `RETURN g, c` and
+       `RETURN sum(c)` stay valid.
+    4. An aggregate call inside a list comprehension's map or WHERE is the
+       scalar function (`[x IN [1] | sum([1, 2])]` is `[3]`), while the
+       comprehension's SOURCE is still the projection's (`size([x IN collect(k)
+       | x])` counts the group).
+
+  Fixed (0164171e1 test, 37bb168b6 fix). Item 1 of the ticket (a parsed MATCH takes
+  the engine-direct node scan stream again: a routing/performance property with
+  no output difference) and the leak items 6 and 8 are not observable from the
+  wire; see harness-lanes/transport-coverage.md.
+
+  CANARY: REQ=REQ-SONNY-6383-QUERY-RESIDUALS; FEATURE="CallSubquery"; ASPECT=ReturnClausesAndGroupBy; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6383_query_residuals.yml; OWNER=engine; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+tests:
+- name: seed-eight-nodes
+  description: eight :Z nodes k=0..7, g=k%2 (the end of range() is exclusive)
+  args:
+  - query
+  - '-'
+  stdin: 'FOR k IN range(0, 8) CREATE (:Z {k: k, g: k % 2, r: 7 - k})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags: &id001
+  - call-subquery
+  - sonny-6383
+  - regression
+- name: call-with-return-order-by-desc-limit
+  description: CALL { } WITH ... RETURN ... ORDER BY k DESC LIMIT 2 (the mini-parser accepted no ORDER BY or paging after RETURN)
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (z:Z) RETURN z.k AS k } WITH k RETURN k ORDER BY k DESC LIMIT 2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"ordered":true'
+    - '"rows":[{"k":7},{"k":6}]'
+  tags: *id001
+- name: call-with-return-skip
+  description: SKIP 6 after the RETURN
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (z:Z) RETURN z.k AS k } WITH k RETURN k ORDER BY k SKIP 6
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":6},{"k":7}]'
+  tags: *id001
+- name: call-with-where-return-offset-limit
+  description: WITH ... WHERE then RETURN ORDER BY OFFSET 1 LIMIT 1
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (z:Z) RETURN z.k AS k } WITH k WHERE k > 4 RETURN k ORDER BY k OFFSET 1 LIMIT 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"k":6}]'
+  tags: *id001
+- name: call-with-return-group-by
+  description: GROUP BY after the RETURN of a CALL { } WITH ... query
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (z:Z) RETURN z.g AS g, z.k AS k } WITH g, k RETURN g, count(k) AS c GROUP BY g ORDER BY g DESC
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":1,"c":4},{"g":0,"c":4}]'
+  tags: *id001
+- name: call-with-return-distinct-order
+  description: RETURN DISTINCT ... ORDER BY after CALL { } WITH
+  args:
+  - query
+  - '-'
+  stdin: CALL { MATCH (z:Z) RETURN z.k AS k } WITH k RETURN DISTINCT k % 2 AS m ORDER BY m
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"m":0},{"m":1}]'
+  tags: *id001
+- name: return-mixing-aggregate-and-plain-item-under-with-group-by-is-refused
+  description: 'GROUP BY belongs to the WITH, so RETURN g, sum(c) mixes an aggregate with a non-grouped item: 42803'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z) WITH z.g AS g, count(*) AS c GROUP BY g RETURN g, sum(c) AS s
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_contains:
+    - '42803'
+    - grouping error
+  tags:
+  - group-by
+  - sonny-6383
+  - regression
+  - negative
+- name: with-group-by-then-plain-columns-stays-valid
+  description: RETURN g, c over the WITH's grouped output is fine
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z) WITH z.g AS g, count(*) AS c GROUP BY g RETURN g, c ORDER BY g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":0,"c":4},{"g":1,"c":4}]'
+  tags:
+  - group-by
+  - sonny-6383
+  - regression
+- name: with-group-by-then-global-aggregate-stays-valid
+  description: RETURN sum(c) aggregates the WITH's groups into one row (8)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z) WITH z.g AS g, count(*) AS c GROUP BY g RETURN sum(c) AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"s":8}]'
+  tags:
+  - group-by
+  - sonny-6383
+  - regression
+- name: aggregate-in-comprehension-map-is-the-scalar-function
+  description: sum([1, 2]) inside a comprehension is the scalar list function
+  args:
+  - query
+  - '-'
+  stdin: RETURN [x IN [1] | sum([1, 2])] AS s
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"s":[3]}]'
+  tags:
+  - list-comprehension
+  - sonny-6383
+  - regression
+- name: comprehension-source-is-still-the-projections-aggregate
+  description: collect(z.k) as the comprehension source counts the three matching rows
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:Z) WHERE z.k < 3 RETURN size([x IN collect(z.k) | x]) AS n
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"n":3}]'
+  tags:
+  - list-comprehension
+  - sonny-6383
+  - regression

@@ -1,0 +1,302 @@
+version: '1.0'
+name: Cluster membership churn - repeated kill and restart of nodes (SONNY-6451, SONNY-6447)
+description: |
+  SONNY-6451: the Raft transport to a follower stalled permanently after
+  repeated restarts (membership churn); handleNodeFailure also got an
+  uninitialised node id.
+  SONNY-6447: a node that was killed could not restart on its own data
+  directory (DataDirLocked after the crash) and the dns Address.eql panic took
+  cluster nodes down during churn. (The IP-move half of the reported churn
+  needs network namespaces and stays in tests/cluster/netns_*; here every
+  restart keeps its address, which is the part reachable from the harness.)
+
+  Scenario on 3 real `geode serve` processes with verified peer TLS: write
+  rows through whichever node is the leader, then SIGKILL and immediately
+  restart, in turn, node 1 twice in a row, node 2 and node 0 (leader or
+  follower, any can be the victim), writing 5 more rows after every restart.
+  After every restart all three nodes must converge on exactly the rows
+  written so far, each id exactly once, and every restart must succeed (the
+  harness restart_node step waits for the node to serve again, so a
+  DataDirLocked or crash-on-start fails the spec). At the end each node
+  reports 3 members, one leader and one agreed leader_id.
+
+  CANARY: REQ=REQ-SONNY-6451-CLUSTER-CHURN; FEATURE="Cluster membership churn"; ASPECT=KillRestart; STATUS=TESTED; OWNER=distributed; UPDATED=2026-11-17
+
+cluster:
+  nodes: 3
+  target_node: leader
+  startup_timeout_ms: 120000
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: repeated_kill_restart_keeps_every_node_converged
+  type: sequential
+  timeout_ms: 1500000
+  steps:
+  - type: bash
+    timeout_ms: 400000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 20 "$2" 2>&1
+      }
+      w() {
+        local deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 0.5
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      # converge N: every node reports exactly N distinct Churn rows
+      converge() {
+        local want=$1 deadline=$(( $(date +%s) + 150 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          local all=1
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "MATCH (n:Churn) RETURN count(n) AS c, count(DISTINCT n.id) AS d")
+            if ! (echo "${out}" | grep -q "\"c\":${want}[,}]" && echo "${out}" | grep -q "\"d\":${want}[,}]"); then all=0; break; fi
+          done
+          [ "${all}" = 1 ] && { echo "converged=${want}"; return 0; }
+          sleep 1
+        done
+        echo "no convergence on ${want} rows: last=${out:0:300}"; return 1
+      }
+      for i in 1 2 3 4 5; do w "MERGE (n:Churn {id: ${i}})" || exit 1; done
+      converge 5
+  - type: signal
+    target: node:1
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 1000
+  - type: restart_node
+    target: node:1
+  - type: bash
+    timeout_ms: 400000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 20 "$2" 2>&1
+      }
+      w() {
+        local deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 0.5
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      # converge N: every node reports exactly N distinct Churn rows
+      converge() {
+        local want=$1 deadline=$(( $(date +%s) + 150 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          local all=1
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "MATCH (n:Churn) RETURN count(n) AS c, count(DISTINCT n.id) AS d")
+            if ! (echo "${out}" | grep -q "\"c\":${want}[,}]" && echo "${out}" | grep -q "\"d\":${want}[,}]"); then all=0; break; fi
+          done
+          [ "${all}" = 1 ] && { echo "converged=${want}"; return 0; }
+          sleep 1
+        done
+        echo "no convergence on ${want} rows: last=${out:0:300}"; return 1
+      }
+      for i in $(seq 6 10); do w "MERGE (n:Churn {id: ${i}})" || exit 1; done
+      converge 10
+  - type: signal
+    target: node:1
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 1000
+  - type: restart_node
+    target: node:1
+  - type: bash
+    timeout_ms: 400000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 20 "$2" 2>&1
+      }
+      w() {
+        local deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 0.5
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      # converge N: every node reports exactly N distinct Churn rows
+      converge() {
+        local want=$1 deadline=$(( $(date +%s) + 150 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          local all=1
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "MATCH (n:Churn) RETURN count(n) AS c, count(DISTINCT n.id) AS d")
+            if ! (echo "${out}" | grep -q "\"c\":${want}[,}]" && echo "${out}" | grep -q "\"d\":${want}[,}]"); then all=0; break; fi
+          done
+          [ "${all}" = 1 ] && { echo "converged=${want}"; return 0; }
+          sleep 1
+        done
+        echo "no convergence on ${want} rows: last=${out:0:300}"; return 1
+      }
+      for i in $(seq 11 15); do w "MERGE (n:Churn {id: ${i}})" || exit 1; done
+      converge 15
+  - type: signal
+    target: node:2
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 1000
+  - type: restart_node
+    target: node:2
+  - type: bash
+    timeout_ms: 400000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 20 "$2" 2>&1
+      }
+      w() {
+        local deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 0.5
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      # converge N: every node reports exactly N distinct Churn rows
+      converge() {
+        local want=$1 deadline=$(( $(date +%s) + 150 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          local all=1
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "MATCH (n:Churn) RETURN count(n) AS c, count(DISTINCT n.id) AS d")
+            if ! (echo "${out}" | grep -q "\"c\":${want}[,}]" && echo "${out}" | grep -q "\"d\":${want}[,}]"); then all=0; break; fi
+          done
+          [ "${all}" = 1 ] && { echo "converged=${want}"; return 0; }
+          sleep 1
+        done
+        echo "no convergence on ${want} rows: last=${out:0:300}"; return 1
+      }
+      for i in $(seq 16 20); do w "MERGE (n:Churn {id: ${i}})" || exit 1; done
+      converge 20
+  - type: signal
+    target: node:0
+    sig: SIGKILL
+  - type: wait
+    wait_ms: 1000
+  - type: restart_node
+    target: node:0
+  - type: bash
+    timeout_ms: 400000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 20 "$2" 2>&1
+      }
+      w() {
+        local deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 0.5
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      # converge N: every node reports exactly N distinct Churn rows
+      converge() {
+        local want=$1 deadline=$(( $(date +%s) + 150 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          local all=1
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "MATCH (n:Churn) RETURN count(n) AS c, count(DISTINCT n.id) AS d")
+            if ! (echo "${out}" | grep -q "\"c\":${want}[,}]" && echo "${out}" | grep -q "\"d\":${want}[,}]"); then all=0; break; fi
+          done
+          [ "${all}" = 1 ] && { echo "converged=${want}"; return 0; }
+          sleep 1
+        done
+        echo "no convergence on ${want} rows: last=${out:0:300}"; return 1
+      }
+      for i in $(seq 21 25); do w "MERGE (n:Churn {id: ${i}})" || exit 1; done
+      converge 25
+  - type: bash
+    timeout_ms: 400000
+    command: |
+      PW="${GEODE_ADMIN_PASSWORD}"
+      PORTS=($(echo "${GEODE_CLUSTER_PORTS}" | tr ',' ' '))
+      q() {
+        "${GEODE_BINARY}" query --server "127.0.0.1:$1" ${GEODE_CLIENT_TLS} --format json \
+          -U geode -P "${PW}" --timeout 20 "$2" 2>&1
+      }
+      w() {
+        local deadline=$(( $(date +%s) + 120 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "$1")
+            if echo "${out}" | grep -q '"status_class":"00000"'; then return 0; fi
+          done
+          sleep 0.5
+        done
+        echo "write never succeeded: $1 last=${out}"; return 1
+      }
+      # converge N: every node reports exactly N distinct Churn rows
+      converge() {
+        local want=$1 deadline=$(( $(date +%s) + 150 ))
+        while [ "$(date +%s)" -lt "${deadline}" ]; do
+          local all=1
+          for P in "${PORTS[@]}"; do
+            out=$(q "${P}" "MATCH (n:Churn) RETURN count(n) AS c, count(DISTINCT n.id) AS d")
+            if ! (echo "${out}" | grep -q "\"c\":${want}[,}]" && echo "${out}" | grep -q "\"d\":${want}[,}]"); then all=0; break; fi
+          done
+          [ "${all}" = 1 ] && { echo "converged=${want}"; return 0; }
+          sleep 1
+        done
+        echo "no convergence on ${want} rows: last=${out:0:300}"; return 1
+      }
+      # membership is whole and one leader is agreed on every node
+      for P in "${PORTS[@]}"; do
+        out=$(q "${P}" "SHOW CLUSTER STATUS")
+        echo "${out}" | python3 -c 'import sys,json; r=json.load(sys.stdin)["rows"]; assert len(r)==3 and sum(1 for x in r if x["role"]=="leader")==1 and len({x["leader_id"] for x in r})==1, r' || { echo "bad membership on ${P}: ${out:0:400}"; exit 1; }
+      done
+      echo churn_ok rows=25
+  tags: [cluster, raft, churn, sonny-6451, sonny-6447]

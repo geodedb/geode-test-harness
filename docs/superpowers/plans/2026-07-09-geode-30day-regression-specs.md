@@ -21,7 +21,7 @@
   4. **Bug rule**: if the server ACCEPTS input the task says must be rejected, or returns a wrong result, that is a product bug — do NOT weaken the assertion to green. Add the case as a limitation-pin test (name suffix `-limitation-pin`, description referencing the geode commit and stating the expected-but-unmet contract, asserting today's actual behavior), and report the finding in your task summary.
   5. **Commit**: `git add geodetestlab-cli/specs/<file>.yml && git commit -m "test(specs): <one-line> (<geode sha or gap ref>)"`. NEVER `git add -A` (the worktree has an unrelated modified `.geode_admin_password`).
 - Test data: each spec uses a unique label prefix (e.g. `RG1_`, `RG2_`…) so specs stay independent under `--parallel`.
-- Auth defaults: admin user `geode`, password `GeodeTestPassword123!` (`GEODE_ADMIN_PASSWORD`); harness injects credentials automatically for query tests.
+- Auth defaults: admin user `geode`, password `Geode Test Admin Passphrase` (`GEODE_ADMIN_PASSWORD`); harness injects credentials automatically for query tests.
 
 ---
 
@@ -66,6 +66,7 @@ Task 24 is a verification-only sweep (no new file).
 Contract: alias-grouped GROUP BY must not collapse rows into a single null group (pre-fix silent wrong result).
 
 Tests (Standard Task Steps apply):
+
 - `setup-seed`: `query: | CREATE (:RG1_Item {category:'a', src:'x', v:1}) …` — seed 9 nodes: 4×category `a`, 3×`b`, 2×`c`; 5 with `src:'x'`, 4 with `src:'y'`. Expect exit 0.
 - `alias-grouped-count` (KEY, positive): `MATCH (n:RG1_Item) RETURN n.category AS s, count(*) AS c GROUP BY s` → stdout contains all three of `a`, `b`, `c` and counts `4`, `3`, `2`; `stdout_not_contains: ["null"]`.
 - `alias-grouped-sum` (positive): `RETURN n.category AS s, sum(n.v) AS total GROUP BY s` → 3 groups, correct sums.
@@ -85,6 +86,7 @@ Tests (Standard Task Steps apply):
 Contract: after restart, re-MERGE of persisted nodes MATCHes (no duplicates).
 
 Tests:
+
 - `seed-merge-initial`: `query: |` with 6 statements `MERGE (n:RG2_Taxon {taxon_id: <i>, source: 'gbif'}) SET n.rank = 'species'` for i=1..6. Exit 0.
 - `count-before-restart`: `MATCH (n:RG2_Taxon) RETURN count(n)` → `6`.
 - `restart`: `type: bash`, `command: echo RESTART`, `restart_server: true`.
@@ -105,6 +107,7 @@ Tests:
 Contract: FIRST post-reopen query `count(n:Label)` returns the full count (pre-fix: deferred-empty index served 0/partial).
 
 Tests:
+
 - `seed`: create 250 `RG3_A` nodes via `query: |` batch of `CREATE` statements (use FOREACH/UNWIND if supported — probe first; else 250-line query block). Exit 0.
 - `count-before`: `MATCH (n:RG3_A) RETURN count(n)` → `250`.
 - `restart`: bash echo + `restart_server: true`.
@@ -122,6 +125,7 @@ Tests:
 **Interfaces:** labels `RG4_Src`, `RG4_Dst`, edge `RG4_LINKS`.
 
 Tests:
+
 - `seed`: 3 `RG4_Src` nodes (`id: s1..s3`) each `-[:RG4_LINKS]->` a shared `RG4_Dst {id:'d1'}`; plus `RG4_Dst {id:'d2'}` with no in-edges.
 - `reverse-bound-arrowhead` (KEY): `MATCH (b:RG4_Dst)<-[:RG4_LINKS]-(a) WHERE b.id='d1' RETURN a.id` → 3 rows `s1,s2,s3`.
 - `forward-differential`: `MATCH (a:RG4_Src)-[:RG4_LINKS]->(b) WHERE b.id='d1' RETURN a.id` → same 3 ids.
@@ -137,6 +141,7 @@ Tests:
 **Interfaces:** server started WITHOUT `--data-dir` (probe how the harness config expresses in-memory mode; if the managed server always passes a data_dir, use `server_args` to omit/override, else document and pin).
 
 Tests:
+
 - `create-graph`: `CREATE GRAPH rg5_g1` → exit 0.
 - `tenant-bound-session` (KEY): connect with graph-bound DSN (`--dsn` field on the test, pattern from `dsn_graph_binding.yml`) to `rg5_g1` → query `RETURN 1` succeeds.
 - `bind-nonexistent-graph` (negative): DSN bound to `rg5_missing` → nonzero exit + error mentioning the graph.
@@ -153,6 +158,7 @@ Tests:
 Contract: ReadOnly non-admin binding an ungranted graph is denied (BOLA); ReadWrite non-admin allowed in non-strict single-tenant mode; strict tenancy denies both without GRANT.
 
 Tests (probe role names/DDL syntax first — `CREATE USER … ; GRANT ROLE …`):
+
 - `setup-users-graph`: admin creates both users + `CREATE GRAPH rg6_secret`.
 - `readonly-bind-denied` (KEY negative): as `rg6_ro`, graph-bound connect/`USE GRAPH rg6_secret` → denied, stderr contains access-denied text.
 - `readwrite-bind-allowed-nonstrict` (positive): as `rg6_rw` → allowed, can `RETURN 1`.
@@ -169,6 +175,7 @@ Tests (probe role names/DDL syntax first — `CREATE USER … ; GRANT ROLE …`)
 **Interfaces:** non-admin user `rg7_user`; CDC control surface (probe: `geode cdc …` CLI subcommands / gRPC ctrl endpoints).
 
 Tests:
+
 - `unauthenticated-cdc-denied` (KEY negative): CDC ctrl/diag call with no credentials → rejected (auth error, not success and not crash).
 - `nonadmin-cdc-denied` (negative): as `rg7_user` → rejected.
 - `admin-cdc-allowed` (positive): as admin → succeeds (status/list op).
@@ -182,6 +189,7 @@ Tests:
 **Files:** Create `geodetestlab-cli/specs/security_reserved_username_guard_860.yml`
 
 Tests (probe the reserved list — check geode source `reserved` near the #860 commits; likely `geode`, `__geode_*`, `system`):
+
 - `create-reserved-user-refused` (KEY negative): `user create <reserved> …` → nonzero exit + error naming the reserved/invalid username. One test per reserved name found (≥2).
 - `auth-as-reserved-rejected` (negative): `auth login --user <reserved-internal>` → rejected.
 - `ordinary-user-ok` (positive control): `user create rg8_normal …` → created.
@@ -196,6 +204,7 @@ Tests (probe the reserved list — check geode source `reserved` near the #860 c
 **Interfaces:** `cli.server.env: {GEODE_WAL_SYNC: deferred}`, `cleanup: false`.
 
 Tests:
+
 - `create-user-deferred`: `user create rg9_user rg9@test.example.com --password Rg9_Pass_2026!` → exit 0.
 - `rotate-password`: alter rg9_user's password to `Rg9_New_2026!` (probe exact CLI: `user alter`/`ALTER USER`). Exit 0.
 - `restart`: bash + `restart_server: true`.
@@ -213,6 +222,7 @@ Tests:
 **Interfaces:** `cleanup: false`. Persisted admin password rotation (probe `geode admin` / `ALTER USER geode`).
 
 Tests:
+
 - `rotate-admin-password`: set admin password to `Rg10_Admin_2026!` (persisted).
 - `restart`: bash + `restart_server: true`. NOTE: the managed server env still carries the original `GEODE_ADMIN_PASSWORD` — this is exactly the 88f82375 contract: persisted credential must win over env on reopen.
 - `persisted-password-works` (KEY positive): login with `Rg10_Admin_2026!` → success.
@@ -230,6 +240,7 @@ Tests:
 **Interfaces:** TDE-enabled server (copy `tde_config`/env from `tde_bitflip_detection.yml` — probe it), `cleanup: false`. Sentinel `TDE_SENTINEL_RG11_XYZZY`.
 
 Tests:
+
 - `seed-sentinel`: create 50 nodes `(:RG11_Doc {secret:'TDE_SENTINEL_RG11_XYZZY<i>'})`.
 - `force-persistence`: run a checkpoint-inducing op or `restart_server: true` (probing which flushes hydration snaps).
 - `scan-datadir` (KEY negative): `type: bash`, `command: "! grep -r 'TDE_SENTINEL_RG11_XYZZY' ${GEODE_DATA_DIR}"` (probe the env var the harness exports for data_dir; `regression_issue_539…` shows the pattern) → exit 0 (no plaintext found). Alternatively use the spec-level `plaintext_verification`/`plaintext_check` block with `search_patterns: [TDE_SENTINEL_RG11_XYZZY]` — prefer the built-in scanner.
@@ -245,6 +256,7 @@ Tests:
 **Interfaces:** label `RG12_P {k, grp}`; `cleanup: false`; per-test `timeout_ms: 15000` on post-reopen reads (prompt-response contract).
 
 Tests:
+
 - `seed`: 500 nodes with `k` = `key<i>`, `grp` = i mod 5; `CREATE INDEX` on `(RG12_P.k)` (probe exact DDL).
 - `warm-checks`: `WHERE n.k='key42' RETURN n.grp` → correct; `RETURN DISTINCT n.grp` → 5 rows.
 - `restart` (clean shutdown): bash + `restart_server: true`.
@@ -263,6 +275,7 @@ Tests:
 **Interfaces:** label `RG13_N {v}` — NO `CREATE INDEX` anywhere in this spec.
 
 Tests:
+
 - `seed`: 100 nodes, `v` = shuffled 1..100 (write out literal CREATEs with non-monotonic values).
 - `orderby-fresh-asc` (KEY): `MATCH (n:RG13_N) RETURN n.v ORDER BY n.v LIMIT 10` → stdout_regex asserting `1..10` in order (probe output format, then anchor a regex like `1\D+2\D+3…`).
 - `orderby-alias-parity` (KEY): `RETURN n.v AS a ORDER BY a LIMIT 10` → identical values/order to previous.
@@ -279,6 +292,7 @@ Tests:
 **Interfaces:** label `RG14_N {k}`; per-test `timeout_ms: 20000` so a wedge fails fast instead of hanging the suite.
 
 Tests (order matters — nodes BEFORE index is the deadlock trigger):
+
 - `seed-first`: 200 `RG14_N` nodes.
 - `create-index-on-populated` (KEY): `CREATE INDEX` on `RG14_N.k` → exit 0 within timeout.
 - `server-alive-followup` (KEY): `MATCH (n:RG14_N) RETURN count(n)` → 200 (a wedged server would time out).
@@ -296,6 +310,7 @@ Tests (order matters — nodes BEFORE index is the deadlock trigger):
 **Interfaces:** `cli.server.env: {GEODE_READ_EXECUTOR_BUDGET_MB: '1'}`; big label `RG15_Big {k, pad}`.
 
 Tests:
+
 - `seed-large`: enough rows with a fat `pad` string (e.g. 2000 nodes × 1KB pad; probe how much trips a 1MB budget) — split across several `query: |` tests if needed.
 - `oversized-read-budget-error` (KEY negative): `MATCH (n:RG15_Big) RETURN n.k, n.pad, count(*) GROUP BY n.k, n.pad` (materializing aggregation) → error containing `53200` or `ReadQueryBudgetExceeded` (probe the exact surface), nonzero or error-status; server MUST stay alive.
 - `server-alive-after` (positive): `RETURN 1` → success.
@@ -312,6 +327,7 @@ Tests:
 **Interfaces:** label `RG16_N {k, other, val}` with `CREATE INDEX` on `k`; `cleanup: false`.
 
 Tests:
+
 - `seed+index`: 50 nodes `k='pk<i>'`, `val=0`; index on `k`.
 - `indexed-seek-set` (KEY): `MATCH (n:RG16_N) WHERE n.k='pk7' SET n.val=42` → exit 0; `RETURN n.val` for pk7 → 42; count of `val=42` → 1 (exactly one node touched).
 - `legacy-path-differential`: `MATCH (n:RG16_N) WHERE n.other IS NULL AND n.k='pk8' SET n.val=43` (non-indexed predicate forces legacy path) → same observable semantics.
@@ -327,6 +343,7 @@ Tests:
 **Files:** Create `geodetestlab-cli/specs/quic_stream_multiplexing_default.yml` (default-ON assertions) — opt-out runs as a `pre_server`-less second spec would be cleaner, but a single spec with default env covers the primary contract; cover opt-out via `type: bash` scratch-server test.
 
 Tests:
+
 - `rapid-sequential-queries`: 10 consecutive query tests (or one bash loop invoking `geode query` 10×) → all succeed (secondary streams don't hang).
 - `parallel-burst`: `type: bash` launching 5 concurrent `geode query 'RETURN 1' --server ${GEODE_SERVER_ADDRESS}` with `wait` → all exit 0.
 - `optout-boots-and-serves`: `type: bash` — start scratch server with `GEODE_QUIC_ENABLE_STREAM_MULTIPLEXING=0` on a free port, run one query, kill it → exit 0.
@@ -341,6 +358,7 @@ Tests:
 **Interfaces:** entirely `type: bash` tests against scratch servers (the managed server must stay up for the harness); `single_node_only: true`.
 
 Tests:
+
 - `sigterm-bounded` (KEY): bash script — start scratch geode with `GEODE_SHUTDOWN_DRAIN_TIMEOUT_MS=2000` on a free port, wait for ready, open a client query in background, send SIGTERM, poll for process exit with a 15 s ceiling; assert exited (echo `EXITED_WITHIN_BOUND`). Generous gates to avoid CI flake.
 - `sigterm-immediate`: same with `=0` → exits within 10 s.
 
@@ -354,6 +372,7 @@ Tests:
 **Interfaces:** `cli.server.env: {GEODE_BUFFER_POOL_PAGES: '8192'}`, `cleanup: false`.
 
 Tests:
+
 - `crud-under-override` (positive): create/read/update/delete a handful of `RG19_N` nodes → all green.
 - `survives-restart`: restart; data intact.
 - `garbage-value-fallback` (negative→graceful): `type: bash` scratch server with `GEODE_BUFFER_POOL_PAGES=garbage` → boots (or exits with a clean config error — probe; assert whichever contract holds, no crash/panic text).
@@ -368,6 +387,7 @@ Tests:
 **Interfaces:** FLE-enabled server (copy env/setup from `fle_plaintext_verification_access_control.yml` — probe), role `rg20_analyst`, user `rg20_user`, FLE field `RG20_Rec.ssn`; `cleanup: false`.
 
 Tests:
+
 - `setup`: FLE field config + user/role + seed `(:RG20_Rec {ssn:'123-45-6789'})`.
 - `read-before-grant` (KEY negative): as rg20_user, `RETURN n.ssn` → placeholder/denied (NOT plaintext; `stdout_not_contains: ['123-45-6789']`).
 - `grant-online` (KEY): `CALL geode.fle.grantPlaintext('RG20_Rec','ssn','rg20_analyst')` as admin → exit 0, NO restart.
@@ -384,6 +404,7 @@ Tests:
 **Interfaces:** edges `RG21_KNOWS`, `RG21_LIKES`; `cleanup: false`.
 
 Tests:
+
 - `seed`: 12 `RG21_KNOWS` + 5 `RG21_LIKES` edges between fresh nodes.
 - `typed-count` (KEY): `MATCH ()-[r:RG21_KNOWS]->() RETURN count(r)` → 12; `RG21_LIKES` → 5.
 - `restart` + `typed-count-after-reopen` (KEY): both counts unchanged.
@@ -399,6 +420,7 @@ Tests:
 **Files:** Create `geodetestlab-cli/specs/gql_backup_restore_refusal.yml`
 
 Tests:
+
 - `gql-backup-refused` (KEY negative): `query: "BACKUP DATABASE TO '/tmp/x'"` (probe the exact syntax the parser recognizes-then-refuses) → clean stable "unsupported/not supported" error, server alive; NOT a crash.
 - `gql-restore-refused` (negative): same for RESTORE.
 - `server-alive` (positive): `RETURN 1` after both.
@@ -413,6 +435,7 @@ Tests:
 **Files:** Create `geodetestlab-cli/specs/cdc_unsupported_sink_failloud.yml`
 
 Tests (probe CDC config surface from `cdc_kafka_resume_token.yml` / `geode_cdc_comprehensive.yml`):
+
 - `kinesis-sink-rejected` (KEY negative): configure a CDC sink of type `kinesis` → explicit rejection error naming the unsupported sink (not silent accept).
 - `pubsub-sink-rejected` (negative): same for `pubsub`.
 - `supported-sink-ok` (positive control): `webhook` (or kafka if a broker isn't required for config-accept) config accepted.

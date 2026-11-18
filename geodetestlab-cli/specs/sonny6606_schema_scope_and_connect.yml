@@ -1,0 +1,247 @@
+version: '1.0'
+name: SONNY-6606 schema listings are scoped to the session graph; batch writes count property keys; \connect authenticates
+description: |
+  SONNY-6606 follow-ups to SONNY-6589, proved against the managed server:
+
+    1. `CALL db.labels()`, `db.relationshipTypes()`, `db.propertyKeys()` and
+       `SHOW TABLES` listed the schema of EVERY graph - `__geode_security`
+       included, with its `User` / `Role` / `AuthChainRoot` labels and
+       `password_hash` / `hmac` keys - to every session. They now list the session
+       graph's schema only. Two user graphs with distinct labels, edge types and
+       keys are listed separately, and the default graph's listing never shows a
+       security-graph label or credential key.
+    2. The CREATE fast path (and the batch property writes) skipped the label-
+       property counters, so a key written by `CREATE (n:L {k: v})` was never
+       listed (LSP property completion was empty for user graphs). Observable
+       through db.propertyKeys.
+    5. The shell's `\connect <host:port>` sent its HELLO with no credentials, so
+       it could not reach any server with authentication on (every geode server
+       by default): "Authentication required". It now authenticates with the
+       credentials the shell logged in with (-U / -P). The spec starts a second
+       real server and drives the real `geode shell --plain`.
+  Items 3 (a broken graph logged every save), 4 (backup handshake timeout) and 6
+  (a role-less LSP principal defaults to None) need conditions a black-box run
+  cannot reach (a corrupted graph registry, an unresponsive peer, a role-less
+  LSP principal); see harness-lanes/transport-coverage.md.
+
+  Fixed (78d326d1e tests, 6e7c9ee08 fix).
+
+  CANARY: REQ=REQ-SONNY-6606-META-SCHEMA-SCOPE; FEATURE="GPS Metadata Isolation"; ASPECT=SessionGraphOnlyAndConnectAuth; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6606_schema_scope_and_connect.yml; OWNER=security; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+tests:
+- name: create-graph-a
+  description: graph g6606a
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g6606a
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6606
+  - regression
+- name: create-graph-b
+  description: graph g6606b
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g6606b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6606
+  - regression
+- name: graph-a-data
+  description: a node, an edge type and property keys only in graph a
+  args:
+  - query
+  - -g
+  - g6606a
+  - '-'
+  stdin: 'CREATE (:OnlyA {ka: 1})-[:REL_A]->(:OnlyA2 {ka2: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6606
+  - regression
+- name: graph-b-data
+  description: a node and property key only in graph b
+  args:
+  - query
+  - -g
+  - g6606b
+  - '-'
+  stdin: 'CREATE (:OnlyB {kb: 3})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - sonny-6606
+  - regression
+- name: db-labels-lists-only-the-session-graph
+  description: db.labels on graph a lists a labels and not graph b labels
+  args:
+  - query
+  - -g
+  - g6606a
+  - '-'
+  stdin: CALL db.labels()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"label":"OnlyA"'
+    - '"label":"OnlyA2"'
+    stdout_not_contains:
+    - OnlyB
+  tags:
+  - sonny-6606
+  - regression
+- name: db-property-keys-lists-only-the-session-graph
+  description: db.propertyKeys on graph a lists ka and ka2 (fast-path CREATE counts its keys) and not kb
+  args:
+  - query
+  - -g
+  - g6606a
+  - '-'
+  stdin: CALL db.propertyKeys()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"propertyKey":"ka"'
+    - '"propertyKey":"ka2"'
+    stdout_not_contains:
+    - '"kb"'
+  tags:
+  - sonny-6606
+  - regression
+- name: db-property-keys-sees-keys-written-by-the-create-fast-path
+  description: 'a plain CREATE (n:L {k: v}) key is listed (the fast path never counted it)'
+  args:
+  - query
+  - -g
+  - g6606b
+  - '-'
+  stdin: CALL db.propertyKeys()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"propertyKey":"kb"'
+    stdout_not_contains:
+    - '"ka"'
+  tags:
+  - sonny-6606
+  - regression
+- name: db-relationship-types-lists-only-the-session-graph
+  description: graph b has no edge types, graph a has REL_A
+  args:
+  - query
+  - -g
+  - g6606b
+  - '-'
+  stdin: CALL db.relationshipTypes()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+    stdout_not_contains:
+    - REL_A
+  tags:
+  - sonny-6606
+  - regression
+- name: show-tables-lists-only-the-session-graph
+  description: SHOW TABLES on graph a
+  args:
+  - query
+  - -g
+  - g6606a
+  - '-'
+  stdin: SHOW TABLES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"OnlyA"'
+    stdout_not_contains:
+    - OnlyB
+  tags:
+  - sonny-6606
+  - regression
+- name: default-graph-listing-never-shows-the-security-graph
+  description: the admin default-graph schema lists no security-graph label or key (User, Role, AuthChainRoot, password_hash, hmac)
+  args:
+  - query
+  - '-'
+  stdin: CALL db.labels()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - AuthChainRoot
+    - '"label":"User"'
+    - '"label":"Role"'
+  tags:
+  - sonny-6606
+  - regression
+- name: default-graph-property-keys-never-show-credential-keys
+  description: db.propertyKeys on the default graph lists no credential key
+  args:
+  - query
+  - '-'
+  stdin: CALL db.propertyKeys()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - password_hash
+    - '"hmac"'
+    - '"salt"'
+  tags:
+  - sonny-6606
+  - regression
+- name: shell-connect-authenticates-with-the-shells-credentials
+  description: \connect <host:port> from a logged-in shell reaches a second server with authentication on (it sent HELLO with no credentials)
+  type: bash
+  timeout_ms: 240000
+  command: "PW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nexport GEODE_ADMIN_PASSWORD=\"$PW\" GEODE_LSP_PORT=0 GEODE_DISABLE_AUDIT=1 GEODE_ALLOW_INSECURE_TLS=1\nBIN=\"${GEODE_BINARY:-geode}\"\nD=$(mktemp -d); PID=\"\"\ntrap '[ -n \"$PID\" ] && kill \"$PID\" 2>/dev/null && wait \"$PID\" 2>/dev/null; rm -rf \"$D\"' EXIT\nBP=$(python3 -c \"import socket;u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);u.bind(('127.0.0.1',0));print(u.getsockname()[1])\")\n# server B: a second real server with authentication ON (the default) and its own data\n\"$BIN\" serve --data-dir \"$D/b\" --listen 127.0.0.1:$BP --log-level warn > \"$D/b.log\" 2>&1 &\nPID=$!\nfor i in $(seq 1 120); do ss -uln \"sport = :$BP\" | grep -q \":$BP\" && break; kill -0 $PID 2>/dev/null || { echo server_b_died; cat \"$D/b.log\"; exit 1; }; sleep 0.5; done\n\"$BIN\" query \"CREATE (:OnlyOnB6606 {k: 1})\" --server 127.0.0.1:$BP --insecure-tls-skip-verify -U geode -P \"$PW\" --format json 2>&1 | grep -q '\"status_class\":\"00000\"' && echo \"B_SEEDED=yes\" || echo \"B_SEEDED=no\"\n# shell logs in to server A (the managed server) with -U/-P, then \\connect's to B\nprintf '\\\\connect 127.0.0.1:%s\\nMATCH (n:OnlyOnB6606) RETURN count(n) + 66060000 AS on_b;\\n' \"$BP\" \\\n  | timeout 60 \"$BIN\" shell --plain --server \"${GEODE_SERVER_ADDRESS}\" --insecure-tls-skip-verify -U geode -P \"$PW\" > \"$D/shell.out\" 2>&1\ngrep -q \"Connected to 127.0.0.1:$BP\" \"$D/shell.out\" && echo \"CONNECTED=yes\" || { echo \"CONNECTED=no\"; cat \"$D/shell.out\"; }\ngrep -q \"connect failed\\|Authentication required\" \"$D/shell.out\" && echo \"AUTH_REFUSED=yes\" || echo \"AUTH_REFUSED=no\"\ngrep -q \"66060001\" \"$D/shell.out\" && echo \"QUERY_RAN_ON_B=yes\" || echo \"QUERY_RAN_ON_B=no\"\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - B_SEEDED=yes
+    - CONNECTED=yes
+    - AUTH_REFUSED=no
+    - QUERY_RAN_ON_B=yes
+    stdout_not_contains:
+    - server_b_died
+  tags:
+  - shell
+  - connect
+  - sonny-6606
+  - regression

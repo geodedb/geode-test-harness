@@ -182,7 +182,7 @@ impl Runner {
         let port: u16 = parts.get(1).unwrap_or(&"3141").parse().unwrap_or(3141);
 
         let username = std::env::var("GEODE_USERNAME").unwrap_or_else(|_| "geode".to_string());
-        let password = std::env::var("GEODE_ADMIN_PASSWORD").unwrap_or_else(|_| "GeodeTestPassword123!".to_string());
+        let password = std::env::var("GEODE_ADMIN_PASSWORD").unwrap_or_else(|_| "Geode Test Admin Passphrase".to_string());
 
         let client = Client::new(host, port)
             .skip_verify(true)

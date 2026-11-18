@@ -1,0 +1,301 @@
+# SONNY-6430: fail-closed operator surfaces (master key format, storage verify,
+# migrate create, graph registry)
+#
+# Bugs (observable ones; each ran with success where it must refuse):
+#   2. GEODE_MASTER_KEY was used as raw bytes and only its first 32 counted: a
+#      64-char hex key silently gave 128 bits. GEODE_MASTER_KEY_FORMAT now selects
+#      hex (exactly 64 hex characters) / base64 (32 bytes) / raw (32 bytes); a
+#      value that does not match, an unknown format or a format without a key
+#      refuses startup without printing the value; an unformatted longer value
+#      still starts (legacy, unchanged) but warns that only its first 32 bytes
+#      are the key.
+#   5/7. `initAuditForGraph` failing soft and `StorageAdapter.init` only warning
+#      on a graph registry that exists but cannot be read let the server start
+#      with no graphs (the first CREATE GRAPH then rewrote the registry without
+#      them); a damaged registry now refuses startup (`Error: cannot open the
+#      data directory`); a missing registry is still a fresh data directory.
+#   6. `geode storage verify` with no data dir configured checked an in-memory
+#      store and printed PASS (and ignored --data-dir); it now checks the data
+#      directory the server would open, names it, reports the node count, and exits
+#      1 on any failure.
+#   8. `geode migrate create` with no HMAC key wrote an unsigned migration and
+#      exited 0 although its help says the key is required; it now exits 1 and
+#      writes nothing; --no-sign is the explicit way to create an unsigned file.
+#   (1 remote backup stall: needs a 24 MB transfer, covered by
+#   zig build test-sonny6430-remote-backup-large; 3,4,9 are dead code, unbuilt
+#   tests and docs: not black-box.)
+#
+# What this spec proves: real `geode serve` / `geode storage` / `geode migrate`
+# processes started by the spec in scratch directories.
+
+version: '1.0'
+name: SONNY-6430 fail-closed master key, storage verify, migrate create and graph registry
+description: GEODE_MASTER_KEY_FORMAT is validated, storage verify checks the real data dir, migrate create refuses without a key, a damaged graph registry refuses startup (SONNY-6430)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s6430-master-key-format
+  description: 'GEODE_MASTER_KEY_FORMAT: bad length, unknown format and a format without a key refuse startup without printing the value; the legacy 64-hex value starts with a first-32-bytes warning; hex format starts quietly'
+  type: bash
+  timeout_ms: 420000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    WORK=/tmp/geode-harness-D.$$.$RANDOM; mkdir -p "$WORK"
+    SRV_PID=""
+    freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    cleanup() {
+      if [ -n "$SRV_PID" ] && kill -0 "$SRV_PID" 2>/dev/null; then kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; fi
+      case "$WORK" in /tmp/geode-harness-D.*) rm -rf "$WORK" ;; esac
+    }
+    trap cleanup EXIT
+    wait_ready() { # wait_ready <log> <seconds>
+      for i in $(seq 1 $(( $2 * 4 ))); do
+        grep -q "server ready" "$1" 2>/dev/null && return 0
+        [ -n "$SRV_PID" ] && ! kill -0 "$SRV_PID" 2>/dev/null && return 1
+        sleep 0.25
+      done
+      return 1
+    }
+
+    # try_serve <name> [ENV=VAL ...]: start serve, return when it exits or says "server ready".
+    try_serve() {
+      NAME=$1; shift
+      TS_PORT=$(freeport)
+      env GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 GEODE_ALLOW_TEST_AUDIT_KEYS=1 "$@" \
+        "$BIN" serve --listen "127.0.0.1:$TS_PORT" --data-dir "$WORK/$NAME" > "$WORK/$NAME.out" 2>&1 < /dev/null &
+      SRV_PID=$!
+      TS_STATE=timeout
+      for i in $(seq 1 300); do
+        if ! kill -0 "$SRV_PID" 2>/dev/null; then wait "$SRV_PID"; TS_RC=$?; TS_STATE=exited; break; fi
+        if grep -q "server ready" "$WORK/$NAME.out" 2>/dev/null; then TS_STATE=started; break; fi
+        sleep 0.2
+      done
+      if [ "$TS_STATE" = started ]; then kill -TERM "$SRV_PID" 2>/dev/null; for i in $(seq 1 150); do kill -0 "$SRV_PID" 2>/dev/null || break; sleep 0.1; done; kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; TS_RC=0; fi
+      SRV_PID=""
+    }
+
+    HEX64=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    BAD=${HEX64:0:40}
+    try_serve bad_len GEODE_MASTER_KEY_FORMAT=hex GEODE_MASTER_KEY="$BAD"
+    [ "$TS_STATE" = exited ] && [ "$TS_RC" -ne 0 ] && grep -q "refusing to start" "$WORK/bad_len.out" && grep -q GEODE_MASTER_KEY_FORMAT "$WORK/bad_len.out" && ! grep -q "$BAD" "$WORK/bad_len.out" \
+      && echo "hex_wrong_length=refused_value_not_printed" || { echo "HEX_WRONG_LENGTH_NOT_REFUSED state=$TS_STATE"; tail -5 "$WORK/bad_len.out"; }
+    [ ! -e "$WORK/bad_len" ] && echo "refused_before_data_dir_created" || echo "DATA_DIR_CREATED_BEFORE_REFUSAL"
+    try_serve bad_fmt GEODE_MASTER_KEY_FORMAT=hexadecimal GEODE_MASTER_KEY="$HEX64"
+    [ "$TS_STATE" = exited ] && [ "$TS_RC" -ne 0 ] && grep -q "refusing to start" "$WORK/bad_fmt.out" && ! grep -q "$HEX64" "$WORK/bad_fmt.out" \
+      && echo "unknown_format=refused" || { echo "UNKNOWN_FORMAT_NOT_REFUSED state=$TS_STATE"; tail -5 "$WORK/bad_fmt.out"; }
+    try_serve no_key GEODE_MASTER_KEY_FORMAT=hex
+    [ "$TS_STATE" = exited ] && [ "$TS_RC" -ne 0 ] && grep -q "refusing to start" "$WORK/no_key.out" \
+      && echo "format_without_key=refused" || { echo "FORMAT_WITHOUT_KEY_NOT_REFUSED state=$TS_STATE"; tail -5 "$WORK/no_key.out"; }
+    try_serve legacy GEODE_MASTER_KEY="$HEX64"
+    [ "$TS_STATE" = started ] && grep -q "first 32" "$WORK/legacy.out" && grep -q GEODE_MASTER_KEY_FORMAT "$WORK/legacy.out" && ! grep -q "$HEX64" "$WORK/legacy.out" \
+      && echo "legacy_64_hex=starts_with_first_32_warning" || { echo "LEGACY_WRONG state=$TS_STATE"; tail -8 "$WORK/legacy.out"; }
+    try_serve hexok GEODE_MASTER_KEY_FORMAT=hex GEODE_MASTER_KEY="$HEX64"
+    [ "$TS_STATE" = started ] && ! grep -q "first 32" "$WORK/hexok.out" && ! grep -q "$HEX64" "$WORK/hexok.out" \
+      && echo "hex_format_full_key=starts_quietly" || { echo "HEX_FORMAT_WRONG state=$TS_STATE"; tail -8 "$WORK/hexok.out"; }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - hex_wrong_length=refused_value_not_printed
+    - refused_before_data_dir_created
+    - unknown_format=refused
+    - format_without_key=refused
+    - legacy_64_hex=starts_with_first_32_warning
+    - hex_format_full_key=starts_quietly
+    stdout_not_contains:
+    - NOT_REFUSED
+    - DATA_DIR_CREATED
+    - LEGACY_WRONG
+    - HEX_FORMAT_WRONG
+  tags:
+  - security
+  - fle
+  - startup
+  - sonny6430
+  - key-assertion
+- name: s6430-storage-verify-and-migrate-create
+  description: storage verify checks the named data dir (and exits 1 when it cannot); migrate create refuses without a key and writes nothing
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    WORK=/tmp/geode-harness-D.$$.$RANDOM; mkdir -p "$WORK"
+    SRV_PID=""
+    freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    cleanup() {
+      if [ -n "$SRV_PID" ] && kill -0 "$SRV_PID" 2>/dev/null; then kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; fi
+      case "$WORK" in /tmp/geode-harness-D.*) rm -rf "$WORK" ;; esac
+    }
+    trap cleanup EXIT
+    wait_ready() { # wait_ready <log> <seconds>
+      for i in $(seq 1 $(( $2 * 4 ))); do
+        grep -q "server ready" "$1" 2>/dev/null && return 0
+        [ -n "$SRV_PID" ] && ! kill -0 "$SRV_PID" 2>/dev/null && return 1
+        sleep 0.25
+      done
+      return 1
+    }
+
+    # --- storage verify on an unopenable directory: exit 1, never PASS / graph_store_ok
+    touch "$WORK/not-a-directory"
+    OUT=$("$BIN" storage verify --check graph_store --data-dir "$WORK/not-a-directory/data" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && ! echo "$OUT" | grep -q '"graph_store_ok":true' && echo "$OUT" | grep -q "not-a-directory" && echo "verify_unopenable=exit_nonzero_named" || { echo "VERIFY_UNOPENABLE_WRONG rc=$RC"; echo "$OUT" | tail -5; }
+    OUT=$("$BIN" storage verify --data-dir "$WORK/not-a-directory/data" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && ! echo "$OUT" | grep -q "PASS" && echo "verify_unopenable_verbose=exit_nonzero" || { echo "VERIFY_UNOPENABLE_VERBOSE_WRONG rc=$RC"; echo "$OUT" | tail -5; }
+    # --- a real store: written by a real server, then verified offline
+    Q=$(freeport)
+    GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 GEODE_ALLOW_TEST_AUDIT_KEYS=1 "$BIN" serve --listen "127.0.0.1:$Q" --data-dir "$WORK/store" --log-level warn > "$WORK/s.log" 2>&1 < /dev/null &
+    SRV_PID=$!
+    wait_ready "$WORK/s.log" 90 || { echo "SERVER_NOT_READY"; tail -20 "$WORK/s.log"; exit 1; }
+    "$BIN" query --server "127.0.0.1:$Q" --insecure-tls-skip-verify -U geode -P "$PW" --timeout 30 "CREATE (:V6430 {k: 1}), (:V6430 {k: 2}), (:V6430 {k: 3})" > "$WORK/c.out" 2>&1 || { echo "CREATE_FAILED"; cat "$WORK/c.out"; }
+    kill -TERM "$SRV_PID"; for i in $(seq 1 200); do kill -0 "$SRV_PID" 2>/dev/null || break; sleep 0.1; done; kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+    OUT=$("$BIN" storage verify --check graph_store --data-dir "$WORK/store" 2>&1); RC=$?
+    echo "$OUT" | grep -q '"graph_store_ok":true' && [ "$RC" -eq 0 ] && echo "$OUT" | grep -q "$WORK/store" && echo "verify_real_store=ok_named" || { echo "VERIFY_REAL_STORE_WRONG rc=$RC"; echo "$OUT" | tail -5; }
+    N=$(echo "$OUT" | sed -n 's/.*"node_count":\([0-9][0-9]*\).*/\1/p' | head -1)
+    [ "${N:-0}" -ge 3 ] && echo "verify_counts_real_nodes=yes" || echo "VERIFY_NODE_COUNT_WRONG n=${N:-none}"
+    # --- migrate create: no key refuses and writes nothing; --no-sign is explicit; a key signs
+    mkdir -p "$WORK/mig"
+    OUT=$(env -u GEODE_MIGRATION_HMAC_KEY HOME="$WORK" "$BIN" migrate create add_people --dir "$WORK/mig" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && echo "$OUT" | grep -q GEODE_MIGRATION_HMAC_KEY && echo "$OUT" | grep -q -- "--no-sign" && [ -z "$(ls -A "$WORK/mig")" ] && echo "migrate_no_key=refused_nothing_written" || { echo "MIGRATE_NO_KEY_WRONG rc=$RC"; echo "$OUT" | tail -5; ls -A "$WORK/mig"; }
+    OUT=$(env -u GEODE_MIGRATION_HMAC_KEY HOME="$WORK" "$BIN" migrate create add_people --dir "$WORK/mig" --no-sign 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && [ -e "$WORK/mig/001_add_people.gql" ] && echo "$OUT" | grep -qi unsigned && echo "migrate_no_sign=unsigned_file_created" || { echo "MIGRATE_NO_SIGN_WRONG rc=$RC"; echo "$OUT" | tail -5; }
+    OUT=$(env HOME="$WORK" GEODE_MIGRATION_HMAC_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff "$BIN" migrate create add_pets --dir "$WORK/mig" 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && echo "$OUT" | grep -q "Signed: 002_add_pets.gql" && echo "migrate_with_key=signed" || { echo "MIGRATE_WITH_KEY_WRONG rc=$RC"; echo "$OUT" | tail -5; }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - verify_unopenable=exit_nonzero_named
+    - verify_unopenable_verbose=exit_nonzero
+    - verify_real_store=ok_named
+    - verify_counts_real_nodes=yes
+    - migrate_no_key=refused_nothing_written
+    - migrate_no_sign=unsigned_file_created
+    - migrate_with_key=signed
+    stdout_not_contains:
+    - WRONG
+    - SERVER_NOT_READY
+    - CREATE_FAILED
+    - MIGRATE_NO_KEY_WRONG
+  tags:
+  - cli
+  - storage
+  - migrate
+  - sonny6430
+  - key-assertion
+- name: s6430-damaged-graph-registry-refuses-startup
+  description: A graph_registry.dat that exists but cannot be loaded (flipped byte, truncated, garbage) refuses startup; the restored file starts with its graph; no registry is a fresh directory
+  type: bash
+  timeout_ms: 600000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    WORK=/tmp/geode-harness-D.$$.$RANDOM; mkdir -p "$WORK"
+    SRV_PID=""
+    freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    cleanup() {
+      if [ -n "$SRV_PID" ] && kill -0 "$SRV_PID" 2>/dev/null; then kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; fi
+      case "$WORK" in /tmp/geode-harness-D.*) rm -rf "$WORK" ;; esac
+    }
+    trap cleanup EXIT
+    wait_ready() { # wait_ready <log> <seconds>
+      for i in $(seq 1 $(( $2 * 4 ))); do
+        grep -q "server ready" "$1" 2>/dev/null && return 0
+        [ -n "$SRV_PID" ] && ! kill -0 "$SRV_PID" 2>/dev/null && return 1
+        sleep 0.25
+      done
+      return 1
+    }
+
+    D="$WORK/reg"
+    start_srv() { # start_srv <log>
+      Q=$(freeport)
+      GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 GEODE_ALLOW_TEST_AUDIT_KEYS=1 "$BIN" serve --listen "127.0.0.1:$Q" --data-dir "$D" --log-level warn > "$1" 2>&1 < /dev/null &
+      SRV_PID=$!
+    }
+    stop_srv() { kill -TERM "$SRV_PID" 2>/dev/null; for i in $(seq 1 200); do kill -0 "$SRV_PID" 2>/dev/null || break; sleep 0.1; done; kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""; }
+    expect_refused() { # expect_refused <label>
+      start_srv "$WORK/r.log"
+      STATE=timeout
+      for i in $(seq 1 300); do
+        if ! kill -0 "$SRV_PID" 2>/dev/null; then wait "$SRV_PID"; RC=$?; STATE=exited; break; fi
+        grep -q "server ready" "$WORK/r.log" 2>/dev/null && { STATE=started; break; }
+        sleep 0.2
+      done
+      if [ "$STATE" = exited ] && [ "$RC" -ne 0 ] && grep -q "cannot open the data directory" "$WORK/r.log"; then echo "$1=refused_startup"; else echo "NOT_REFUSED_$1 state=$STATE rc=${RC:-none}"; tail -6 "$WORK/r.log"; stop_srv; fi
+      SRV_PID=""
+    }
+    start_srv "$WORK/s1.log"
+    wait_ready "$WORK/s1.log" 90 || { echo "SERVER_NOT_READY"; tail -20 "$WORK/s1.log"; exit 1; }
+    "$BIN" query --server "127.0.0.1:$Q" --insecure-tls-skip-verify -U geode -P "$PW" --timeout 30 "CREATE GRAPH reg6430" > "$WORK/c.out" 2>&1
+    stop_srv
+    REG="$D/graph_registry.dat"
+    [ -s "$REG" ] && echo "registry_file_written=yes" || { echo "NO_REGISTRY_FILE"; ls -la "$D" | head; exit 1; }
+    cp "$REG" "$WORK/registry.good"
+    python3 - "$REG" <<'PY'
+    import sys
+    p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[len(b)//2] ^= 0xFF; open(p, "wb").write(b)
+    PY
+    expect_refused flipped_byte
+    SZ=$(stat -c %s "$WORK/registry.good")
+    head -c $((SZ / 2)) "$WORK/registry.good" > "$REG"
+    expect_refused truncated
+    printf 'not a geode graph registry, just text that is long enough' > "$REG"
+    expect_refused garbage
+    # restored: opens again and still has the graph (nothing was rewritten)
+    cp "$WORK/registry.good" "$REG"
+    start_srv "$WORK/s2.log"
+    wait_ready "$WORK/s2.log" 90 && echo "restored_registry=starts" || { echo "RESTORED_REGISTRY_DID_NOT_START"; tail -10 "$WORK/s2.log"; }
+    OUT=$("$BIN" query --server "127.0.0.1:$Q" --insecure-tls-skip-verify -U geode -P "$PW" --timeout 30 "SHOW GRAPHS" 2>&1)
+    echo "$OUT" | grep -q reg6430 && echo "restored_registry_lists_graph=yes" || { echo "GRAPH_LOST_AFTER_RESTORE"; echo "$OUT" | tail -5; }
+    stop_srv
+    # a data directory with no registry at all is a fresh directory and starts
+    rm -rf "$WORK/fresh"; D="$WORK/fresh"
+    start_srv "$WORK/s3.log"
+    wait_ready "$WORK/s3.log" 90 && echo "missing_registry=fresh_dir_starts" || { echo "FRESH_DIR_DID_NOT_START"; tail -10 "$WORK/s3.log"; }
+    stop_srv
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - registry_file_written=yes
+    - flipped_byte=refused_startup
+    - truncated=refused_startup
+    - garbage=refused_startup
+    - restored_registry=starts
+    - restored_registry_lists_graph=yes
+    - missing_registry=fresh_dir_starts
+    stdout_not_contains:
+    - NOT_REFUSED
+    - SERVER_NOT_READY
+    - DID_NOT_START
+    - GRAPH_LOST
+  tags:
+  - storage
+  - startup
+  - sonny6430
+  - key-assertion

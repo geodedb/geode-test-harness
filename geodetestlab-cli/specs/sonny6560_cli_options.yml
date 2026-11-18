@@ -1,0 +1,300 @@
+# SONNY-6560: `geode query` silently ignored unsupported options: an unknown --format printed
+# nothing and exited 0, unknown options exited 0, and the documented --begin/--commit/--rollback
+# were never read, so `--rollback` COMMITTED the write.
+#
+# This spec runs the real CLI binary under test against the managed server: an unsupported
+# format, an unknown option (also before the subcommand and on other commands) and a value option
+# without its value exit 2 with the option named; --begin/--commit/--rollback are refused (exit 2)
+# and write nothing and are gone from --help; `--batch` carries an explicit transaction
+# (BEGIN ... ROLLBACK undoes, BEGIN ... COMMIT keeps).
+
+version: '1.0'
+name: SONNY-6560 CLI refuses unsupported options and formats
+description: CLI option validation and exit codes
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: unsupported-format-refused
+  description: --format txt exits 2 naming the supported formats and prints nothing on stdout
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    OUT=$(Q "RETURN 1 AS x" --format txt 2>/tmp/e6560.$$); RC=$?
+    ERR=$(cat /tmp/e6560.$$); rm -f /tmp/e6560.$$
+    echo "rc=$RC out=[$OUT]"
+    echo "$ERR"
+    [ "$RC" -eq 2 ] && [ -z "$OUT" ]
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rc=2 out=[]
+    - unsupported --format 'txt'
+    - json, table, csv, dot, mermaid
+  tags:
+  - storage
+  - sonny738
+- name: format-is-case-sensitive
+  description: --format JSON is not a supported format either (exit 2)
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    Q "RETURN 1 AS x" --format JSON >/dev/null 2>&1; echo "rc=$?"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rc=2
+  tags:
+  - storage
+  - sonny738
+- name: empty-format-refused
+  description: An empty --format value is refused (exit 2)
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    Q "RETURN 1 AS x" --format "" >/dev/null 2>&1; echo "rc=$?"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rc=2
+  tags:
+  - storage
+  - sonny738
+- name: supported-formats-render
+  description: json, table and csv render a scalar row (exit 0)
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    for f in json table csv; do OUT=$(Q "RETURN 1 AS x" --format $f 2>/dev/null); RC=$?; echo "$f rc=$RC has1=$(echo "$OUT" | grep -c 1)"; done
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - json rc=0 has1=1
+    - table rc=0 has1=
+    - csv rc=0 has1=
+    stdout_not_contains:
+    - rc=1
+    - rc=2
+  tags:
+  - storage
+  - sonny738
+- name: unknown-option-refused
+  description: An unknown option exits 2 naming it
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    ERR=$(Q "RETURN 1" --no-such-opt-6560 2>&1 >/dev/null); RC=$?
+    echo "rc=$RC"; echo "$ERR"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rc=2
+    - --no-such-opt-6560
+  tags:
+  - storage
+  - sonny738
+- name: unknown-option-before-subcommand
+  description: '...also before the subcommand'
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    ERR=$("$BIN" --no-such-opt-6560 query "RETURN 1" 2>&1); echo "rc=$?"; echo "$ERR"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rc=2
+    - --no-such-opt-6560
+  tags:
+  - storage
+  - sonny738
+- name: unknown-option-other-commands
+  description: Other commands refuse an unknown option as well
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    for c in "user show geode" "completion --shell bash" "backup list --dir /nonexistent" "migrate status"; do "$BIN" $c --no-such-opt-6560 >/dev/null 2>/tmp/e6560.$$; echo "$c rc=$? $(grep -c -- --no-such-opt-6560 /tmp/e6560.$$)"; done; rm -f /tmp/e6560.$$
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - user show geode rc=2 1
+    - completion --shell bash rc=2 1
+    - backup list --dir /nonexistent rc=2 1
+    - migrate status rc=2 1
+  tags:
+  - storage
+  - sonny738
+- name: missing-value-refused
+  description: A value option given last without its value exits 2
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    Q "RETURN 1" --format >/dev/null 2>&1; echo "format rc=$?"; Q "RETURN 1" --server >/dev/null 2>&1; echo "server rc=$?"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - format rc=2
+    - server rc=2
+  tags:
+  - storage
+  - sonny738
+- name: rollback-flag-refused
+  description: '--rollback is refused (exit 2), not ignored: the write must NOT be applied'
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    ERR=$(Q "CREATE (:CliRb6560 {k: 1})" --rollback 2>&1 >/dev/null); echo "rc=$?"; echo "$ERR"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rc=2
+    - --rollback is not supported
+  tags:
+  - storage
+  - sonny738
+- name: rollback-flag-nothing-written
+  description: 'No node was created (the ticket: --rollback used to COMMIT the write)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:CliRb6560) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: begin-commit-flags-refused
+  description: --begin and --commit are refused too
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    Q "CREATE (:CliRb6560 {k: 2})" --begin >/dev/null 2>&1; echo "begin rc=$?"; Q "CREATE (:CliRb6560 {k: 3})" --commit >/dev/null 2>&1; echo "commit rc=$?"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - begin rc=2
+    - commit rc=2
+  tags:
+  - storage
+  - sonny738
+- name: still-nothing-written
+  description: Still no node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:CliRb6560) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: help-does-not-document-unread-options
+  description: query --help no longer documents --begin/--commit/--rollback
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    "$BIN" query --help 2>&1 | grep -c -E -- "--(begin|commit|rollback)" || true
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '0'
+  tags:
+  - storage
+  - sonny738
+- name: batch-explicit-transaction-rolls-back
+  description: '--batch carries an explicit BEGIN ... ROLLBACK over one connection: the write is undone'
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    printf "BEGIN\nCREATE (:CliBatch6560 {k: 1})\nROLLBACK\n" | Q --batch >/dev/null 2>&1; echo "rc=$?"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rc=0
+  tags:
+  - storage
+  - sonny738
+- name: batch-rollback-nothing-written
+  description: No CliBatch6560 node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:CliBatch6560) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: batch-explicit-transaction-commits
+  description: BEGIN ... COMMIT keeps the write
+  type: bash
+  command: |-
+    BIN="${GEODE_BINARY:-geode}"
+    PW="Correct Horse Battery Staple 42!"
+    Q() { "$BIN" query --server "${GEODE_SERVER_ADDRESS}" $GEODE_CLIENT_TLS -U geode -P "$PW" "$@"; }
+    printf "BEGIN\nCREATE (:CliBatch6560 {k: 2})\nCOMMIT\n" | Q --batch >/dev/null 2>&1; echo "rc=$?"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - rc=0
+  tags:
+  - storage
+  - sonny738
+- name: batch-commit-written
+  description: One CliBatch6560 node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:CliBatch6560) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738

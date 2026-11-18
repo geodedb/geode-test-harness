@@ -65,7 +65,7 @@ cli:
     timeout_ms: 30000
     format: json
 secrets:
-  admin_password: { source: env, key: GEODE_ADMIN_PASSWORD, required: false, default: GeodeTestPassword123! }
+  admin_password: { source: env, key: GEODE_ADMIN_PASSWORD, required: false, default: Geode Test Admin Passphrase }
 invariants:
 - type: server_running
 tests:

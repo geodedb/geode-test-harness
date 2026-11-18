@@ -1,0 +1,126 @@
+version: '1.0'
+name: Backups never hold key material; restore needs the HMAC key and starts a new audit key epoch (SONNY-6299, SONNY-6322)
+description: |
+  SONNY-6299 (SECURITY): a backup archived every top-level file of the data directory, including the
+  TLS private key (server.key), the auth-chain HMAC key (.geode_hmac_key), the generated admin password
+  and .geode.lock; whoever could read a backup (object storage, an operator's laptop) held the server's
+  TLS key and could re-seal forged auth records. Server backups also landed in ./server_backups of the
+  server's working directory instead of under its data directory.
+
+  SONNY-6322 (SECURITY): the Ed25519 audit signing seed (<graph>/audit.jsonl.key) was still archived,
+  so a backup reader could forge audit entries; a restore of a store without the seed overwrote the
+  audit public key. Now the seed is excluded and the restored store starts a new audit KEY EPOCH
+  (audit.jsonl.pub.<n>), keeping the old public key.
+
+  Restore contract: restoring auth state needs the HMAC key it was sealed with (--hmac-key-file,
+  GEODE_AUTH_HMAC_KEY or GEODE_TDE_KEY); without it `geode restore` refuses (HmacKeyRequired) and
+  restores nothing; with it the chain is verified and the restored directory holds no lock file, TLS
+  key or audit seed, and the key file is 0600.
+
+  Black-box: a real server (working directory separate from its data dir), the real `geode backup
+  create` / `geode restore` CLI, raw-byte scans of the backup file for the actual key bytes of this
+  server, with a positive control (the live data IS in the backup).
+
+  CANARY: REQ=REQ-SONNY-6299-6322-BACKUP-KEYS-BLACKBOX; FEATURE="Backup"; ASPECT=ExcludesKeyMaterial; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants: []
+fuzz:
+  enabled: false
+
+tests:
+- name: backup-excludes-keys-restore-requires-hmac-key
+  type: bash
+  timeout_ms: 900000
+  command: |
+    set -u
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="$GEODE_BINARY"; PW="Sonny Harness Admin Passphrase 6299"
+    W=$(mktemp -d); trap 'kill $PID 2>/dev/null; rm -rf "$W"' EXIT; PID=0
+    D="$W/data"; mkdir -p "$W/cwd"
+    TLS="--insecure-tls-skip-verify"
+    gq() { "$BIN" query "$1" --server "127.0.0.1:$PORT" $TLS -U geode -P "$PW" 2>&1; }
+    start_srv() { # $1 data dir
+      PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+      (cd "$W/cwd" && GEODE_ALLOW_TEST_AUDIT_KEYS=1 GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 setsid nohup "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$1" --log-level warn </dev/null >>"$W/server.log" 2>&1 &
+       echo $! > "$W/pid")
+      PID=$(cat "$W/pid")
+      for i in $(seq 1 300); do
+        gq "RETURN 1 AS x" | grep -q '"status_class":"00000"' && return 0
+        kill -0 $PID 2>/dev/null || { echo "SERVER_EXITED"; tail -20 "$W/server.log"; return 1; }
+        sleep 0.5
+      done; echo SERVER_NOT_READY; return 1
+    }
+    stop_srv() { kill $PID 2>/dev/null; for i in $(seq 1 100); do kill -0 $PID 2>/dev/null || break; sleep 0.3; done; kill -9 $PID 2>/dev/null; }
+    start_srv "$D" || exit 1
+    gq "CREATE USER bk6299 SET PASSWORD 'Backup Six Two Nine Nine Passphrase' ROLE readonly" | grep -q '"status_class":"00000"' || { echo "FAIL create user"; exit 1; }
+    gq "CREATE (:Bk6299 {v: 'BACKUP-SENTINEL-6299'})" | grep -q '"status_class":"00000"' || { echo "FAIL create node"; exit 1; }
+    "$BIN" backup create --output "$W/b.backup" --server "127.0.0.1:$PORT" $TLS -U geode -P "$PW" >"$W/backup.log" 2>&1 || { echo "FAIL backup create"; cat "$W/backup.log"; exit 1; }
+    [ -f "$W/b.backup" ] || { echo "FAIL no backup file"; exit 1; }
+    [ "$(stat -c %a "$W/b.backup")" = "600" ] || { echo "FAIL backup file mode $(stat -c %a "$W/b.backup") (want 600)"; exit 1; }
+
+    # --- the backup holds the live data (control) but none of the secrets
+    grep -a -q "BACKUP-SENTINEL-6299" "$W/b.backup" || { echo "FAIL control: sentinel data missing from the backup"; exit 1; }
+    python3 - "$W" <<'PYEOF'
+    import glob, os, sys
+    w = sys.argv[1]; d = os.path.join(w, "data")
+    blob = open(os.path.join(w, "b.backup"), "rb").read()
+    bad = []
+    hk = open(os.path.join(d, ".geode_hmac_key"), "rb").read().strip()
+    if hk and hk in blob: bad.append("HMAC key (.geode_hmac_key) is in the backup")
+    sk = open(os.path.join(d, "server.key"), "rb").read()
+    if b"PRIVATE KEY" in blob or sk.strip() in blob: bad.append("TLS private key is in the backup")
+    seeds = glob.glob(os.path.join(d, "*", "audit.jsonl.key"))
+    if not seeds: bad.append("precondition: no audit seed file was created by the server")
+    for s in seeds:
+        raw = open(s, "rb").read().strip()
+        if raw and (raw in blob or raw.hex().encode() in blob):
+            bad.append("audit signing seed %s is in the backup" % os.path.basename(os.path.dirname(s)))
+    for name in (".geode.lock",):
+        pass
+    if bad:
+        print("\n".join("LEAK " + b for b in bad)); sys.exit(1)
+    print("BACKUP_HOLDS_NO_KEY_MATERIAL")
+    PYEOF
+    [ $? -eq 0 ] || exit 1
+
+    # --- server backups live under the data dir (0700), never in the server's cwd
+    [ ! -e "$W/cwd/server_backups" ] || { echo "FAIL ./server_backups created in the server's working directory"; exit 1; }
+    [ "$(stat -c %a "$D/backups")" = "700" ] || { echo "FAIL $D/backups mode $(stat -c %a "$D/backups")"; exit 1; }
+
+    # --- restore needs the HMAC key
+    R1="$W/restore-nokey"
+    OUT=$("$BIN" restore "$W/b.backup" --data-dir "$R1" --yes 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && echo "$OUT" | grep -q "HmacKeyRequired" || { echo "FAIL restore without the HMAC key did not refuse (rc=$RC): $OUT"; exit 1; }
+    [ ! -e "$R1/graph_registry.dat" ] || { echo "FAIL a refused restore left a store behind"; exit 1; }
+    R2="$W/restore-key"
+    OUT=$("$BIN" restore "$W/b.backup" --data-dir "$R2" --yes --hmac-key-file "$D/.geode_hmac_key" 2>&1) || { echo "FAIL restore with the key: $OUT"; exit 1; }
+    echo "$OUT" | grep -q "Restored and verified" || { echo "FAIL restore did not verify: $OUT"; exit 1; }
+    for F in .geode.lock server.key server.crt .geode_admin_password; do
+      [ ! -e "$R2/$F" ] || { echo "FAIL restored directory contains $F"; exit 1; }
+    done
+    [ -z "$(find "$R2" -name audit.jsonl.key)" ] || { echo "FAIL the audit seed was restored"; exit 1; }
+    [ "$(stat -c %a "$R2/.geode_hmac_key")" = "600" ] || { echo "FAIL restored key mode"; exit 1; }
+    echo "RESTORE_CONTRACT_OK"
+
+    # --- the restored directory starts, keeps the user, and starts a NEW audit key epoch
+    stop_srv
+    start_srv "$R2" || { echo "FAIL restored directory does not start"; exit 1; }
+    gq "SHOW USERS" | grep -q "bk6299" || { echo "FAIL restored store lost the user"; exit 1; }
+    [ -n "$(find "$R2" -name 'audit.jsonl.pub.1')" ] || { echo "FAIL no new audit key epoch (audit.jsonl.pub.1) after restore"; find "$R2" -name 'audit*'; exit 1; }
+    echo "backup_keys_blackbox_ok"
+  expect:
+    exit_code: 0
+    stdout_contains: [BACKUP_HOLDS_NO_KEY_MATERIAL, RESTORE_CONTRACT_OK, backup_keys_blackbox_ok]
+  tags: [backup, keys, sonny-6299, sonny-6322, critical]
+
+tags: [backup, security, sonny-738, critical]

@@ -1,0 +1,142 @@
+version: '1.0'
+name: SONNY-6647 online REVOKE of a privilege not held is refused
+description: |
+  SONNY-6647 item 1: `REVOKE <privilege> ON GRAPH <graph> FROM <user>`
+  (geode.auth.revoke) ignored what each revoke returned and answered
+  "Revoked ..." whether or not the user held the privilege on that graph.
+  Fixed: it is refused with SQLSTATE 42704 (GrantNotHeld) and nothing
+  changes. REVOKE ALL succeeds when ANY of the three privileges was held.
+
+  Black-box over the wire as Admin, with the stored grants read back through
+  SHOW GRANTS FOR so the "nothing changes" half is observed, not assumed.
+
+  (Item 2 of the ticket, `geode user permissions` listing GraphGrant records
+  and `geode auth prune-legacy-permissions`, is in sonny6647_user_permissions_offline.yml.)
+
+  Engine regression: test-sonny6647-revoke-not-held.
+
+  CANARY: REQ=REQ-SONNY-6647-REVOKE-NOT-HELD; FEATURE="GQL Auth DDL"; ASPECT=RevokeOfNothingRefused; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [auth, security, grants, sonny-6647]
+tests:
+
+- name: s6647_setup
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE GRAPH g6647
+    CREATE GRAPH other6647
+    CREATE USER rv_carol SET PASSWORD 'Carol Revoke Passphrase One' ROLE readonly
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42']
+
+- name: s6647_revoke_never_held_refused
+  description: REVOKE READ of a privilege the user never held is refused 42704.
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE READ ON GRAPH g6647 FROM rv_carol]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42704"']
+    stdout_not_contains: ['"status_class":"00000"', Revoked]
+
+- name: s6647_revoke_all_never_held_refused
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE ALL ON GRAPH g6647 FROM rv_carol]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42704"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6647_revoke_proc_never_held_refused
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.auth.revoke('READ', 'rv_carol', 'g6647')"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42704"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6647_grant_read
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT READ ON GRAPH g6647 TO rv_carol]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6647_revoke_on_other_graph_refused_grant_intact
+  description: Holding READ on g6647 does not make a REVOKE on another graph succeed, and the held grant is untouched.
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE READ ON GRAPH other6647 FROM rv_carol]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42704"']
+
+- name: s6647_grant_still_stored
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRANTS FOR rv_carol]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', g6647, read]
+    stdout_not_contains: [other6647]
+
+- name: s6647_revoke_write_not_held_refused
+  description: Holding READ only - REVOKE WRITE is refused (a privilege not held), READ stays stored.
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE WRITE ON GRAPH g6647 FROM rv_carol]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42704"']
+
+- name: s6647_revoke_read_held_succeeds
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE READ ON GRAPH g6647 FROM rv_carol]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42704"']
+
+- name: s6647_second_revoke_refused
+  description: The grant is gone, so revoking it again is refused.
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE READ ON GRAPH g6647 FROM rv_carol]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42704"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6647_grant_write
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT WRITE ON GRAPH g6647 TO rv_carol]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6647_revoke_all_when_any_held_succeeds
+  description: REVOKE ALL succeeds when any one of the three privileges was held (only WRITE is).
+  args: [query, -U, geode, -P, '${secret:admin_password}', REVOKE ALL ON GRAPH g6647 FROM rv_carol]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42704"']
+
+- name: s6647_nothing_left
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRANTS FOR rv_carol]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: [g6647]

@@ -1,0 +1,126 @@
+version: '1.0'
+name: SONNY-6476 / SONNY-6484 geode shell --plain keeps long lines and UTF-8 whole
+description: |
+  Plain-mode REPL input handling (src/client/repl/repl_loop.zig runPlainMode),
+  proved by piping real input into the real `geode shell --plain` against the
+  managed server:
+
+    * SONNY-6476 item 2: the line buffer was 4,096 bytes and silently truncated at
+      4,095: the first 4,095 bytes ran as one statement and the rest as another (an
+      inlined parameter list or big map literal failed, or ran in two halves). A
+      line now grows dynamically up to 16 MiB; a longer line is refused WHOLE
+      ("the line is longer than 16777216 bytes; it was not run") and the shell
+      keeps going.
+    * SONNY-6484 item 2: the loop kept only bytes 32..126, so every byte of a
+      multi-byte UTF-8 sequence (and a tab) was dropped without a word -
+      `CREATE (:P {s: 'cafe'})` stored 'caf'. Data corruption from the shell. UTF-8
+      now passes through byte for byte, and a line that is not valid UTF-8 is
+      refused with an error and not run.
+
+  The shell echoes its input, so every check reads results from the result table
+  or reads the stored value back over a separate `geode query` client, never from
+  the echoed statement.
+
+  Fixed: SONNY-6476 08044554b/4eb9e8f23, SONNY-6484 c59c0556b/aa232a6ae.
+
+  CANARY: REQ=REQ-SONNY-6476-SHELL-PLAIN-INPUT; FEATURE="ShellPlainMode"; ASPECT=LongLinesAndUtf8; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6476_shell_plain_input.yml; OWNER=cli; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+
+tests:
+- name: statement-longer-than-4095-bytes-runs-whole
+  description: a 6,000-byte statement, and ones of 4,095 / 4,096 / 4,097 bytes, run once and whole (the line buffer cut at 4,095 and ran two halves)
+  type: bash
+  timeout_ms: 240000
+  command: "PW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nBIN=\"${GEODE_BINARY:-geode}\"\nD=$(mktemp -d); trap 'rm -rf \"$D\"' EXIT\nsh_() { timeout 120 \"$BIN\" shell --plain --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" 2>&1; }\nq() { \"$BIN\" query \"$1\" --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" --format json 2>&1; }\nfor LEN in 4095 4096 4097 6000; do\n  python3 -c \"\npre = \\\"RETURN size('\\\"; post = \\\"') AS n;\\\"\nimport sys\nsys.stdout.write(pre + 'a' * (int('$LEN') - len(pre) - len(post)) + post + '\\n')\" > \"$D/line.gql\"\n  [ \"$(( $(stat -c %s \"$D/line.gql\") - 1 ))\" = \"$LEN\" ] || echo \"LINE_LENGTH_WRONG\"\n  N=$((LEN - 21))\n  OUT=$(sh_ < \"$D/line.gql\" | grep -v '^geode> RETURN size')\n  if echo \"$OUT\" | grep -qE \"\\| $N +\\|\" && ! echo \"$OUT\" | grep -qi \"error\"; then echo \"LONG_LINE_OK $LEN\"; else echo \"LONG_LINE_BAD $LEN\"; echo \"$OUT\" | head -8; fi\ndone\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - LONG_LINE_OK 4095
+    - LONG_LINE_OK 4096
+    - LONG_LINE_OK 4097
+    - LONG_LINE_OK 6000
+    stdout_not_contains:
+    - LONG_LINE_BAD
+    - LINE_LENGTH_WRONG
+  tags:
+  - shell
+  - plain-mode
+  - sonny-6476
+  - regression
+- name: line-over-sixteen-mib-is-refused-whole-and-the-next-line-runs
+  description: a 17 MiB line is refused with an error and not run, not cut into pieces; the shell keeps going
+  type: bash
+  timeout_ms: 240000
+  command: "PW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nBIN=\"${GEODE_BINARY:-geode}\"\nD=$(mktemp -d); trap 'rm -rf \"$D\"' EXIT\nsh_() { timeout 120 \"$BIN\" shell --plain --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" 2>&1; }\nq() { \"$BIN\" query \"$1\" --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" --format json 2>&1; }\npython3 -c \"\nimport sys\nsys.stdout.write(\\\"RETURN size('\\\" + 'a' * (17 * 1024 * 1024) + \\\"') AS n;\\n\\\")\nsys.stdout.write('RETURN 6400 + 76 AS after_long;\\n')\" > \"$D/huge.gql\"\nOUT=$(sh_ < \"$D/huge.gql\" | cut -c1-300 | grep -v '^geode> RETURN size')\necho \"$OUT\" | grep -q \"the line is longer than 16777216 bytes; it was not run\" && echo \"REFUSED_WHOLE=yes\" || { echo \"REFUSED_WHOLE=no\"; echo \"$OUT\" | head -6; }\necho \"$OUT\" | grep -qE \"\\| 6476 +\\|\" && echo \"NEXT_LINE_RAN=yes\" || { echo \"NEXT_LINE_RAN=no\"; echo \"$OUT\" | head -6; }\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - REFUSED_WHOLE=yes
+    - NEXT_LINE_RAN=yes
+    stdout_not_contains:
+    - =no
+  tags:
+  - shell
+  - plain-mode
+  - sonny-6476
+  - regression
+  - negative
+- name: non-ascii-text-round-trips-byte-for-byte-through-the-plain-shell
+  description: 'CREATE with 2-, 3- and 4-byte UTF-8 and a combining mark through the shell stores exactly those bytes (it dropped every byte >= 127: caf stored for café)'
+  type: bash
+  timeout_ms: 240000
+  command: "PW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nBIN=\"${GEODE_BINARY:-geode}\"\nD=$(mktemp -d); trap 'rm -rf \"$D\"' EXIT\nsh_() { timeout 120 \"$BIN\" shell --plain --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" 2>&1; }\nq() { \"$BIN\" query \"$1\" --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" --format json 2>&1; }\nprintf \"CREATE (:ShellU6484 {s: 'caf\\xc3\\xa9', t: '\\xe6\\x97\\xa5\\xe6\\x9c\\xac\\xe8\\xaa\\x9e', e: '\\xf0\\x9f\\x98\\x80', c: 'e\\xcc\\x81'});\\n\" | sh_ > /dev/null\n# read back over a SEPARATE client (the shell echoes its input, so its transcript cannot tell stored from echoed)\nq \"MATCH (n:ShellU6484) RETURN n.s AS s, n.t AS t, n.e AS e, n.c AS c\" > \"$D/back.json\"\npython3 - \"$D/back.json\" <<'PY'\nimport json, sys\nraw = open(sys.argv[1], encoding='utf-8').read()\ndoc = json.loads(raw[raw.index('{\"status_class\"'):].splitlines()[0])\nrow = doc[\"rows\"][0] if doc.get(\"rows\") else {}\nwant = {\"s\": \"café\", \"t\": \"日本語\", \"e\": \"\\U0001F600\", \"c\": \"é\"}\nfor k, v in want.items():\n    print((\"UTF8_OK \" if row.get(k) == v else \"UTF8_BAD \") + k, repr(row.get(k)))\nPY\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - UTF8_OK s
+    - UTF8_OK t
+    - UTF8_OK e
+    - UTF8_OK c
+    stdout_not_contains:
+    - UTF8_BAD
+  tags:
+  - shell
+  - plain-mode
+  - utf8
+  - sonny-6484
+  - regression
+- name: invalid-utf8-line-is-refused-and-not-run
+  description: a line that is not valid UTF-8 prints an error and is not executed; the next line runs
+  type: bash
+  timeout_ms: 240000
+  command: "PW=\"${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}\"\nBIN=\"${GEODE_BINARY:-geode}\"\nD=$(mktemp -d); trap 'rm -rf \"$D\"' EXIT\nsh_() { timeout 120 \"$BIN\" shell --plain --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" 2>&1; }\nq() { \"$BIN\" query \"$1\" --server \"${GEODE_SERVER_ADDRESS}\" ${GEODE_CLIENT_TLS} -U geode -P \"$PW\" --format json 2>&1; }\nOUT=$(printf \"CREATE (:ShellBad6484 {s: '\\xff\\xfe'});\\nRETURN 6400 + 84 AS after_bad;\\n\" | sh_)\necho \"$OUT\" | grep -q \"the line is not valid UTF-8; it was not run\" && echo \"REFUSED=yes\" || { echo \"REFUSED=no\"; echo \"$OUT\" | head -8; }\necho \"$OUT\" | grep -qE \"\\| 6484 +\\|\" && echo \"NEXT_LINE_RAN=yes\" || echo \"NEXT_LINE_RAN=no\"\nq \"MATCH (n:ShellBad6484) RETURN count(n) AS c\" | grep -q '\"rows\":\\[{\"c\":0}\\]' && echo \"NOTHING_STORED=yes\" || echo \"NOTHING_STORED=no\"\n"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - REFUSED=yes
+    - NEXT_LINE_RAN=yes
+    - NOTHING_STORED=yes
+    stdout_not_contains:
+    - =no
+  tags:
+  - shell
+  - plain-mode
+  - utf8
+  - sonny-6484
+  - regression
+  - negative

@@ -40,7 +40,7 @@ secrets:
     source: env
     key: GEODE_ADMIN_PASSWORD
     required: false
-    default: GeodeTestPassword123!
+    default: Geode Test Admin Passphrase
 invariants:
 - type: server_running
 fuzz:
@@ -51,20 +51,20 @@ tests:
   # ============================================================================
 - name: phase3-preflight-drop
   description: Idempotent preflight cleanup.
-  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
   stdin: |
-    DROP GRAPH IF EXISTS phase3_alpha;
-    DROP GRAPH IF EXISTS phase3_beta;
+    DROP GRAPH IF EXISTS phase3_alpha
+    DROP GRAPH IF EXISTS phase3_beta
   expect:
     exit_code: 0
   tags: [phase3, setup]
 
 - name: phase3-create-graphs
   description: Create two test graphs.
-  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
   stdin: |
-    CREATE GRAPH phase3_alpha;
-    CREATE GRAPH phase3_beta;
+    CREATE GRAPH phase3_alpha
+    CREATE GRAPH phase3_beta
   expect:
     exit_code: 0
   tags: [phase3, setup]
@@ -181,12 +181,24 @@ tests:
   # ============================================================================
 - name: phase3-db-labels-admin-sees-both
   description: |
-    POSITIVE — admin without a tenant binding sees BOTH seeded labels in
-    db.labels() output. (Cross-tenant filtering is unit-tested separately.)
-  args: [query, -U, geode, -P, '${secret:admin_password}', CALL db.labels()]
+    POSITIVE — db.labels() lists the schema of the graph the session is on, never another
+    graph's (docs/GQL_COMPLIANCE.md "Procedure Calls", SONNY-6606). Admin on phase3_alpha
+    sees the alpha label and not the beta one.
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, phase3_alpha, CALL db.labels()]
   expect:
     exit_code: 0
-    stdout_contains: [Phase3AlphaLabel, Phase3BetaLabel]
+    stdout_contains: [Phase3AlphaLabel]
+    stdout_not_contains: [Phase3BetaLabel]
+  tags: [phase3, positive, db_labels]
+
+- name: phase3-db-labels-admin-beta-graph
+  description: |
+    POSITIVE — the same call on phase3_beta lists the beta label and not the alpha one.
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, phase3_beta, CALL db.labels()]
+  expect:
+    exit_code: 0
+    stdout_contains: [Phase3BetaLabel]
+    stdout_not_contains: [Phase3AlphaLabel]
   tags: [phase3, positive, db_labels]
 
   # ============================================================================
@@ -224,10 +236,10 @@ tests:
   # ============================================================================
 - name: phase3-cleanup-graphs
   description: Drop test graphs.
-  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  args: [query, --batch, -U, geode, -P, '${secret:admin_password}', '-']
   stdin: |
-    DROP GRAPH IF EXISTS phase3_alpha;
-    DROP GRAPH IF EXISTS phase3_beta;
+    DROP GRAPH IF EXISTS phase3_alpha
+    DROP GRAPH IF EXISTS phase3_beta
   expect:
     exit_code: 0
   tags: [phase3, teardown]

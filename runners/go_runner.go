@@ -88,7 +88,7 @@ type Runner struct {
 
 // Default admin credentials for testing
 const defaultUsername = "geode"
-const defaultPassword = "GeodeTestPassword123!"
+const defaultPassword = "Geode Test Admin Passphrase"
 
 func main() {
 	specPath := flag.String("spec", "", "Test specification file")

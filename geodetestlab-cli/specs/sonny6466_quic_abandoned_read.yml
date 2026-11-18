@@ -1,0 +1,124 @@
+version: '1.0'
+name: SONNY-6466 an abandoned QUIC read is cancelled by the stall watchdog (vanished client)
+description: |
+  SONNY-6466 item 1: a client that VANISHES (a crash: no CONNECTION_CLOSE) left
+  its read running for 60-100+ s. The per-connection stall watchdog grouped
+  streams by the peer's IP, so any other open connection from the same address
+  (every loopback client, every client behind one NAT) counted as a live sibling
+  and hid the abandoned read; the 60 s threshold was hard-coded.
+
+  Fixed (68126c5f5): the watchdog groups by connection identity and the
+  threshold is GEODE_QUIC_STALL_CANCEL_MS (default 60000). This spec starts the
+  managed server with GEODE_QUIC_STALL_CANCEL_MS=10000, seeds 400 nodes, starts a
+  comma join of 64M bindings from one client, keeps a SECOND idle-but-live shell
+  connection open from the same address, SIGKILLs the first client (nothing goes
+  on the wire), and requires the server's busiest thread (read from /proc) to go
+  idle within 30 s - while the bystander connection is still alive.
+
+  CANARY: REQ=REQ-SONNY-6466-STALL-WATCHDOG; FEATURE="QuicTransport"; ASPECT=VanishedClientReadCancelled; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6466_quic_abandoned_read.yml; OWNER=transport; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_QUIC_STALL_CANCEL_MS: '10000'
+  client:
+    timeout_ms: 120000
+    tls_verify: false
+    format: json
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: vanished-client-read-cancelled-despite-a-live-sibling-connection
+  description: SIGKILLed client, bystander connection from the same IP stays open; server idle within 30 s at a 10 s threshold
+  type: bash
+  timeout_ms: 300000
+  command: |
+    GP="${GEODETESTLAB_PYTHON:-python3}"
+    "$GP" - <<'PY'
+    import glob, os, sys, time, subprocess
+    port = os.environ["GEODE_SERVER_ADDRESS"].rsplit(":", 1)[1]
+    def server_pid():
+        for p in glob.glob("/proc/[0-9]*/cmdline"):
+            try:
+                a = open(p, "rb").read().split(b"\0")
+            except OSError:
+                continue
+            a = [x.decode(errors="replace") for x in a]
+            if "serve" in a and any(x == "127.0.0.1:" + port for x in a):
+                return int(p.split("/")[2])
+        return None
+    def ticks(pid):
+        out = {}
+        for t in glob.glob("/proc/%d/task/*/stat" % pid):
+            try:
+                s = open(t).read()
+            except OSError:
+                continue
+            f = s[s.rindex(")") + 2:].split()
+            out[t.split("/")[4]] = int(f[11]) + int(f[12])
+        return out
+    def busiest(pid, secs=1.0):
+        a = ticks(pid); time.sleep(secs); b = ticks(pid)
+        return max([b[t] - a[t] for t in b if t in a] or [0])
+    pw = os.environ.get("GEODE_ADMIN_PASSWORD", "Geode Test Admin Passphrase")
+    base = [os.environ.get("GEODE_BINARY", "geode"), "query", "--server", os.environ["GEODE_SERVER_ADDRESS"]] + os.environ.get("GEODE_CLIENT_TLS", "").split() + ["-U", "geode", "-P", pw, "--format", "json"]
+    def q(stmt, timeout=60, extra=()):
+        return subprocess.run(base + ["--timeout", str(timeout)] + list(extra) + [stmt], capture_output=True, text=True, timeout=timeout + 30)
+    pid = server_pid()
+    assert pid, "no server pid"
+    r = q("FOR i IN range(0, 400) CREATE (:Spin {i: i})", 120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    r = q("MATCH (n:Spin) RETURN count(n) AS c")
+    assert '400' in r.stdout, r.stdout
+    SPIN = "MATCH (a:Spin), (b:Spin), (c:Spin) WHERE a.i + b.i + c.i < 0 RETURN count(*) AS c"
+
+    spin = subprocess.Popen(base + ["--timeout", "300", SPIN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # a second, idle-but-live connection from the same address (the old IP-grouped watchdog counted it as a live sibling)
+    by = subprocess.Popen("sleep 170 | " + " ".join(["'%s'" % x for x in [os.environ.get("GEODE_BINARY", "geode"), "shell", "--plain", "--server", os.environ["GEODE_SERVER_ADDRESS"]] + os.environ.get("GEODE_CLIENT_TLS", "").split() + ["-U", "geode", "-P", pw]]), shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+    time.sleep(2.5)
+    b = busiest(pid)
+    print("busy_before_kill=%s (busiest thread %d ticks/s)" % ("yes" if b >= 50 else "no", b))
+    spin.kill(); spin.wait()
+    t0 = time.time(); idle_at = None
+    while time.time() - t0 < 60:
+        if busiest(pid) < 30:
+            idle_at = time.time() - t0
+            break
+    print("idle_after_s=%s" % ("never" if idle_at is None else "%.1f" % idle_at))
+    print("stopped_inside_30s=%s" % ("yes" if idle_at is not None and idle_at <= 30 else "no"))
+    r = q("RETURN 9090 AS alive", 30)
+    print("server_answers=%s" % ("yes" if "9090" in r.stdout else "no"))
+    try:
+        os.killpg(os.getpgid(by.pid), 9)
+    except Exception:
+        pass
+    PY
+  expect:
+    exit_code: 0
+    stdout_contains: [busy_before_kill=yes, stopped_inside_30s=yes, server_answers=yes]
+    stdout_not_contains: [Traceback]
+  tags: [quic, cancel, watchdog, sonny-6466, regression]

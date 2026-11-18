@@ -1,0 +1,179 @@
+version: '1.0'
+name: 'SONNY-3034: geode.rls deny and attribute restrictions are durable across restarts'
+description: |
+  Ticket: SONNY-3034 (security).
+  geode.rls.add_deny_policy / add_attribute_policy restrictions lived in memory only:
+  a restart dropped every restriction without a word, so a user denied a label could
+  read it again after the server came back. Fixed: they are stored in __geode_security
+  as sealed rls_deny / rls_attribute records, put back in force at startup before any
+  listener starts, and their removal is durable too.
+  Proves, with real server restarts: (1) a label deny still hides the label from bob
+  after a restart, the admin is unaffected; (2) an attribute policy still restricts
+  alice after a restart; (3) after geode.rls.remove_deny_policy / remove_attribute_policy
+  and another restart the user sees the rows again (a removal does not come back
+  as a stale restriction, nor does it leave the data hidden).
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s3034-create-user-bob
+  description: 'bob: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER bob SET PASSWORD 'Bob Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created bob]
+  tags: [s3034, setup]
+
+- name: s3034-create-user-alice
+  description: "alice: a readwrite user with department 'engineering'."
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER alice SET PASSWORD 'Alice Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created alice]
+  tags: [s3034, setup]
+
+- name: s3034-seed
+  description: Seed rows as the admin.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:Hidden {s: 'leak'});
+    CREATE (:Doc {s: 'sales1', dept: 'sales'});
+    CREATE (:Doc {s: 'eng1', dept: 'engineering'})
+  expect:
+    exit_code: 0
+  tags: [s3034, setup]
+
+- name: s3034-deny
+  description: Deny bob label Hidden.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('default', 'Hidden', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [deny policy added]
+  tags: [s3034, setup]
+
+- name: s3034-pre-bob-denied
+  description: 'Before the restart: bob sees no Hidden row.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":0}]']
+  tags: [s3034]
+
+- name: s3034-attr
+  description: Add an attribute policy on Doc.dept = principal attribute department.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_attribute_policy('default', 'Doc', 'dept', 'department')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [attribute policy added]
+  tags: [s3034, setup]
+
+- name: s3034-pre-alice
+  description: 'Before the restart: alice (no department attribute yet is fail-closed) sees no sales row.'
+  args: [query, -U, alice, -P, Alice Query Passphrase For Testing, "MATCH (d:Doc {dept: 'sales'}) RETURN count(d) AS c"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":0}]']
+  tags: [s3034]
+
+- name: s3034-restart-1
+  description: 'Stop and restart the server: both restrictions must be reloaded from __geode_security.'
+  type: bash
+  command: echo "restart checkpoint"
+  restart_server: true
+  expect: {exit_code: 0}
+  tags: [s3034, restart]
+
+- name: s3034-post1-bob-denied
+  description: 'After the restart: bob still sees no Hidden row.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":0}]']
+  tags: [s3034]
+
+- name: s3034-post1-admin-sees
+  description: 'After the restart: the admin still sees the Hidden row.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":1}]']
+  tags: [s3034]
+
+- name: s3034-post1-alice-restricted
+  description: 'After the restart: the attribute policy still hides the sales row from alice.'
+  args: [query, -U, alice, -P, Alice Query Passphrase For Testing, "MATCH (d:Doc {dept: 'sales'}) RETURN count(d) AS c"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":0}]']
+  tags: [s3034]
+
+- name: s3034-remove-deny
+  description: Remove bob's deny.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.remove_deny_policy('default', 'Hidden', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s3034]
+
+- name: s3034-remove-attr
+  description: Remove the attribute policy.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.remove_attribute_policy('default', 'Doc', 'dept', 'department')"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s3034]
+
+- name: s3034-post-remove-bob
+  description: 'Without a restart: bob sees the Hidden row again.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":1}]']
+  tags: [s3034]
+
+- name: s3034-restart-2
+  description: 'Restart again: the removals must be durable (no stale restriction reloaded).'
+  type: bash
+  command: echo "restart checkpoint"
+  restart_server: true
+  expect: {exit_code: 0}
+  tags: [s3034, restart]
+
+- name: s3034-post2-bob-sees
+  description: 'After the second restart: bob still sees the Hidden row (the removed deny did not come back).'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":1}]']
+  tags: [s3034]
+
+- name: s3034-post2-alice-sees
+  description: 'After the second restart: alice sees both Doc rows (the removed attribute policy did not come back).'
+  args: [query, -U, alice, -P, Alice Query Passphrase For Testing, MATCH (x:Doc) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":2}]']
+  tags: [s3034]

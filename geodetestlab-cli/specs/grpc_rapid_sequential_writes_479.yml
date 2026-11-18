@@ -136,6 +136,7 @@ tests:
   - >
     MATCH (n:RapidTest)
     RETURN n.batch AS batch, count(n) AS count
+    GROUP BY n.batch
     ORDER BY batch
   expect:
     exit_code: 0
@@ -198,14 +199,11 @@ tests:
   description: 'MERGE nodes with relationships - #479 pattern with edges'
   args:
   - query
-  - >
-    MERGE (a:MergeTest {id: 1})
-    MERGE (b:MergeTest {id: 2})
-    CREATE (a)-[:LINKED {seq: 1}]->(b)
-    WITH a, b
-    MERGE (c:MergeTest {id: 3})
-    CREATE (b)-[:LINKED {seq: 2}]->(c)
-    RETURN count(*) AS ops
+  - '-'
+  # MERGE then CREATE must be separate statements (geode: "MERGE followed by CREATE is not supported"; write-shape allowlist, SONNY-3139)
+  stdin: |
+    MERGE (a:MergeTest {id: 1}) MERGE (b:MergeTest {id: 2}) MERGE (c:MergeTest {id: 3});
+    MATCH (a:MergeTest {id: 1}), (b:MergeTest {id: 2}), (c:MergeTest {id: 3}) CREATE (a)-[:LINKED {seq: 1}]->(b), (b)-[:LINKED {seq: 2}]->(c) RETURN a, b, c
   expect:
     exit_code: 0
     geode_query:
@@ -299,8 +297,8 @@ tests:
   args:
   - query
   - >
-    MATCH (start:MergeTest {id: 1})-[:CHAIN*]->(end:MergeTest)
-    RETURN end.id AS reached_id
+    MATCH (s0:MergeTest {id: 1})-[:CHAIN*]->(e0:MergeTest)
+    RETURN e0.id AS reached_id
     ORDER BY reached_id
   expect:
     exit_code: 0
@@ -343,14 +341,12 @@ tests:
   description: Multiple mixed operations
   args:
   - query
-  - >
-    CREATE (x1:MixedTest {id: 2, status: 'new'}),
-           (x2:MixedTest {id: 3, status: 'new'}),
-           (x3:MixedTest {id: 4, status: 'new'})
-    WITH x1, x2, x3
-    SET x1.status = 'processed', x2.status = 'processed', x3.status = 'processed'
-    CREATE (x1)-[:DEPENDS_ON]->(x2), (x2)-[:DEPENDS_ON]->(x3)
-    RETURN count(*) AS ops
+  - '-'
+  # a CREATE cannot be followed by WITH ... SET ... CREATE in one statement (write-shape allowlist, SONNY-3139): create, then MATCH ... SET ... CREATE
+  stdin: |
+    CREATE (x1:MixedTest {id: 2, status: 'new'}), (x2:MixedTest {id: 3, status: 'new'}), (x3:MixedTest {id: 4, status: 'new'});
+    MATCH (x1:MixedTest {id: 2}), (x2:MixedTest {id: 3}), (x3:MixedTest {id: 4}) SET x1.status = 'processed', x2.status = 'processed', x3.status = 'processed';
+    MATCH (x1:MixedTest {id: 2}), (x2:MixedTest {id: 3}), (x3:MixedTest {id: 4}) CREATE (x1)-[:DEPENDS_ON]->(x2), (x2)-[:DEPENDS_ON]->(x3) RETURN x1, x2, x3
   expect:
     exit_code: 0
     geode_query:
@@ -455,13 +451,13 @@ tests:
   - >
     MATCH (n:RapidTest)
     WHERE n.id = 1
-    RETURN n.data AS data
+    RETURN n.data AS payload
   expect:
     exit_code: 0
     geode_query:
       row_count: 1
       columns:
-      - data
+      - payload
       execution_time_ms: 5000
     stdout_contains: payload_001
   tags:

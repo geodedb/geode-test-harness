@@ -61,6 +61,23 @@ python -m geodetestlab run --specs specs --parallel 4 -v
 python -m geodetestlab run --specs specs --transport grpc -v
 ```
 
+## Running several harness processes on one machine
+
+- A harness process no longer `pkill`s `geode serve.*geode-test-` at exit: that
+  SIGKILLed the managed servers of every OTHER harness run on the machine
+  ("Server died during test (signal 9)", and a first boot killed that way leaves a
+  data directory that refuses to start). Servers are reaped through the process
+  groups the run itself tracks.
+- `GEODETESTLAB_DATA_PREFIX` / `GEODETESTLAB_TLS_PREFIX` rename the managed
+  server's temp directories (default `geode-test-` / `geode-test-tls-`), so a run
+  can be kept clear of any older harness whose cleanup still matches that pattern.
+- A restarted managed server (`restart_server`, crash recovery) is started with the
+  same arguments as the first one, including the provisioned `--cert/--key`.
+- A run stopped by SIGINT/SIGTERM fails (`<run interrupted>`) instead of reporting
+  the tests it never ran as green.
+- Bash steps get `GEODETESTLAB_PYTHON` (the harness interpreter, whose venv has
+  grpcio and aioquic) for specs that speak a wire protocol directly.
+
 ## OTel Monitoring (debugging via spans/metrics)
 
 When investigating slow queries, transaction failures, or connection issues,
@@ -102,7 +119,7 @@ per line, rotates at 64 MB × 3). After a run:
 ### InstrumentationScopes
 
 | Scope | Origin | Useful for |
-|---|---|---|
+| --- | --- | --- |
 | `com.geodedb.geode` | geode itself | `geode.transport.request`, `geode.query.execute`, `geode.graph_store.{create_node,get_nodes_by_label}`, `gql.execute.PARSE`, `wal.{create,update,delete}_*` |
 | `wal` | DevNW wal lib | `wal.replay`, `wal.append` (×2 paths), `wal.append_batch` (×2), `wal.commit`, `wal.checkpoint`, `wal.truncate` |
 | `gql` | DevNW gql lib | parser entry (`gql.execute.query`) |
@@ -241,7 +258,7 @@ GEODE_PORT=8443 make docker-start
 - `GEODE_HOST` - Server host (default: 127.0.0.1)
 - `GEODE_PORT` - QUIC server port (default: 3141, UDP)
 - `GEODE_GRPC_PORT` - gRPC server port (default: 50051, TCP)
-- `GEODE_ADMIN_PASSWORD` - Admin password (default: GeodeTestPassword123!)
+- `GEODE_ADMIN_PASSWORD` - Admin password (default: Geode Test Admin Passphrase)
 - `GEODE_USERNAME` - Username (default: geode)
 - `GEODE_VERIFY_SSL` - Enable SSL verification (default: 0)
 

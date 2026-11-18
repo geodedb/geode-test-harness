@@ -1,0 +1,227 @@
+version: '1.0'
+name: SONNY-2979 transactions are crash-atomic (durable undo log)
+description: |
+  SONNY-2979 (DATA INTEGRITY): a multi-request transaction (START
+  TRANSACTION ... COMMIT over several client requests) was not crash-atomic:
+  every statement committed its own durable engine write and the undo log was
+  memory-only, so a SIGKILL in the middle of an open transaction left the
+  statements executed so far applied after the restart, with no way to roll
+  them back. The fix makes the undo log durable (txn_undo.wal) and undoes
+  every transaction that was open at the restart, and nothing else.
+
+  Black-box: a real `geode serve` is driven through one interactive
+  `geode shell --plain` session per step (the session keeps the transaction
+  open across requests; a FIFO holds the shell's stdin open so the transaction
+  is genuinely still open when the server is killed). SIGKILL (no shutdown, no
+  checkpoint) then restart on the same data dir:
+    * an OPEN transaction (two node CREATEs and a property SET on a node that
+      existed before it) leaves nothing behind: no new node, the old value;
+    * a COMMITTED transaction (same shapes) survives the kill whole;
+    * a ROLLED-BACK transaction stays rolled back, and is not undone a second
+      time: a later committed change to the value its undo restored survives a
+      second kill.
+
+  CANARY: REQ=REQ-SONNY-2979-TXN-CRASH-ATOMIC; FEATURE="TransactionManagement"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny2979_txn_crash_atomic.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+  client:
+    timeout_ms: 120000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+default_timeout_ms: 120000
+
+tests:
+- name: seed
+  description: A node that exists before any transaction.
+  query: "CREATE (:Pre2979 {i: 1, v: 'orig'})"
+  expected:
+    exit_code: 0
+
+- name: committed-transaction
+  description: A transaction over several requests that COMMITs (two creates and a SET of the pre-existing node).
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    F=$(mktemp -u "${GEODE_DATA_DIR}.fifo.XXXXXX"); mkfifo "$F"
+    OUT=$(mktemp "${GEODE_DATA_DIR}.shout.XXXXXX")
+    "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" < "$F" > "$OUT" 2>&1 &
+    SH=$!
+    exec 3> "$F"
+    printf '%s\n' 'START TRANSACTION;' 'CREATE (:Com2979 {i: 1});' 'CREATE (:Com2979 {i: 2});' 'MATCH (p:Pre2979) SET p.v = '"'"'committed'"'"';' 'COMMIT;' >&3
+    printf 'exit\n' >&3
+    exec 3>&-
+    wait $SH || true
+    cat "$OUT"
+    rm -f "$F" "$OUT"
+    echo COMMITTED_OK
+  timeout_ms: 90000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - COMMITTED_OK
+
+- name: rolled-back-transaction
+  description: 'A transaction that ROLLBACKs: its undo restores v to committed.'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    F=$(mktemp -u "${GEODE_DATA_DIR}.fifo.XXXXXX"); mkfifo "$F"
+    OUT=$(mktemp "${GEODE_DATA_DIR}.shout.XXXXXX")
+    "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" < "$F" > "$OUT" 2>&1 &
+    SH=$!
+    exec 3> "$F"
+    printf '%s\n' 'START TRANSACTION;' 'CREATE (:Rb2979 {i: 1});' 'MATCH (p:Pre2979) SET p.v = '"'"'rolled'"'"';' 'ROLLBACK;' >&3
+    printf 'exit\n' >&3
+    exec 3>&-
+    wait $SH || true
+    cat "$OUT"
+    rm -f "$F" "$OUT"
+    echo ROLLED_BACK_OK
+  timeout_ms: 90000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - ROLLED_BACK_OK
+
+- name: pre-crash-state
+  description: 'Before the crash: committed work visible, rolled-back work gone.'
+  query: MATCH (c:Com2979) RETURN count(c) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+
+- name: pre-crash-rolled-back-gone
+  description: The rolled-back create and SET are gone.
+  query: MATCH (r:Rb2979) RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: open-transaction-then-sigkill
+  description: Open a transaction (three creates, a SET of Pre, a SET of a committed node), prove it is open (the session counts its own 3 uncommitted nodes), SIGKILL the server and restart it.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    F=$(mktemp -u "${GEODE_DATA_DIR}.fifo.XXXXXX"); mkfifo "$F"
+    OUT=$(mktemp "${GEODE_DATA_DIR}.shout.XXXXXX")
+    "${GEODE_BINARY:-geode}" shell --plain --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" < "$F" > "$OUT" 2>&1 &
+    SH=$!
+    exec 3> "$F"
+    printf '%s\n' 'START TRANSACTION;' 'CREATE (:Open2979 {i: 1});' 'CREATE (:Open2979 {i: 2});' 'CREATE (:Open2979 {i: 3});' 'MATCH (p:Pre2979) SET p.w = '"'"'open'"'"';' 'MATCH (c:Com2979 {i: 1}) SET c.touched = true;' 'MATCH (o:Open2979) RETURN count(o) AS inside;' >&3
+    sleep 4
+    grep -Eq '^\| 3 +\|' "$OUT" || { cat "$OUT"; echo SESSION_NOT_OPEN; exit 1; }
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    exec 3>&-; kill -9 $SH 2>/dev/null || true; wait $SH 2>/dev/null || true
+    rm -f "$F" "$OUT"
+    echo OPEN_TXN_KILLED
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - OPEN_TXN_KILLED
+
+- name: after-kill-open-transaction-undone-nodes
+  description: None of the open transaction's nodes survived.
+  query: MATCH (o:Open2979) RETURN count(o) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: after-kill-open-transaction-undone-set
+  description: Its SET of the pre-existing node is undone (no w) and the COMMITTED transaction's value is intact.
+  query: MATCH (p:Pre2979) RETURN p.v AS v, p.w IS NULL AS no_w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"v":"committed"'
+    - '"no_w":true'
+
+- name: after-kill-open-transaction-undone-touched
+  description: Its SET on a committed node is undone.
+  query: MATCH (c:Com2979) WHERE c.touched IS NOT NULL RETURN count(c) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: after-kill-committed-transaction-survives
+  description: 'The committed transaction survived the kill whole: both nodes.'
+  query: MATCH (c:Com2979) RETURN count(c) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'
+
+- name: after-kill-rolled-back-stays-rolled-back
+  description: The rolled-back transaction left nothing behind either.
+  query: MATCH (r:Rb2979) RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+
+- name: later-committed-change
+  description: A committed change after the recovery, to the value the earlier undo restored.
+  query: MATCH (p:Pre2979) SET p.v = 'later'
+  expected:
+    exit_code: 0
+
+- name: second-sigkill-restart
+  description: A second SIGKILL; the recovery must not undo the already-undone (or rolled-back) transactions again over this later committed value.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo SECOND_KILL
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SECOND_KILL
+
+- name: after-second-kill-later-change-survives
+  description: 'The later committed value survived: no earlier undo was replayed over it.'
+  query: MATCH (p:Pre2979) RETURN p.v AS v, p.w IS NULL AS no_w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"v":"later"'
+    - '"no_w":true'
+
+- name: after-second-kill-counts
+  description: And the committed transaction's nodes are still there.
+  query: MATCH (c:Com2979) RETURN count(c) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":2'

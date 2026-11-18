@@ -1,0 +1,635 @@
+# SONNY-6570: CDC procedures answer from the engine or refuse (0A000), Admin only
+#
+# Bug: no write path feeds the CDC engine (change capture is not implemented,
+# SONNY-6572), yet CALL cdc.* answered as if it were: cdc.get_events returned one
+# invented event (seq 1, insert, 2025-10-25T00:00:00Z, {}), get_ordered_events /
+# get_corruption_analysis / get_pending_events / get_flush_metrics /
+# get_telemetry_metrics returned fixed rows, pause / resume / set_guardrail /
+# configure_* / set_retention_policy / cleanup_expired_events changed nothing and
+# reported success, cdc.start/stop/reset_guardrails answered success with CDC not
+# enabled, and a readwrite or readonly user could read cdc.status() and run
+# cdc.enable() / cdc.disable().
+#
+# Fixed behaviour:
+#   * every procedure that cannot answer truthfully fails with SQLSTATE 0A000
+#     whose message names the procedure and "SONNY-6572"
+#   * cdc.start() / cdc.stop() / cdc.reset_guardrails() with CDC not enabled
+#     fail 55000
+#   * the honest procedures answer the engine's state: cdc.status() reports
+#     enabled=false / streaming=false / event_count=0 before enable, enabled=true
+#     after, and drops the old last_checkpoint column
+#   * every cdc.* procedure is Admin only (42501 for readwrite / readonly)
+#   * writes performed with CDC enabled are NOT captured, so cdc.status keeps
+#     event_count 0 (the honest answer; nothing invents events)
+#
+# What this spec proves: real server, real users over the QUIC wire; no fixed
+# invented rows can appear because every refusal is asserted by SQLSTATE.
+
+version: '1.0'
+name: SONNY-6570 CDC procedures answer truthfully or refuse, Admin only
+description: cdc.* procedures that cannot answer truthfully fail 0A000 naming SONNY-6572, start/stop/reset need CDC enabled (55000), and all are Admin only (SONNY-6570)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s6570-create-users
+  description: Create a readwrite and a readonly user
+  args:
+  - query
+  - '-'
+  stdin: "DROP USER IF EXISTS cdc6570_rw;\nDROP USER IF EXISTS cdc6570_ro;\nCREATE USER cdc6570_rw SET PASSWORD 'Cdc6570 Readwrite Passphrase 2026' ROLE readwrite;\nCREATE USER cdc6570_ro SET PASSWORD 'Cdc6570 Readonly Passphrase 2026' ROLE readonly"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - setup
+  - sonny6570
+- name: s6570-status-before-enable
+  description: cdc.status() before enable reports the engine's state, not a made-up row
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.status()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"enabled":false'
+    - '"streaming":false'
+    - '"event_count":0'
+    stdout_not_contains:
+    - last_checkpoint
+  tags:
+  - cdc
+  - sonny6570
+- name: s6570-start-without-enable
+  description: CALL cdc.start() with CDC not enabled fails 55000 (it used to report success)
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.start()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"55000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+- name: s6570-stop-without-enable
+  description: CALL cdc.stop() with CDC not enabled fails 55000 (it used to report success)
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.stop()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"55000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+- name: s6570-reset_guardrails-without-enable
+  description: CALL cdc.reset_guardrails() with CDC not enabled fails 55000 (it used to report success)
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.reset_guardrails()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"55000"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+- name: s6570-get_events-refused
+  description: CALL cdc.get_events() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_events()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_events
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-pause-refused
+  description: CALL cdc.pause() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.pause()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.pause
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-resume-refused
+  description: CALL cdc.resume() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.resume()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.resume
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_watermark-refused
+  description: CALL cdc.get_watermark() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_watermark()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_watermark
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_pending_events-refused
+  description: CALL cdc.get_pending_events() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_pending_events()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_pending_events
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-configure_adaptive_flush-refused
+  description: CALL cdc.configure_adaptive_flush() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.configure_adaptive_flush()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.configure_adaptive_flush
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_flush_metrics-refused
+  description: CALL cdc.get_flush_metrics() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_flush_metrics()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_flush_metrics
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_malformed_records-refused
+  description: CALL cdc.get_malformed_records() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_malformed_records()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_malformed_records
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_corruption_analysis-refused
+  description: CALL cdc.get_corruption_analysis() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_corruption_analysis()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_corruption_analysis
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_ordered_events-refused
+  description: CALL cdc.get_ordered_events() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_ordered_events()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_ordered_events
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-check_duplicates-refused
+  description: CALL cdc.check_duplicates() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.check_duplicates()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.check_duplicates
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_change_status-refused
+  description: CALL cdc.get_change_status() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_change_status()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_change_status
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-configure_change_stream-refused
+  description: CALL cdc.configure_change_stream() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.configure_change_stream()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.configure_change_stream
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-set_retention_policy-refused
+  description: CALL cdc.set_retention_policy() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.set_retention_policy()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.set_retention_policy
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-cleanup_expired_events-refused
+  description: CALL cdc.cleanup_expired_events() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.cleanup_expired_events()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.cleanup_expired_events
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_telemetry_metrics-refused
+  description: CALL cdc.get_telemetry_metrics() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_telemetry_metrics()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_telemetry_metrics
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_performance_alerts-refused
+  description: CALL cdc.get_performance_alerts() fails 0A000 naming the procedure and SONNY-6572 instead of inventing an answer
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_performance_alerts()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.get_performance_alerts
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-set_guardrail-refused
+  description: CALL cdc.set_guardrail(...) fails 0A000 (it changed nothing and reported success)
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.set_guardrail('warn_threshold', 10)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - cdc.set_guardrail
+    - SONNY-6572
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-readwrite-cannot-read-status
+  description: A readwrite user cannot read cdc.status() (Admin only)
+  args:
+  - query
+  - '-'
+  - -U
+  - cdc6570_rw
+  - -P
+  - Cdc6570 Readwrite Passphrase 2026
+  stdin: CALL cdc.status()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42501"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - authz
+  - sonny6570
+  - key-assertion
+- name: s6570-readwrite-cannot-enable
+  description: A readwrite user cannot run cdc.enable()
+  args:
+  - query
+  - '-'
+  - -U
+  - cdc6570_rw
+  - -P
+  - Cdc6570 Readwrite Passphrase 2026
+  stdin: CALL cdc.enable()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42501"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - authz
+  - sonny6570
+  - key-assertion
+- name: s6570-readonly-cannot-read-diagnostics
+  description: A readonly user cannot read cdc.export_diagnostics()
+  args:
+  - query
+  - '-'
+  - -U
+  - cdc6570_ro
+  - -P
+  - Cdc6570 Readonly Passphrase 2026
+  stdin: CALL cdc.export_diagnostics()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42501"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - authz
+  - sonny6570
+- name: s6570-readonly-cannot-disable
+  description: A readonly user cannot run cdc.disable()
+  args:
+  - query
+  - '-'
+  - -U
+  - cdc6570_ro
+  - -P
+  - Cdc6570 Readonly Passphrase 2026
+  stdin: CALL cdc.disable()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42501"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - authz
+  - sonny6570
+- name: s6570-refused-attempts-did-not-enable
+  description: The refused non-admin cdc.enable() left CDC disabled
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.status()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"enabled":false'
+  tags:
+  - cdc
+  - authz
+  - sonny6570
+- name: s6570-admin-enable
+  description: Admin enables CDC
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.enable()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - enabled
+  tags:
+  - cdc
+  - sonny6570
+- name: s6570-status-after-enable
+  description: cdc.status() reports enabled=true after enable
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.status()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"enabled":true'
+    - '"event_count":0'
+  tags:
+  - cdc
+  - sonny6570
+- name: s6570-write-with-cdc-enabled
+  description: A write with CDC enabled succeeds
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:Cdc6570 {k: 1});\nMATCH (n:Cdc6570) SET n.k = 2"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+- name: s6570-writes-are-not-captured
+  description: 'Writes are not captured (honest: event_count stays 0, nothing is invented)'
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.status()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"event_count":0'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-get_events-still-refused-when-enabled
+  description: With CDC enabled cdc.get_events() still refuses 0A000 rather than returning the fabricated event
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.get_events()
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"0A000"'
+    - SONNY-6572
+    stdout_not_contains:
+    - '2025-10-25'
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570
+  - key-assertion
+- name: s6570-admin-disable
+  description: Admin disables CDC again
+  args:
+  - query
+  - '-'
+  stdin: CALL cdc.disable()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - cdc
+  - sonny6570

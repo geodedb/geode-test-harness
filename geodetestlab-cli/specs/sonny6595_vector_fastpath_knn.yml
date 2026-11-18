@@ -1,0 +1,68 @@
+version: '1.0'
+name: Vector index follows the QUIC node fast paths and refuses a wrong dimension (SONNY-6595)
+description: |
+  SONNY-6595 items 1-2: single-statement `CREATE (n:L {k: v})` (no RETURN) and
+  bulk `MERGE` take a QUIC fast path that never maintained vector (HNSW)
+  indexes, so knn() answered from a stale non-empty index and did not find a
+  node written there; the CREATE fast path also stored a wrong-dimension
+  vector the executor refuses (22000).
+
+  Proven on a real server with a vector bound as `--param` (a `vectorf32(...)`
+  literal is not fast-pathed): an index is created on (:V).emb, then a fast-path
+  CREATE writes a node and knn(q, 1) must return that node as the nearest
+  neighbour of its own vector, a fast-path `MERGE ... ON CREATE SET` likewise;
+  a 2-dimensional vector written next to the 3-dimensional ones is refused with
+  status 22000 by the fast path and nothing is stored.
+
+  CANARY: REQ=REQ-SONNY-6595-VECTOR-WRITE-PATHS; FEATURE="VectorIndex"; ASPECT=WireFastPaths; STATUS=TESTED; OWNER=index; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: vector_index_is_current_after_fast_path_writes
+  type: bash
+  timeout_ms: 180000
+  command: |
+    q() { "${GEODE_BINARY}" query --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} --format json -U geode -P "${GEODE_ADMIN_PASSWORD}" "$@" 2>&1; }
+    ok() { echo "$1" | grep -q '"status_class":"00000"'; }
+    out=$(q --param q '[1.0,0.0,0.0]' "CREATE (n:V {key: 'seed', emb: \$q}) RETURN n.key AS k"); ok "$out" || { echo "seed: $out"; exit 1; }
+    out=$(q "CREATE INDEX v_emb ON V (emb) USING vector WITH (metric = 'l2')"); ok "$out" || { echo "index: $out"; exit 1; }
+    knn() { q --param q "$1" "MATCH (v:V) WHERE id(v) IN knn('emb', \$q, 1, 'l2') RETURN v.key AS k"; }
+    # fast-path CREATE (single statement, no RETURN)
+    out=$(q --param q '[0.0,1.0,0.0]' "CREATE (:V {key: 'fastcreate', emb: \$q})"); ok "$out" || { echo "create: $out"; exit 1; }
+    out=$(knn '[0.0,1.0,0.0]'); echo "$out" | grep -q '"k":"fastcreate"' || { echo "fast-path CREATE not found by knn: $out"; exit 1; }
+    # fast-path MERGE ... ON CREATE SET
+    out=$(q --param q '[0.0,0.0,1.0]' "MERGE (n:V {key: 'fastmerge'}) ON CREATE SET n.emb = \$q"); ok "$out" || { echo "merge: $out"; exit 1; }
+    out=$(knn '[0.0,0.0,1.0]'); echo "$out" | grep -q '"k":"fastmerge"' || { echo "fast-path MERGE not found by knn: $out"; exit 1; }
+    # wrong dimension through the executor (vectorf32() is not fast-pathed) is
+    # refused and not stored. (The fast-path half needs a VECTOR_F32-typed
+    # parameter, which the CLI cannot send: a --param list is a LIST, so that
+    # half is covered by tests/test_sonny6595_vector_write_paths.zig.)
+    out=$(q --param q '[0.0,1.0]' "CREATE (n:V {key: 'baddim', emb: vectorf32(\$q)}) RETURN n.key AS k")
+    echo "$out" | grep -q '"status_class":"22' || { echo "wrong dimension accepted by the executor: $out"; exit 1; }
+    out=$(q "MATCH (n:V) WHERE n.key = 'baddim' RETURN n.key AS k"); echo "$out" | grep -q '"rows":\[\]' || { echo "wrong-dimension node was stored: $out"; exit 1; }
+    echo vector_fastpath_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - vector_fastpath_ok
+  tags: [vector, index, fastpath, sonny-6595]

@@ -1,0 +1,444 @@
+version: '1.0'
+name: 'SONNY-6483: aggregating WITH followed by WITH, RLS aggregates over no MATCH, self-loops, failing property maps'
+description: |
+  Ticket: SONNY-6483.
+  (1) MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s returned NULL
+  rows on the legacy sessions; (2) RETURN count(1), sum(2) gave 1, NULL on an RLS
+  session; (3) an undirected self-loop was counted twice (MATCH (a)-[r]-(b)); (4) a
+  node or relationship property map whose value fails to evaluate (1 / 0) matched
+  nothing instead of failing the statement (ISO/IEC 39075 19.1 GR 1).
+  Proves each fixed answer exactly (sums, averages, collect sizes, WHERE and
+  ORDER BY after the second WITH, the self-loop counted once, 22012 for a failing
+  property map) on both sessions.
+
+    Every query runs on two sessions of the same server, over QUIC through the real
+    geode CLI: the admin on graph qa (no row-level security) and bob on graph qb,
+    where the same data plus one X:Hidden node is stored and bob is denied label
+    Hidden with CALL geode.rls.add_deny_policy (a row-level-security session, which
+    geode serves through the legacy read executor). The expected answers are the
+    same for both sessions, so the spec also proves the two executors agree.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s6483-create-graph-qa
+  description: 'qa: plain graph read by the admin (no row-level security).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH qa]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s6483, setup]
+
+- name: s6483-create-graph-qb
+  description: 'qb: graph read by bob, who is denied label Hidden (a row-level-security session).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH qb]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s6483, setup]
+
+- name: s6483-create-user-bob
+  description: 'bob: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER bob SET PASSWORD 'Bob Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created bob]
+  tags: [s6483, setup]
+
+- name: s6483-seed-qa
+  description: Seed graph qa with the Y-R->Q-R->X chains, the Z rows and the S edges.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH qa;
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0});
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1});
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2});
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3});
+    CREATE (:Z {k: 0, g: 0, r: 7});
+    CREATE (:Z {k: 1, g: 0, r: 6});
+    CREATE (:Z {k: 2, g: 0, r: 5});
+    CREATE (:Z {k: 3, g: 0, r: 4});
+    CREATE (:Z {k: 4, g: 1, r: 3});
+    CREATE (:Z {k: 5, g: 1, r: 2});
+    CREATE (:Z {k: 6, g: 1, r: 1});
+    CREATE (:Z {k: 7, g: 1, r: 0});
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b);
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+  tags: [s6483, setup]
+
+- name: s6483-seed-qb
+  description: Seed graph qb with the Y-R->Q-R->X chains, the Z rows and the S edges, plus one X:Hidden node bob may not read.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH qb;
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0});
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1});
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2});
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3});
+    CREATE (:Z {k: 0, g: 0, r: 7});
+    CREATE (:Z {k: 1, g: 0, r: 6});
+    CREATE (:Z {k: 2, g: 0, r: 5});
+    CREATE (:Z {k: 3, g: 0, r: 4});
+    CREATE (:Z {k: 4, g: 1, r: 3});
+    CREATE (:Z {k: 5, g: 1, r: 2});
+    CREATE (:Z {k: 6, g: 1, r: 1});
+    CREATE (:Z {k: 7, g: 1, r: 0});
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b);
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a);
+    MATCH (q:Q {k: 0}) CREATE (q)-[:R {w: 9}]->(:X:Hidden {k: 99})
+  expect:
+    exit_code: 0
+  tags: [s6483, setup]
+
+- name: s6483-deny-hidden
+  description: 'Deny bob label Hidden: his sessions are RLS-filtered.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('qb', 'Hidden', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [deny policy added, '"status_class":"00000"']
+  tags: [s6483, setup]
+
+- name: s6483-control-rls-active
+  description: "Control: the admin sees the Hidden node in qb, bob does not (so bob's reads really are filtered)."
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qb, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":1}]']
+  tags: [s6483, setup]
+
+- name: s6483-control-rls-bob
+  description: 'Control: bob sees no Hidden node.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":0}]']
+  tags: [s6483, setup]
+
+- name: s6483-aw1-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s ORDER BY g'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"s":6},{"g":1,"s":22}]']
+  tags: [s6483]
+
+- name: s6483-aw1-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s ORDER BY g'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"s":6},{"g":1,"s":22}]']
+  tags: [s6483]
+
+- name: s6483-aw2-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s + 1 AS t RETURN g, t ORDER BY g'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s + 1 AS t RETURN g, t ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"t":7},{"g":1,"t":23}]']
+  tags: [s6483]
+
+- name: s6483-aw2-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s + 1 AS t RETURN g, t ORDER BY g'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s + 1 AS t RETURN g, t ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"t":7},{"g":1,"t":23}]']
+  tags: [s6483]
+
+- name: s6483-aw3-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, collect(z.k) AS s WITH g, size(s) AS n RETURN g, n ORDER BY g'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, collect(z.k) AS s WITH g, size(s) AS n RETURN g, n ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"n":4},{"g":1,"n":4}]']
+  tags: [s6483]
+
+- name: s6483-aw3-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, collect(z.k) AS s WITH g, size(s) AS n RETURN g, n ORDER BY g'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, collect(z.k) AS s WITH g, size(s) AS n RETURN g, n ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"n":4},{"g":1,"n":4}]']
+  tags: [s6483]
+
+- name: s6483-aw4-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, avg(z.k) AS s WITH g, s RETURN g, s ORDER BY g'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, avg(z.k) AS s WITH g, s RETURN g, s ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"s":1.5},{"g":1,"s":5.5}]']
+  tags: [s6483]
+
+- name: s6483-aw4-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, avg(z.k) AS s WITH g, s RETURN g, s ORDER BY g'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, avg(z.k) AS s WITH g, s RETURN g, s ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"s":1.5},{"g":1,"s":5.5}]']
+  tags: [s6483]
+
+- name: s6483-aw5-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s WHERE s > 7 RETURN g, s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s WHERE s > 7 RETURN g, s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":1,"s":22}]']
+  tags: [s6483]
+
+- name: s6483-aw5-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s WHERE s > 7 RETURN g, s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s WHERE s > 7 RETURN g, s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":1,"s":22}]']
+  tags: [s6483]
+
+- name: s6483-aw6-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s ORDER BY s DESC RETURN g, s ORDER BY s DESC'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s ORDER BY s DESC RETURN g, s ORDER BY s DESC']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":1,"s":22},{"g":0,"s":6}]']
+  tags: [s6483]
+
+- name: s6483-aw6-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s ORDER BY s DESC RETURN g, s ORDER BY s DESC'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s ORDER BY s DESC RETURN g, s ORDER BY s DESC']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":1,"s":22},{"g":0,"s":6}]']
+  tags: [s6483]
+
+- name: s6483-aw7-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH count(*) AS c WITH c RETURN c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, MATCH (z:Z) WITH count(*) AS c WITH c RETURN c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":8}]']
+  tags: [s6483]
+
+- name: s6483-aw7-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH count(*) AS c WITH c RETURN c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, MATCH (z:Z) WITH count(*) AS c WITH c RETURN c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":8}]']
+  tags: [s6483]
+
+- name: s6483-aw8-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH sum(s) AS t RETURN t'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH sum(s) AS t RETURN t']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"t":28}]']
+  tags: [s6483]
+
+- name: s6483-aw8-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH sum(s) AS t RETURN t'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH sum(s) AS t RETURN t']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"t":28}]']
+  tags: [s6483]
+
+- name: s6483-aw9-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, max(z.k) AS m WITH g, m WITH g, m * 2 AS d RETURN g, d ORDER BY g'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, max(z.k) AS m WITH g, m WITH g, m * 2 AS d RETURN g, d ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"d":6},{"g":1,"d":14}]']
+  tags: [s6483]
+
+- name: s6483-aw9-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, max(z.k) AS m WITH g, m WITH g, m * 2 AS d RETURN g, d ORDER BY g'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, max(z.k) AS m WITH g, m WITH g, m * 2 AS d RETURN g, d ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"d":6},{"g":1,"d":14}]']
+  tags: [s6483]
+
+- name: s6483-aw10-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s ORDER BY g LIMIT 1'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s ORDER BY g LIMIT 1']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"s":6}]']
+  tags: [s6483]
+
+- name: s6483-aw10-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s ORDER BY g LIMIT 1'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, sum(z.k) AS s WITH g, s RETURN g, s ORDER BY g LIMIT 1']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"s":6}]']
+  tags: [s6483]
+
+- name: s6483-aw11-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (z:Z) WITH z.g AS g, min(toString(z.k)) AS m WITH g, m RETURN g, m ORDER BY g'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (z:Z) WITH z.g AS g, min(toString(z.k)) AS m WITH g, m RETURN g, m ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"m":"0"},{"g":1,"m":"4"}]']
+  tags: [s6483]
+
+- name: s6483-aw11-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (z:Z) WITH z.g AS g, min(toString(z.k)) AS m WITH g, m RETURN g, m ORDER BY g'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (z:Z) WITH z.g AS g, min(toString(z.k)) AS m WITH g, m RETURN g, m ORDER BY g']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"g":0,"m":"0"},{"g":1,"m":"4"}]']
+  tags: [s6483]
+
+- name: s6483-nm1-qa
+  description: 'SONNY-6483 [admin (no RLS)]: RETURN count(1) AS c, sum(2) AS s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'RETURN count(1) AS c, sum(2) AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1,"s":2}]']
+  tags: [s6483]
+
+- name: s6483-nm1-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: RETURN count(1) AS c, sum(2) AS s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'RETURN count(1) AS c, sum(2) AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1,"s":2}]']
+  tags: [s6483]
+
+- name: s6483-nm2-qa
+  description: 'SONNY-6483 [admin (no RLS)]: RETURN sum(2) + 1 AS x'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, RETURN sum(2) + 1 AS x]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"x":3}]']
+  tags: [s6483]
+
+- name: s6483-nm2-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: RETURN sum(2) + 1 AS x'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, RETURN sum(2) + 1 AS x]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"x":3}]']
+  tags: [s6483]
+
+- name: s6483-sl1-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (a:Q)-[r:S]-(b) RETURN count(*) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (a:Q)-[r:S]-(b) RETURN count(*) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":3}]']
+  tags: [s6483]
+
+- name: s6483-sl1-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (a:Q)-[r:S]-(b) RETURN count(*) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (a:Q)-[r:S]-(b) RETURN count(*) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":3}]']
+  tags: [s6483]
+
+- name: s6483-sl2-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (a:Q {k: 3})-[r:S]-(b) RETURN count(r) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (a:Q {k: 3})-[r:S]-(b) RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s6483]
+
+- name: s6483-sl2-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (a:Q {k: 3})-[r:S]-(b) RETURN count(r) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (a:Q {k: 3})-[r:S]-(b) RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s6483]
+
+- name: s6483-sl3-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (a:Q {k: 0})-[r:S]-(b) RETURN count(r) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (a:Q {k: 0})-[r:S]-(b) RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s6483]
+
+- name: s6483-sl3-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (a:Q {k: 0})-[r:S]-(b) RETURN count(r) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (a:Q {k: 0})-[r:S]-(b) RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s6483]
+
+- name: s6483-pm1-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (n:Z {k: 1 / 0}) RETURN n.k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (n:Z {k: 1 / 0}) RETURN n.k']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22012"']
+  tags: [s6483]
+
+- name: s6483-pm1-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (n:Z {k: 1 / 0}) RETURN n.k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (n:Z {k: 1 / 0}) RETURN n.k']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22012"']
+  tags: [s6483]
+
+- name: s6483-pm2-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (a:Q)-[r:R {w: 1 / 0}]->(b) RETURN b.k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (a:Q)-[r:R {w: 1 / 0}]->(b) RETURN b.k']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22012"']
+  tags: [s6483]
+
+- name: s6483-pm2-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (a:Q)-[r:R {w: 1 / 0}]->(b) RETURN b.k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (a:Q)-[r:R {w: 1 / 0}]->(b) RETURN b.k']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22012"']
+  tags: [s6483]
+
+- name: s6483-pm3-qa
+  description: 'SONNY-6483 [admin (no RLS)]: MATCH (a:Q {k: 1 / 0})-[r:R]->(b) RETURN b.k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (a:Q {k: 1 / 0})-[r:R]->(b) RETURN b.k']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22012"']
+  tags: [s6483]
+
+- name: s6483-pm3-qb
+  description: 'SONNY-6483 [bob (RLS-filtered)]: MATCH (a:Q {k: 1 / 0})-[r:R]->(b) RETURN b.k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (a:Q {k: 1 / 0})-[r:R]->(b) RETURN b.k']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22012"']
+  tags: [s6483]

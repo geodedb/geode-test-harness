@@ -35,7 +35,7 @@ async function loadGeodeClient() {
 
 // Default admin credentials for testing
 const DEFAULT_USERNAME = 'geode';
-const DEFAULT_PASSWORD = 'GeodeTestPassword123!';
+const DEFAULT_PASSWORD = 'Geode Test Admin Passphrase';
 
 /**
  * Parse command-line arguments.
