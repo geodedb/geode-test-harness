@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import secrets
 import shlex
 import signal as _signal
 import subprocess
@@ -185,7 +186,7 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
         password = flags.get("--password", "")
         role = flags.get("--role", "user")
         if "--generate-password" in flags:
-            password = "auto_generated_password_placeholder"
+            password = _generated_passphrase()
         return f"CALL geode.auth.user_create('{esc(username)}', '{esc(password)}', '{esc(email)}', '{esc(role)}')"
     elif subcmd == "user" and action == "import":
         # Migration import of a PRE-COMPUTED password hash (no plaintext).
@@ -222,13 +223,13 @@ def _convert_auth_to_call(args: list[str]) -> str | None:
         old_pw = flags.get("--old-password", "")
         new_pw = flags.get("--new-password", "")
         if "--generate-password" in flags:
-            new_pw = "auto_generated_password_placeholder"
+            new_pw = _generated_passphrase()
         return f"CALL geode.auth.user_change_password('{esc(username)}', '{esc(old_pw)}', '{esc(new_pw)}')"
     elif subcmd == "user" and action == "reset-password":
         username = positionals[0] if positionals else ""
         new_pw = flags.get("--new-password", "")
         if "--generate-password" in flags:
-            new_pw = "auto_generated_password_placeholder"
+            new_pw = _generated_passphrase()
         return f"CALL geode.auth.user_reset_password('{esc(username)}', '{esc(new_pw)}')"
     elif subcmd == "user" and action == "mfa":
         # Nested: user mfa enable/disable <username> [--code <code>]
@@ -397,6 +398,23 @@ def _resolve_server_address(env: dict[str, str]) -> tuple[str, bool]:
     return server_addr, use_grpc
 
 
+_PASSPHRASE_WORDS = (
+    "amber", "basalt", "cedar", "dune", "ember", "fjord", "garnet", "harbor",
+    "iris", "juniper", "kelp", "lagoon", "marble", "nimbus", "onyx", "prairie",
+)  # fmt: skip
+
+
+def _generated_passphrase() -> str:
+    """A fresh random passphrase that satisfies geode's password policy.
+
+    Stands in for the password `--generate-password` makes the CLI generate when
+    a user command is sent to the server as a CALL. Random per call, never a fixed
+    value; 5 words + 2 digits (20+ characters, 3+ words, upper and lower case).
+    """
+    words = [secrets.choice(_PASSPHRASE_WORDS) for _ in range(5)]
+    return f"{words[0].capitalize()} {' '.join(words[1:])} {secrets.randbelow(100):02d}"
+
+
 def _is_remote_admin_command(args: list[str]) -> bool:
     """Return True for CLI commands that execute against the live server."""
     if not args:
@@ -410,16 +428,27 @@ def _is_remote_admin_command(args: list[str]) -> bool:
         # the migrations directory and reject --server/--user/--password.
         return len(args) > 1 and args[1] in {"run", "up"}
 
-    return args[0] == "restore"
+    if args[0] == "restore":
+        # `restore <backup_file> --data-dir <dir>` is offline and refuses --server;
+        # only `restore --server ...` (no backup file) asks a server to restore.
+        return len(args) == 1 or args[1].startswith("-")
+
+    if args[0] == "fle":
+        # migrate-encrypt runs in the server (SONNY-6688); the other fle subcommands
+        # work on the local data directory.
+        return len(args) > 1 and args[1] == "migrate-encrypt"
+
+    return False
 
 
 # Local commands whose argument parser has no --data-dir option (geode rejects it).
+_NO_DATA_DIR_COMMANDS = {"session", "authn"}
 _NO_DATA_DIR_SUBCOMMANDS = {("auth", "validate"), ("auth", "logout")}
 
 
 def _accepts_data_dir(args: list[str]) -> bool:
     """False for local subcommands that reject --data-dir."""
-    return tuple(args[:2]) not in _NO_DATA_DIR_SUBCOMMANDS
+    return bool(args) and args[0] not in _NO_DATA_DIR_COMMANDS and tuple(args[:2]) not in _NO_DATA_DIR_SUBCOMMANDS
 
 
 def _convert_grpc_auth_login_probe(binary: str, args: list[str], server_addr: str, timeout_ms: int) -> list[str] | None:
@@ -568,9 +597,9 @@ def _build_cli_command(
         if "query" in command_str and "-U" not in command_str and "-P" not in command_str:
             command_str = command_str.strip()
             if command_str.endswith(" -"):
-                command_str = command_str[:-2] + f" -U geode -P {admin_password} -"
+                command_str = command_str[:-2] + f" -U geode -P {shlex.quote(admin_password)} -"
             else:
-                command_str += f" -U geode -P {admin_password}"
+                command_str += f" -U geode -P {shlex.quote(admin_password)}"
 
         if "query" in command_str and "--timeout" not in command_str:
             cli_timeout = max(timeout_ms // 1000, 30)
@@ -774,6 +803,10 @@ def _execute_and_check(
     """Execute the command and check expectations."""
     test_env = env.copy()
     test_env.update(test_case.env)
+    # `geode fle grant-plaintext|show-*` work on the data directory and read it from
+    # GEODE_DATA_DIR (SONNY-6274); the managed server's directory is the one under test.
+    if data_dir and len(cmd) > 2 and cmd[1] == "fle" and cmd[2] != "migrate-encrypt":
+        test_env.setdefault("GEODE_DATA_DIR", str(data_dir))
     # Expose the reconciled client-TLS posture to bash/command steps so specs can
     # connect to the provisioned server without hardcoding --insecure (which a
     # release binary refuses). Resolves to "--ca-cert <ca>" when a CA was
