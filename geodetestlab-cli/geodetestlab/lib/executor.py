@@ -405,7 +405,21 @@ def _is_remote_admin_command(args: list[str]) -> bool:
     if args[0] == "backup" and len(args) > 1 and args[1] == "create":
         return True
 
-    return args[0] in {"restore", "migrate"}
+    if args[0] == "migrate":
+        # Only `migrate run|up` talk to a server; status, create and sign work on
+        # the migrations directory and reject --server/--user/--password.
+        return len(args) > 1 and args[1] in {"run", "up"}
+
+    return args[0] == "restore"
+
+
+# Local commands whose argument parser has no --data-dir option (geode rejects it).
+_NO_DATA_DIR_SUBCOMMANDS = {("auth", "validate"), ("auth", "logout")}
+
+
+def _accepts_data_dir(args: list[str]) -> bool:
+    """False for local subcommands that reject --data-dir."""
+    return tuple(args[:2]) not in _NO_DATA_DIR_SUBCOMMANDS
 
 
 def _convert_grpc_auth_login_probe(binary: str, args: list[str], server_addr: str, timeout_ms: int) -> list[str] | None:
@@ -665,7 +679,7 @@ def _build_cli_command(
                 if "--insecure-tls-skip-verify" not in cmd and "--insecure" not in cmd and "--ca-cert" not in cmd:
                     env["GEODE_ALLOW_INSECURE_TLS"] = "1"
                     cmd.append("--insecure-tls-skip-verify")
-            elif "--data-dir" not in args and data_dir:
+            elif "--data-dir" not in args and data_dir and _accepts_data_dir(args):
                 cmd.extend(["--data-dir", str(data_dir)])
         elif args and _is_remote_admin_command(args):
             if use_grpc:
