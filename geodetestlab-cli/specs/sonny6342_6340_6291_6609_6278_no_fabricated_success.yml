@@ -1,0 +1,365 @@
+version: '1.0'
+name: Procedures that cannot do what they report are refused, never answered with made-up values (SONNY-6342, SONNY-6340, SONNY-6291, SONNY-2796, SONNY-6609, SONNY-6278)
+description: |
+  A family of fabricated-success bugs, all the same class: a procedure/command told the
+  operator something happened (or was allowed) when nothing was.
+
+  SONNY-6342 / SONNY-6340 / SONNY-2796: the tde.* key-management procedures were
+  stubs returning constants (`mk-00000001`): an operator calling `CALL
+  tde.rotate_keys` was told a rotation happened when nothing did;
+  `tde.create_encrypted_backup` / `restore_with_keys` and many `audit.*`
+  diagnostics returned paths/rows that were never written; `tde.configure_rotation('x',
+  -1)` accepted a negative age and returned the invalid date '2025-11-32T00:00:00Z'.
+  Contract now: every such procedure is refused as unsupported (0A000) and no row with an
+  invented value is returned. The procedures that run real cryptography on the server's
+  key (tde.test_encryption, tde.test_decryption) still answer, with success=true.
+
+  SONNY-6291 (SECURITY): geode.auth.apikey_check_scope always answered 'scope granted',
+  apikey_revoke reported success and did nothing, user_show leaked any user's
+  email/role/status and invented a row for a missing user. Now every apikey_* procedure
+  is 0A000 (mutating ones Admin-gated first: 42501), user_show is self-or-Admin (42501
+  otherwise, the same answer whether or not the target exists) and a missing user is an
+  error (42002) for an Admin.
+
+  SONNY-6609 (2): DROP USER of a user that does not exist answered "deleted"; it is now
+  an error (42002 "User does not exist"; IF EXISTS stays a no-op).
+
+  SONNY-6278: custom-role keys were kept in the per-request allocator (use-after-free
+  after the request ended): CREATE ROLE in one request, then SHOW ROLES / GRANT /
+  DROP ROLE / re-CREATE in later requests must all work.
+
+  Black-box over the real wire with real roles (admin, readonly, readwrite) and a TDE
+  server (GEODE_TDE_KEY), so the "TDE on" half of the refusal contract is exercised.
+
+  CANARY: REQ=REQ-SONNY-6342-6340-6291-NO-FABRICATED-SUCCESS; FEATURE="Procedures"; ASPECT=FailClosedNotFabricated; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+    Execution note: the server is a private scratch server started by the first step (own port and
+    data dir under /tmp/sonny738-crypto-*, outside the harness-managed lifecycle), so these steps are not
+    affected by concurrent harness runs on a shared machine.
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+invariants: []
+tests:
+- name: scratch-server-start
+  description: Starts a private geode server (own data dir and port, outside the harness-managed lifecycle) for the steps below.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    ST="/tmp/sonny738-crypto-6342"
+    rm -rf "$ST"; mkdir -p "$ST"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    cat > "$ST/env.sh" <<'ENVEOF'
+    export GEODE_ALLOW_INSECURE_TLS=1
+    export ST="/tmp/sonny738-crypto-6342"
+    export D="$ST/data"
+    export GEODE_DATA_DIR="$D"
+    export GEODE_CLIENT_TLS="--insecure-tls-skip-verify"
+    export ADMINPW="Sonny Harness Admin Passphrase 738"
+    SRV_ENV=(
+      'GEODE_ADMIN_PASSWORD=Sonny Harness Admin Passphrase 738'
+      GEODE_ALLOW_TEST_AUDIT_KEYS=1
+      GEODE_LSP_PORT=0
+      GEODE_TDE_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+    )
+    SRV_ARGS=()
+    gq_as() { local u="$1" p="$2"; shift 2; "$GEODE_BINARY" query -U "$u" -P "$p" "$@" --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS; }
+    gq() { gq_as geode "$ADMINPW" "$@"; }
+    start_srv() {
+      env "${SRV_ENV[@]}" setsid nohup "$GEODE_BINARY" serve --listen "$GEODE_SERVER_ADDRESS" --data-dir "$D" --log-level warn "${SRV_ARGS[@]}" </dev/null >>"$ST/server.log" 2>&1 &
+      echo $! > "$ST/pid"
+      local i
+      for i in $(seq 1 400); do
+        gq "RETURN 1 AS x" >/dev/null 2>&1 && return 0
+        kill -0 "$(cat "$ST/pid")" 2>/dev/null || { echo "SERVER_EXITED"; tail -20 "$ST/server.log"; return 1; }
+        sleep 0.5
+      done
+      echo "SERVER_NOT_READY"; tail -20 "$ST/server.log"; return 1
+    }
+    stop_srv() {
+      [ -f "$ST/pid" ] || return 0
+      local p; p=$(cat "$ST/pid")
+      kill "$p" 2>/dev/null
+      local i; for i in $(seq 1 200); do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+      kill -9 "$p" 2>/dev/null; rm -f "$ST/pid"
+    }
+    restart_srv() { stop_srv; start_srv; }
+    ENVEOF
+    echo "export GEODE_SERVER_ADDRESS=127.0.0.1:$PORT" >> "$ST/env.sh"
+    . "$ST/env.sh"
+    mkdir -p "$D"
+    start_srv && echo "SCRATCH_SERVER_READY"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+  tags:
+  - setup
+- name: setup-users
+  expect:
+    exit_code: 0
+  tags:
+  - setup
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' - <<'GQLEOF'
+    CREATE USER alice6291 SET PASSWORD 'Alice Six Two Nine One Passphrase' ROLE readonly;
+    CREATE USER bob6291 SET PASSWORD 'Bob Six Two Nine One Passphrase' ROLE readwrite;
+    GQLEOF
+  timeout_ms: 300000
+- name: stub-procedures-refused-as-unsupported
+  description: every stub tde.* / diagnostic audit.* procedure is 0A000 for an Admin and never returns a made-up row
+  type: bash
+  timeout_ms: 600000
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    set -u
+    PW="Sonny Harness Admin Passphrase 738"
+    export GEODE_BINARY GEODE_SERVER_ADDRESS GEODE_CLIENT_TLS PW
+    check_one() {
+      P="$1"
+      OUT=$("$GEODE_BINARY" query "CALL $P()" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$PW" 2>&1)
+      if ! echo "$OUT" | grep -q '0A000'; then echo "NOT_REFUSED $P -> $(echo "$OUT" | head -c 300)"; fi
+      if echo "$OUT" | grep -q -E 'mk-0000|2025-11-32'; then echo "FABRICATED $P"; fi
+    }
+    export -f check_one
+    LIST="tde.initialize_key_hierarchy tde.rotate_keys tde.get_encryption_status tde.configure_kms tde.verify_encrypted_state tde.benchmark_encryption tde.test_key_rotation tde.configure_key_provider tde.configure_mock_kms tde.derive_data_key tde.derive_backup_key tde.test_roundtrip tde.zeroize_keys tde.verify_no_plaintext tde.test_access_control tde.configure_rotation_schedule tde.test_rotation_state_persistence tde.configure_adaptive_rotation tde.validate_overhead tde.benchmark_aead tde.simulate_oltp tde.test_kms_unavailable tde.test_corrupted_key tde.configure_provider tde.get_rotation_state tde.configure_rotation tde.test_key_zeroization tde.audit_plaintext_keys tde.test_key_access_control tde.configure_external_kms tde.test_privileged_unwrap tde.test_key_recovery tde.evaluate_rotation_schedule tde.test_kms_failure tde.test_corrupted_key_handling tde.cleanup_key_hierarchy tde.measure_overhead tde.create_encrypted_backup tde.restore_with_keys tde.backup_encrypted tde.encrypt_backup tde.verify_backup_encryption tde.generate_key_manifest tde.restore_with_historical_keys audit.configure audit.log_auth_event audit.log_lifecycle_event audit.get_recent_events audit.verify_hash_chain audit.comprehensive_integrity_check audit.test_command_categories audit.test_data_access_categories audit.configure_rotation audit.simulate_windows_eventlog audit.simulate_syslog_output audit.test_combined_output audit.test_siem_correlation audit.test_siem_alerts audit.generate_compliance_report audit.test_powershell_compatibility audit.test_rotation_continuity audit.configure_retention audit.detect_anomalies audit.extract_threat_indicators audit.detect_privilege_escalation audit.performance_test audit.memory_usage_test audit.concurrent_access_test audit.test_disk_space_handling audit.test_corruption_handling audit.test_invalid_config audit.export_for_verification audit.prepare_forensic_package audit.compliance_verification"
+    N=$(echo $LIST | wc -w)
+    BADOUT=$(echo $LIST | tr ' ' '\n' | xargs -P 8 -I{} bash -c 'check_one {}')
+    BAD=$(echo -n "$BADOUT" | grep -c . || true)
+    [ -n "$BADOUT" ] && echo "$BADOUT"
+    echo "checked=$N bad=$BAD"
+    [ "$BAD" -eq 0 ] && echo "ALL_STUBS_REFUSED" || exit 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ALL_STUBS_REFUSED
+  tags:
+  - tde
+  - audit
+  - sonny-6342
+  - sonny-6340
+  - critical
+- name: negative-rotation-age-refused-not-invalid-date
+  description: SONNY-2796 (2) — tde.configure_rotation with a negative age must not return an invalid date
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+    stdout_not_contains:
+    - '2025-11-32'
+  tags:
+  - tde
+  - sonny-2796
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL tde.configure_rotation('"'"'x'"'"', -1)'
+  timeout_ms: 300000
+- name: real-crypto-procedures-still-answer
+  description: tde.test_encryption runs real AEAD on the server's key and reports success=true
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - 0A000
+  tags:
+  - tde
+  - sonny-6340
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL tde.test_encryption()'
+  timeout_ms: 300000
+- name: apikey-check-scope-never-grants
+  description: SONNY-6291 — apikey_check_scope is 0A000 for admin and for ordinary users, never 'scope granted'
+  type: bash
+  timeout_ms: 120000
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    set -u
+    A="Sonny Harness Admin Passphrase 738"
+    for CRED in "geode:$A" "alice6291:Alice Six Two Nine One Passphrase" "bob6291:Bob Six Two Nine One Passphrase"; do
+      U=${CRED%%:*}; P=${CRED#*:}
+      OUT=$("$GEODE_BINARY" query "CALL geode.auth.apikey_check_scope('bob6291', 'k6291', 'write')" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U "$U" -P "$P" 2>&1)
+      echo "$OUT" | grep -q '0A000' || { echo "FAIL $U not 0A000: $OUT"; exit 1; }
+      if echo "$OUT" | grep -qi 'granted'; then echo "FAIL $U was told granted"; exit 1; fi
+    done
+    echo "apikey_scope_never_granted"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - apikey_scope_never_granted
+  tags:
+  - auth
+  - sonny-6291
+  - critical
+- name: apikey-revoke-needs-admin-and-never-claims-success
+  type: bash
+  timeout_ms: 120000
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    set -u
+    A="Sonny Harness Admin Passphrase 738"
+    OUT=$("$GEODE_BINARY" query "CALL geode.auth.apikey_revoke('bob6291', 'k6291')" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U alice6291 -P 'Alice Six Two Nine One Passphrase' 2>&1)
+    echo "$OUT" | grep -q '42501' || { echo "FAIL non-admin revoke not 42501: $OUT"; exit 1; }
+    OUT=$("$GEODE_BINARY" query "CALL geode.auth.apikey_revoke('bob6291', 'k6291')" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$A" 2>&1)
+    echo "$OUT" | grep -q '0A000' || { echo "FAIL admin revoke not 0A000: $OUT"; exit 1; }
+    if echo "$OUT" | grep -qi 'revoked'; then echo "FAIL claimed revoked"; exit 1; fi
+    echo "apikey_revoke_honest"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - apikey_revoke_honest
+  tags:
+  - auth
+  - sonny-6291
+  - critical
+- name: user-show-self-is-allowed
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - alice6291
+    - readonly
+  tags:
+  - auth
+  - sonny-6291
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    gq_as alice6291 'Alice Six Two Nine One Passphrase' 'CALL geode.auth.user_show('"'"'alice6291'"'"')'
+  timeout_ms: 300000
+- name: user-show-other-user-denied-same-as-missing
+  description: another user's record needs Admin (42501); a missing user gets the identical refusal (no user enumeration)
+  type: bash
+  timeout_ms: 120000
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    set -u
+    S="${GEODE_SERVER_ADDRESS}"
+    O1=$("$GEODE_BINARY" query "CALL geode.auth.user_show('bob6291')" --server "$S" ${GEODE_CLIENT_TLS} -U alice6291 -P 'Alice Six Two Nine One Passphrase' 2>&1)
+    O2=$("$GEODE_BINARY" query "CALL geode.auth.user_show('nobody6291')" --server "$S" ${GEODE_CLIENT_TLS} -U alice6291 -P 'Alice Six Two Nine One Passphrase' 2>&1)
+    echo "$O1" | grep -q '42501' || { echo "FAIL other user not 42501: $O1"; exit 1; }
+    echo "$O2" | grep -q '42501' || { echo "FAIL missing user not 42501: $O2"; exit 1; }
+    if echo "$O1" | grep -q 'bob6291@\|readwrite'; then echo "FAIL leaked bob's record"; exit 1; fi
+    M1=$(echo "$O1" | grep -o '"message":"[^"]*"' | sed 's/bob6291\|nobody6291/X/g')
+    M2=$(echo "$O2" | grep -o '"message":"[^"]*"' | sed 's/bob6291\|nobody6291/X/g')
+    [ "$M1" = "$M2" ] || { echo "FAIL refusal messages differ: [$M1] vs [$M2]"; exit 1; }
+    echo "user_show_no_enumeration"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - user_show_no_enumeration
+  tags:
+  - auth
+  - sonny-6291
+  - critical
+- name: admin-user-show-missing-user-is-error-not-invented-row
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42002'
+    stdout_not_contains:
+    - unknown
+  tags:
+  - auth
+  - sonny-6291
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.auth.user_show('"'"'nobody6291'"'"')'
+  timeout_ms: 300000
+- name: admin-user-show-existing-user
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - bob6291
+    - readwrite
+  tags:
+  - auth
+  - sonny-6291
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CALL geode.auth.user_show('"'"'bob6291'"'"')'
+  timeout_ms: 300000
+- name: drop-missing-user-is-error
+  description: SONNY-6609 (2) — DROP USER of a missing user is an error (42002 User does not exist), not "deleted"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42002'
+    - User does not exist
+    stdout_not_contains:
+    - deleted
+  tags:
+  - auth
+  - sonny-6609
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'DROP USER nobody6609'
+  timeout_ms: 300000
+- name: drop-missing-user-if-exists-is-noop
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - auth
+  - sonny-6609
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'DROP USER IF EXISTS nobody6609'
+  timeout_ms: 300000
+- name: custom-role-created-in-one-request-lives-in-later-ones
+  description: 'SONNY-6278 — CREATE ROLE, then separate requests: SHOW ROLES lists it, DROP ROLE removes it, re-CREATE works'
+  type: bash
+  timeout_ms: 180000
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    set -u
+    A="Sonny Harness Admin Passphrase 738"
+    q() { "$GEODE_BINARY" query "$1" --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "$A" 2>&1; }
+    for ROUND in 1 2 3; do
+      q "CREATE ROLE role6278_$ROUND" | grep -q '"status_class":"00000"' || { echo "FAIL create round $ROUND"; exit 1; }
+      for J in 1 2 3; do q "SELECT 1 AS pad" >/dev/null; done
+      q "SHOW ROLES" | grep -q "role6278_$ROUND" || { echo "FAIL SHOW ROLES lost role6278_$ROUND"; exit 1; }
+      q "DROP ROLE role6278_$ROUND" | grep -q '"status_class":"00000"' || { echo "FAIL drop round $ROUND"; exit 1; }
+      if q "SHOW ROLES" | grep -q "role6278_$ROUND"; then echo "FAIL role survived DROP"; exit 1; fi
+    done
+    q "CREATE ROLE role6278_again" | grep -q '"status_class":"00000"' || { echo "FAIL re-create"; exit 1; }
+    q "SHOW ROLES" | grep -q "role6278_again" || { echo "FAIL re-created role missing"; exit 1; }
+    echo "custom_role_lifetime_ok"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - custom_role_lifetime_ok
+  tags:
+  - auth
+  - sonny-6278
+- name: scratch-server-stop
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6342/env.sh"
+    stop_srv; rm -rf "$ST"; echo SCRATCH_SERVER_STOPPED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags:
+  - teardown
+tags:
+- security
+- fail-closed
+- sonny-738

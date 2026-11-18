@@ -1,0 +1,849 @@
+version: '1.0'
+name: Query and MERGE semantics fixed in the SONNY-738 sweep (SONNY-6433, SONNY-2796, SONNY-2847, SONNY-3241, SONNY-6281, SONNY-2811, SONNY-6499)
+description: |
+  Black-box proofs, over the real wire, for the engine-semantics bugs in the crypto/storage lane:
+
+  SONNY-6433 (1): keys(n) / keys(r) kept listing a property after REMOVE while the value read
+  null. (2): MERGE with a null key created a node (now 22004); MERGE on a list key never matched
+  (a duplicate every time).
+  SONNY-2796 (1): .hour/.minute of a zoned datetime before 1970 were negative (@rem vs @mod).
+  SONNY-2847: the MERGE property index held ONE node per key, so with two value-equal nodes (CREATE
+  can make them) deleting the indexed one hid the other and MERGE created a duplicate.
+  SONNY-3241: MERGE ... ON CREATE SET ... SET ... on an existing node wrongly applied the ON CREATE
+  action through the fast path, and MATCH...CREATE made 1 edge where the key has 2 holders.
+  SONNY-6281: NOT NULL / EXISTS / NODE KEY constraints were recorded but never enforced.
+  SONNY-2811: an ORDER BY key that is not projected did not sort.
+  SONNY-2807: '=' on DECIMAL vs DOUBLE compares exact values. SONNY-2699: GROUP BY q HAVING EXISTS {...} works again.
+    SONNY-6351 (5): CREATE ... RETURN n.i ORDER BY n.i parses. SONNY-3135 (N7a): PROFILE/EXPLAIN allowlist.
+    SONNY-6499: CAST to STRING returned NULL for a DOUBLE; ORDER BY ... LIMIT fast paths dropped rows
+  lacking the sort key.
+
+  CANARY: REQ=REQ-SONNY-738-QUERY-SEMANTICS-BLACKBOX; FEATURE="QuerySemantics"; ASPECT=SweepRegressions; STATUS=TESTED; TEST=self; OWNER=engine; UPDATED=2026-11-17
+
+    Execution note: the server is a private scratch server started by the first step (own port and
+    data dir under /tmp/sonny738-crypto-*, outside the harness-managed lifecycle), so these steps are not
+    affected by concurrent harness runs on a shared machine.
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 60000
+    tls_verify: false
+    format: json
+invariants: []
+tests:
+- name: scratch-server-start
+  description: Starts a private geode server (own data dir and port, outside the harness-managed lifecycle) for the steps below.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    ST="/tmp/sonny738-crypto-6433"
+    rm -rf "$ST"; mkdir -p "$ST"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    cat > "$ST/env.sh" <<'ENVEOF'
+    export GEODE_ALLOW_INSECURE_TLS=1
+    export ST="/tmp/sonny738-crypto-6433"
+    export D="$ST/data"
+    export GEODE_DATA_DIR="$D"
+    export GEODE_CLIENT_TLS="--insecure-tls-skip-verify"
+    export ADMINPW="Sonny Harness Admin Passphrase 738"
+    SRV_ENV=(
+      'GEODE_ADMIN_PASSWORD=Sonny Harness Admin Passphrase 738'
+      GEODE_ALLOW_TEST_AUDIT_KEYS=1
+      GEODE_LSP_PORT=0
+    )
+    SRV_ARGS=()
+    gq_as() { local u="$1" p="$2"; shift 2; "$GEODE_BINARY" query -U "$u" -P "$p" "$@" --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS; }
+    gq() { gq_as geode "$ADMINPW" "$@"; }
+    start_srv() {
+      env "${SRV_ENV[@]}" setsid nohup "$GEODE_BINARY" serve --listen "$GEODE_SERVER_ADDRESS" --data-dir "$D" --log-level warn "${SRV_ARGS[@]}" </dev/null >>"$ST/server.log" 2>&1 &
+      echo $! > "$ST/pid"
+      local i
+      for i in $(seq 1 400); do
+        gq "RETURN 1 AS x" >/dev/null 2>&1 && return 0
+        kill -0 "$(cat "$ST/pid")" 2>/dev/null || { echo "SERVER_EXITED"; tail -20 "$ST/server.log"; return 1; }
+        sleep 0.5
+      done
+      echo "SERVER_NOT_READY"; tail -20 "$ST/server.log"; return 1
+    }
+    stop_srv() {
+      [ -f "$ST/pid" ] || return 0
+      local p; p=$(cat "$ST/pid")
+      kill "$p" 2>/dev/null
+      local i; for i in $(seq 1 200); do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+      kill -9 "$p" 2>/dev/null; rm -f "$ST/pid"
+    }
+    restart_srv() { stop_srv; start_srv; }
+    ENVEOF
+    echo "export GEODE_SERVER_ADDRESS=127.0.0.1:$PORT" >> "$ST/env.sh"
+    . "$ST/env.sh"
+    mkdir -p "$D"
+    start_srv && echo "SCRATCH_SERVER_READY"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+  tags:
+  - setup
+- name: keys-setup
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 3
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (n:K6433 {a: 1, b: 2, p: 3}) RETURN size(keys(n)) AS c'
+  timeout_ms: 300000
+- name: keys-after-remove
+  description: 'SONNY-6433 (1): a removed property is gone from keys(n)'
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:K6433) REMOVE n.p RETURN size(keys(n)) AS c'
+  timeout_ms: 300000
+- name: keys-reread-after-remove
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+    - expression: results[0].pc
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:K6433) RETURN size(keys(n)) AS c, size(keys(properties(n))) AS pc'
+  timeout_ms: 300000
+- name: keys-removed-key-not-listed
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 0
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:K6433) WHERE '"'"'p'"'"' IN keys(n) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: keys-edge-setup
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:KE6433)-[r:KR6433 {a: 1, b: 2}]->(:KE6433) RETURN size(keys(r)) AS c'
+  timeout_ms: 300000
+- name: keys-edge-after-remove
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH ()-[r:KR6433]->() REMOVE r.b RETURN size(keys(r)) AS c'
+  timeout_ms: 300000
+- name: keys-edge-reread
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH ()-[r:KR6433]->() RETURN size(keys(r)) AS c'
+  timeout_ms: 300000
+- name: merge-null-key-refused
+  description: 'SONNY-6433 (2): MERGE with a null key is 22004, never a node'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '22004'
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (n:MN6433 {k: null})'
+  timeout_ms: 300000
+- name: merge-null-key-created-nothing
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 0
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:MN6433) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: merge-list-key-1
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (n:ML6433 {k: [1, 2]}) RETURN size(n.k) AS c'
+  timeout_ms: 300000
+- name: merge-list-key-2
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (n:ML6433 {k: [1, 2]}) RETURN size(n.k) AS c'
+  timeout_ms: 300000
+- name: merge-list-key-3
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (n:ML6433 {k: [1, 2]}) RETURN size(n.k) AS c'
+  timeout_ms: 300000
+- name: merge-list-key-no-duplicates
+  description: MERGE on a list key matches the existing node (one node after three MERGEs)
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:ML6433) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: merge-list-key-order-matters
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (n:ML6433 {k: [2, 1]}) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: merge-list-key-order-two-nodes
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:ML6433) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: hour-before-1970
+  description: 'SONNY-2796 (1): time-of-day fields of a pre-1970 zoned datetime are non-negative'
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].h
+      equals: 23
+    - expression: results[0].m
+      equals: 30
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'RETURN datetime('"'"'1969-12-31T23:30:15Z'"'"').hour AS h, datetime('"'"'1969-12-31T23:30:15Z'"'"').minute AS m'
+  timeout_ms: 300000
+- name: hour-epoch
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].h
+      equals: 0
+    - expression: results[0].m
+      equals: 0
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'RETURN datetime('"'"'1970-01-01T00:00:00Z'"'"').hour AS h, datetime('"'"'1970-01-01T00:00:00Z'"'"').minute AS m'
+  timeout_ms: 300000
+- name: holders-setup
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:MM2847 {k: 7}), (:MM2847 {k: 7}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: holders-merge-matches-existing
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (n:MM2847 {k: 7}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: holders-still-two
+  description: 'SONNY-2847: MERGE matched an existing holder, created nothing'
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:MM2847 {k: 7}) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: holders-delete-one
+  expect:
+    exit_code: 0
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:MM2847 {k: 7}) WITH n ORDER BY id(n) LIMIT 1 DELETE n'
+  timeout_ms: 300000
+- name: holders-merge-after-delete-no-duplicate
+  description: after deleting one of two value-equal nodes, MERGE still finds the other
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (n:MM2847 {k: 7}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: holders-one-left
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:MM2847 {k: 7}) RETURN count(n) AS c'
+  timeout_ms: 300000
+- name: parity-setup
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:Z3241 {k: 1, c: 0}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: parity-on-create-not-applied-to-match
+  description: 'SONNY-3241: ON CREATE SET must not run on a matched node'
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 0
+    - expression: results[0].b
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MERGE (z:Z3241 {k: 1}) ON CREATE SET z.c = 1 SET z.b = 2 RETURN z.c AS c, z.b AS b'
+  timeout_ms: 300000
+- name: parity-batch-on-create-not-applied
+  description: same through the /*+BATCH*/ group-commit fast path
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 0
+    - expression: results[0].b
+      equals: 3
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' '/*+BATCH*/ MERGE (z:Z3241 {k: 1}) ON CREATE SET z.c = 1 SET z.b = 3 RETURN z.c AS c, z.b AS b'
+  timeout_ms: 300000
+- name: parity-edge-setup
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:S3241 {k: 1}), (:S3241 {k: 1}), (:T3241 {k: 2}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: parity-edge-two-holders
+  expect:
+    exit_code: 0
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (a:S3241 {k: 1}), (b:T3241 {k: 2}) CREATE (a)-[:E3241]->(b)'
+  timeout_ms: 300000
+- name: parity-edge-count-is-two
+  description: two holders of the key -> two edges (the fast path made one)
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 2
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (:S3241)-[r:E3241]->(:T3241) RETURN count(r) AS c'
+  timeout_ms: 300000
+- name: cons-create
+  expect:
+    exit_code: 0
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE CONSTRAINT c6281_name FOR (n:C6281) REQUIRE n.name IS NOT NULL'
+  timeout_ms: 300000
+- name: cons-not-null-enforced-create
+  description: 'SONNY-6281: NOT NULL is enforced on CREATE'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '23502'
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:C6281 {other: 1})'
+  timeout_ms: 300000
+- name: cons-valid-create
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:C6281 {name: '"'"'ok'"'"'}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: cons-not-null-enforced-remove
+  description: removing a required property is refused
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '23502'
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:C6281 {name: '"'"'ok'"'"'}) REMOVE n.name'
+  timeout_ms: 300000
+- name: cons-not-null-enforced-set-null
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '23502'
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:C6281 {name: '"'"'ok'"'"'}) SET n.name = null'
+  timeout_ms: 300000
+- name: cons-still-one-node
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].c
+      equals: 1
+    - expression: results[0].named
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:C6281) RETURN count(n) AS c, count(n.name) AS named'
+  timeout_ms: 300000
+- name: cons-unique-index-refused
+  description: CREATE UNIQUE INDEX is refused, not silently non-unique
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE UNIQUE INDEX u6281 FOR (n:U6281) ON (n.id)'
+  timeout_ms: 300000
+- name: order-setup
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:O2811 {k: '"'"'a'"'"', x: 3}), (:O2811 {k: '"'"'b'"'"', x: 1}), (:O2811 {k: '"'"'c'"'"', x: 2}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: order-by-unprojected-key
+  description: 'SONNY-2811: an unprojected ORDER BY key sorts (b, c, a)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"k":"b"'
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:O2811) RETURN n.k AS k ORDER BY n.x'
+  timeout_ms: 300000
+- name: cast-double-to-string
+  description: 'SONNY-6499 (2): CAST of a non-temporal value to STRING is not NULL'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '1.5'
+    - '-1.50'
+    stdout_not_contains:
+    - 'null'
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'RETURN CAST(1.5e0 AS STRING) AS s, CAST(-1.50 AS STRING) AS t'
+  timeout_ms: 300000
+- name: cast-bool-to-string
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'TRUE'
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'RETURN CAST(true AS STRING) AS s'
+  timeout_ms: 300000
+- name: orderby-null-rows-present
+  expect:
+    exit_code: 0
+    stdout_json_assert:
+    - expression: results[0].ok
+      equals: 1
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'CREATE (:ON6499 {k: 1}), (:ON6499 {k: 2}), (:ON6499 {other: 9}) RETURN 1 AS ok'
+  timeout_ms: 300000
+- name: orderby-limit-keeps-null-key-rows
+  description: 'SONNY-6499 (1): ORDER BY ... LIMIT must include the node lacking the key'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - 'null'
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:ON6499) RETURN n.k AS k ORDER BY n.k LIMIT 3'
+  timeout_ms: 300000
+- name: orderby-limit-row-count
+  expect:
+    exit_code: 0
+  tags:
+  - query
+  - sonny-738
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq_as geode 'Sonny Harness Admin Passphrase 738' 'MATCH (n:ON6499) RETURN n.k AS k ORDER BY n.k LIMIT 3'
+  timeout_ms: 300000
+- name: decimal-vs-double-equality-is-exact
+  description: "SONNY-2807: '=' compares numbers by exact value (the rule GROUP BY/inline maps/MERGE use): DECIMAL 0.1 is not the DOUBLE nearest 0.1; a value both hold exactly (0.5) is equal"
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'RETURN 0.1 = 0.1e0 AS eq, 0.5 = 0.5e0 AS eq2'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"eq":false'
+    - '"eq2":true'
+  tags:
+  - query
+  - sonny-738
+- name: grouped-having-exists-setup
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'CREATE (:Q2699 {k: 1})-[:S2699]->(:Y2699), (:Q2699 {k: 2})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - query
+  - sonny-738
+- name: grouped-having-exists-binds-group-key
+  description: 'SONNY-2699: GROUP BY q HAVING EXISTS {(q)-[:S]->()} was refused 0A000; the pattern variable is bound to the group key'
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'MATCH (q:Q2699) RETURN q.k AS k, count(*) AS c GROUP BY q HAVING EXISTS { (q)-[:S2699]->() }'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"k":1'
+    stdout_not_contains:
+    - '"k":2'
+    - 0A000
+  tags:
+  - query
+  - sonny-738
+- name: create-return-order-by-property
+  description: 'SONNY-6351 (5): CREATE ... RETURN n.i AS i ORDER BY n.i was an UnexpectedToken parse error'
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'CREATE (n:W6351 {i: 1}) RETURN n.i AS i ORDER BY n.i'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"i":1'
+  tags:
+  - query
+  - sonny-738
+- name: profile-control-query-allowed
+  description: 'SONNY-3135 N7a control: PROFILE of a plain query still works'
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'PROFILE MATCH (n:Q2699) RETURN n'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"profile"'
+  tags:
+  - query
+  - sonny-738
+- name: profile-refuses-profile-call-geode-tenant-backfill-edge
+  description: 'SONNY-3135 N7a: EXPLAIN/PROFILE wrap only a listed statement class; the unlisted one is refused at once (PROFILE of the self-locking backfill procedure used to block up to 120 s on its own lock)'
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'PROFILE CALL geode.tenant.backfill_edge_tags()'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+    - EXPLAIN and PROFILE take
+  tags:
+  - query
+  - sonny-738
+- name: profile-refuses-profile-create-user-u3135-set-password
+  description: 'SONNY-3135 N7a: EXPLAIN/PROFILE wrap only a listed statement class; the unlisted one is refused at once (PROFILE of the self-locking backfill procedure used to block up to 120 s on its own lock)'
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'PROFILE CREATE USER u3135 SET PASSWORD '"'"'Secret Three One Three Five Pw'"'"''
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+    - EXPLAIN and PROFILE take
+  tags:
+  - query
+  - sonny-738
+- name: profile-refuses-explain-drop-graph-g2
+  description: 'SONNY-3135 N7a: EXPLAIN/PROFILE wrap only a listed statement class; the unlisted one is refused at once (PROFILE of the self-locking backfill procedure used to block up to 120 s on its own lock)'
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'EXPLAIN DROP GRAPH g2'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+    - EXPLAIN and PROFILE take
+  tags:
+  - query
+  - sonny-738
+- name: profile-refuses-profile-create-graph-g3135
+  description: 'SONNY-3135 N7a: EXPLAIN/PROFILE wrap only a listed statement class; the unlisted one is refused at once (PROFILE of the self-locking backfill procedure used to block up to 120 s on its own lock)'
+  type: bash
+  timeout_ms: 300000
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    gq 'PROFILE CREATE GRAPH g3135'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 0A000
+    - EXPLAIN and PROFILE take
+  tags:
+  - query
+  - sonny-738
+- name: scratch-server-stop
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6433/env.sh"
+    stop_srv; rm -rf "$ST"; echo SCRATCH_SERVER_STOPPED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags:
+  - teardown
+tags:
+- query
+- merge
+- sonny-738

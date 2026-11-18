@@ -1,0 +1,112 @@
+version: '1.0'
+name: CLI saved session file posture and no fixed /tmp TLS key (SONNY-6551, SONNY-6325)
+description: |
+  SONNY-6551 (1, 2): `geode auth login --save-session` wrote hand-built, unescaped JSON under the
+  key `session_token` (the reader looked for `token`, so a saved session NEVER auto-loaded), through
+  a symbolic link at the final path, in place; the reader created `~/.geode` with mode 0755 even on a
+  read-only auto-load. Now: ONE writer/reader, std.json, file 0600 in a 0700 directory (an existing
+  0755 directory is tightened), written to a temp file and renamed over the final path (a symlink is
+  replaced, never followed), and `geode query` finds the saved session for that server.
+
+  SONNY-6325 (SECURITY): without --cert/--key a server used the FIXED paths /tmp/geode-server.crt and
+  /tmp/geode-server.key (another local user could pre-create the key and have the server serve with an
+  attacker-known key, or plant a symlink). Now the generated TLS pair lives in the data directory
+  (key 0600), created exclusively, and /tmp is never touched.
+
+  Black-box: real server, real `geode auth login` / `geode query` with a private HOME, real file modes.
+
+  CANARY: REQ=REQ-SONNY-6551-6325-CLI-STATE-TLS-BLACKBOX; FEATURE="CLI"; ASPECT=SecretFilePosture; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants: []
+fuzz:
+  enabled: false
+
+tests:
+- name: saved-session-file-0600-in-0700-dir-and-read-back
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="$GEODE_BINARY"; PW="Sonny Harness Admin Passphrase 6551"
+    W=$(mktemp -d); trap 'kill $PID 2>/dev/null; rm -rf "$W"' EXIT; PID=0
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 nohup "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$W/data" --log-level warn >"$W/server.log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 200); do
+      "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:$PORT" --insecure-tls-skip-verify -U geode -P "$PW" >/dev/null 2>&1 && break
+      kill -0 $PID 2>/dev/null || { echo "FAIL server died"; cat "$W/server.log"; exit 1; }
+      sleep 0.3
+    done
+    H="$W/home"; mkdir -p "$H"
+    # an older geode's 0755 directory and a symlink planted at the final path
+    mkdir -p "$H/.geode"; chmod 755 "$H/.geode"
+    echo "victim contents" > "$W/victim.txt"; chmod 644 "$W/victim.txt"
+    ln -s "$W/victim.txt" "$H/.geode/credentials.json"
+    HOME="$H" "$BIN" auth login -U geode -P "$PW" --server "127.0.0.1:$PORT" --insecure --save-session >"$W/login.log" 2>&1 || { echo "FAIL login"; cat "$W/login.log"; exit 1; }
+    [ "$(cat "$W/victim.txt")" = "victim contents" ] || { echo "FAIL the save followed the symlink and overwrote the victim file"; exit 1; }
+    [ "$(stat -c %a "$W/victim.txt")" = "644" ] || { echo "FAIL victim mode changed"; exit 1; }
+    [ -f "$H/.geode/credentials.json" ] && [ ! -L "$H/.geode/credentials.json" ] || { echo "FAIL credentials.json is not a regular file"; exit 1; }
+    [ "$(stat -c %a "$H/.geode/credentials.json")" = "600" ] || { echo "FAIL credentials mode $(stat -c %a "$H/.geode/credentials.json")"; exit 1; }
+    [ "$(stat -c %a "$H/.geode")" = "700" ] || { echo "FAIL ~/.geode mode $(stat -c %a "$H/.geode") (want 700)"; exit 1; }
+    python3 - "$H/.geode/credentials.json" "127.0.0.1:$PORT" <<'PYEOF'
+    import json, sys
+    d = json.load(open(sys.argv[1]))
+    assert d.get("token"), "no token key (the reader looks for 'token')"
+    assert "session_token" not in d, "old writer key present"
+    assert d.get("server") == sys.argv[2], d.get("server")
+    assert d.get("username") == "geode"
+    print("FILE_FORMAT_OK")
+    PYEOF
+    [ $? -eq 0 ] || { echo "FAIL credentials format"; exit 1; }
+    if [ "$(find "$H/.geode" -type f | wc -l)" != "1" ]; then echo "FAIL temp file left behind"; ls -la "$H/.geode"; exit 1; fi
+    TOKEN=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$H/.geode/credentials.json")
+    Q=$(HOME="$H" "$BIN" query --server "127.0.0.1:$PORT" --insecure-tls-skip-verify --timeout 10 "RETURN 1 AS x" 2>&1)
+    echo "$Q" | grep -q "Note: found a saved session for" || { echo "FAIL geode query did not find the saved session: $Q"; exit 1; }
+    if echo "$Q" | grep -q -F "$TOKEN"; then echo "FAIL geode query printed the session token"; exit 1; fi
+    # a read-only auto-load never creates ~/.geode
+    H2="$W/home2"; mkdir -p "$H2"
+    HOME="$H2" "$BIN" query --server "127.0.0.1:$PORT" --insecure-tls-skip-verify --timeout 10 "RETURN 1 AS x" >/dev/null 2>&1
+    [ ! -e "$H2/.geode" ] || { echo "FAIL a read created ~/.geode"; exit 1; }
+    echo "saved_session_posture_ok"
+  expect:
+    exit_code: 0
+    stdout_contains: [FILE_FORMAT_OK, saved_session_posture_ok]
+  tags: [cli, session, sonny-6551, critical]
+
+- name: generated-tls-pair-lives-in-data-dir-never-fixed-tmp
+  type: bash
+  timeout_ms: 180000
+  command: |
+    set -u
+    BIN="$GEODE_BINARY"
+    W=$(mktemp -d); trap 'kill $PID 2>/dev/null; rm -rf "$W"' EXIT; PID=0
+    BEFORE_KEY=$(stat -c '%Y %s' /tmp/geode-server.key 2>/dev/null || echo ABSENT)
+    BEFORE_CRT=$(stat -c '%Y %s' /tmp/geode-server.crt 2>/dev/null || echo ABSENT)
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    GEODE_ADMIN_PASSWORD="Sonny Harness Admin Passphrase 6325" GEODE_LSP_PORT=0 nohup "$BIN" serve --listen "127.0.0.1:$PORT" --data-dir "$W/data" --log-level info >"$W/server.log" 2>&1 &
+    PID=$!
+    for i in $(seq 1 200); do grep -q "QUIC transport listening" "$W/server.log" && break; kill -0 $PID 2>/dev/null || { echo "FAIL server died"; cat "$W/server.log"; exit 1; }; sleep 0.3; done
+    grep -q "QUIC transport listening" "$W/server.log" || { echo "FAIL not listening"; exit 1; }
+    [ -f "$W/data/server.key" ] && [ -f "$W/data/server.crt" ] || { echo "FAIL generated TLS pair is not in the data dir"; ls -la "$W/data"; exit 1; }
+    [ "$(stat -c %a "$W/data/server.key")" = "600" ] || { echo "FAIL server.key mode $(stat -c %a "$W/data/server.key")"; exit 1; }
+    AFTER_KEY=$(stat -c '%Y %s' /tmp/geode-server.key 2>/dev/null || echo ABSENT)
+    AFTER_CRT=$(stat -c '%Y %s' /tmp/geode-server.crt 2>/dev/null || echo ABSENT)
+    [ "$BEFORE_KEY" = "$AFTER_KEY" ] && [ "$BEFORE_CRT" = "$AFTER_CRT" ] || { echo "FAIL the server touched /tmp/geode-server.{key,crt}: key $BEFORE_KEY -> $AFTER_KEY crt $BEFORE_CRT -> $AFTER_CRT"; exit 1; }
+    echo "tls_pair_in_data_dir_tmp_untouched"
+  expect:
+    exit_code: 0
+    stdout_contains: [tls_pair_in_data_dir_tmp_untouched]
+  tags: [tls, tmp, sonny-6325, critical]
+
+tags: [cli, tls, security, sonny-738]

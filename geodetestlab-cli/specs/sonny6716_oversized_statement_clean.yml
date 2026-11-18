@@ -1,0 +1,149 @@
+version: '1.0'
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 60000
+    format: json
+tags:
+- storage
+- buffer-pool
+- sonny-738
+name: 'A statement larger than the buffer pool fails cleanly: 53200, nothing applied, server usable (SONNY-6716)'
+description: |
+  SONNY-6716: a single statement that dirties more pages than the pool holds (no-steal keeps its pages in memory until it ends) must fail with a clear error and apply nothing. Before: the statement failed with BufferPoolFull, its undo then needed frames the held pages had taken, and the client got 40003 "changes could not all be undone" with part of the statement applied (63 of 4000 nodes). Fix (graph-storage 0.4.29): a transaction cannot take the last frames of the pool; the undo of the failed statement may. The server maps BufferPoolFull to 53200 naming GEODE_BUFFER_POOL_PAGES.
+
+    Proof: one FOR ... CREATE of 4000 nodes with 1000-byte properties (about 4 MB, twice the 256-page pool) fails with 53200, no :Big node exists afterwards, an earlier node is untouched, and a following write works.
+
+    CANARY: REQ=REQ-SONNY-6716-OVERSIZED-STATEMENT-BLACKBOX; FEATURE="BufferPool"; ASPECT=OversizedStatementClean; STATUS=TESTED; TEST=self; OWNER=storage; UPDATED=2026-11-17
+
+    Execution note: the server is a private scratch server started by the first step (own port and
+    data dir under /tmp/sonny738-crypto-*, outside the harness-managed lifecycle), so these steps are not
+    affected by concurrent harness runs on a shared machine.
+tests:
+- name: scratch-server-start
+  description: Starts a private geode server (own data dir and port, outside the harness-managed lifecycle) for the steps below.
+  type: bash
+  timeout_ms: 300000
+  command: |
+    set -u
+    ST="/tmp/sonny738-crypto-6716b"
+    rm -rf "$ST"; mkdir -p "$ST"
+    PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+    cat > "$ST/env.sh" <<'ENVEOF'
+    export GEODE_ALLOW_INSECURE_TLS=1
+    export ST="/tmp/sonny738-crypto-6716b"
+    export D="$ST/data"
+    export GEODE_DATA_DIR="$D"
+    export GEODE_CLIENT_TLS="--insecure-tls-skip-verify"
+    export ADMINPW="Sonny Harness Admin Passphrase 738"
+    SRV_ENV=(
+      'GEODE_ADMIN_PASSWORD=Sonny Harness Admin Passphrase 738'
+      GEODE_ALLOW_TEST_AUDIT_KEYS=1
+      GEODE_BUFFER_POOL_AUTO_SIZE=0
+      GEODE_BUFFER_POOL_PAGES=256
+      GEODE_LSP_PORT=0
+    )
+    SRV_ARGS=()
+    gq_as() { local u="$1" p="$2"; shift 2; "$GEODE_BINARY" query -U "$u" -P "$p" "$@" --server "$GEODE_SERVER_ADDRESS" $GEODE_CLIENT_TLS; }
+    gq() { gq_as geode "$ADMINPW" "$@"; }
+    start_srv() {
+      env "${SRV_ENV[@]}" setsid nohup "$GEODE_BINARY" serve --listen "$GEODE_SERVER_ADDRESS" --data-dir "$D" --log-level warn "${SRV_ARGS[@]}" </dev/null >>"$ST/server.log" 2>&1 &
+      echo $! > "$ST/pid"
+      local i
+      for i in $(seq 1 400); do
+        gq "RETURN 1 AS x" >/dev/null 2>&1 && return 0
+        kill -0 "$(cat "$ST/pid")" 2>/dev/null || { echo "SERVER_EXITED"; tail -20 "$ST/server.log"; return 1; }
+        sleep 0.5
+      done
+      echo "SERVER_NOT_READY"; tail -20 "$ST/server.log"; return 1
+    }
+    stop_srv() {
+      [ -f "$ST/pid" ] || return 0
+      local p; p=$(cat "$ST/pid")
+      kill "$p" 2>/dev/null
+      local i; for i in $(seq 1 200); do kill -0 "$p" 2>/dev/null || break; sleep 0.3; done
+      kill -9 "$p" 2>/dev/null; rm -f "$ST/pid"
+    }
+    restart_srv() { stop_srv; start_srv; }
+    ENVEOF
+    echo "export GEODE_SERVER_ADDRESS=127.0.0.1:$PORT" >> "$ST/env.sh"
+    . "$ST/env.sh"
+    mkdir -p "$D"
+    start_srv && echo "SCRATCH_SERVER_READY"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_READY
+  tags:
+  - setup
+- name: keep-node
+  type: bash
+  command: |-
+    . "/tmp/sonny738-crypto-6716b/env.sh"
+    gq "CREATE (:Keep6716 {i: 1})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  timeout_ms: 300000
+- name: oversized-statement-fails-with-53200
+  type: bash
+  timeout_ms: 600000
+  command: |
+    . "/tmp/sonny738-crypto-6716b/env.sh"
+    set -u
+    PAD=$(python3 -c "print('p'*1000)")
+    OUT=$(gq "FOR i IN range(1, 4000) CREATE (:Big6716 {i: i, pad: '$PAD'})")
+    echo "$OUT" | cut -c1-300
+    echo "$OUT" | grep -q '"status_class":"53200"' || { echo "NOT_53200"; exit 1; }
+    echo "$OUT" | grep -q "GEODE_BUFFER_POOL_PAGES" || { echo "MESSAGE_DOES_NOT_NAME_THE_KNOB"; exit 1; }
+    echo CLEAN_53200
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CLEAN_53200
+- name: nothing-applied
+  type: bash
+  command: |-
+    . "/tmp/sonny738-crypto-6716b/env.sh"
+    gq "MATCH (n:Big6716) RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"c":0'
+  timeout_ms: 300000
+- name: earlier-data-untouched
+  type: bash
+  command: |-
+    . "/tmp/sonny738-crypto-6716b/env.sh"
+    gq "MATCH (n:Keep6716) RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+  timeout_ms: 300000
+- name: server-still-writes
+  type: bash
+  command: |-
+    . "/tmp/sonny738-crypto-6716b/env.sh"
+    gq "CREATE (:Keep6716 {i: 2})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  timeout_ms: 300000
+- name: scratch-server-stop
+  type: bash
+  command: |
+    . "/tmp/sonny738-crypto-6716b/env.sh"
+    stop_srv; rm -rf "$ST"; echo SCRATCH_SERVER_STOPPED
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - SCRATCH_SERVER_STOPPED
+  tags:
+  - teardown
+invariants: []
