@@ -967,7 +967,6 @@ def run_tests(
                 failure_file,
             )
 
-        server_state.server_args = server_args
         env["GEODE_SERVER_ADDRESS"] = f"127.0.0.1:{server_state.port}"
         env["PORT"] = str(server_state.port)
         env["data_dir"] = str(data_dir)

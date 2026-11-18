@@ -1,0 +1,131 @@
+version: '1.0'
+name: SONNY-6292 GRANT ROLE of a custom role is refused, not silently recorded
+description: |
+  SONNY-6292: custom-role membership lived in an in-memory side-table
+  (g_custom_role_members) that was never saved (lost at restart), survived
+  DROP ROLE (a re-created role silently regained its old members), was read by
+  no authorization path (a custom role confers no privilege), and handed out
+  a slice that escaped its lock. `GRANT ROLE <custom role> TO <user>` /
+  `ALTER USER ... SET ROLE <custom>` / geode.auth.user_assign_role answered
+  "assigned custom role" - a success that conferred nothing.
+
+  Fixed: assigning a custom role fails with 0A000 (feature not supported,
+  error.CustomRoleMembershipNotSupported) and changes nothing; the side-table
+  is gone. Built-in roles are granted as before.
+
+  Black-box proof as Admin over the wire:
+    - CREATE ROLE works; GRANT ROLE of it, ALTER USER SET ROLE of it and
+      CALL geode.auth.user_assign_role of it are each refused 0A000;
+    - the user keeps her built-in role (readonly: reads yes, writes 42501) -
+      nothing was "assigned";
+    - drop-then-recreate the role and grant again: still refused (no stale
+      membership could have been resurrected);
+    - control: a built-in role (GRANT ROLE readwrite) still works and then
+      lets her write.
+
+  Engine regression: test-sonny6292-custom-role-membership.
+
+  CANARY: REQ=REQ-SONNY-6292-CUSTOM-ROLE-MEMBERSHIP; FEATURE="GQL Auth DDL"; ASPECT=CustomRoleGrantRefused; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [auth, security, rbac, sonny-6292]
+tests:
+
+- name: s6292_setup_role_and_user
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE ROLE r6292_writer SET DESCRIPTION 'custom role carrying no privileges';
+    CREATE USER u6292_dan SET PASSWORD 'Dan Custom Role Passphrase' ROLE readonly
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42', '"status_class":"0A']
+
+- name: s6292_grant_role_custom_refused
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT ROLE r6292_writer TO u6292_dan]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"0A000"']
+    stdout_not_contains: ['"status_class":"00000"', assigned]
+
+- name: s6292_alter_user_set_custom_role_refused
+  args: [query, -U, geode, -P, '${secret:admin_password}', ALTER USER u6292_dan SET ROLE r6292_writer]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"0A000"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6292_assign_role_proc_custom_refused
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.auth.user_assign_role('u6292_dan', 'r6292_writer')"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"0A000"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6292_dan_still_readonly_cannot_write
+  description: Nothing was assigned - dan is still on his built-in readonly role and cannot write.
+  args: [query, -U, u6292_dan, -P, Dan Custom Role Passphrase, 'CREATE (n:R6292Node {v: 1})']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s6292_drop_and_recreate_role
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    DROP ROLE r6292_writer;
+    CREATE ROLE r6292_writer SET DESCRIPTION 'recreated'
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6292_grant_recreated_role_still_refused
+  description: The recreated role has no members and a grant of it is still refused (no stale membership).
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT ROLE r6292_writer TO u6292_dan]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"0A000"']
+
+- name: s6292_dan_still_readonly_after_recreate
+  args: [query, -U, u6292_dan, -P, Dan Custom Role Passphrase, 'CREATE (n:R6292Node {v: 2})']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+
+- name: s6292_builtin_role_grant_works
+  description: Control - a built-in role is still granted.
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT ROLE readwrite TO u6292_dan]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"0A000"']
+
+- name: s6292_dan_can_write_after_builtin_grant
+  args: [query, -U, u6292_dan, -P, Dan Custom Role Passphrase, 'CREATE (n:R6292Node {v: 3}) RETURN n.v AS v']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"v":3']

@@ -1,0 +1,164 @@
+# SONNY-6374: embedded LSP AuthProvider use-after-free, plus server residuals
+#
+# Bugs (observable ones):
+#   1. SECURITY: `geode serve` freed the embedded LSP listener's AuthProvider as
+#      soon as the listener thread was spawned (the defer sat inside the if
+#      block), so every LSP session's `initialize` verified its token against
+#      freed memory (a debug server panicked on the first session).
+#   3. `geode serve --help` gave `--listen-grpc 0.0.0.0:3142` as its example (the
+#      embedded LSP default port) and did not document --lsp-port.
+#   4. GEODE_ENABLE_ABAC logged "ABAC enforcement enabled" although nothing
+#      enforces ABAC.
+#   (Not black-box: item 2 a test-client timeout, 5 a corrupt Argon2id hash in
+#   the stored credential, 6 `or true` assertions, 7 CANARY TEST= tokens, 8 dead
+#   modules; covered by zig build test-sonny6374-server-residuals.)
+#
+# Fixed behaviour proven here, black box, against real `geode serve` processes
+# started by the spec (own data dir, free ports, torn down by the spec):
+#   * two consecutive LSP sessions each get the -32002 "invalid auth token"
+#     answer to `initialize` from the live AuthProvider, and the server keeps
+#     serving a QUIC query afterwards
+#   * SIGTERM with the listener running prints "[shutdown] LSP listener stopped"
+#     and exits 0 (the provider is freed only after the listener stopped)
+#   * `serve --help` documents --lsp-port and never pairs --listen-grpc with :3142
+#   * with GEODE_ENABLE_ABAC=1 the startup log does not claim ABAC enforcement
+
+version: '1.0'
+name: SONNY-6374 embedded LSP AuthProvider lifetime and serve residuals
+description: LSP sessions are answered by a live AuthProvider, SIGTERM stops the listener, serve --help documents --lsp-port, and no ABAC enforcement is claimed (SONNY-6374)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s6374-serve-help
+  description: serve --help documents --lsp-port/--lsp-bind-all and never gives the LSP default port as the gRPC example
+  type: bash
+  timeout_ms: 60000
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    OUT=$("$BIN" serve --help 2>&1)
+    echo "$OUT" | grep -q -- "--lsp-port" && echo "help_documents_lsp_port" || echo "HELP_MISSING_LSP_PORT"
+    echo "$OUT" | grep -q -- "--lsp-bind-all" && echo "help_documents_lsp_bind_all" || echo "HELP_MISSING_LSP_BIND_ALL"
+    echo "$OUT" | grep -- "--listen-grpc" | grep -q ":3142" && echo "GRPC_EXAMPLE_ON_LSP_PORT" || echo "grpc_example_not_on_lsp_port"
+    echo "$OUT" | grep -- "--listen-grpc" | grep -q "50051" && echo "grpc_example_is_50051" || echo "GRPC_EXAMPLE_NOT_50051"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - help_documents_lsp_port
+    - help_documents_lsp_bind_all
+    - grpc_example_not_on_lsp_port
+    - grpc_example_is_50051
+    stdout_not_contains:
+    - HELP_MISSING
+    - GRPC_EXAMPLE_ON_LSP_PORT
+    - GRPC_EXAMPLE_NOT_50051
+  tags:
+  - cli
+  - help
+  - sonny6374
+- name: s6374-lsp-sessions-use-live-authprovider
+  description: Two LSP sessions each get -32002 invalid auth token from the live AuthProvider; the server survives; SIGTERM stops the listener; no ABAC enforcement claim
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    WORK=/tmp/geode-harness-D.$$.$RANDOM; mkdir -p "$WORK"
+    SRV_PID=""
+    freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    cleanup() {
+      if [ -n "$SRV_PID" ] && kill -0 "$SRV_PID" 2>/dev/null; then kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; fi
+      case "$WORK" in /tmp/geode-harness-D.*) rm -rf "$WORK" ;; esac
+    }
+    trap cleanup EXIT
+    wait_ready() { # wait_ready <log> <seconds>
+      for i in $(seq 1 $(( $2 * 4 ))); do
+        grep -q "server ready" "$1" 2>/dev/null && return 0
+        [ -n "$SRV_PID" ] && ! kill -0 "$SRV_PID" 2>/dev/null && return 1
+        sleep 0.25
+      done
+      return 1
+    }
+
+    LSP=$(freeport); Q=$(freeport)
+    GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT="$LSP" GEODE_ENABLE_ABAC=1 GEODE_ALLOW_TEST_AUDIT_KEYS=1 \
+      "$BIN" serve --data-dir "$WORK/data" --listen "127.0.0.1:$Q" --log-level info > "$WORK/s.log" 2>&1 < /dev/null &
+    SRV_PID=$!
+    wait_ready "$WORK/s.log" 90 || { echo "SERVER_NOT_READY"; tail -30 "$WORK/s.log"; exit 1; }
+    for i in $(seq 1 100); do (echo > /dev/tcp/127.0.0.1/$LSP) 2>/dev/null && break; sleep 0.2; done
+    python3 - "$LSP" <<'PY'
+    import json, socket, sys, time
+    port = int(sys.argv[1])
+    def session(n):
+        s = socket.create_connection(("127.0.0.1", port), timeout=15)
+        body = json.dumps({"jsonrpc":"2.0","id":n,"method":"initialize","params":{"processId":None,"rootUri":None,"capabilities":{},
+                "initializationOptions":{"geode":{"authToken":"sonny6374-not-an-issued-token"}}}}).encode()
+        s.sendall(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+        got = b""; deadline = time.time() + 15
+        while b"invalid auth token" not in got and time.time() < deadline:
+            try:
+                d = s.recv(4096)
+            except socket.timeout:
+                break
+            if not d: break
+            got += d
+        s.close()
+        ok = b"invalid auth token" in got and b"-32002" in got
+        print("lsp_session_%d=%s" % (n, "rejected_with_-32002" if ok else "BAD:" + got[:200].decode("latin1")))
+    session(1); session(2)
+    PY
+    kill -0 "$SRV_PID" 2>/dev/null && echo "server_alive_after_lsp_sessions" || echo "SERVER_DIED_AFTER_LSP_SESSIONS"
+    OUT=$("$BIN" query --server "127.0.0.1:$Q" --insecure-tls-skip-verify -U geode -P "$PW" --timeout 20 "RETURN 6374 AS ok" 2>&1)
+    echo "$OUT" | grep -q 6374 && echo "quic_query_after_lsp=ok" || { echo "QUIC_QUERY_FAILED"; echo "$OUT" | tail -5; }
+    kill -TERM "$SRV_PID"
+    for i in $(seq 1 200); do kill -0 "$SRV_PID" 2>/dev/null || break; sleep 0.1; done
+    wait "$SRV_PID" 2>/dev/null; RC=$?
+    SRV_PID=""
+    echo "exit_status=$RC"
+    grep -q "\[shutdown\] LSP listener stopped" "$WORK/s.log" && echo "lsp_listener_stopped_logged" || echo "NO_LSP_STOPPED_LINE"
+    grep -q "ABAC enforcement enabled" "$WORK/s.log" && echo "ABAC_ENFORCEMENT_CLAIMED" || echo "no_abac_enforcement_claim"
+    grep -q "ABAC policies are not enforced" "$WORK/s.log" && echo "abac_not_enforced_stated" || echo "abac_not_enforced_line_missing"
+    grep -qE "panic|use-after-free|Segmentation" "$WORK/s.log" && { echo "PANIC_IN_LOG"; grep -nE "panic|Segmentation" "$WORK/s.log" | head -3; } || echo "no_panic_in_log"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - lsp_session_1=rejected_with_-32002
+    - lsp_session_2=rejected_with_-32002
+    - server_alive_after_lsp_sessions
+    - quic_query_after_lsp=ok
+    - exit_status=0
+    - lsp_listener_stopped_logged
+    - no_abac_enforcement_claim
+    - abac_not_enforced_stated
+    - no_panic_in_log
+    stdout_not_contains:
+    - 'BAD:'
+    - SERVER_DIED
+    - SERVER_NOT_READY
+    - QUIC_QUERY_FAILED
+    - NO_LSP_STOPPED_LINE
+    - ABAC_ENFORCEMENT_CLAIMED
+    - PANIC_IN_LOG
+  tags:
+  - lsp
+  - security
+  - sonny6374
+  - key-assertion

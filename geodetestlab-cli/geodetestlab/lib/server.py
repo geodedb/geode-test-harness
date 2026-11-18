@@ -73,21 +73,61 @@ def cleanup_servers() -> None:
     _active_servers.clear()
 
 
+def _is_orphaned(pid: int) -> bool:
+    """True when ``pid``'s parent is gone (init or a user-session subreaper).
+
+    A server still owned by a live harness process belongs to a live run and
+    must not be touched by another run's cleanup.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        if ppid <= 1:
+            return True
+        with open(f"/proc/{ppid}/comm", encoding="utf-8") as fh:
+            return fh.read().strip() in ("systemd", "init")
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def kill_orphaned_test_servers(sig: int = signal.SIGTERM) -> None:
+    """Signal geode servers in a ``geode-test-`` temp dir whose parent is gone.
+
+    The previous implementation ran ``pkill -f "geode serve.*geode-test-"``,
+    which killed EVERY harness-managed server on the machine, including those
+    of other runs that are still going (a spec on a busy shared host saw its
+    server die with SIGKILL as soon as another run started or finished).
+    """
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "geode serve.*geode-test-"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except Exception:
+        return
+    for token in out.split():
+        try:
+            pid = int(token)
+        except ValueError:
+            continue
+        if pid == os.getpid() or not _is_orphaned(pid):
+            continue
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
 def kill_stale_servers() -> None:
     """Kill any stale Geode servers from previous test runs.
 
     Uses a scoped pattern that only matches servers started with a
     ``geode-test-`` temp directory to avoid killing unrelated processes.
     """
-    try:
-        subprocess.run(
-            ["pkill", "-f", "geode serve.*geode-test-"],
-            capture_output=True,
-            timeout=5,
-        )
-        time.sleep(0.5)  # Give processes time to terminate
-    except Exception:
-        pass
+    kill_orphaned_test_servers(signal.SIGTERM)
+    time.sleep(0.5)  # Give processes time to terminate
 
 
 # Register cleanup handler

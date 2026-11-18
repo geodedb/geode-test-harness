@@ -1,0 +1,112 @@
+# SONNY-6448: QUIC clients verify against the CA bundle they are given; the TDE
+# self-test no longer reports a fake performance figure
+#
+# Bugs (observable ones):
+#   1. `geode query` / `shell` / REPL turned certificate verification OFF unless
+#      --client-cert/--client-key were given, so --ca-cert was ignored: a server
+#      signed by any CA was accepted. (The same fail-open lived in the cluster
+#      QuicClient.connectEx, which warned and connected without a trust anchor
+#      when its CA bundle could not load; that path needs a cluster and is
+#      covered by zig build test-sonny6448-tls-fail-closed.)
+#   4. `CALL tde.test_transparent_encryption()` answered performance_impact_pct,
+#      which compared a memcpy against encrypt+decrypt and measured nothing about
+#      TDE overhead.
+#   (Not black-box: 2 the vendored tls exporter, 3 a test that did not compile,
+#   5 compose pids_limit, 7 the local_dev KMS provider and the CA-less benchmark
+#   KMS client; covered by test-sonny6448-kms-dead-paths and friends.)
+#
+# Fixed behaviour proven here against the harness's real TLS-provisioned server:
+#   * `geode query --ca-cert <the server's CA>` connects (positive control: the
+#     verification is real, not blanket refusal)
+#   * `geode query --ca-cert <a CA that did not sign the server>` is REFUSED:
+#     non-zero exit and no result row (it used to be accepted)
+#   * `geode query --ca-cert <missing file>` is refused as well
+#   * with TDE on, `CALL tde.test_transparent_encryption()` answers exactly
+#     types_tested, all_transparent (true) and errors_encountered (0), and no
+#     performance_impact_pct
+
+version: '1.0'
+name: SONNY-6448 CLI verifies the supplied CA bundle; TDE self-test has no fake impact figure
+description: geode query --ca-cert verifies the server (wrong CA refused) and tde.test_transparent_encryption answers no performance_impact_pct (SONNY-6448)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    - --enable-tde
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+      GEODE_ENABLE_TDE: '1'
+      GEODE_TDE_ENABLED: 'true'
+      GEODE_TDE_KEY: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s6448-cli-verifies-supplied-ca
+  description: 'The CLI verifies against --ca-cert: the right CA connects, a CA that did not sign the server and a missing file are refused'
+  type: bash
+  timeout_ms: 120000
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    SERVER="${GEODE_SERVER_ADDRESS}"
+    CA=$(echo "${GEODE_CLIENT_TLS}" | sed -n 's/.*--ca-cert \([^ ]*\).*/\1/p')
+    echo "have_server_ca=$([ -n "$CA" ] && [ -s "$CA" ] && echo yes || echo no)"
+    if [ -z "$CA" ] || [ ! -s "$CA" ]; then echo "GEODE_CLIENT_TLS=${GEODE_CLIENT_TLS}"; exit 0; fi
+    OUT=$("$BIN" query --server "$SERVER" --ca-cert "$CA" -U geode -P "$PW" --timeout 15 "RETURN 6448 AS ok" 2>&1); RC=$?
+    echo "$OUT" | grep -q 6448 && echo "correct_ca=connected rc=$RC" || { echo "CORRECT_CA_REFUSED rc=$RC"; echo "$OUT" | tail -5; }
+    W=/tmp/geode-harness-D.$$.$RANDOM; mkdir -p "$W"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -keyout "$W/k.pem" -out "$W/wrong-ca.pem" -days 1 -nodes -subj "/CN=WrongCA-SONNY6448" 2>/dev/null
+    OUT=$("$BIN" query --server "$SERVER" --ca-cert "$W/wrong-ca.pem" -U geode -P "$PW" --timeout 15 "RETURN 6448 AS ok" 2>&1); RC=$?
+    if echo "$OUT" | grep -q '"ok"\|6448 *$' && [ "$RC" -eq 0 ]; then echo "WRONG_CA_ACCEPTED rc=$RC"; else echo "wrong_ca=refused rc_nonzero=$([ "$RC" -ne 0 ] && echo yes || echo no)"; fi
+    echo "$OUT" | grep -q '"rows"' && echo "WRONG_CA_RETURNED_ROWS" || echo "wrong_ca_no_rows"
+    OUT=$("$BIN" query --server "$SERVER" --ca-cert "$W/does-not-exist.pem" -U geode -P "$PW" --timeout 15 "RETURN 6448 AS ok" 2>&1); RC=$?
+    if [ "$RC" -eq 0 ]; then echo "MISSING_CA_ACCEPTED"; else echo "missing_ca=refused"; fi
+    rm -rf "$W"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - have_server_ca=yes
+    - correct_ca=connected
+    - wrong_ca=refused rc_nonzero=yes
+    - wrong_ca_no_rows
+    - missing_ca=refused
+    stdout_not_contains:
+    - CORRECT_CA_REFUSED
+    - WRONG_CA_ACCEPTED
+    - WRONG_CA_RETURNED_ROWS
+    - MISSING_CA_ACCEPTED
+  tags:
+  - tls
+  - cli
+  - security
+  - sonny6448
+  - key-assertion
+- name: s6448-tde-selftest-columns
+  description: tde.test_transparent_encryption() answers the functional self-test
+  args:
+  - query
+  - '-'
+  stdin: CALL tde.test_transparent_encryption()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"types_tested"'
+    - '"all_transparent":true'
+    - '"errors_encountered":0'
+    stdout_not_contains:
+    - performance_impact_pct
+  tags:
+  - tde
+  - sonny6448
+  - key-assertion

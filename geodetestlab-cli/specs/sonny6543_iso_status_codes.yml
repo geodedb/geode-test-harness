@@ -1,0 +1,112 @@
+version: '1.0'
+name: SONNY-6543 ISO/IEC 39075 Table 8 status codes (42002 invalid reference, 42000 UNION arity)
+description: |
+  SONNY-6543: geode answered an undefined object (an unknown GROUP BY key, an
+  unknown HAVING name, knn()'s unknown property) with 42703 - the
+  PostgreSQL-style "undefined_column", an implementation-defined subclass -
+  although ISO/IEC 39075:2024 Table 8 defines 42002 "invalid reference"
+  (and 23.2 GR 2)d attaches the INVALID_REFERENCE diagnostic only to 42002).
+  A UNION column-count mismatch was 42601 (PostgreSQL syntax error); the
+  standard's Syntax Rule refusal class is 42000.
+
+  Fixed (BREAKING for clients that matched 42703 / 42601): the server sends
+  42002 for an invalid reference and 42000 for a UNION column-count mismatch;
+  no mapping sends 42703 or 42601 any more (a parse refusal reports the
+  parser's own 42000). Unknown GROUP BY / HAVING names are now caught earlier by
+  the variable-scope check (42000, ISO 20.12 SR 8), so the invalid-reference
+  shape reachable over the wire is knn()'s unknown property.
+
+  This spec drives each shape over the real wire and asserts the exact
+  SQLSTATE class in the JSON result. The same statements also cover the
+  controls (a valid GROUP BY / HAVING / UNION is 00000) so the change cannot be satisfied by renaming everything.
+
+  Not reachable from the CLI: the CDC_DIAGNOSTICS / CDC_CONTROL Admin refusal
+  (a QUIC frame / gRPC method with no query text) is now 42501 on both
+  transports; that half is covered in-process by
+  test-sonny6543-iso-status-codes and test-sonny6561-cdc-transport-parity.
+
+  Companion edits: vector_knn_contract.yml and
+  vector_knn_bounded_cache_restart.yml expected the old 42703 and now expect
+  42002. group_by_aggregation_negative.yml also expects 42703 for HAVING /
+  GROUP BY of an unknown name, but the engine now answers 42000 (variable
+  scope check) there: left for the query lane to update.
+
+  Engine regression: test-sonny6543-iso-status-codes.
+
+  CANARY: REQ=REQ-SONNY-6543-ISO-STATUS-CODES; FEATURE="GQLSTATUS"; ASPECT=Table8; STATUS=TESTED; TEST=self; OWNER=query; UPDATED=2026-11-17
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [gql, status-codes, iso, sonny-6543]
+tests:
+
+- name: s6543_setup
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:S6543N {g: 1, v: 10});
+    CREATE (:S6543N {g: 1, v: 20});
+    CREATE (:S6543N {g: 2, v: 30})
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s6543_control_group_by_having_valid
+  description: Control - a valid GROUP BY / HAVING is 00000.
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (n:S6543N) RETURN n.g AS grp, count(*) AS c GROUP BY grp HAVING c > 1']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"grp":1']
+    stdout_not_contains: ['"status_class":"42']
+
+- name: s6543_knn_unknown_property_is_42002
+  description: knn() over a property no row supplies - invalid reference 42002 (was 42703).
+  args: [query, -U, geode, -P, '${secret:admin_password}', "RETURN knn('nosuch_idx6543', vectorf32('[1.0, 0.0]'), 10, 'l2') AS ids"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42002"', Unknown property]
+    stdout_not_contains: ['"status_class":"42703"', '"status_class":"00000"']
+
+- name: s6543_union_column_count_mismatch_is_42000
+  description: A UNION whose branches have different column counts is the Syntax Rule refusal 42000 (was 42601).
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'RETURN 1 AS a UNION RETURN 1 AS a, 2 AS b']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+    stdout_not_contains: ['"status_class":"42601"', '"status_class":"00000"']
+
+- name: s6543_control_union_valid
+  args: [query, -U, geode, -P, '${secret:admin_password}', RETURN 1 AS a UNION RETURN 2 AS a]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"a":1', '"a":2']
+
+- name: s6543_syntax_error_is_not_42601_or_42703
+  description: Control - a genuine syntax error answers the standard class 42000 (never the PostgreSQL 42601), with the parser's own message.
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (n:S6543N RETURN n]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"', expected token]
+    stdout_not_contains: ['"status_class":"42601"', '"status_class":"42703"', '"status_class":"00000"']

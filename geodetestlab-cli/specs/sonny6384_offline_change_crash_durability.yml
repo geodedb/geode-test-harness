@@ -1,0 +1,110 @@
+version: '1.0'
+name: SONNY-6384 security-graph writes after an offline user change survive SIGKILL
+description: |
+  Ticket: SONNY-6384 (item 1: the storage-level loss; the gRPC chunk-summary and
+  Raft graph-drop items of the same ticket are covered by zig tests).
+  Bug: after an offline `geode user ...` change on a data directory (the offline CLI
+  ends its process without closing the engine, after a full checkpoint compacted
+  the shard WAL), the server's later writes to `__geode_security` (CREATE USER,
+  ALTER USER) were lost after a SIGKILL, and the graph could fail to load on the
+  next start (WAL numbered from 0 while recovery replayed from the checkpoint LSN).
+  Spec drives real `geode serve` processes on one data directory: bootstrap server
+  -> SIGKILL -> offline `user create` -> server: CREATE USER over the wire and ALTER
+  USER of the offline user -> SIGKILL -> server: the admin can log in (graph loaded),
+  the wire user logs in, the offline user logs in with the NEW password and not the
+  old, another ALTER + SIGKILL + restart keeps that too, and `geode auth verify`
+  still passes.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6384-writes-after-offline-change-survive-sigkill
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+     GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+     start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+     for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+     echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+     ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+     O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+     SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+     [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+
+    NEWPW='Offline Change Second Passphrase'
+    OFFPW='Offline Change First Passphrase'
+    login() { q2 "$1" "$2" "RETURN 1 AS x" | grep -q '"rows"'; }
+    q2() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify --no-saved-session -U "$1" -P "$2" "$3" 2>&1; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    # the store was bootstrapped by `auth init`; run a server on it once and kill it
+    kill9
+    "$BIN" user create off6384 off6384@example.com --password "$OFFPW" --role readwrite --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL offline create"; exit 1; }
+    start
+    login off6384 "$OFFPW" || { echo "FAIL offline user cannot log in"; exit 1; }
+    ok "wire create" "$(q "CREATE USER wire6384 SET PASSWORD 'Wire Created First Passphrase' ROLE readwrite")"
+    ok "alter" "$(q "ALTER USER off6384 SET PASSWORD '$NEWPW'")"
+    kill9
+    start
+    login geode "$PW" || { echo "FAIL admin cannot log in after SIGKILL (security graph did not load)"; tail -20 "$D/srv.log"; exit 1; }
+    login wire6384 'Wire Created First Passphrase' || { echo "FAIL user created over the wire is gone after SIGKILL"; exit 1; }
+    login off6384 "$NEWPW" || { echo "FAIL ALTER USER password change is gone after SIGKILL"; exit 1; }
+    login off6384 "$OFFPW" && { echo "FAIL old offline password still logs in"; exit 1; }
+    ok "alter 2" "$(q "ALTER USER wire6384 SET PASSWORD '$NEWPW'")"
+    kill9
+    start
+    login wire6384 "$NEWPW" || { echo "FAIL second ALTER USER lost after the second SIGKILL"; exit 1; }
+    stop
+    OUT=$("$BIN" auth verify --data-dir "$SD" 2>&1) || { echo "FAIL auth verify"; echo "$OUT"; exit 1; }
+    echo "CRASH_DURABLE_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [CRASH_DURABLE_OK]
+  tags: [auth, storage, crash, sonny6384]

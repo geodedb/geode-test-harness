@@ -1,0 +1,145 @@
+version: '1.0'
+name: SONNY-6608 offline MFA enable needs a code; enrollments are stored (not memory-only)
+description: |
+  Ticket: SONNY-6608.
+  Bug: the offline CLI enabled MFA without verifying any code and never stored the
+  recovery codes; `mfa_enable` / `mfa_disable` changed no stored state and MFA
+  enrollments were kept in memory only.
+  Spec proves on the real binary: (offline) after `user mfa-setup` the user is
+  "MFA: disabled (enrolled", `mfa enable` without --code is refused and leaves MFA
+  disabled, `mfa enable --code <TOTP of the printed secret>` enables it, a later
+  separate process sees "MFA: enabled (enrolled" and `mfa disable` turns it off
+  (state lives in the store, not the process); (online) an enrollment made over
+  the wire with `geode.auth.mfa_setup` + `mfa_enable` survives a SIGKILL-free
+  restart of `geode serve`: `mfa_verify` of a fresh code for the enrolled secret
+  still succeeds after the restart.
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 420000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_ENABLE_MFA: '1'
+      GEODE_ADMIN_PASSWORD: Geode Test Admin Passphrase
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+fuzz:
+  enabled: false
+
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: Geode Test Admin Passphrase
+
+tests:
+
+- name: sonny6608-offline-enable-needs-code-and-persists
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    GEODE_ADMIN_PASSWORD='Offline Mfa Admin Passphrase' "$BIN" auth init --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+    enrol() { # user -> sets SECRET and SETUP_OUT
+     "$BIN" user create "$1" "$1@example.com" --password "Correct Horse Battery Staple 6619" --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL create $1"; exit 1; }
+     SETUP_OUT=$("$BIN" user mfa-setup "$1" --data-dir "$D" 2>&1) || { echo "FAIL mfa-setup $1"; echo "$SETUP_OUT"; exit 1; }
+     SECRET=$(echo "$SETUP_OUT" | sed -n 's/^MFA secret: //p' | head -1)
+     [ -n "$SECRET" ] || { echo "FAIL no secret printed"; echo "$SETUP_OUT"; exit 1; }
+    }
+
+    enrol en6608
+    st() { "$BIN" user show en6608 --data-dir "$D" 2>&1 | grep "^MFA:"; }
+    st | grep -q "MFA: disabled (enrolled" || { echo "FAIL after setup: $(st)"; exit 1; }
+    OUT=$("$BIN" user mfa enable en6608 --data-dir "$D" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] || { echo "FAIL enable without --code succeeded"; echo "$OUT"; exit 1; }
+    st | grep -q "MFA: disabled (enrolled" || { echo "FAIL enable without code changed state: $(st)"; exit 1; }
+    "$BIN" user mfa enable en6608 --code "$(totp "$SECRET")" --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL enable with code"; exit 1; }
+    st | grep -q "MFA: enabled (enrolled" || { echo "FAIL not enabled after code: $(st)"; exit 1; }
+    "$BIN" user mfa disable en6608 --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL disable"; exit 1; }
+    st | grep -q "MFA: disabled (enrolled" || { echo "FAIL not disabled: $(st)"; exit 1; }
+    echo "ENROLL_PERSIST_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [ENROLL_PERSIST_OK]
+  tags: [mfa, offline, sonny6608]
+
+- name: sonny6608-online-enrollment-survives-restart
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    GEODE_ADMIN_PASSWORD='Offline Mfa Admin Passphrase' "$BIN" auth init --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+    enrol() { # user -> sets SECRET and SETUP_OUT
+     "$BIN" user create "$1" "$1@example.com" --password "Correct Horse Battery Staple 6619" --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL create $1"; exit 1; }
+     SETUP_OUT=$("$BIN" user mfa-setup "$1" --data-dir "$D" 2>&1) || { echo "FAIL mfa-setup $1"; echo "$SETUP_OUT"; exit 1; }
+     SECRET=$(echo "$SETUP_OUT" | sed -n 's/^MFA secret: //p' | head -1)
+     [ -n "$SECRET" ] || { echo "FAIL no secret printed"; echo "$SETUP_OUT"; exit 1; }
+    }
+
+    ADDR="127.0.0.1:$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
+    PW='Offline Mfa Admin Passphrase'
+    export GEODE_ALLOW_INSECURE_TLS=1
+    SD="$D/srv"; mkdir -p "$SD"
+    GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL init"; exit 1; }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "RETURN 1" >/dev/null 2>&1 && return 0; sleep 0.5; done
+      echo "FAIL server did not start"; cat "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; }
+    trap 'kill $SPID 2>/dev/null; rm -rf "$D"' EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    start
+    q "CREATE USER rs6608 SET PASSWORD 'Correct Horse Battery Staple 6608'" >/dev/null
+    OUT=$(q "CALL geode.auth.mfa_setup('rs6608')")
+    SECRET=$(echo "$OUT" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+    [ -n "$SECRET" ] || { echo "FAIL no secret"; echo "$OUT"; exit 1; }
+    OUT=$(q "CALL geode.auth.mfa_enable('rs6608', '$(totp "$SECRET")')") || { echo "FAIL enable"; echo "$OUT"; exit 1; }
+    stop; start
+    OUT=$(q "CALL geode.auth.mfa_verify('rs6608', '$(totp "$SECRET")')"); RC=$?
+    [ "$RC" -eq 0 ] || { echo "FAIL mfa_verify after restart rc=$RC (enrollment lost)"; echo "$OUT"; exit 1; }
+    stop
+    echo "ONLINE_RESTART_OK"
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [ONLINE_RESTART_OK]
+  tags: [mfa, online, sonny6608]

@@ -1,0 +1,612 @@
+version: '1.0'
+name: 'SONNY-2679 / SONNY-6437 / SONNY-6460: RLS-denied hop targets and metadata are unreachable for a restricted user'
+description: |
+  Tickets: SONNY-2679 (and SONNY-6437 item 5 / SONNY-6460).
+  SONNY-2679 (security, critical): an RLS session is served by the legacy read
+  executor, whose hop targets never passed the row-level-security check: single hop,
+  variable-length, aggregation, multi-hop and the comprehension/COUNT/EXISTS/
+  shortestPath forms returned properties, counts and whole nodes of RLS-denied
+  nodes and edges reachable through relationship patterns, and writes through a
+  hop (SET/DELETE on a hop target) could touch them.
+  SONNY-6437 item 5 / SONNY-6460: db.relationshipTypes() and db.propertyKeys() ignored
+  RLS label policies; they must omit an edge type or key only hidden edges carry,
+  including an edge whose endpoint is a hidden node.
+  Fixture (default graph, built by the admin): g1 -R-> ok -R-> ok2; g1 -R-> leak(:Hidden)
+  -R-> far -R-> far2; g1 -SECRET{x:'topsecret'}-> viaSecret -R-> beyond;
+  (:Hidden h2) -LINK-> (:Doc d2). bob is denied the labels Hidden and SECRET with
+  CALL geode.rls.add_deny_policy; every query runs as the admin (sees all) and as bob.
+  Proves: bob never reads, counts, collects or reaches a denied node or edge through
+  any traversal shape, the admin still does (positive control), bob's writes through a
+  hop leave the hidden rows untouched, and the metadata procedures list only what bob
+  can reach.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s2679-create-user-bob
+  description: 'bob: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER bob SET PASSWORD 'Bob Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created bob]
+  tags: [s2679, setup]
+
+- name: s2679-seed
+  description: Seed the fixture as the admin.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    CREATE (:G {s: 'g1'});
+    CREATE (:Doc {s: 'ok', cls: 'public'});
+    CREATE (:Doc {s: 'ok2', cls: 'public'});
+    CREATE (:Doc {s: 'far', cls: 'public'});
+    CREATE (:Doc {s: 'far2', cls: 'public'});
+    CREATE (:Doc {s: 'viaSecret', cls: 'public'});
+    CREATE (:Doc {s: 'beyond', cls: 'public'});
+    CREATE (:Hidden {s: 'leak', cls: 'secret'});
+    MATCH (a:G {s: 'g1'}), (b:Doc {s: 'ok'}) CREATE (a)-[:R]->(b);
+    MATCH (a:Doc {s: 'ok'}), (b:Doc {s: 'ok2'}) CREATE (a)-[:R]->(b);
+    MATCH (a:G {s: 'g1'}), (b:Hidden {s: 'leak'}) CREATE (a)-[:R]->(b);
+    MATCH (a:Hidden {s: 'leak'}), (b:Doc {s: 'far'}) CREATE (a)-[:R]->(b);
+    MATCH (a:Doc {s: 'far'}), (b:Doc {s: 'far2'}) CREATE (a)-[:R]->(b);
+    MATCH (a:G {s: 'g1'}), (b:Doc {s: 'viaSecret'}) CREATE (a)-[:SECRET {x: 'topsecret'}]->(b);
+    MATCH (a:Doc {s: 'viaSecret'}), (b:Doc {s: 'beyond'}) CREATE (a)-[:R]->(b);
+    CREATE (:Hidden {s: 'h2', cls: 'secret'})-[:LINK {link_key: 1}]->(:Doc {s: 'd2', cls: 'public'})
+  expect:
+    exit_code: 0
+  tags: [s2679, setup]
+
+- name: s2679-deny-Hidden
+  description: Deny bob Hidden.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('default', 'Hidden', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [deny policy added]
+  tags: [s2679, setup]
+
+- name: s2679-deny-SECRET
+  description: Deny bob SECRET.
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('default', 'SECRET', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [deny policy added]
+  tags: [s2679, setup]
+
+- name: s2679-control-bob-hidden
+  description: 'Control: bob sees no Hidden node, the admin sees two.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":0}]']
+  tags: [s2679, setup]
+
+- name: s2679-control-admin-hidden
+  description: 'Control: the admin sees both Hidden nodes.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":2}]']
+  tags: [s2679, setup]
+
+- name: s2679-single-hop-prop-admin
+  description: 'SONNY-2679 single hop target property [admin, no restriction]: MATCH (g:G)-[:R]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"leak"},{"s":"ok"}]']
+  tags: [s2679]
+
+- name: s2679-single-hop-prop-bob
+  description: 'SONNY-2679 single hop target property [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok"}]']
+  tags: [s2679]
+
+- name: s2679-single-hop-count-admin
+  description: 'SONNY-2679 single hop aggregate [admin, no restriction]: MATCH (g:G)-[:R]->(h) RETURN count(h) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R]->(h) RETURN count(h) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":2}]']
+  tags: [s2679]
+
+- name: s2679-single-hop-count-bob
+  description: 'SONNY-2679 single hop aggregate [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R]->(h) RETURN count(h) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(h) RETURN count(h) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s2679]
+
+- name: s2679-undirected-hop-admin
+  description: 'SONNY-2679 undirected hop [admin, no restriction]: MATCH (g:G)-[:R]-(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R]-(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"leak"},{"s":"ok"}]']
+  tags: [s2679]
+
+- name: s2679-undirected-hop-bob
+  description: 'SONNY-2679 undirected hop [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R]-(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]-(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok"}]']
+  tags: [s2679]
+
+- name: s2679-reverse-hop-admin
+  description: "SONNY-2679 reverse hop to a hidden start [admin, no restriction]: MATCH (f)<-[:R]-(h) WHERE f.s = 'far' RETURN count(h) AS c"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (f)<-[:R]-(h) WHERE f.s = 'far' RETURN count(h) AS c"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s2679]
+
+- name: s2679-reverse-hop-bob
+  description: "SONNY-2679 reverse hop to a hidden start [bob, denied Hidden and SECRET]: MATCH (f)<-[:R]-(h) WHERE f.s = 'far' RETURN count(h) AS c"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (f)<-[:R]-(h) WHERE f.s = 'far' RETURN count(h) AS c"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":0}]']
+  tags: [s2679]
+
+- name: s2679-single-hop-group-admin
+  description: 'SONNY-2679 grouped hop [admin, no restriction]: MATCH (g:G)-[:R]->(h) RETURN h.s AS s, count(*) AS c GROUP BY h.s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R]->(h) RETURN h.s AS s, count(*) AS c GROUP BY h.s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"leak","c":1},{"s":"ok","c":1}]']
+  tags: [s2679]
+
+- name: s2679-single-hop-group-bob
+  description: 'SONNY-2679 grouped hop [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R]->(h) RETURN h.s AS s, count(*) AS c GROUP BY h.s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(h) RETURN h.s AS s, count(*) AS c GROUP BY h.s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok","c":1}]']
+  tags: [s2679]
+
+- name: s2679-two-hop-admin
+  description: 'SONNY-2679 two-hop target [admin, no restriction]: MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"far"},{"s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-two-hop-bob
+  description: 'SONNY-2679 two-hop target [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-two-hop-mid-admin
+  description: 'SONNY-2679 two-hop middle node [admin, no restriction]: MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN m.s AS m, h.s AS s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN m.s AS m, h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"m":"leak","s":"far"},{"m":"ok","s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-two-hop-mid-bob
+  description: 'SONNY-2679 two-hop middle node [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN m.s AS m, h.s AS s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN m.s AS m, h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"m":"ok","s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-two-hop-group-admin
+  description: 'SONNY-2679 two-hop grouped count [admin, no restriction]: MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN g.s AS s, count(h) AS c GROUP BY g.s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN g.s AS s, count(h) AS c GROUP BY g.s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"g1","c":2}]']
+  tags: [s2679]
+
+- name: s2679-two-hop-group-bob
+  description: 'SONNY-2679 two-hop grouped count [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN g.s AS s, count(h) AS c GROUP BY g.s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(m)-[:R]->(h) RETURN g.s AS s, count(h) AS c GROUP BY g.s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"g1","c":1}]']
+  tags: [s2679]
+
+- name: s2679-three-hop-admin
+  description: 'SONNY-2679 three-hop target behind a hidden node [admin, no restriction]: MATCH (g:G)-[:R]->(a)-[:R]->(b)-[:R]->(c) RETURN c.s AS s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R]->(a)-[:R]->(b)-[:R]->(c) RETURN c.s AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"far2"}]']
+  tags: [s2679]
+
+- name: s2679-three-hop-bob
+  description: 'SONNY-2679 three-hop target behind a hidden node [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R]->(a)-[:R]->(b)-[:R]->(c) RETURN c.s AS s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(a)-[:R]->(b)-[:R]->(c) RETURN c.s AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s2679]
+
+- name: s2679-varlen-prop-admin
+  description: 'SONNY-2679 variable-length targets [admin, no restriction]: MATCH (g:G)-[:R*1..3]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R*1..3]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"far"},{"s":"far2"},{"s":"leak"},{"s":"ok"},{"s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-varlen-prop-bob
+  description: 'SONNY-2679 variable-length targets [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R*1..3]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R*1..3]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok"},{"s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-varlen-count-admin
+  description: 'SONNY-2679 variable-length aggregate [admin, no restriction]: MATCH (g:G)-[:R*1..3]->(h) RETURN count(h) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R*1..3]->(h) RETURN count(h) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":5}]']
+  tags: [s2679]
+
+- name: s2679-varlen-count-bob
+  description: 'SONNY-2679 variable-length aggregate [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R*1..3]->(h) RETURN count(h) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R*1..3]->(h) RETURN count(h) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":2}]']
+  tags: [s2679]
+
+- name: s2679-varlen-min2-admin
+  description: 'SONNY-2679 variable-length lower bound 2 [admin, no restriction]: MATCH (g:G)-[:R*2..3]->(h) RETURN count(h) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:R*2..3]->(h) RETURN count(h) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":3}]']
+  tags: [s2679]
+
+- name: s2679-varlen-min2-bob
+  description: 'SONNY-2679 variable-length lower bound 2 [bob, denied Hidden and SECRET]: MATCH (g:G)-[:R*2..3]->(h) RETURN count(h) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R*2..3]->(h) RETURN count(h) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s2679]
+
+- name: s2679-varlen-reverse-admin
+  description: 'SONNY-2679 variable-length reverse [admin, no restriction]: MATCH (h)<-[:R*1..3]-(g:G) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (h)<-[:R*1..3]-(g:G) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"far"},{"s":"far2"},{"s":"leak"},{"s":"ok"},{"s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-varlen-reverse-bob
+  description: 'SONNY-2679 variable-length reverse [bob, denied Hidden and SECRET]: MATCH (h)<-[:R*1..3]-(g:G) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (h)<-[:R*1..3]-(g:G) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok"},{"s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-varlen-any-type-admin
+  description: 'SONNY-2679 variable-length any relationship type [admin, no restriction]: MATCH (g:G)-[*1..3]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[*1..3]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"beyond"},{"s":"far"},{"s":"far2"},{"s":"leak"},{"s":"ok"},{"s":"ok2"},{"s":"viaSecret"}]']
+  tags: [s2679]
+
+- name: s2679-varlen-any-type-bob
+  description: 'SONNY-2679 variable-length any relationship type [bob, denied Hidden and SECRET]: MATCH (g:G)-[*1..3]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[*1..3]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok"},{"s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-optional-admin
+  description: 'SONNY-2679 OPTIONAL MATCH hop [admin, no restriction]: MATCH (g:G) OPTIONAL MATCH (g)-[:R]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G) OPTIONAL MATCH (g)-[:R]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"leak"},{"s":"ok"}]']
+  tags: [s2679]
+
+- name: s2679-optional-bob
+  description: 'SONNY-2679 OPTIONAL MATCH hop [bob, denied Hidden and SECRET]: MATCH (g:G) OPTIONAL MATCH (g)-[:R]->(h) RETURN h.s AS s ORDER BY s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G) OPTIONAL MATCH (g)-[:R]->(h) RETURN h.s AS s ORDER BY s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok"}]']
+  tags: [s2679]
+
+- name: s2679-comprehension-admin
+  description: 'SONNY-2679 pattern comprehension [admin, no restriction]: MATCH (g:G) RETURN size([(g)-[:R]->(h) | h.s]) AS n'
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    MATCH (g:G) RETURN size([(g)-[:R]->(h) | h.s]) AS n
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"n":2}]']
+  tags: [s2679]
+
+- name: s2679-comprehension-bob
+  description: 'SONNY-2679 pattern comprehension [bob, denied Hidden and SECRET]: MATCH (g:G) RETURN size([(g)-[:R]->(h) | h.s]) AS n'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, '-']
+  stdin: |
+    MATCH (g:G) RETURN size([(g)-[:R]->(h) | h.s]) AS n
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"n":1}]']
+  tags: [s2679]
+
+- name: s2679-count-subquery-admin
+  description: 'SONNY-2679 COUNT {} [admin, no restriction]: MATCH (g:G) RETURN COUNT { (g)-[:R]->(h) } AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G) RETURN COUNT { (g)-[:R]->(h) } AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":2}]']
+  tags: [s2679]
+
+- name: s2679-count-subquery-bob
+  description: 'SONNY-2679 COUNT {} [bob, denied Hidden and SECRET]: MATCH (g:G) RETURN COUNT { (g)-[:R]->(h) } AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G) RETURN COUNT { (g)-[:R]->(h) } AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s2679]
+
+- name: s2679-count-subquery-varlen-admin
+  description: 'SONNY-2679 COUNT {} variable length [admin, no restriction]: MATCH (g:G) RETURN COUNT { (g)-[:R*1..3]->(h) } AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G) RETURN COUNT { (g)-[:R*1..3]->(h) } AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":5}]']
+  tags: [s2679]
+
+- name: s2679-count-subquery-varlen-bob
+  description: 'SONNY-2679 COUNT {} variable length [bob, denied Hidden and SECRET]: MATCH (g:G) RETURN COUNT { (g)-[:R*1..3]->(h) } AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G) RETURN COUNT { (g)-[:R*1..3]->(h) } AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":2}]']
+  tags: [s2679]
+
+- name: s2679-exists-subquery-admin
+  description: "SONNY-2679 EXISTS {} on a hidden target [admin, no restriction]: MATCH (g:G) RETURN EXISTS { (g)-[:R]->(h {s: 'leak'}) } AS e"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (g:G) RETURN EXISTS { (g)-[:R]->(h {s: 'leak'}) } AS e"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"e":true}]']
+  tags: [s2679]
+
+- name: s2679-exists-subquery-bob
+  description: "SONNY-2679 EXISTS {} on a hidden target [bob, denied Hidden and SECRET]: MATCH (g:G) RETURN EXISTS { (g)-[:R]->(h {s: 'leak'}) } AS e"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "MATCH (g:G) RETURN EXISTS { (g)-[:R]->(h {s: 'leak'}) } AS e"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"e":false}]']
+  tags: [s2679]
+
+- name: s2679-secret-count-admin
+  description: 'SONNY-2679 denied relationship type count [admin, no restriction]: MATCH (g:G)-[r:SECRET]->(h) RETURN count(r) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[r:SECRET]->(h) RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s2679]
+
+- name: s2679-secret-count-bob
+  description: 'SONNY-2679 denied relationship type count [bob, denied Hidden and SECRET]: MATCH (g:G)-[r:SECRET]->(h) RETURN count(r) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[r:SECRET]->(h) RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":0}]']
+  tags: [s2679]
+
+- name: s2679-secret-target-admin
+  description: 'SONNY-2679 denied relationship type target [admin, no restriction]: MATCH (g:G)-[r:SECRET]->(h) RETURN h.s AS s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[r:SECRET]->(h) RETURN h.s AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"viaSecret"}]']
+  tags: [s2679]
+
+- name: s2679-secret-target-bob
+  description: 'SONNY-2679 denied relationship type target [bob, denied Hidden and SECRET]: MATCH (g:G)-[r:SECRET]->(h) RETURN h.s AS s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[r:SECRET]->(h) RETURN h.s AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s2679]
+
+- name: s2679-secret-prop-admin
+  description: 'SONNY-2679 denied relationship property [admin, no restriction]: MATCH (g:G)-[r:SECRET]->(h) RETURN r.x AS x'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[r:SECRET]->(h) RETURN r.x AS x']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"x":"topsecret"}]']
+  tags: [s2679]
+
+- name: s2679-secret-prop-bob
+  description: 'SONNY-2679 denied relationship property [bob, denied Hidden and SECRET]: MATCH (g:G)-[r:SECRET]->(h) RETURN r.x AS x'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[r:SECRET]->(h) RETURN r.x AS x']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s2679]
+
+- name: s2679-all-edges-admin
+  description: 'SONNY-2679 every relationship the session may traverse [admin, no restriction]: MATCH ()-[r]->() RETURN count(r) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH ()-[r]->() RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":8}]']
+  tags: [s2679]
+
+- name: s2679-all-edges-bob
+  description: 'SONNY-2679 every relationship the session may traverse [bob, denied Hidden and SECRET]: MATCH ()-[r]->() RETURN count(r) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH ()-[r]->() RETURN count(r) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":4}]']
+  tags: [s2679]
+
+- name: s2679-secret-optional-admin
+  description: 'SONNY-2679 OPTIONAL MATCH over a denied relationship type [admin, no restriction]: MATCH (g:G) OPTIONAL MATCH (g)-[r:SECRET]->(h) RETURN h.s AS s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G) OPTIONAL MATCH (g)-[r:SECRET]->(h) RETURN h.s AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"viaSecret"}]']
+  tags: [s2679]
+
+- name: s2679-secret-optional-bob
+  description: 'SONNY-2679 OPTIONAL MATCH over a denied relationship type [bob, denied Hidden and SECRET]: MATCH (g:G) OPTIONAL MATCH (g)-[r:SECRET]->(h) RETURN h.s AS s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G) OPTIONAL MATCH (g)-[r:SECRET]->(h) RETURN h.s AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":null}]']
+  tags: [s2679]
+
+- name: s2679-secret-chain-admin
+  description: 'SONNY-2679 chain behind a denied relationship type [admin, no restriction]: MATCH (g:G)-[:SECRET]->(m)-[:R]->(h) RETURN h.s AS s'
+  args: [query, -U, geode, -P, '${secret:admin_password}', 'MATCH (g:G)-[:SECRET]->(m)-[:R]->(h) RETURN h.s AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"beyond"}]']
+  tags: [s2679]
+
+- name: s2679-secret-chain-bob
+  description: 'SONNY-2679 chain behind a denied relationship type [bob, denied Hidden and SECRET]: MATCH (g:G)-[:SECRET]->(m)-[:R]->(h) RETURN h.s AS s'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:SECRET]->(m)-[:R]->(h) RETURN h.s AS s']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[]']
+  tags: [s2679]
+
+- name: s2679-shortest-path-admin
+  description: "SONNY-2679 shortestPath through a hidden node [admin, no restriction]: RETURN shortestPath((a:G {s: 'g1'})-[*]-(b {s: 'far'})) AS p"
+  args: [query, -U, geode, -P, '${secret:admin_password}', "RETURN shortestPath((a:G {s: 'g1'})-[*]-(b {s: 'far'})) AS p"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"p":']
+    stdout_not_contains: ['"p":null']
+  tags: [s2679]
+
+- name: s2679-shortest-path-bob
+  description: "SONNY-2679 shortestPath through a hidden node [bob, denied Hidden and SECRET]: RETURN shortestPath((a:G {s: 'g1'})-[*]-(b {s: 'far'})) AS p"
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, "RETURN shortestPath((a:G {s: 'g1'})-[*]-(b {s: 'far'})) AS p"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"p":null}]']
+  tags: [s2679]
+
+- name: s2679-meta-rel-types-admin
+  description: 'SONNY-6437/6460 relationship types (LINK only has a hidden endpoint, SECRET is denied) [admin, no restriction]: CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType AS t ORDER BY t'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType AS t ORDER BY t]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"t":"LINK"},{"t":"R"},{"t":"SECRET"}]']
+  tags: [s2679]
+
+- name: s2679-meta-rel-types-bob
+  description: 'SONNY-6437/6460 relationship types (LINK only has a hidden endpoint, SECRET is denied) [bob, denied Hidden and SECRET]: CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType AS t ORDER BY t'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType AS t ORDER BY t]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"t":"R"}]']
+  tags: [s2679]
+
+- name: s2679-meta-prop-keys-admin
+  description: 'SONNY-6437/6460 property keys (link_key and x live only on edges bob cannot reach) [admin, no restriction]: CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey AS k ORDER BY k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey AS k ORDER BY k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":"cls"},{"k":"link_key"},{"k":"s"},{"k":"x"}]']
+  tags: [s2679]
+
+- name: s2679-meta-prop-keys-bob
+  description: 'SONNY-6437/6460 property keys (link_key and x live only on edges bob cannot reach) [bob, denied Hidden and SECRET]: CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey AS k ORDER BY k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey AS k ORDER BY k]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":"cls"},{"k":"s"}]']
+  tags: [s2679]
+
+- name: s2679-write-set-hop
+  description: 'bob: SET through a hop touches only the visible target.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(h) SET h.touched = 1']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s2679]
+
+- name: s2679-write-set-two-hop
+  description: 'bob: SET through a two-hop pattern touches only the visible target.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:R]->(m)-[:R]->(h) SET h.touched2 = 1']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s2679]
+
+- name: s2679-write-detach-secret
+  description: 'bob: DETACH DELETE through a denied relationship type deletes nothing.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, 'MATCH (g:G)-[:SECRET]->(h) DETACH DELETE h']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s2679]
+
+- name: s2679-write-verify-set
+  description: 'admin: only the visible hop target carries the mark; the hidden node was not touched.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (h) WHERE h.touched = 1 RETURN h.s AS s ORDER BY s]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok"}]']
+  tags: [s2679]
+
+- name: s2679-write-verify-set2
+  description: 'admin: only the visible two-hop target carries the mark.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', MATCH (h) WHERE h.touched2 = 1 RETURN h.s AS s ORDER BY s]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"s":"ok2"}]']
+  tags: [s2679]
+
+- name: s2679-write-verify-delete
+  description: "admin: the node behind the denied relationship type survived bob's DETACH DELETE."
+  args: [query, -U, geode, -P, '${secret:admin_password}', "MATCH (h:Doc {s: 'viaSecret'}) RETURN count(h) AS c"]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":1}]']
+  tags: [s2679]

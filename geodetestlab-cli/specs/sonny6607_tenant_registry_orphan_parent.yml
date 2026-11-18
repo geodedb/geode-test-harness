@@ -1,0 +1,120 @@
+# SONNY-6607 (item 4, startup half): a tenant registry holding a tenant whose parent is
+# not registered refuses startup
+#
+# Bug: `main.zig rehydrateTenantDerivedState` treated an orphan parent (a registry
+# line whose "parent" is not a registered tenant, e.g. after a cascade drop of the
+# parent missed a child) as a warning, so the server started and the tenant ran
+# OUTSIDE the tenant hierarchy (parent tenants could not see it, quotas and
+# hierarchy rules did not apply). Fixed: startup refuses a tenant registry holding
+# an orphan parent (TenantRegistryOrphanParent), naming each tenant on stderr and
+# in the log. A registry that is consistent starts normally.
+#
+# (The other halves of the ticket: tenant create undoing itself when the hierarchy
+# add fails (OOM), a dropping tenant's session refused with TenantDropping, the
+# backfill failure of CREATE INDEX reported to the client, the gRPC max frame size
+# per connection and void-write undo failures need fault injection or in-process
+# races; covered by zig build test-sonny6607-tenant-lifecycle,
+# test-sonny6607-index-backfill-warning, test-sonny6607-grpc-frame-size,
+# test-sonny6607-void-write-errors, test-sonny6607-adjacency-property-read-failure.)
+#
+# What this spec proves: real `geode serve` processes started by the spec on a
+# scratch data directory whose tenants/registry.jsonl is written by the spec,
+# exactly as the ticket's regression does: a consistent registry (parent listed)
+# starts; the same registry with an orphan line is refused with a non-zero exit
+# and never prints "server ready", and the output names the orphan tenant.
+
+version: '1.0'
+name: SONNY-6607 an orphan tenant parent refuses startup
+description: A tenant registry holding a tenant whose parent is not registered refuses startup naming the tenant (SONNY-6607)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s6607-orphan-parent-refuses-startup
+  description: A tenant registry with an orphan parent refuses startup naming the tenant; a consistent registry starts
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:-Geode Test Admin Passphrase}"
+    WORK=/tmp/geode-harness-D.$$.$RANDOM; mkdir -p "$WORK"
+    SRV_PID=""
+    freeport() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    cleanup() {
+      if [ -n "$SRV_PID" ] && kill -0 "$SRV_PID" 2>/dev/null; then kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; fi
+      case "$WORK" in /tmp/geode-harness-D.*) rm -rf "$WORK" ;; esac
+    }
+    trap cleanup EXIT
+    wait_ready() { # wait_ready <log> <seconds>
+      for i in $(seq 1 $(( $2 * 4 ))); do
+        grep -q "server ready" "$1" 2>/dev/null && return 0
+        [ -n "$SRV_PID" ] && ! kill -0 "$SRV_PID" 2>/dev/null && return 1
+        sleep 0.25
+      done
+      return 1
+    }
+
+    mk_registry() { # mk_registry <dir> <with_orphan 0|1>
+      mkdir -p "$1/tenants"
+      printf '{"tenant_id":"healthy6607","parent":null,"created_at_ms":1,"active":true,"has_quota":false}\n' > "$1/tenants/registry.jsonl"
+      printf '{"tenant_id":"child6607","parent":"healthy6607","created_at_ms":2,"active":true,"has_quota":false}\n' >> "$1/tenants/registry.jsonl"
+      [ "$2" = 1 ] && printf '{"tenant_id":"orphan6607","parent":"gone6607","created_at_ms":3,"active":true,"has_quota":false}\n' >> "$1/tenants/registry.jsonl"
+      return 0
+    }
+    run_serve() { # run_serve <dir> <out>
+      Q=$(freeport)
+      GEODE_ADMIN_PASSWORD="$PW" GEODE_LSP_PORT=0 GEODE_ALLOW_TEST_AUDIT_KEYS=1 "$BIN" serve --listen "127.0.0.1:$Q" --data-dir "$1" --log-level info > "$2" 2>&1 < /dev/null &
+      SRV_PID=$!
+      RS_STATE=timeout; RS_RC=""
+      for i in $(seq 1 300); do
+        if ! kill -0 "$SRV_PID" 2>/dev/null; then wait "$SRV_PID"; RS_RC=$?; RS_STATE=exited; break; fi
+        grep -q "server ready" "$2" 2>/dev/null && { RS_STATE=started; break; }
+        sleep 0.2
+      done
+      if [ "$RS_STATE" != exited ]; then kill -TERM "$SRV_PID" 2>/dev/null; for i in $(seq 1 100); do kill -0 "$SRV_PID" 2>/dev/null || break; sleep 0.1; done; kill -9 "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; fi
+      SRV_PID=""
+    }
+    mk_registry "$WORK/ok" 0
+    run_serve "$WORK/ok" "$WORK/ok.out"
+    [ "$RS_STATE" = started ] && echo "consistent_registry=starts" || { echo "CONSISTENT_REGISTRY_DID_NOT_START state=$RS_STATE rc=$RS_RC"; tail -8 "$WORK/ok.out"; }
+    mk_registry "$WORK/orphan" 1
+    run_serve "$WORK/orphan" "$WORK/orphan.out"
+    if [ "$RS_STATE" = exited ] && [ "$RS_RC" -ne 0 ]; then echo "orphan_registry=refused_startup"; else echo "ORPHAN_REGISTRY_STARTED state=$RS_STATE rc=$RS_RC"; fi
+    grep -q "server ready" "$WORK/orphan.out" && echo "ORPHAN_SERVER_BECAME_READY" || echo "orphan_never_ready"
+    grep -q "orphan6607" "$WORK/orphan.out" && echo "orphan_named_in_output" || { echo "ORPHAN_NOT_NAMED"; tail -8 "$WORK/orphan.out"; }
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - consistent_registry=starts
+    - orphan_registry=refused_startup
+    - orphan_never_ready
+    - orphan_named_in_output
+    stdout_not_contains:
+    - DID_NOT_START
+    - ORPHAN_REGISTRY_STARTED
+    - ORPHAN_SERVER_BECAME_READY
+    - ORPHAN_NOT_NAMED
+  tags:
+  - tenant
+  - startup
+  - security
+  - sonny6607
+  - key-assertion

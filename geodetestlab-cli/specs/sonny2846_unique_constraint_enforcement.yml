@@ -1,0 +1,494 @@
+# SONNY-2846 (and SONNY-3358): UNIQUE constraints are enforced on every write path
+#
+# Bug: `CREATE CONSTRAINT ... REQUIRE n.p IS UNIQUE` recorded a catalog row and
+# nothing ever read it, so CREATE, MERGE's create path, SET of a taken value and
+# SET of the constrained label all produced duplicates (in-memory and persisted
+# sessions alike).
+#
+# Fixed behaviour (SQLSTATE 23505, UniqueConstraintViolation; the statement is
+# atomic: a refused statement leaves nothing behind; the message names the
+# constraint, never the value or the holder):
+#   * CREATE of a taken value, a multi-element CREATE containing one, and two new
+#     nodes of one statement that collide are all refused
+#   * a NULL / missing property is no conflict (SQL: NULLs are distinct)
+#   * values compare as MERGE compares them: 1 = 1.0, '1' <> 1
+#   * SET of a taken value and SET n:P adding the constrained label are refused
+#   * a MERGE that matches the holder is fine; a MERGE that would create a
+#     duplicate (also through ON CREATE SET) is refused
+#   * deleting the holder frees the value
+#   * a composite UNIQUE keys on the tuple (a NULL component is no conflict)
+#   * CREATE CONSTRAINT over existing duplicates is refused and creates nothing
+#   * enforcement survives a server restart (the holder is no longer resident)
+#
+# What this spec proves: a real persisted `geode serve` over the QUIC wire (one
+# statement or program per call; refusals exit 1 and answer the 23505 JSON; only
+# the LAST statement of a program prints its result, so each assertion is its
+# own call). cleanup is off so the restart keeps the data directory.
+
+version: '1.0'
+name: SONNY-2846 UNIQUE constraint enforcement on every write path
+description: UNIQUE constraints are enforced on CREATE, MERGE and SET with 23505, atomically, also after a restart (SONNY-2846)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s2846-create-constraints
+  description: Single-property and composite UNIQUE constraints are accepted
+  args:
+  - query
+  - '-'
+  stdin: "CREATE CONSTRAINT u2846_p_id FOR (n:U2846P) REQUIRE n.id IS UNIQUE;\nCREATE CONSTRAINT u2846_r_ab ON :U2846R ASSERT (a, b) IS UNIQUE"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-first-holder
+  description: The first node holding a value is created
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846P {id: 1, name: 'first'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-create-duplicate-refused
+  description: CREATE of a taken value is refused 23505, naming the constraint and never the holder's data
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846P {id: 1, name: 'second'})"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    - u2846_p_id
+    stdout_not_contains:
+    - first
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+  - key-assertion
+- name: s2846-duplicate-left-no-second-holder
+  description: Still exactly one node holds id 1
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U2846P) WHERE n.id = 1 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-duplicate-left-nothing-behind
+  description: The refused CREATE wrote nothing (no node named 'second')
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U2846P) WHERE n.name = 'second' RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-multi-create-atomic
+  description: A multi-element CREATE with one violating element is refused as a whole
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:U2846P {id: 50}), (:U2846P {id: 51}), (:U2846P {id: 1})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+  - atomicity
+- name: s2846-multi-create-left-nothing
+  description: Neither id 50 nor 51 exists after the refused multi-element CREATE
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U2846P) WHERE n.id IN [50, 51] RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - constraints
+  - sonny2846
+  - atomicity
+- name: s2846-same-statement-collision
+  description: Two new nodes of one statement that collide with each other are refused
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:U2846P {id: 7}), (:U2846P {id: 7})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-collision-left-nothing
+  description: Neither colliding node was written
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U2846P) WHERE n.id = 7 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - constraints
+  - sonny2846
+  - atomicity
+- name: s2846-null-and-missing-no-conflict
+  description: Missing and NULL values are no conflict (four such nodes are created)
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846P {name: 'no id a'});\nCREATE (:U2846P {name: 'no id b'});\nCREATE (:U2846P {id: null, name: 'null id a'});\nCREATE (:U2846P {id: null, name: 'null id b'});\nMATCH (n:U2846P) WHERE n.name STARTS WITH 'n' RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":4'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-float-one-collides-with-integer-one
+  description: 1.0 collides with 1 (as MERGE matches them)
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:U2846P {id: 1.0})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-string-one-is-a-distinct-value
+  description: The string '1' is a distinct value from the integer 1
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846P {id: '1'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-set-taken-value-refused
+  description: SET of a value another node holds is refused 23505
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846P {id: 2});\nMATCH (n:U2846P) WHERE n.id = 2 SET n.id = 1"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+  - key-assertion
+- name: s2846-set-left-old-value
+  description: The node whose SET was refused still holds id 2
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U2846P) WHERE n.id = 2 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - constraints
+  - sonny2846
+  - atomicity
+- name: s2846-set-label-refused
+  description: SET adding the constrained label to a node whose id is taken is refused
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846Q {id: 1});\nMATCH (n:U2846Q) WHERE n.id = 1 SET n:U2846P"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-set-label-left-nothing
+  description: The refused SET left the node without the constrained label
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U2846Q:U2846P) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - constraints
+  - sonny2846
+  - atomicity
+- name: s2846-merge-matching-holder-ok
+  description: MERGE that matches the existing holder is not a violation and creates nothing
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:U2846P {id: 1});\nMATCH (n:U2846P) WHERE n.id = 1 RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-merge-create-duplicate-refused
+  description: MERGE whose pattern matches nothing would create a duplicate of id 1 and is refused
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:U2846P {id: 1, name: 'other'})"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-merge-on-create-set-refused
+  description: ON CREATE SET of a taken value is refused
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:U2846P {code: 'z'}) ON CREATE SET n.id = 1"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-merge-on-create-set-left-nothing
+  description: No node with code 'z' exists
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U2846P) WHERE n.code = 'z' RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - constraints
+  - sonny2846
+  - atomicity
+- name: s2846-delete-frees-value
+  description: Deleting the holder frees the value for a new node
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846P {id: 4});\nMATCH (n:U2846P) WHERE n.id = 4 DELETE n;\nCREATE (:U2846P {id: 4});\nMATCH (n:U2846P) WHERE n.id = 4 RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-composite-distinct-tuples-ok
+  description: Composite UNIQUE accepts distinct tuples and a NULL component
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846R {a: 1, b: 1});\nCREATE (:U2846R {a: 1, b: 2});\nCREATE (:U2846R {a: 1});\nCREATE (:U2846R {a: 1});\nMATCH (n:U2846R) RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":4'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-composite-duplicate-refused
+  description: The same (a, b) tuple is refused
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:U2846R {a: 1, b: 1})'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-constraint-over-duplicates-refused
+  description: CREATE CONSTRAINT over data that already holds duplicates is refused
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846D {k: 1}), (:U2846D {k: 1}), (:U2846D {k: 2});\nCREATE CONSTRAINT u2846_d_k FOR (n:U2846D) REQUIRE n.k IS UNIQUE"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-refused-constraint-not-listed
+  description: The refused constraint does not exist; the accepted one does
+  args:
+  - query
+  - '-'
+  stdin: SHOW CONSTRAINTS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - u2846_p_id
+    stdout_not_contains:
+    - u2846_d_k
+  tags:
+  - constraints
+  - sonny2846
+- name: s2846-restart-checkpoint
+  description: Restart the server on the same data directory (the holders are no longer resident)
+  type: bash
+  command: "echo 'restart checkpoint'\n"
+  restart_server: true
+  expect:
+    exit_code: 0
+  tags:
+  - constraints
+  - restart
+  - sonny2846
+- name: s2846-after-restart-create-duplicate-refused
+  description: After a restart the constraint is still enforced against the persisted holder
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846P {id: 1, name: 'after restart'})"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    - u2846_p_id
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+  - restart
+  - key-assertion
+- name: s2846-after-restart-set-refused
+  description: After a restart SET of a taken value is still refused
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U2846P) WHERE n.id = 2 SET n.id = 1
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+  - restart
+- name: s2846-after-restart-merge-refused
+  description: After a restart a MERGE that would duplicate is still refused
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:U2846P {id: 1, name: 'again'})"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - constraints
+  - sonny2846
+  - restart
+- name: s2846-after-restart-fresh-value-ok
+  description: After a restart a fresh value is still accepted
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:U2846P {id: 9999});\nMATCH (n:U2846P) WHERE n.id = 9999 RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - constraints
+  - sonny2846
+  - restart

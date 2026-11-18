@@ -1,0 +1,116 @@
+# SONNY-6567 (item 4): a tenant drop is refused inside a transaction
+#
+# Bug (the observable part):
+#   4. `geode.tenant.drop` ran inside an explicit transaction although a drop
+#      cannot be undone; it is refused (TenantDropInTransaction) and leaves the
+#      tenant registered.
+#   (Not black-box: 1 the gRPC client defects (`geode query --grpc` printed 384 of
+#   4,000 rows and exited 0; every Execute reused HTTP/2 stream 3): the gRPC
+#   listener requires TLS and the CLI's gRPC client speaks plaintext HTTP/2 only
+#   on a release binary, so no client the harness can run reaches it
+#   (zig build test-sonny6567-grpc-stream-ids drives the real client against a
+#   real server); 2 hydrated getters turning engine errors into null, 3 an
+#   unreadable FTS hit, 4's failure-injection halves, 5 startup auth hydration
+#   under load failures, 6 raft apply; covered by
+#   zig build test-sonny6567-hydrated-getter-errors, -fts-unreadable-hit,
+#   -tenant-drop-failures, -auth-hydration and -raft-apply-hydration.)
+#
+# What this spec proves: against a real server over the wire,
+#   * a tenant drop inside START TRANSACTION fails and the tenant is still listed,
+#     and the same drop outside a transaction succeeds.
+
+version: '1.0'
+name: SONNY-6567 tenant drop is refused inside a transaction
+description: geode.tenant.drop is refused inside an explicit transaction and leaves the tenant registered (SONNY-6567)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s6567-tenant-create
+  description: Create a tenant
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.tenant.create('t6567')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - tenant
+  - sonny6567
+- name: s6567-tenant-drop-in-transaction-refused
+  description: geode.tenant.drop inside START TRANSACTION is refused with TenantDropInTransaction
+  args:
+  - query
+  - '-'
+  stdin: "START TRANSACTION;\nCALL geode.tenant.drop('t6567', true);\nCOMMIT"
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"58000"'
+    - TenantDropInTransaction
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - tenant
+  - transactions
+  - sonny6567
+  - key-assertion
+- name: s6567-tenant-still-registered
+  description: The refused drop left the tenant registered
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.tenant.list()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - t6567
+  tags:
+  - tenant
+  - sonny6567
+- name: s6567-tenant-drop-outside-transaction
+  description: The same drop outside a transaction succeeds
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.tenant.drop('t6567', true)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - tenant
+  - sonny6567
+- name: s6567-tenant-gone
+  description: The tenant is gone after the drop
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.tenant.list()
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - t6567
+  tags:
+  - tenant
+  - sonny6567

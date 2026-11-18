@@ -1,0 +1,471 @@
+# SONNY-6368: full-text and vector indexes follow SET n:L, REMOVE n.prop and every label;
+# a repeated SET target answers 22G0M
+#
+# Bugs (index maintenance gaps found during SONNY-3381):
+#   1. a repeated SET target (SET q.c = 1, q.c = 2) answered 22G03; ISO/IEC
+#      39075:2024 13.3 GR 7a names 22G0M (multiple assignments to a graph element
+#      property)
+#   3. a live `SET n:L` put the node in neither the full-text nor the vector
+#      indexes on L, so neither search found it
+#   4. a committed `REMOVE n.prop` left the removed text in the full-text index,
+#      so the node stayed findable by the removed word
+#   5. vector maintenance used only the node's FIRST label, so an index on a
+#      second label went stale
+#   (2: CALL geode.fts.rebuild from a session on another graph rebuilds the
+#   default graph's index, where every full-text index lives, by design; 6 is an
+#   in-process race with a concurrent rebuild; both covered by
+#   zig build test-sonny6368-index-maintenance.)
+#
+# What this spec proves (real server, QUIC wire): after each of those writes the
+# search procedures answer for the current store contents. Row counts are taken
+# with `YIELD ... RETURN count(...)` so the assertions are exact.
+
+version: '1.0'
+name: 'SONNY-6368 index maintenance: SET n:L, REMOVE n.prop, second labels, 22G0M'
+description: Full-text and vector indexes follow SET n:L, REMOVE n.prop and every label of a node, and a repeated SET target answers 22G0M (SONNY-6368)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s6368-set-setup
+  description: A node to assign to
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:Q6368 {i: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - set
+  - sonny6368
+- name: s6368-repeated-set-target
+  description: A SET clause assigning one property twice is refused 22G0M (it answered 22G03)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (q:Q6368 {i: 1}) SET q.c = 1, q.c = 2'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0M"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - set
+  - sonny6368
+  - key-assertion
+- name: s6368-repeated-set-two-vars
+  description: Two variables bound to one node assigned the same property is refused 22G0M
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:Q6368 {i: 1}), (b:Q6368 {i: 1}) SET a.c = 1, b.c = 2'
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0M"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - set
+  - sonny6368
+- name: s6368-repeated-set-left-nothing
+  description: The refused SET left no property c behind
+  args:
+  - query
+  - '-'
+  stdin: MATCH (q:Q6368) WHERE q.c IS NOT NULL RETURN count(q) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - set
+  - sonny6368
+- name: s6368-distinct-set-targets-ok
+  description: Assigning two different properties is still fine
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (q:Q6368 {i: 1}) SET q.c = 1, q.d = 2 RETURN q.c AS c, q.d AS d'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+    - '"d":2'
+  tags:
+  - set
+  - sonny6368
+- name: s6368-fts-index-l
+  description: Create a fulltext index on label L6368
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX l6368 FOR (n:L6368) ON (n.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-node-with-other-label
+  description: A node with another label carrying the indexed property
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P6368 {k: 1, body: 'walnut'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-before-set-label
+  description: Before SET n:L the node is not in the index
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('l6368', 'walnut') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-set-label
+  description: SET n:L6368 on the node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:P6368) WHERE p.k = 1 SET p:L6368
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-after-set-label
+  description: After SET n:L the node is found by its text (it was in neither index)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('l6368', 'walnut') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - fts
+  - sonny6368
+  - key-assertion
+- name: s6368-fts-set-label-with-prop
+  description: SET n:L, n.x in one clause also joins the index
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P6368 {k: 3, body: 'pecan'});\nMATCH (p:P6368) WHERE p.k = 3 SET p:L6368, p.x = 1 RETURN p.k AS k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"k":3'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-set-label-with-prop-found
+  description: The node of SET n:L, n.x is found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('l6368', 'pecan') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-remove-setup
+  description: Nodes for REMOVE n.prop
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:D6368 {k: 1, body: 'cherry'}), (:D6368 {k: 2, title: 'almond', body: 'quince'}), (:D6368 {k: 3, body: 'cherry'});\nCREATE INDEX d6368 FOR (n:D6368) ON (n.title, n.body) USING fulltext"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-remove-seeded
+  description: Both cherry nodes are indexed
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('d6368', 'cherry') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-remove-prop
+  description: REMOVE d.body on the first cherry node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (d:D6368) WHERE d.k = 1 REMOVE d.body
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-remove-took-text-out
+  description: The node is no longer findable by the removed word (it stayed findable)
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('d6368', 'cherry') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - fts
+  - sonny6368
+  - key-assertion
+- name: s6368-fts-remove-one-of-two
+  description: REMOVE one of two indexed properties
+  args:
+  - query
+  - '-'
+  stdin: MATCH (d:D6368) WHERE d.k = 2 REMOVE d.title
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-removed-word-gone
+  description: The removed title word is gone
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('d6368', 'almond') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-other-property-kept
+  description: The other property's word is still found
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('d6368', 'quince') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-remove-in-transaction
+  description: A committed REMOVE inside a transaction also takes the text out
+  args:
+  - query
+  - '-'
+  stdin: "START TRANSACTION;\nMATCH (d:D6368) WHERE d.k = 3 REMOVE d.body;\nCOMMIT"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-remove-committed
+  description: After the commit no cherry node is findable
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('d6368', 'cherry') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":0'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-set-after-remove
+  description: SET after REMOVE re-indexes the new text
+  args:
+  - query
+  - '-'
+  stdin: MATCH (d:D6368) WHERE d.k = 1 SET d.body = 'damson'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-fts-set-after-remove-found
+  description: The new text is findable
+  args:
+  - query
+  - '-'
+  stdin: CALL geode.fts.search('d6368', 'damson') YIELD node RETURN count(node) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - fts
+  - sonny6368
+- name: s6368-vec-index-lv
+  description: Create a vector index on label LV6368
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX lv6368 ON LV6368 (embl6368) USING vector WITH (metric = 'l2')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - vector
+  - sonny6368
+- name: s6368-vec-seed
+  description: One indexed node and two nodes under another label
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:LV6368 {k: 0, embl6368: vectorf32([1.0, 0.0, 0.0])});\nCREATE (:P6368 {k: 2, embl6368: vectorf32([0.0, 1.0, 0.0])})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - vector
+  - sonny6368
+- name: s6368-vec-set-label
+  description: SET n:LV6368 puts the node in the vector index on LV6368
+  args:
+  - query
+  - '-'
+  stdin: MATCH (p:P6368) WHERE p.k = 2 SET p:LV6368
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - vector
+  - sonny6368
+- name: s6368-vec-knn-finds-set-label-node
+  description: knn over the index finds the node that joined by SET n:L (it was stale)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:LV6368) WHERE id(v) IN knn('embl6368', vectorf32([0.0, 0.9, 0.1]), 1, 'l2') AND v.k = 2 RETURN count(v) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - vector
+  - sonny6368
+  - key-assertion
+- name: s6368-vec-second-label-index
+  description: Create a vector index on label B6368
+  args:
+  - query
+  - '-'
+  stdin: CREATE INDEX b6368 ON B6368 (embb6368) USING vector WITH (metric = 'l2')
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - vector
+  - sonny6368
+- name: s6368-vec-second-label-create
+  description: A node whose FIRST label is A6368 and whose second is B6368
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:A6368:B6368 {k: 1, embb6368: vectorf32([0.0, 0.0, 1.0])});\nCREATE (:B6368 {k: 2, embb6368: vectorf32([1.0, 1.0, 0.0])})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - vector
+  - sonny6368
+- name: s6368-vec-second-label-update
+  description: SET a new embedding on the second-label node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:A6368) WHERE n.k = 1 SET n.embb6368 = vectorf32([5.0, 5.0, 5.0])
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - vector
+  - sonny6368
+- name: s6368-vec-second-label-knn-new
+  description: The index on the SECOND label sees the new embedding (maintenance used only the first label)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (v:B6368) WHERE id(v) IN knn('embb6368', vectorf32([5.0, 5.0, 5.0]), 1, 'l2') AND v.k = 1 RETURN count(v) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - vector
+  - sonny6368
+  - key-assertion

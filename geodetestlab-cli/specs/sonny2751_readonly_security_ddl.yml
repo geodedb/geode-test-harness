@@ -1,0 +1,219 @@
+version: '1.0'
+name: SONNY-2751 read-only request refuses security DDL
+description: |
+  SONNY-2751: statement classification grouped CREATE/ALTER/DROP USER,
+  CREATE/DROP ROLE, GRANT, REVOKE and CREATE/ALTER/DROP POLICY (and
+  ALTER USER <self> SET PASSWORD, which was intercepted from raw text before
+  the gate) with session statements as "no write". A request marked
+  read_only (`geode query --read-only`, ExecuteRequest.read_only) therefore
+  still ran them; each only had its own Admin check, and the caller here IS
+  an Admin.
+
+  Fixed behaviour proved here, over the real wire as an Admin:
+    - every security DDL statement (and the mutating geode.auth.* procedures)
+      sent with --read-only is refused with GQLSTATUS 42501 "Read-only
+      request";
+    - the refusals change nothing (the user is not created, the existing
+      user keeps her role, her password and her grant, the role is not
+      created);
+    - read-only security statements (SHOW USERS / SHOW GRANTS / SHOW ROLES /
+      geode.auth.grant_list) are still allowed under --read-only (no
+      over-classification);
+    - control: without --read-only the same Admin runs the same DDL.
+
+  Engine regression: zig build test-sonny2751-readonly-security-ddl.
+
+  CANARY: REQ=REQ-SONNY-2751-READONLY-SECURITY-DDL; FEATURE="ReadOnlyRequestFloor"; ASPECT=SecurityDDL; STATUS=TESTED; TEST=self; OWNER=security; UPDATED=2026-11-17
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+tags: [auth, security, read-only, sonny-2751]
+tests:
+
+- name: s2751_setup_user
+  description: Admin (not read-only) creates a user that the refused statements will target.
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER ro2751_alice SET PASSWORD 'Read Only Passphrase One' ROLE readonly]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s2751_setup_graph
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH ro2751g]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_create_user_refused
+  description: CREATE USER under --read-only is refused 42501.
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', CREATE USER ro2751_new SET PASSWORD 'Read Only Passphrase Two' ROLE readonly]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_alter_user_password_refused
+  description: ALTER USER SET PASSWORD (another user) under --read-only is refused 42501.
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', ALTER USER ro2751_alice SET PASSWORD 'Read Only Passphrase Three']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_alter_user_role_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', ALTER USER ro2751_alice SET ROLE admin]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_alter_user_disable_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', ALTER USER ro2751_alice DISABLE]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_drop_user_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', DROP USER ro2751_alice]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_create_role_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', CREATE ROLE ro2751_role SET DESCRIPTION 'x']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_grant_role_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', GRANT ROLE readwrite TO ro2751_alice]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_grant_graph_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', GRANT READ ON GRAPH ro2751g TO ro2751_alice]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_revoke_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', REVOKE READ ON GRAPH ro2751g FROM ro2751_alice]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_create_policy_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', CREATE POLICY ro2751_pol ON GRAPH * FOR READ]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_drop_policy_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', DROP POLICY IF EXISTS ro2751_pol]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_proc_user_create_refused
+  description: The mutating geode.auth.* procedures are refused too.
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', "CALL geode.auth.user_create('ro2751_proc', 'Read Only Passphrase Four')"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_proc_grant_refused
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', "CALL geode.auth.grant('READ', 'ro2751_alice', 'ro2751g')"]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"', Read-only request]
+    stdout_not_contains: ['"status_class":"00000"']
+
+- name: s2751_ro_show_users_allowed
+  description: Control, no over-classification - SHOW USERS under --read-only still runs, and shows that no refused CREATE took effect.
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', SHOW USERS]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', ro2751_alice]
+    stdout_not_contains: [ro2751_new, ro2751_proc, '"status_class":"42501"']
+
+- name: s2751_ro_show_roles_allowed
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', SHOW ROLES]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: [ro2751_role, '"status_class":"42501"']
+
+- name: s2751_ro_show_grants_allowed
+  description: Control - SHOW GRANTS FOR is read-only; no refused GRANT took effect (no grant row for the graph).
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', SHOW GRANTS FOR ro2751_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: [ro2751g, '"status_class":"42501"']
+
+- name: s2751_ro_grant_list_proc_allowed
+  description: Control - geode.auth.grant_list is on the read-only procedure list.
+  args: [query, --read-only, -U, geode, -P, '${secret:admin_password}', CALL geode.auth.grant_list('ro2751_alice')]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42501"']
+
+- name: s2751_alice_keeps_old_password
+  description: The refused ALTER USER SET PASSWORD changed nothing - alice still logs in with the original password.
+  args: [query, -U, ro2751_alice, -P, Read Only Passphrase One, RETURN 1 AS ok]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"ok":1']
+
+- name: s2751_alice_still_not_admin
+  description: The refused ALTER USER SET ROLE admin changed nothing - alice is still readonly and cannot run admin DDL.
+  args: [query, -U, ro2751_alice, -P, Read Only Passphrase One, CREATE USER ro2751_escalated SET PASSWORD 'Read Only Passphrase Five' ROLE readonly]
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42501"']
+
+- name: s2751_control_without_read_only_runs
+  description: Control - without --read-only the same Admin runs the same GRANT (the refusal above was the read-only floor's).
+  args: [query, -U, geode, -P, '${secret:admin_password}', GRANT READ ON GRAPH ro2751g TO ro2751_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+    stdout_not_contains: ['"status_class":"42501"']
+
+- name: s2751_grant_now_visible
+  args: [query, -U, geode, -P, '${secret:admin_password}', SHOW GRANTS FOR ro2751_alice]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', ro2751g]

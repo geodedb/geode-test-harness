@@ -1,0 +1,243 @@
+version: '1.0'
+name: SONNY-6544 DSN password with '@', relative HOME, MCP completion shape
+description: |
+  Ticket: SONNY-6544.
+  Bug: (1) `--dsn quic://admin:p@ss@host` split at the FIRST '@': logged in as
+  password 'p' against host 'ss@host', and `geode shell` printed that tail of
+  the password in its "Connecting to" line; (2) a relative or empty HOME
+  panicked `geode query` in Debug / wrote state under the working directory;
+  (3) the MCP `completion/complete` handler answered `[]` instead of the MCP
+  CompleteResult shape.
+  Spec proves on the real binary: a user whose password contains '@' and ':'
+  logs in through `--dsn` (userinfo ends at its LAST '@') and neither `query`
+  nor `shell` ever prints a fragment of the password; `geode query`, `auth
+  token`, `session info` and `auth login --save-session` with a relative or
+  empty HOME refuse with "HOME is empty or not an absolute path", no panic and
+  no files created under the working directory; a real `geode mcp --stdio`
+  session answers `completion/complete` with {"result":{"completion":{"values":[...]}}}.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6544-dsn-password-with-at-sign
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    UPW='At@Sign:Pass Is Long Enough 6544'
+    UPE=${UPW// /%20}
+    OUT=$(HOME="$H" "$BIN" query --server "$ADDR" --insecure-tls-skip-verify --no-saved-session -U geode -P "$PW" "CREATE USER at6544 SET PASSWORD '$UPW' ROLE readwrite" 2>&1); RC=$?
+    [ "$RC" -eq 0 ] || { echo "FAIL create user rc=$RC"; echo "$OUT"; exit 1; }
+    DSN="quic://at6544:$UPE@$ADDR?insecure=true"
+    OUT=$(HOME="$H" "$BIN" query --dsn "$DSN" --no-saved-session --timeout 10 "RETURN 6544 * 7 AS x" 2>&1); RC=$?
+    [ "$RC" -eq 0 ] && echo "$OUT" | grep -q 45808 || { echo "FAIL dsn login rc=$RC"; echo "$OUT"; exit 1; }
+    for frag in "Sign:Pass" "Long%20Enough" "Long Enough"; do echo "$OUT" | grep -qF "$frag" && { echo "FAIL query output leaks password fragment '$frag'"; echo "$OUT"; exit 1; }; done
+    OUT=$(printf 'RETURN 1 AS x;\n\\q\n' | HOME="$H" timeout 30 "$BIN" shell --dsn "$DSN" 2>&1)
+    for frag in "Sign:Pass" "Long%20Enough" "Long Enough" "$UPW"; do echo "$OUT" | grep -qF "$frag" && { echo "FAIL shell output leaks password fragment '$frag'"; echo "$OUT"; exit 1; }; done
+    # a wrong password must be refused (the tail after the first '@' is not "the host")
+    OUT=$(HOME="$H" "$BIN" query --dsn "quic://at6544:At@Sign:Wrong@$ADDR?insecure=true" --no-saved-session --timeout 10 "RETURN 6544 * 7 AS x" 2>&1); RC=$?
+    [ "$RC" -ne 0 ] && ! echo "$OUT" | grep -q 45808 || { echo "FAIL wrong password accepted rc=$RC"; echo "$OUT"; exit 1; }
+    echo "AT_PASSWORD_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [AT_PASSWORD_OK]
+  tags: [cli, dsn, sonny6544]
+
+- name: sonny6544-relative-or-empty-home-refused
+  type: bash
+  command: |
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+    fails=0
+    chk() { # label home args...
+      label="$1"; home="$2"; shift 2
+      before=$(cd "$W" && find . | sort)
+      OUT=$(cd "$W" && HOME="$home" "$BIN" "$@" </dev/null 2>&1); RC=$?
+      after=$(cd "$W" && find . | sort)
+      if [ "$RC" -eq 0 ] || ! echo "$OUT" | grep -q "HOME is empty or not an absolute path" || echo "$OUT" | grep -qiE "panic|unreachable"; then
+        echo "FAIL $label home='$home' rc=$RC"; echo "$OUT"; fails=$((fails+1))
+      fi
+      [ "$before" = "$after" ] || { echo "FAIL $label home='$home' created files under cwd:"; diff <(echo "$before") <(echo "$after"); fails=$((fails+1)); }
+    }
+    for h in relhome "" .; do
+      chk "query" "$h" query --server "$ADDR" --insecure-tls-skip-verify --timeout 5 "RETURN 1"
+    done
+    for h in relhome ""; do
+      chk "auth token" "$h" auth token
+      chk "session info" "$h" session info
+    done
+    chk "login --save-session" relhome auth login --server "$ADDR" -U geode -P "$PW" --insecure-tls-skip-verify --save-session
+    [ "$fails" -eq 0 ] || exit 1
+    echo "HOME_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [HOME_OK]
+  tags: [cli, sonny6544]
+
+- name: sonny6544-mcp-completion-result-shape
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    PWE=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=''))" "$PW")
+    EP="quic://$ADDR?insecure=true&user=geode&pass=$PWE"
+    OUT=$(printf '%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"sonny6544","version":"1.0"}}}' \
+      '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+      '{"jsonrpc":"2.0","id":2,"method":"completion/complete"}' \
+      '{"jsonrpc":"2.0","id":3,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"explore_graph"},"argument":{"name":"graph","value":"so"}}}' \
+      | HOME="$H" timeout 60 "$BIN" mcp --stdio --no-auth --endpoint "$EP" 2>/dev/null)
+    echo "$OUT" | python3 -c '
+    import sys, json
+    seen = {}
+    for line in sys.stdin:
+        line = line.strip()
+        if not line: continue
+        m = json.loads(line)
+        if m.get("id") in (2, 3): seen[m["id"]] = m
+    for i in (2, 3):
+        m = seen.get(i)
+        assert m is not None, "no response to id %d" % i
+        assert "error" not in m, "id %d error: %s" % (i, m["error"])
+        r = m["result"]
+        assert isinstance(r, dict), "id %d result is not an object: %r" % (i, r)
+        c = r.get("completion")
+        assert isinstance(c, dict), "id %d result has no completion object: %r" % (i, r)
+        v = c.get("values")
+        assert isinstance(v, list) and len(v) <= 100 and all(isinstance(x, str) for x in v), "bad values %r" % (v,)
+    print("COMPLETION_SHAPE_OK")
+    '
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [COMPLETION_SHAPE_OK]
+  tags: [mcp, sonny6544]

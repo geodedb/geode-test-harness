@@ -1,0 +1,413 @@
+version: '1.0'
+name: 'SONNY-6645: chained WITH ... MATCH keeps MATCH variables; list-form shortest_path refused; LET and sibling-alias scope; NULL arguments'
+description: |
+  Ticket: SONNY-6645.
+  (1) WITH 1 AS a WITH a, 2 AS b MATCH (n) RETURN n.k, b lost the MATCH variables
+  (n.k NULL, WHERE never matched); (2) the one-argument list form
+  shortest_path([a, b]) fabricated a two-node path; (3) a leading LET a = b, b = 1
+  read b as NULL; (4) bigint/smallint/real/double/toReal/datetime/power with a NULL
+  argument raised TypeMismatch instead of returning NULL; (5) a WITH or RETURN item
+  read a sibling item's alias (silent NULL); it is now 42000 Variable not in scope.
+  Proves the chained-MATCH rows, the refusals (22G03 for the list-form path, 42000
+  for the forward LET and the sibling-alias reads), NULL-in/NULL-out, and that
+  GROUP BY / ORDER BY still see the aliases, on both sessions.
+
+    Every query runs on two sessions of the same server, over QUIC through the real
+    geode CLI: the admin on graph qa (no row-level security) and bob on graph qb,
+    where the same data plus one X:Hidden node is stored and bob is denied label
+    Hidden with CALL geode.rls.add_deny_policy (a row-level-security session, which
+    geode serves through the legacy read executor). The expected answers are the
+    same for both sessions, so the spec also proves the two executors agree.
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 60000
+    format: json
+secrets:
+  admin_password:
+    source: env
+    key: GEODE_ADMIN_PASSWORD
+    required: false
+    default: GeodeTestPassword123!
+invariants:
+- type: server_running
+fuzz:
+  enabled: false
+
+tests:
+- name: s6645-create-graph-qa
+  description: 'qa: plain graph read by the admin (no row-level security).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH qa]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s6645, setup]
+
+- name: s6645-create-graph-qb
+  description: 'qb: graph read by bob, who is denied label Hidden (a row-level-security session).'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE GRAPH qb]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"']
+  tags: [s6645, setup]
+
+- name: s6645-create-user-bob
+  description: 'bob: a readwrite user.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', CREATE USER bob SET PASSWORD 'Bob Query Passphrase For Testing' ROLE readwrite]
+  expect:
+    exit_code: 0
+    stdout_contains: [created bob]
+  tags: [s6645, setup]
+
+- name: s6645-seed-qa
+  description: Seed graph qa with the Y-R->Q-R->X chains, the Z rows and the S edges.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH qa;
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0});
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1});
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2});
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3});
+    CREATE (:Z {k: 0, g: 0, r: 7});
+    CREATE (:Z {k: 1, g: 0, r: 6});
+    CREATE (:Z {k: 2, g: 0, r: 5});
+    CREATE (:Z {k: 3, g: 0, r: 4});
+    CREATE (:Z {k: 4, g: 1, r: 3});
+    CREATE (:Z {k: 5, g: 1, r: 2});
+    CREATE (:Z {k: 6, g: 1, r: 1});
+    CREATE (:Z {k: 7, g: 1, r: 0});
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b);
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a)
+  expect:
+    exit_code: 0
+  tags: [s6645, setup]
+
+- name: s6645-seed-qb
+  description: Seed graph qb with the Y-R->Q-R->X chains, the Z rows and the S edges, plus one X:Hidden node bob may not read.
+  args: [query, -U, geode, -P, '${secret:admin_password}', '-']
+  stdin: |
+    USE GRAPH qb;
+    CREATE (:Y {k: 0})-[:R]->(:Q {k: 0, f: 1})-[:R {w: 0}]->(:X {k: 0});
+    CREATE (:Y {k: 1})-[:R]->(:Q {k: 1, f: 1})-[:R {w: 1}]->(:X {k: 1});
+    CREATE (:Y {k: 2})-[:R]->(:Q {k: 2})-[:R {w: 2}]->(:X {k: 2});
+    CREATE (:Y {k: 3})-[:R]->(:Q {k: 3})-[:R {w: 3}]->(:X {k: 3});
+    CREATE (:Z {k: 0, g: 0, r: 7});
+    CREATE (:Z {k: 1, g: 0, r: 6});
+    CREATE (:Z {k: 2, g: 0, r: 5});
+    CREATE (:Z {k: 3, g: 0, r: 4});
+    CREATE (:Z {k: 4, g: 1, r: 3});
+    CREATE (:Z {k: 5, g: 1, r: 2});
+    CREATE (:Z {k: 6, g: 1, r: 1});
+    CREATE (:Z {k: 7, g: 1, r: 0});
+    MATCH (a:Q {k: 0}), (b:Q {k: 1}) CREATE (a)-[:S]->(b);
+    MATCH (a:Q {k: 3}) CREATE (a)-[:S]->(a);
+    MATCH (q:Q {k: 0}) CREATE (q)-[:R {w: 9}]->(:X:Hidden {k: 99})
+  expect:
+    exit_code: 0
+  tags: [s6645, setup]
+
+- name: s6645-deny-hidden
+  description: 'Deny bob label Hidden: his sessions are RLS-filtered.'
+  args: [query, -U, geode, -P, '${secret:admin_password}', "CALL geode.rls.add_deny_policy('qb', 'Hidden', 'bob')"]
+  expect:
+    exit_code: 0
+    stdout_contains: [deny policy added, '"status_class":"00000"']
+  tags: [s6645, setup]
+
+- name: s6645-control-rls-active
+  description: "Control: the admin sees the Hidden node in qb, bob does not (so bob's reads really are filtered)."
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qb, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":1}]']
+  tags: [s6645, setup]
+
+- name: s6645-control-rls-bob
+  description: 'Control: bob sees no Hidden node.'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, MATCH (x:Hidden) RETURN count(x) AS c]
+  expect:
+    exit_code: 0
+    stdout_contains: ['"rows":[{"c":0}]']
+  tags: [s6645, setup]
+
+- name: s6645-ch1-qa
+  description: 'SONNY-6645 [admin (no RLS)]: WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k = b RETURN n.k AS k, a'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k = b RETURN n.k AS k, a']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":2,"a":1}]']
+  tags: [s6645]
+
+- name: s6645-ch1-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k = b RETURN n.k AS k, a'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k = b RETURN n.k AS k, a']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":2,"a":1}]']
+  tags: [s6645]
+
+- name: s6645-ch2-qa
+  description: 'SONNY-6645 [admin (no RLS)]: WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k >= a AND n.k < 4 RETURN count(n) AS c'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k >= a AND n.k < 4 RETURN count(n) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":3}]']
+  tags: [s6645]
+
+- name: s6645-ch2-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k >= a AND n.k < 4 RETURN count(n) AS c'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k >= a AND n.k < 4 RETURN count(n) AS c']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"c":3}]']
+  tags: [s6645]
+
+- name: s6645-ch3-qa
+  description: 'SONNY-6645 [admin (no RLS)]: WITH 1 AS a WITH a + 1 AS b MATCH (n:Z {k: b}) RETURN n.k AS k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'WITH 1 AS a WITH a + 1 AS b MATCH (n:Z {k: b}) RETURN n.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":2}]']
+  tags: [s6645]
+
+- name: s6645-ch3-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: WITH 1 AS a WITH a + 1 AS b MATCH (n:Z {k: b}) RETURN n.k AS k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'WITH 1 AS a WITH a + 1 AS b MATCH (n:Z {k: b}) RETURN n.k AS k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":2}]']
+  tags: [s6645]
+
+- name: s6645-ch4-qa
+  description: 'SONNY-6645 [admin (no RLS)]: UNWIND [1, 2] AS a WITH a MATCH (n:Z) WHERE n.k = a RETURN a, n.k AS k ORDER BY a'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'UNWIND [1, 2] AS a WITH a MATCH (n:Z) WHERE n.k = a RETURN a, n.k AS k ORDER BY a']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"a":1,"k":1},{"a":2,"k":2}]']
+  tags: [s6645]
+
+- name: s6645-ch4-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: UNWIND [1, 2] AS a WITH a MATCH (n:Z) WHERE n.k = a RETURN a, n.k AS k ORDER BY a'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'UNWIND [1, 2] AS a WITH a MATCH (n:Z) WHERE n.k = a RETURN a, n.k AS k ORDER BY a']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"a":1,"k":1},{"a":2,"k":2}]']
+  tags: [s6645]
+
+- name: s6645-ch5-qa
+  description: 'SONNY-6645 [admin (no RLS)]: WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, b ORDER BY k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, b ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":0,"b":2},{"k":1,"b":2}]']
+  tags: [s6645]
+
+- name: s6645-ch5-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, b ORDER BY k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'WITH 1 AS a WITH a, 2 AS b MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, b ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":0,"b":2},{"k":1,"b":2}]']
+  tags: [s6645]
+
+- name: s6645-sp1-qa
+  description: 'SONNY-6645 [admin (no RLS)]: MATCH (a:Y {k: 0}), (b:Y {k: 1}) RETURN shortest_path([a, b]) AS p'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (a:Y {k: 0}), (b:Y {k: 1}) RETURN shortest_path([a, b]) AS p']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22G03"']
+  tags: [s6645]
+
+- name: s6645-sp1-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: MATCH (a:Y {k: 0}), (b:Y {k: 1}) RETURN shortest_path([a, b]) AS p'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (a:Y {k: 0}), (b:Y {k: 1}) RETURN shortest_path([a, b]) AS p']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22G03"']
+  tags: [s6645]
+
+- name: s6645-sp2-qa
+  description: 'SONNY-6645 [admin (no RLS)]: MATCH (a:Y {k: 0}), (b:Y {k: 1}) RETURN all_shortest_paths([a, b]) AS p'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (a:Y {k: 0}), (b:Y {k: 1}) RETURN all_shortest_paths([a, b]) AS p']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22G03"']
+  tags: [s6645]
+
+- name: s6645-sp2-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: MATCH (a:Y {k: 0}), (b:Y {k: 1}) RETURN all_shortest_paths([a, b]) AS p'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (a:Y {k: 0}), (b:Y {k: 1}) RETURN all_shortest_paths([a, b]) AS p']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"22G03"']
+  tags: [s6645]
+
+- name: s6645-let1-qa
+  description: 'SONNY-6645 [admin (no RLS)]: LET a = b, b = 1 RETURN a'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'LET a = b, b = 1 RETURN a']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+  tags: [s6645]
+
+- name: s6645-let1-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: LET a = b, b = 1 RETURN a'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'LET a = b, b = 1 RETURN a']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+  tags: [s6645]
+
+- name: s6645-let2-qa
+  description: 'SONNY-6645 [admin (no RLS)]: LET a = 1, b = a RETURN b'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'LET a = 1, b = a RETURN b']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"b":1}]']
+  tags: [s6645]
+
+- name: s6645-let2-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: LET a = 1, b = a RETURN b'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'LET a = 1, b = a RETURN b']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"b":1}]']
+  tags: [s6645]
+
+- name: s6645-nul1-qa
+  description: 'SONNY-6645 [admin (no RLS)]: RETURN bigint(NULL) AS a, smallint(NULL) AS b, real(NULL) AS c, double(NULL) AS d'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'RETURN bigint(NULL) AS a, smallint(NULL) AS b, real(NULL) AS c, double(NULL) AS d']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"a":null,"b":null,"c":null,"d":null}]']
+  tags: [s6645]
+
+- name: s6645-nul1-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: RETURN bigint(NULL) AS a, smallint(NULL) AS b, real(NULL) AS c, double(NULL) AS d'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'RETURN bigint(NULL) AS a, smallint(NULL) AS b, real(NULL) AS c, double(NULL) AS d']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"a":null,"b":null,"c":null,"d":null}]']
+  tags: [s6645]
+
+- name: s6645-nul2-qa
+  description: 'SONNY-6645 [admin (no RLS)]: RETURN toReal(NULL) AS a, datetime(NULL) AS b, power(NULL, 2) AS c, power(2, NULL) AS d'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'RETURN toReal(NULL) AS a, datetime(NULL) AS b, power(NULL, 2) AS c, power(2, NULL) AS d']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"a":null,"b":null,"c":null,"d":null}]']
+  tags: [s6645]
+
+- name: s6645-nul2-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: RETURN toReal(NULL) AS a, datetime(NULL) AS b, power(NULL, 2) AS c, power(2, NULL) AS d'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'RETURN toReal(NULL) AS a, datetime(NULL) AS b, power(NULL, 2) AS c, power(2, NULL) AS d']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"a":null,"b":null,"c":null,"d":null}]']
+  tags: [s6645]
+
+- name: s6645-sib1-qa
+  description: 'SONNY-6645 [admin (no RLS)]: RETURN 1 AS a, a + 1 AS b'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'RETURN 1 AS a, a + 1 AS b']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+  tags: [s6645]
+
+- name: s6645-sib1-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: RETURN 1 AS a, a + 1 AS b'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'RETURN 1 AS a, a + 1 AS b']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+  tags: [s6645]
+
+- name: s6645-sib2-qa
+  description: 'SONNY-6645 [admin (no RLS)]: WITH 1 AS a, a + 1 AS b RETURN b'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'WITH 1 AS a, a + 1 AS b RETURN b']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+  tags: [s6645]
+
+- name: s6645-sib2-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: WITH 1 AS a, a + 1 AS b RETURN b'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'WITH 1 AS a, a + 1 AS b RETURN b']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+  tags: [s6645]
+
+- name: s6645-sib3-qa
+  description: 'SONNY-6645 [admin (no RLS)]: MATCH (n:Z) WITH n.k AS k, k * 2 AS d RETURN d'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (n:Z) WITH n.k AS k, k * 2 AS d RETURN d']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+  tags: [s6645]
+
+- name: s6645-sib3-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: MATCH (n:Z) WITH n.k AS k, k * 2 AS d RETURN d'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (n:Z) WITH n.k AS k, k * 2 AS d RETURN d']
+  expect:
+    exit_code: 1
+    stdout_contains: ['"status_class":"42000"']
+  tags: [s6645]
+
+- name: s6645-sib4-qa
+  description: 'SONNY-6645 [admin (no RLS)]: MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, n.k * 2 AS d ORDER BY k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, n.k * 2 AS d ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":0,"d":0},{"k":1,"d":2}]']
+  tags: [s6645]
+
+- name: s6645-sib4-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, n.k * 2 AS d ORDER BY k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, n.k * 2 AS d ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":0,"d":0},{"k":1,"d":2}]']
+  tags: [s6645]
+
+- name: s6645-sib5-qa
+  description: 'SONNY-6645 [admin (no RLS)]: MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, count(*) AS c GROUP BY k ORDER BY k'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, count(*) AS c GROUP BY k ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":0,"c":1},{"k":1,"c":1}]']
+  tags: [s6645]
+
+- name: s6645-sib5-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, count(*) AS c GROUP BY k ORDER BY k'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (n:Z) WHERE n.k < 2 RETURN n.k AS k, count(*) AS c GROUP BY k ORDER BY k']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"k":0,"c":1},{"k":1,"c":1}]']
+  tags: [s6645]
+
+- name: s6645-sib6-qa
+  description: 'SONNY-6645 [admin (no RLS)]: MATCH (n:Z) WITH n.k AS k WITH k, k * 2 AS d RETURN d ORDER BY d LIMIT 2'
+  args: [query, -U, geode, -P, '${secret:admin_password}', -g, qa, 'MATCH (n:Z) WITH n.k AS k WITH k, k * 2 AS d RETURN d ORDER BY d LIMIT 2']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"d":0},{"d":2}]']
+  tags: [s6645]
+
+- name: s6645-sib6-qb
+  description: 'SONNY-6645 [bob (RLS-filtered)]: MATCH (n:Z) WITH n.k AS k WITH k, k * 2 AS d RETURN d ORDER BY d LIMIT 2'
+  args: [query, -U, bob, -P, Bob Query Passphrase For Testing, -g, qb, 'MATCH (n:Z) WITH n.k AS k WITH k, k * 2 AS d RETURN d ORDER BY d LIMIT 2']
+  expect:
+    exit_code: 0
+    stdout_contains: ['"status_class":"00000"', '"rows":[{"d":0},{"d":2}]']
+  tags: [s6645]

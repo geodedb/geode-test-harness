@@ -1,0 +1,143 @@
+version: '1.0'
+name: SONNY-6367 offline user CLI gives roles, prints stored data, fails for missing users
+description: |
+  Ticket: SONNY-6367.
+  Bug: `geode user create --role`, `user update --role` and `user assign-role`
+  stored a role node but never gave it to the user and reported success;
+  `user list` printed `(role: user)` for everyone, `user show` of a missing
+  user printed invented details and exited 0, `user enable/disable` of a
+  missing user answered success, and several auth procedures answered 00000
+  with an error row.
+  Spec proves, against the real offline `geode user` CLI: the role asked for is
+  the role stored (shown by `user list` / `user show`), custom/unknown roles
+  are refused and change nothing, a missing user fails show/enable/disable/
+  assign-role, and online `geode.auth.user_enable` of a missing user is a real
+  error, not a success row.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6367-roles-list-show
+  type: bash
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    GEODE_ADMIN_PASSWORD='Offline Roles Admin Passphrase' "$BIN" auth init --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL init"; exit 1; }
+    ok()   { OUT=$("$@" 2>&1) || { echo "FAIL expected success: $*"; echo "$OUT"; exit 1; }; echo "$OUT"; }
+    refuse(){ OUT=$("$@" 2>&1); RC=$?; [ "$RC" -ne 0 ] || { echo "FAIL expected failure (rc=0): $*"; echo "$OUT"; exit 1; }; }
+    ok "$BIN" user create bob bob@example.com --password "Correct Horse Battery Staple Seven" --role readonly --data-dir "$D" >/dev/null
+    ok "$BIN" user create carol carol@example.com --password "Purple Elephant Dancing Quietly Nine" --role readwrite --data-dir "$D" >/dev/null
+    ok "$BIN" user create dave dave@example.com --password "Silver Mountain River Lantern Four" --data-dir "$D" >/dev/null
+    LIST=$("$BIN" user list --data-dir "$D" 2>&1)
+    echo "$LIST" | grep -qF -- "- bob (role: readonly)"   || { echo "FAIL list bob"; echo "$LIST"; exit 1; }
+    echo "$LIST" | grep -qF -- "- carol (role: readwrite)" || { echo "FAIL list carol"; echo "$LIST"; exit 1; }
+    echo "$LIST" | grep -qF -- "- dave (role: user)"       || { echo "FAIL list dave default role"; echo "$LIST"; exit 1; }
+    ok "$BIN" user update bob --role readwrite --data-dir "$D" >/dev/null
+    ok "$BIN" user assign-role carol admin --data-dir "$D" >/dev/null
+    "$BIN" user show bob --data-dir "$D" 2>&1 | grep -qF "Role: readwrite" || { echo "FAIL show bob after update"; exit 1; }
+    "$BIN" user show carol --data-dir "$D" 2>&1 | grep -qF "Role: admin"   || { echo "FAIL show carol after assign-role"; exit 1; }
+    # unknown / custom role refused, nothing changed
+    ok "$BIN" role create auditors --data-dir "$D" >/dev/null
+    refuse "$BIN" user assign-role bob auditors --data-dir "$D"
+    refuse "$BIN" user update bob --role nosuchrole --data-dir "$D"
+    refuse "$BIN" user create erin erin@example.com --password "Silver Mountain River Lantern Five" --role nosuchrole --data-dir "$D"
+    "$BIN" user show bob --data-dir "$D" 2>&1 | grep -qF "Role: readwrite" || { echo "FAIL bob role changed by refused command"; exit 1; }
+    "$BIN" user list --data-dir "$D" 2>&1 | grep -q "erin" && { echo "FAIL erin was created despite refusal"; exit 1; }
+    echo "ROLES_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [ROLES_OK]
+  tags: [auth, cli, offline, sonny6367]
+
+- name: sonny6367-missing-user-fails
+  type: bash
+  command: |
+    set -u
+    BIN="${GEODE_BINARY:-geode}"
+    D=$(mktemp -d); trap 'rm -rf "$D"' EXIT
+    GEODE_ADMIN_PASSWORD='Offline Roles Admin Passphrase' "$BIN" auth init --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL init"; exit 1; }
+    for sub in "show nobody6367" "enable nobody6367" "disable nobody6367" "assign-role nobody6367 readonly"; do
+      OUT=$("$BIN" user $sub --data-dir "$D" 2>&1); RC=$?
+      [ "$RC" -ne 0 ] || { echo "FAIL 'user $sub' exited 0"; echo "$OUT"; exit 1; }
+    done
+    "$BIN" user disable geode --data-dir "$D" >/dev/null 2>&1 || { echo "FAIL disable existing"; exit 1; }
+    "$BIN" user show geode --data-dir "$D" 2>&1 | grep -qF "Status: disabled" || { echo "FAIL status not disabled"; exit 1; }
+    echo "MISSING_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [MISSING_OK]
+  tags: [auth, cli, offline, sonny6367]
+
+- name: sonny6367-online-enable-missing-user-is-error
+  description: geode.auth.user_enable / user_disable of a missing user is a GQLSTATUS error (42002), not a 00000 success row
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+      GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+      start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+      for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+      echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+      ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+      O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+      SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+      [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+    for p in user_enable user_disable; do
+      OUT=$("$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "CALL geode.auth.$p('nobody6367')" 2>&1)
+      echo "$p: $OUT"
+      echo "$OUT" | grep -q '"error_code":"42002"' || { echo "FAIL $p of a missing user was not a 42002 error"; exit 1; }
+    done
+    echo "ONLINE_MISSING_OK"
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [ONLINE_MISSING_OK]
+  tags: [auth, sonny6367]

@@ -1,0 +1,487 @@
+# SONNY-2808 (items 1 and 2): temporal string parsing keeps offsets and refuses trailing text
+#
+# Bug: (1) time('10:00:00+01:00') returned a plain local time and dropped the
+# offset (datetime('...T10:00:00+02:00') likewise ignored its offset and returned
+# 10:00 UTC); (2) the time-of-day parser read the first eight characters and
+# ignored the rest, so time('10:00:00xyz'), datetime('...T10:00:00xyz'),
+# timestamp(...) etc. all parsed. (Item 3, an embedded caller's MERGE tenant, is
+# not reachable over the wire: transport handlers always set the context;
+# covered by zig build test-sonny2808-temporal-parsing.)
+#
+# Fixed behaviour (ISO/IEC 39075:2024 20.27: a string that is not an ISO 8601
+# representation is a data exception, invalid datetime format, 22007):
+#   * time('10:00:00+01:00') is a zoned time that keeps its offset: it equals
+#     timetz('09:00:00+00:00') (same instant) and differs from the plain 10:00:00
+#   * datetime('2024-01-01T10:00:00+02:00') is the instant 08:00 UTC
+#   * trailing text is refused (22007) by time, localtime, timetz, date,
+#     datetime, timestamp, timestamptz, localdatetime
+#   * a local time / local datetime must not carry an offset
+#   * duration() accepts negative components and fractional seconds, and refuses
+#     trailing text
+#
+# What this spec proves: real `geode serve`, values and error SQLSTATEs over the
+# QUIC wire; results are compared inside GQL (=, >) so the assertions do not
+# depend on the client's temporal formatting.
+
+version: '1.0'
+name: 'SONNY-2808 temporal string parsing: offsets kept, trailing text refused'
+description: time()/datetime()/timestamptz() keep offsets and every temporal constructor refuses trailing text with 22007 (SONNY-2808)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s2808-time-offset-kept
+  description: "time('10:00:00+01:00') keeps its offset: same instant as timetz('09:00:00+00:00')"
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('10:00:00+01:00') = timetz('09:00:00+00:00') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-time-offset-not-dropped
+  description: time('10:00:00+01:00') is not the local time 10:00:00
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('10:00:00+01:00') = time('10:00:00') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":false'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-time-z
+  description: time('10:00:00Z') equals the UTC zoned time 10:00:00+00:00
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('10:00:00Z') = timetz('10:00:00+00:00') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-time-fraction
+  description: time('10:00:00.25') is 250 ms past 10:00:00
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('10:00:00.25') > time('10:00:00') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-time-reduced-precision
+  description: time('10:00') (hours and minutes) equals time('10:00:00')
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('10:00') = time('10:00:00') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-datetime-offset-instant
+  description: datetime('2024-01-01T10:00:00+02:00') is the instant 08:00:00Z
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('2024-01-01T10:00:00+02:00') = datetime('2024-01-01T08:00:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-datetime-negative-offset
+  description: datetime('2024-01-01T10:00:00-05:30') is the instant 15:30:00Z
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('2024-01-01T10:00:00-05:30') = datetime('2024-01-01T15:30:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-timestamptz-offset-instant
+  description: timestamptz('2024-01-01T10:00:00+02:00') is the instant 08:00:00Z
+  args:
+  - query
+  - '-'
+  stdin: RETURN timestamptz('2024-01-01T10:00:00+02:00') = timestamptz('2024-01-01T08:00:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-datetime-date-only
+  description: datetime('2024-01-01') is midnight UTC
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('2024-01-01') = datetime('2024-01-01T00:00:00Z') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-time-trailing-text
+  description: time('10:00:00xyz') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('10:00:00xyz') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-time-trailing-dot
+  description: time('10:00:00.') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('10:00:00.') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-time-offset-trailing-text
+  description: time('10:00:00+01:00x') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('10:00:00+01:00x') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-time-one-digit-hour
+  description: time('1:00:00') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN time('1:00:00') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-localtime-trailing-text
+  description: localtime('10:00:00abc') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN localtime('10:00:00abc') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-timetz-offset-trailing-text
+  description: timetz('10:00:00+01:00x') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN timetz('10:00:00+01:00x') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-date-trailing-text
+  description: date('2024-01-01x') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN date('2024-01-01x') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-datetime-trailing-text
+  description: datetime('2024-01-01T10:00:00xyz') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('2024-01-01T10:00:00xyz') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-datetime-z-trailing-text
+  description: datetime('2024-01-01T10:00:00Zxyz') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('2024-01-01T10:00:00Zxyz') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-datetime-offset-with-seconds
+  description: datetime('2024-01-01T10:00:00+02:00:00') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN datetime('2024-01-01T10:00:00+02:00:00') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-timestamp-trailing-text
+  description: timestamp('2024-01-01T10:00:00abc') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN timestamp('2024-01-01T10:00:00abc') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-timestamptz-trailing-text
+  description: timestamptz('2024-01-01T10:00:00+02:00abc') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN timestamptz('2024-01-01T10:00:00+02:00abc') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-localdatetime-trailing-text
+  description: localdatetime('2024-01-01T10:00:00abc') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN localdatetime('2024-01-01T10:00:00abc') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-localtime-refuses-offset
+  description: localtime('10:00:00+01:00') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN localtime('10:00:00+01:00') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-localdatetime-refuses-offset
+  description: localdatetime('2024-01-01T10:00:00+02:00') is refused (SQLSTATE 22007)
+  args:
+  - query
+  - '-'
+  stdin: RETURN localdatetime('2024-01-01T10:00:00+02:00') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22007"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-duration-negative-component
+  description: duration('P-1D') is accepted and is negative
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('P-1D') < duration('PT0S') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-duration-negative-hours-minutes
+  description: duration('PT-90M') equals duration('PT-1H-30M')
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('PT-90M') = duration('PT-1H-30M') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-duration-fractional-seconds
+  description: duration('PT1.5S') = duration('PT1S') + duration('PT0.5S')
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('PT1.5S') = duration('PT1S') + duration('PT0.5S') AS x
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"x":true'
+  tags:
+  - temporal
+  - sonny2808
+- name: s2808-duration-trailing-text
+  description: duration('P1Dxyz') is refused (SQLSTATE 22G0H)
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('P1Dxyz') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0H"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused
+- name: s2808-duration-bare-digit
+  description: duration('1D') is refused (SQLSTATE 22G0H)
+  args:
+  - query
+  - '-'
+  stdin: RETURN duration('1D') AS x
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"22G0H"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - temporal
+  - sonny2808
+  - refused

@@ -1,0 +1,72 @@
+version: '1.0'
+name: SONNY-6589 MCP endpoint timeout is applied to a silent backend
+description: |
+  Ticket: SONNY-6589 (item 2 here; the embedded-LSP AuthProvider and the REPL
+  connect error text are in sonny6589_lsp_auth.yml / zig tests; the client-library
+  initFromConfig page_size/hello/tls item is library-internal, covered by
+  test-sonny6589-mcp-timeout's "clients carry their timeout" case).
+  Bug: the MCP client never applied `timeout_ms` from its endpoint DSN, so a tool
+  call against an unresponsive backend hung for the library's 30 s default.
+  Spec proves on the real `geode mcp --stdio --endpoint quic://host:port?timeout=2000`
+  whose backend is a UDP port that never answers (a network black hole, not a
+  simulated geode): the `query` tool answers an isError result mentioning Timeout
+  after about 2 s (1.5 s .. 20 s window), not after 30 s.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6589-mcp-query-gives-up-after-endpoint-timeout
+  type: bash
+  command: |
+    BIN="${GEODE_BINARY:-geode}"
+    H=$(mktemp -d); trap 'rm -rf "$H"' EXIT
+    python3 - "$BIN" "$H" <<'PY'
+    import socket, subprocess, sys, time, json, os
+    binp, home = sys.argv[1], sys.argv[2]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+    for param, lo, hi in (("timeout=2000", 1.5, 20.0), ("timeout_ms=3000", 2.5, 20.0)):
+        ep = "quic://127.0.0.1:%d?%s" % (port, param)
+        msgs = [
+          {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"sonny6589","version":"1.0"}}},
+          {"jsonrpc":"2.0","method":"notifications/initialized"},
+          {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"query","arguments":{"query":"RETURN 1 AS x"}}},
+        ]
+        inp = "".join(json.dumps(m) + "\n" for m in msgs)
+        env = dict(os.environ, HOME=home, GEODE_LSP_PORT="0")
+        t0 = time.time()
+        r = subprocess.run([binp, "mcp", "--stdio", "--no-auth", "--endpoint", ep], input=inp, capture_output=True, text=True, timeout=120, env=env)
+        el = time.time() - t0
+        resp = None
+        for line in r.stdout.splitlines():
+            try: m = json.loads(line)
+            except Exception: continue
+            if m.get("id") == 2: resp = m
+        assert resp is not None, "no response to tools/call: stdout=%r stderr=%r" % (r.stdout[-500:], r.stderr[-500:])
+        text = json.dumps(resp)
+        assert "isError" in text and "imeout" in text, "not a timeout error result: %s" % text
+        assert lo <= el < hi, "%s: answered after %.1fs, want %.1f..%.1fs (timeout not applied?)" % (param, el, lo, hi)
+    print("MCP_TIMEOUT_OK")
+    PY
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [MCP_TIMEOUT_OK]
+  tags: [mcp, sonny6589]

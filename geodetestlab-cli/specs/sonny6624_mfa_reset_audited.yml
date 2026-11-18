@@ -1,0 +1,106 @@
+version: '1.0'
+name: SONNY-6624 admin mfa_disable is audited as MFA_RESET_BY_ADMIN
+description: |
+  Ticket: SONNY-6624 (the DROP USER MfaAttempts cleanup and the timeseries
+  wal_dir workaround items are in-process: covered by zig tests).
+  Bug: `CALL geode.auth.mfa_disable(user)` resets a user's MFA without any proof
+  of possession (no code, or a code checked for format only) and left only the
+  security graph's MFA_DISABLE record, which does not name who did it.
+  Spec proves against the real server with the audit log on: two admin
+  mfa_disable calls (one without a code, one with an unverified code) leave
+  exactly two MFA_RESET_BY_ADMIN records in the audit JSONL, each naming the
+  actor (username geode) and the target (target_user), the details saying "no
+  code" / "not verified"; a refused disable of a missing user (42002) adds none.
+
+single_node_only: true  # each step starts its own private geode server / offline CLI: no harness server
+
+cli:
+  binary: ./zig-out/bin/geode
+  env:
+    GEODE_LOG_LEVEL: warn
+  server:
+    enabled: false
+  client:
+    timeout_ms: 420000
+    tls_verify: false
+    format: json
+
+invariants: []
+
+fuzz:
+  enabled: false
+
+tests:
+
+- name: sonny6624-reset-audited
+  type: bash
+  command: |
+    export GEODE_AUDIT_ENABLED=1 GEODE_DISABLE_AUDIT=0 GEODE_ALLOW_TEST_AUDIT_KEYS=1
+    BIN="${GEODE_BINARY:-geode}"
+    export GEODE_ENABLE_MFA=1 GEODE_ALLOW_INSECURE_TLS=1 GEODE_DATA_DIR_LOCK_TIMEOUT_MS=0
+    D=$(mktemp -d); H="$D/home"; mkdir -p "$H"
+    PW='Geode Test Admin Passphrase'
+    SD="$D/srv"; mkdir -p "$SD"
+    PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    ADDR="127.0.0.1:$PORT"
+    SPID=""
+    cleanup() { [ -n "$SPID" ] && kill -9 "$SPID" 2>/dev/null; rm -rf "$D"; }
+    trap cleanup EXIT
+    q() { "$BIN" query --server "$ADDR" --insecure-tls-skip-verify -U geode -P "$PW" "$1" 2>&1; }
+    privstart() {
+     GEODE_ADMIN_PASSWORD="$PW" "$BIN" auth init --data-dir "$SD" >/dev/null 2>&1 || { echo "FAIL auth init"; exit 1; }
+     start
+    }
+    start() { "$BIN" serve --listen "$ADDR" --data-dir "$SD" --log-level warn >>"$D/srv.log" 2>&1 & SPID=$!
+     for i in $(seq 1 120); do q "RETURN 1" | grep -q '"rows"' && return 0; kill -0 "$SPID" 2>/dev/null || break; sleep 0.5; done
+     echo "FAIL server did not start"; tail -20 "$D/srv.log"; exit 1; }
+    stop() { kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    kill9() { kill -9 "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; SPID=""; }
+    totp() { python3 - "$1" <<'PY'
+    import sys,hmac,hashlib,struct,time,base64
+    s=sys.argv[1].strip().upper(); s+='='*(-len(s)%8)
+    k=base64.b32decode(s)
+    h=hmac.new(k,struct.pack('>Q',int(time.time())//30),hashlib.sha1).digest()
+    o=h[-1]&15
+    print('%06d'%((struct.unpack('>I',h[o:o+4])[0]&0x7fffffff)%1000000))
+    PY
+    }
+    want() { echo "$2" | grep -q "\"error_code\":\"$3\"" || { echo "FAIL $1: want error_code $3"; echo "$2"; exit 1; }; }
+    ok() { echo "$2" | grep -q '"error_code"' && { echo "FAIL $1: unexpected error"; echo "$2"; exit 1; }; return 0; }
+    enrol() { # user -> SECRET
+     ok "create $1" "$(q "CREATE USER $1 SET PASSWORD 'Correct Horse Battery Staple 6623'")"
+     O=$(q "CALL geode.auth.mfa_setup('$1')"); ok "setup $1" "$O"
+     SECRET=$(echo "$O" | grep -o 'MFA secret: [A-Z2-7]*' | head -1 | sed 's/MFA secret: //')
+     [ -n "$SECRET" ] || { echo "FAIL no secret for $1"; echo "$O"; exit 1; }
+    }
+    privstart
+
+    AUDIT="$SD/audit.jsonl"
+    ok "create" "$(q "CREATE USER tg6624 SET PASSWORD 'Correct Horse Battery Staple 6624'")"
+    ok "setup" "$(q "CALL geode.auth.mfa_setup('tg6624')")"
+    ok "disable no code" "$(q "CALL geode.auth.mfa_disable('tg6624')")"
+    ok "disable with code" "$(q "CALL geode.auth.mfa_disable('tg6624', '123456')")"
+    want "disable missing user" "$(q "CALL geode.auth.mfa_disable('nobody6624')")" 42002
+    sleep 2
+    python3 - "$AUDIT" <<'PY'
+    import sys, json
+    recs = []
+    for line in open(sys.argv[1]):
+        try: r = json.loads(line)
+        except Exception: continue
+        if r.get("action") == "MFA_RESET_BY_ADMIN": recs.append(r)
+    assert len(recs) == 2, "want 2 MFA_RESET_BY_ADMIN records, got %d" % len(recs)
+    for r in recs:
+        d = r.get("details") or {}
+        assert d.get("username") == "geode", "actor not recorded: %r" % d
+        assert d.get("target_user") == "tg6624", "target not recorded: %r" % d
+    assert "no code" in recs[0]["details"]["details"], recs[0]
+    assert "not verified" in recs[1]["details"]["details"], recs[1]
+    print("MFA_RESET_AUDIT_OK")
+    PY
+
+  timeout_ms: 420000
+  expect:
+    exit_code: 0
+    stdout_contains: [MFA_RESET_AUDIT_OK]
+  tags: [mfa, audit, sonny6624]

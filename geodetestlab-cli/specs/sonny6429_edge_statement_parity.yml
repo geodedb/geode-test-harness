@@ -1,0 +1,284 @@
+# SONNY-6429 (item 1, with SONNY-6436 / SONNY-6447 parity fixes): the MATCH ... CREATE and
+# MATCH ... MERGE edge statements answer and write what the executor does
+#
+# Bug (found merging the security lane): the QUIC handler's MATCH ... CREATE /
+# MATCH ... MERGE edge fast paths (`executeBulkMatchCreateEdge`, the group commit
+# `bulk_match_create_edge` op) diverged from the executor:
+#   * the first statement inside a transaction that followed an autocommit
+#     executor write SEGFAULTED the server (the process-global undo log kept a
+#     freed per-query scratch arena's allocator);
+#   * MATCH ... CREATE answered no columns / no row where the executor answers a
+#     summary row (nodes_created, relationships_created);
+#   * MATCH ... MERGE took the FIRST of several nodes an endpoint matches and
+#     MERGEd one edge where the executor MERGEs one per matched pair;
+#   * under lean indexing (GEODE_INDEX_MERGE_KEYS_ONLY=1) the CREATE fast path
+#     answered "no holder" for a key no MERGE had registered, so the edge was
+#     silently NOT created.
+#   (The tenant-scoped sole-holder lookup (a)/(b)/(c) of the ticket needs tenant
+#   sessions on a tenant registry; it is covered in process and over QUIC by
+#   zig build test-sonny6429-sole-holder-tenant-wire, which compares every
+#   statement against the executor per tenant. This spec covers the unscoped
+#   wire contract, with and without lean indexing.)
+#
+# What this spec proves (real server, QUIC, autocommit and explicit
+# transactions): the edge statements create exactly what the executor creates,
+# one edge per matched pair, answer a summary row, never drop an edge, and the
+# server survives a transaction that follows an autocommit write.
+
+version: '1.0'
+name: SONNY-6429 MATCH ... CREATE / MERGE edge statements match the executor
+description: Edge statements create one edge per matched pair, answer a summary row and survive a transaction after an autocommit write (SONNY-6429)
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+      GEODE_LSP_PORT: '0'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: s6429-seed
+  description: 'Seed endpoints: one holder of each of k=1 and k=2, two holders of A.k=5, one B.k=6'
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:EA6429 {k: 1}), (:EB6429 {k: 2}), (:EA6429 {k: 5}), (:EA6429 {k: 5}), (:EB6429 {k: 6})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - edges
+  - fast-path
+  - sonny6429
+- name: s6429-create-edge-autocommit
+  description: MATCH ... CREATE edge in autocommit answers a summary row with relationships_created 1 (the fast path answered no row)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:EA6429 {k: 1}), (b:EB6429 {k: 2}) CREATE (a)-[:ER6429]->(b)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"relationships_created":1'
+  tags:
+  - edges
+  - fast-path
+  - sonny6429
+  - key-assertion
+- name: s6429-edge-written
+  description: The edge exists exactly once
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[e:ER6429]->()  RETURN count(e) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - edges
+  - sonny6429
+- name: s6429-create-edge-in-transaction
+  description: The same statement inside START TRANSACTION ... COMMIT answers and writes
+  args:
+  - query
+  - '-'
+  stdin: "START TRANSACTION;\nMATCH (a:EA6429 {k: 1}), (b:EB6429 {k: 6}) CREATE (a)-[:ER6429]->(b);\nCOMMIT"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - edges
+  - transactions
+  - sonny6429
+- name: s6429-edge-count-after-tx
+  description: Two edges now
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[e:ER6429]->()  RETURN count(e) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+  tags:
+  - edges
+  - transactions
+  - sonny6429
+- name: s6429-tx-after-autocommit-write
+  description: A transaction after an autocommit executor write in one message no longer crashes the server (it segfaulted)
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:EZ6429 {k: 1});\nSTART TRANSACTION;\nMATCH (a:EA6429 {k: 1}), (b:EB6429 {k: 2}) CREATE (a)-[:ER6429 {t: 'tx'}]->(b);\nCOMMIT"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - edges
+  - transactions
+  - sonny6429
+  - key-assertion
+- name: s6429-server-alive-after-tx
+  description: The server still answers and has three edges
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[e:ER6429]->()  RETURN count(e) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":3'
+  tags:
+  - edges
+  - transactions
+  - sonny6429
+  - key-assertion
+- name: s6429-duplicate-holders-create-per-pair
+  description: "Two nodes match the A endpoint: one edge per matched pair (the executor's result), not one for the first node"
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (a:EA6429 {k: 5}), (b:EB6429 {k: 2}) CREATE (a)-[:ER6429 {t: 'dup'}]->(b)"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - edges
+  - fast-path
+  - sonny6429
+  - key-assertion
+- name: s6429-duplicate-holders-edge-count
+  description: Exactly two edges carry t = 'dup'
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[e:ER6429]->() WHERE e.t = 'dup' RETURN count(e) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":2'
+  tags:
+  - edges
+  - sonny6429
+  - key-assertion
+- name: s6429-missing-endpoint-creates-nothing
+  description: An endpoint nothing holds creates no edge (and no error)
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:EA6429 {k: 99}), (b:EB6429 {k: 2}) CREATE (a)-[:ER6429]->(b)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - edges
+  - sonny6429
+- name: s6429-missing-endpoint-count-unchanged
+  description: Still five edges (3 + 2 dup)
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[e:ER6429]->()  RETURN count(e) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":5'
+  tags:
+  - edges
+  - sonny6429
+- name: s6429-merge-edge
+  description: MATCH ... MERGE edge creates the edge
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:EA6429 {k: 1}), (b:EB6429 {k: 2}) MERGE (a)-[:EM6429]->(b)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - edges
+  - merge
+  - sonny6429
+- name: s6429-merge-edge-idempotent
+  description: Repeating the MERGE edge creates nothing new
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:EA6429 {k: 1}), (b:EB6429 {k: 2}) MERGE (a)-[:EM6429]->(b)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - edges
+  - merge
+  - sonny6429
+- name: s6429-merge-edge-count-one
+  description: One merged edge
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[e:EM6429]->()  RETURN count(e) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":1'
+  tags:
+  - edges
+  - merge
+  - sonny6429
+- name: s6429-merge-duplicate-holders
+  description: 'Two nodes match the A endpoint: MERGE makes one edge per matched pair (the fast path made one)'
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (a:EA6429 {k: 5}), (b:EB6429 {k: 2}) MERGE (a)-[:EM6429]->(b)'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - edges
+  - merge
+  - sonny6429
+  - key-assertion
+- name: s6429-merge-edge-count-three
+  description: 1 + 2 merged edges
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[e:EM6429]->()  RETURN count(e) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"c":3'
+  tags:
+  - edges
+  - merge
+  - sonny6429
+  - key-assertion
