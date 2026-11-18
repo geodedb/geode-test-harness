@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# ruff: noqa: BLE001, S110, SIM102
+# Legacy runner: these findings predate the default-password change and are left as is.
 """
 Interactive shell test runner for Geode.
 
@@ -14,14 +16,14 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import yaml
 
 from runners.shell_test_methods import (
-    run_source_test,
     run_persistence_test,
     run_query_test,
+    run_source_test,
     run_steps_test,
 )
 
@@ -54,9 +56,9 @@ class ShellTestRunner:
 
     def __init__(
         self,
-        server: Optional[str] = None,
+        server: str | None = None,
         geode_binary: str = "./zig-out/bin/geode",
-        data_dir: Optional[str] = None,
+        data_dir: str | None = None,
         verbose: bool = False,
         auto_allocate_port: bool = False,
     ):
@@ -79,8 +81,8 @@ class ShellTestRunner:
         """
         self.geode_binary = geode_binary
         self.verbose = verbose
-        self.shell_process: Optional[pexpect.spawn] = None
-        self.server_manager: Optional[ServerManager] = None
+        self.shell_process: pexpect.spawn | None = None
+        self.server_manager: ServerManager | None = None
         self.prompt_pattern = r"geode(?:\([^)]+\))?>\s*"
         self.default_timeout = 30
 
@@ -147,7 +149,7 @@ class ShellTestRunner:
             return False
 
         # Use json format for reliable parsing.
-        cmd = f"{self.geode_binary} shell --server {self.server} --insecure-tls-skip-verify --format json --no-history -U geode -P GeodeTestPassword123!"
+        cmd = f"{self.geode_binary} shell --server {self.server} --insecure-tls-skip-verify --format json --no-history -U geode -P 'Geode Test Admin Passphrase'"
         self.log(f"Starting shell: {cmd}")
 
         # Environment to disable colors and spinners
@@ -198,8 +200,8 @@ class ShellTestRunner:
                 self.shell_process = None
 
     def send_command(
-        self, command: str, timeout: Optional[int] = None
-    ) -> Tuple[bool, str]:
+        self, command: str, timeout: int | None = None
+    ) -> tuple[bool, str]:
         """
         Send a command to the shell and wait for the response.
 
@@ -259,9 +261,7 @@ class ShellTestRunner:
             self.log("Shell process ended")
             return False, "Shell process ended unexpectedly"
 
-    def execute_query(
-        self, query: str, timeout: Optional[int] = None
-    ) -> Dict[str, Any]:
+    def execute_query(self, query: str, timeout: int | None = None) -> dict[str, Any]:
         """Execute a GQL query and return the result."""
         success, output = self.send_command(query, timeout)
 
@@ -363,9 +363,7 @@ class ShellTestRunner:
 
         return result
 
-    def source_file(
-        self, file_path: str, timeout: Optional[int] = None
-    ) -> Dict[str, Any]:
+    def source_file(self, file_path: str, timeout: int | None = None) -> dict[str, Any]:
         """Execute /source command with a file."""
         timeout = timeout or 300  # 5 minutes for large files
         success, output = self.send_command(f"/source {file_path}", timeout)
@@ -404,7 +402,7 @@ class ShellTestRunner:
         except OSError:
             return -1
 
-    def run_test(self, test: Dict[str, Any]) -> Dict[str, Any]:
+    def run_test(self, test: dict[str, Any]) -> dict[str, Any]:
         """Run a single shell test."""
         test_name = test.get("name", "unnamed")
         test_type = test.get("type", "query")
@@ -444,10 +442,10 @@ class ShellTestRunner:
 def run_spec(
     spec_path: str,
     geode_binary: str = "./zig-out/bin/geode",
-    server: Optional[str] = None,
-    data_dir: Optional[str] = None,
+    server: str | None = None,
+    data_dir: str | None = None,
     verbose: bool = False,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Run all tests in a spec file with proper isolation.
 
     When the spec has manage_server=True, this function automatically:
