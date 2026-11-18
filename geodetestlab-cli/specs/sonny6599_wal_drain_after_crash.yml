@@ -1,0 +1,123 @@
+version: '1.0'
+name: Shard WALs drain after a crash restart and a clean shutdown (SONNY-6599, SONNY-6595 item 5)
+description: |
+  SONNY-6595 item 5 / SONNY-6599: after a restart the shard WALs of a graph
+  never drained. Crash recovery (graph-storage) replayed the WAL tail into the
+  pages and advanced the manifests, but did not truncate the WAL, and the
+  engine opened "clean", so no checkpoint touched the shard again: the replayed
+  tail (and, after a SIGTERM, a "clean" shutdown's full checkpoint) left WAL
+  bytes on disk until the shard was next written. graph-storage v0.4.22 drains
+  the WAL it replayed.
+
+  Black-box proof on a hand-rolled scratch server (fresh mktemp data dir, the
+  shipped binary), by looking at the user graph's shard WAL files
+  (<data>/<root>/graphs/<graph>/wal/graph.wal, the security graph's root is
+  skipped):
+    1. write 40 nodes with persistence ticking off (one-hour interval), then
+       SIGKILL: the WALs hold the un-checkpointed writes (> 0 bytes; if they
+       did not, the scenario would prove nothing and the spec fails);
+    2. restart and read the nodes back: all 40 are there (durability), and
+       once the statement has opened the graph its WALs are 0 bytes;
+    3. SIGTERM: a clean shutdown leaves 0 WAL bytes, and a further restart
+       still reads 40 nodes.
+
+  CANARY: REQ=REQ-SONNY-6595-WAL-DRAIN; FEATURE="WAL recovery"; ASPECT=DrainAfterCrash; STATUS=TESTED; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: wal_is_empty_after_crash_restart_statement_and_clean_shutdown
+  type: bash
+  timeout_ms: 400000
+  command: |
+    unset GEODE_DATA_DIR
+    D=/tmp/s6599.$$.$RANDOM; mkdir -p "${D}"
+    PID=""
+    cleanup() { [ -n "${PID}" ] && kill -9 "${PID}" 2>/dev/null; rm -rf "${D}"; }
+    trap cleanup EXIT
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/ca.key" 2>/dev/null
+    openssl req -x509 -new -sha256 -key "${D}/ca.key" -days 1 -subj "/CN=s6599-ca" -addext basicConstraints=critical,CA:TRUE -out "${D}/ca.crt" 2>/dev/null
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/leaf.key" 2>/dev/null
+    openssl req -new -sha256 -key "${D}/leaf.key" -subj "/CN=geode" -out "${D}/leaf.csr" 2>/dev/null
+    printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth,clientAuth\n' > "${D}/leaf.ext"
+    openssl x509 -req -sha256 -in "${D}/leaf.csr" -CA "${D}/ca.crt" -CAkey "${D}/ca.key" -CAcreateserial -days 1 -extfile "${D}/leaf.ext" -out "${D}/leaf.crt" 2>/dev/null
+    PORT=$(python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    mkdir -p "${D}/data"
+    q() { "${GEODE_BINARY}" query --server "127.0.0.1:${PORT}" --ca-cert "${D}/ca.crt" -U geode -P "${GEODE_ADMIN_PASSWORD}" --timeout 30 "$1" 2>&1; }
+    start() { # persist interval ms
+      "${GEODE_BINARY}" serve --listen "127.0.0.1:${PORT}" --data-dir "${D}/data" --persist-interval "$1" \
+        --cert "${D}/leaf.crt" --key "${D}/leaf.key" --log-level warn >> "${D}/server.log" 2>&1 &
+      PID=$!
+      for i in $(seq 1 90); do
+        q "RETURN 1 AS x" | grep -q '"x":1' && return 0
+        kill -0 "${PID}" 2>/dev/null || { echo "server died: $(tail -5 ${D}/server.log)"; return 1; }
+        sleep 1
+      done
+      echo "server never answered"; return 1
+    }
+    wal_bytes() {
+      local total=0 root f
+      for root in "${D}"/data/*/; do
+        [ -e "${root}audit.jsonl" ] && continue
+        for f in "${root}"graphs/*/wal/graph.wal; do
+          [ -f "${f}" ] && total=$(( total + $(stat -c %s "${f}") ))
+        done
+      done
+      echo "${total}"
+    }
+    count_w() { q "MATCH (n:W) RETURN count(n) AS c" | grep -o '"c":[0-9]*' | head -1; }
+
+    # 1. writes, no checkpoint (one-hour tick), SIGKILL
+    start 3600000 || exit 1
+    STMTS=""
+    for i in $(seq 1 40); do STMTS="${STMTS}CREATE (n:W {i: ${i}}) RETURN n.i AS i; "; done
+    out=$(q "${STMTS}"); echo "${out}" | grep -q '"status_class":"00000"' || { echo "writes failed: ${out:0:300}"; exit 1; }
+    kill -9 "${PID}"; wait "${PID}" 2>/dev/null; PID=""
+    TAIL=$(wal_bytes)
+    echo "wal_after_sigkill=${TAIL}"
+    [ "${TAIL}" -gt 0 ] || { echo "no un-checkpointed WAL tail to recover: scenario proves nothing"; find "${D}/data" -name graph.wal | head; exit 1; }
+
+    # 2. restart, read the graph (opens its engine), the WAL is drained
+    start 3600000 || exit 1
+    c=$(count_w); echo "after_restart ${c}"
+    [ "${c}" = '"c":40' ] || { echo "lost nodes after the crash: ${c}"; exit 1; }
+    AFTER_OPEN=$(wal_bytes)
+    echo "wal_after_open=${AFTER_OPEN}"
+    [ "${AFTER_OPEN}" = 0 ] || { echo "WAL not drained after the graph was opened: ${AFTER_OPEN} bytes (was ${TAIL})"; exit 1; }
+
+    # 3. clean shutdown leaves nothing, data survives another restart
+    kill -TERM "${PID}"
+    for i in $(seq 1 60); do kill -0 "${PID}" 2>/dev/null || break; sleep 1; done
+    kill -0 "${PID}" 2>/dev/null && { echo "server did not stop on SIGTERM"; exit 1; }
+    PID=""
+    AFTER_TERM=$(wal_bytes)
+    echo "wal_after_sigterm=${AFTER_TERM}"
+    [ "${AFTER_TERM}" = 0 ] || { echo "SIGTERM left ${AFTER_TERM} WAL bytes"; exit 1; }
+    start 3600000 || exit 1
+    c=$(count_w)
+    [ "${c}" = '"c":40' ] || { echo "lost nodes after the clean restart: ${c}"; exit 1; }
+    echo wal_drain_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - wal_drain_ok
+  tags: [storage, wal, recovery, sonny-6599, sonny-6595]

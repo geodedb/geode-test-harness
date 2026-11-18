@@ -1,0 +1,136 @@
+version: '1.0'
+name: An auto-commit multi-shard statement is all-or-nothing across a SIGKILL (SONNY-6658)
+description: |
+  SONNY-6658: explicit transactions were crash-atomic (txn_undo.wal), but an
+  auto-commit statement outside BEGIN...COMMIT that changed several shards
+  committed one engine transaction on its own shard and one per change on the
+  others. A SIGKILL in the middle of `MATCH (n:T) SET n.v = 1, n:Marked` kept the
+  changes already committed per shard after restart.
+
+  Black-box proof on a hand-rolled scratch server (fresh mktemp data dir): 6,000
+  :T nodes (spread over every shard) are loaded and checkpointed. For each of
+  several kill points the statement is started in the background and the server
+  is SIGKILLed a different number of milliseconds into it (fractions of the
+  statement's own measured duration), then restarted on the same data directory.
+  After EVERY restart the statement must have left either nothing or everything:
+  the number of nodes with v = 1 and the number labelled :Marked are equal to
+  each other and each is either 0 or 6000, never in between. The un-killed run
+  (control) must finish whole (6000), and a fully applied statement must
+  survive a SIGKILL right after it returns.
+
+  The kill points are timing driven (the invariant holds whichever side of the
+  commit the kill lands on); the in-process, deterministic crash-point version
+  of this scenario is tests/test_sonny6658_autocommit_crash_atomicity.zig.
+
+  CANARY: REQ=REQ-SONNY-6658-AUTOCOMMIT-ATOMIC; FEATURE="Crash atomicity"; ASPECT=AutoCommitMultiShard; STATUS=TESTED; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+
+invariants:
+- type: server_running
+
+tests:
+- name: multi_shard_autocommit_statement_is_all_or_nothing_after_sigkill
+  type: bash
+  timeout_ms: 1500000
+  command: |
+    unset GEODE_DATA_DIR
+    D=/tmp/s6658.$$.$RANDOM; mkdir -p "${D}"
+    PID=""
+    cleanup() { [ -n "${PID}" ] && kill -9 "${PID}" 2>/dev/null; rm -rf "${D}"; }
+    trap cleanup EXIT
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/ca.key" 2>/dev/null
+    openssl req -x509 -new -sha256 -key "${D}/ca.key" -days 1 -subj "/CN=s6658-ca" -addext basicConstraints=critical,CA:TRUE -out "${D}/ca.crt" 2>/dev/null
+    openssl ecparam -name prime256v1 -genkey -noout -out "${D}/leaf.key" 2>/dev/null
+    openssl req -new -sha256 -key "${D}/leaf.key" -subj "/CN=geode" -out "${D}/leaf.csr" 2>/dev/null
+    printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth,clientAuth\n' > "${D}/leaf.ext"
+    openssl x509 -req -sha256 -in "${D}/leaf.csr" -CA "${D}/ca.crt" -CAkey "${D}/ca.key" -CAcreateserial -days 1 -extfile "${D}/leaf.ext" -out "${D}/leaf.crt" 2>/dev/null
+    PORT=$(python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+    mkdir -p "${D}/data"
+    q() { "${GEODE_BINARY}" query --server "127.0.0.1:${PORT}" --ca-cert "${D}/ca.crt" -U geode -P "${GEODE_ADMIN_PASSWORD}" --timeout 120 "$1" 2>&1; }
+    start() {
+      "${GEODE_BINARY}" serve --listen "127.0.0.1:${PORT}" --data-dir "${D}/data" --persist-interval 500 \
+        --cert "${D}/leaf.crt" --key "${D}/leaf.key" --log-level warn >> "${D}/server.log" 2>&1 &
+      PID=$!
+      for i in $(seq 1 90); do q "RETURN 1 AS x" | grep -q '"x":1' && return 0; kill -0 "${PID}" 2>/dev/null || { echo "died: $(tail -5 ${D}/server.log)"; return 1; }; sleep 1; done
+      return 1
+    }
+    counts() { # -> "<v1> <marked> <total>"
+      local a b t
+      a=$(q "MATCH (n:T) WHERE n.v = 1 RETURN count(n) AS c" | grep -o '"c":[0-9]*' | head -1 | cut -d: -f2)
+      b=$(q "MATCH (n:Marked) RETURN count(n) AS c" | grep -o '"c":[0-9]*' | head -1 | cut -d: -f2)
+      t=$(q "MATCH (n:T) RETURN count(n) AS c" | grep -o '"c":[0-9]*' | head -1 | cut -d: -f2)
+      echo "${a:-ERR} ${b:-ERR} ${t:-ERR}"
+    }
+    STMT="MATCH (n:T) SET n.v = 1, n:Marked"
+    N=6000
+    wait_ckpt() { for i in $(seq 1 120); do [ -z "$(find "${D}/data" -name graph.wal -size +0 | head -1)" ] && return 0; sleep 1; done; return 1; }
+
+    start || exit 1
+    q "FOR i IN range(1, $((N + 1))) CREATE (n:T {i: i, v: 0})" | grep -q '"status_class":"00000"' || { echo "seed failed"; exit 1; }
+    wait_ckpt || { echo "no checkpoint after the seed"; exit 1; }
+    # control: how long the statement takes when nothing kills it (then undo it
+    # by recreating the dataset from the checkpoint: we just kill + restart and
+    # re-seed values with a plain SET in a single-statement per node is too slow,
+    # so the control runs LAST on a fresh seed below).
+    kill -9 "${PID}"; wait "${PID}" 2>/dev/null; PID=""
+    cp -a "${D}/data" "${D}/seed"
+
+    # duration probe on a copy of the seeded store
+    rm -rf "${D}/data"; cp -a "${D}/seed" "${D}/data"
+    start || exit 1
+    S0=$(date +%s%N); out=$(q "${STMT}"); E0=$(date +%s%N)
+    echo "${out}" | grep -q '"status_class":"00000"' || { echo "control statement failed: ${out:0:300}"; exit 1; }
+    DUR_MS=$(( (E0 - S0) / 1000000 ))
+    read V M T <<< "$(counts)"
+    echo "control duration_ms=${DUR_MS} counts v=${V} marked=${M} total=${T}"
+    [ "${V}" = "${N}" ] && [ "${M}" = "${N}" ] && [ "${T}" = "${N}" ] || { echo "control did not apply whole"; exit 1; }
+    # a finished statement survives an immediate SIGKILL
+    kill -9 "${PID}"; wait "${PID}" 2>/dev/null; PID=""
+    start || exit 1
+    read V M T <<< "$(counts)"
+    [ "${V}" = "${N}" ] && [ "${M}" = "${N}" ] || { echo "a completed statement was lost or torn by a SIGKILL: v=${V} marked=${M}"; exit 1; }
+    kill -9 "${PID}"; wait "${PID}" 2>/dev/null; PID=""
+
+    # kill points: 10%..100% of the measured duration (plus the connection
+    # setup time, which is the query CLI's own and is added below)
+    KILLED_MID=0
+    for PCT in 8 20 35 50 65 80 95; do
+      rm -rf "${D}/data"; cp -a "${D}/seed" "${D}/data"
+      start || exit 1
+      DELAY_MS=$(( DUR_MS * PCT / 100 + 150 ))
+      ( q "${STMT}" > /dev/null 2>&1 ) &
+      QPID=$!
+      python3 -c "import time,sys; time.sleep(int(sys.argv[1])/1000.0)" "${DELAY_MS}"
+      kill -9 "${PID}" 2>/dev/null; wait "${PID}" 2>/dev/null; PID=""
+      wait "${QPID}" 2>/dev/null
+      start || exit 1
+      read V M T <<< "$(counts)"
+      echo "kill_at=${PCT}% (+150ms, ${DELAY_MS}ms) after restart: v=${V} marked=${M} total=${T}"
+      [ "${T}" = "${N}" ] || { echo "nodes lost: total=${T}"; exit 1; }
+      [ "${V}" = "${M}" ] || { echo "TORN: ${V} nodes have v=1 but ${M} are :Marked"; exit 1; }
+      if [ "${V}" != 0 ] && [ "${V}" != "${N}" ]; then echo "TORN: only ${V} of ${N} nodes carry the statement's change"; exit 1; fi
+      kill -9 "${PID}"; wait "${PID}" 2>/dev/null; PID=""
+    done
+    echo autocommit_atomic_ok
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - autocommit_atomic_ok
+  tags: [storage, transactions, crash, sonny-6658]

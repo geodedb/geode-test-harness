@@ -132,13 +132,16 @@ def _kill_geode_processes() -> None:
             pass
         _tracked_pids.discard(pid)
 
-    # No machine-wide pattern pkill here. The old fallback
-    # (`pkill -9 -f "geode serve.*geode-test-"`) ran at the exit of EVERY harness
-    # process and so SIGKILLed the managed servers of every OTHER harness run on the
-    # machine (parallel lanes, CI shards sharing a runner), failing their tests with
-    # "Server died during test (signal 9)" and, when it hit a first boot, leaving a
-    # data directory the next start refuses (AuthChainTampered). A run's own servers
-    # are reaped by server.cleanup_servers() through their tracked process groups.
+    # Servers in a ``geode-test-`` temp dir whose owning run is gone (orphans of a
+    # crashed run). NEVER a machine-wide ``pkill -f "geode serve.*geode-test-"``:
+    # that ran at the exit of EVERY harness process and SIGKILLed the managed
+    # servers of every OTHER live run on the host ("Server died during test
+    # (signal 9)", and on a first boot a data dir the next start refuses with
+    # AuthChainTampered). A run's own servers are reaped by
+    # server.cleanup_servers() through their tracked process groups.
+    from lib.server import kill_orphaned_test_servers
+
+    kill_orphaned_test_servers(signal.SIGKILL)
 
 
 def _kill_child_processes() -> None:

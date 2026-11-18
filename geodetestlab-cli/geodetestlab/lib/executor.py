@@ -1336,6 +1336,65 @@ def _run_sequential_test(
                         )
                     outputs.append(f"Step {i + 1}: restart_node — {message}")
 
+                elif step.step_type == "bash":
+                    # Run a shell command against the live (cluster) servers.
+                    # Same environment as a shell test: GEODE_BINARY, the
+                    # reconciled client-TLS flags and, in cluster mode,
+                    # GEODE_CLUSTER_PORTS / GEODE_CLUSTER_SIZE. The step fails
+                    # on a non-zero exit or an unmet stdout_contains.
+                    if not step.command:
+                        errors.append(f"Step {i + 1} failed: bash step missing 'command'")
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs),
+                            error="\n".join(errors),
+                        )
+                    bash_env = env.copy()
+                    bash_env["GEODE_BINARY"] = str(binary)
+                    bin_dir = os.path.dirname(os.path.abspath(str(binary)))
+                    if bin_dir:
+                        bash_env["PATH"] = bin_dir + os.pathsep + bash_env.get("PATH", os.environ.get("PATH", ""))
+                    bash_env.setdefault("GEODE_CLIENT_TLS", " ".join(client_tls_args(bash_env)))
+                    try:
+                        bash_result = subprocess.run(
+                            ["bash", "-c", step.command],
+                            env=bash_env,
+                            capture_output=True,
+                            text=True,
+                            timeout=max(step.timeout_ms, 1) / 1000.0,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        errors.append(
+                            f"Step {i + 1} failed: bash step timed out after {step.timeout_ms}ms"
+                            + timeout_output_excerpt(exc)
+                        )
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs),
+                            error="\n".join(errors),
+                        )
+                    bash_failure = ""
+                    if bash_result.returncode != 0:
+                        bash_failure = f"exit code {bash_result.returncode}"
+                    if step.gql_expected and not bash_failure:
+                        for needle in _as_list(step.gql_expected.get("stdout_contains")):
+                            if needle not in bash_result.stdout:
+                                bash_failure = f"stdout missing {needle!r}"
+                    if bash_failure and not step.allow_failure:
+                        errors.append(f"Step {i + 1} failed: bash {bash_failure}")
+                        return TestResult(
+                            name=test_case.name,
+                            passed=False,
+                            duration_ms=(time.time() - start_time) * 1000,
+                            output="\n".join(outputs) + "\n" + bash_result.stdout + bash_result.stderr[-2000:],
+                            error="\n".join(errors),
+                        )
+                    outputs.append(f"Step {i + 1}: bash OK :: {bash_result.stdout.strip()[-300:]}")
+
                 elif step.step_type == "http":
                     # Execute HTTP step
                     url = _substitute_one(step.url or "", env, {}, None)
@@ -1475,6 +1534,16 @@ def _run_sequential_test(
 
                     suffix = " (allow_failure)" if step_failed else ""
                     outputs.append(f"Step {i + 1}: GQL OK{suffix} :: {result.stdout.strip()[:160]}")
+
+                else:
+                    errors.append(f"Step {i + 1} failed: unknown step type {step.step_type!r}")
+                    return TestResult(
+                        name=test_case.name,
+                        passed=False,
+                        duration_ms=(time.time() - start_time) * 1000,
+                        output="\n".join(outputs),
+                        error="\n".join(errors),
+                    )
 
         finally:
             if _owned_seq:

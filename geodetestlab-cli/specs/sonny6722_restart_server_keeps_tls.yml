@@ -1,0 +1,40 @@
+version: '1.0'
+name: restart_server keeps the server's TLS identity (SONNY-6722)
+description: |
+  SONNY-6722: the runner provisions a CA and leaf certificate for a managed server
+  and starts it with --cert/--key, and the client verifies against that CA. A
+  `restart_server: true` test restarted the server with only the spec's own
+  args, so it minted a fresh self-signed certificate the client's CA does not
+  verify: every query after the restart hung in the TLS handshake until the
+  harness timed out. Proof: a query before and a query after a requested
+  restart both succeed against the real server.
+
+  CANARY: REQ=REQ-SONNY-6722-RESTART-TLS; FEATURE="Harness restart_server"; ASPECT=TlsIdentity; STATUS=TESTED; OWNER=harness; UPDATED=2026-11-17
+single_node_only: true
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args: [--log-level, warn]
+  client:
+    timeout_ms: 15000
+    tls_verify: false
+    format: json
+invariants:
+- type: server_running
+tests:
+- name: query_before_restart
+  query: RETURN 1 AS x
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains: ['"x":1']
+- name: query_after_restart
+  query: RETURN 2 AS x
+  expected:
+    exit_code: 0
+    stdout_contains: ['"x":2']
