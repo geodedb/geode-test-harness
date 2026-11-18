@@ -313,6 +313,7 @@ GEODETESTLAB_CLI := geodetestlab-cli
 SPECS_DIR := $(GEODETESTLAB_CLI)/specs
 GEODETESTLAB_VENV := $(GEODETESTLAB_CLI)/.venv
 GEODETESTLAB_PIP := $(GEODETESTLAB_VENV)/bin/pip
+GEODE_CLIENT_PYTHON_DIR ?= ../geode-client-python
 GEODETESTLAB_PYTHON := $(GEODETESTLAB_VENV)/bin/python3
 
 # Auto-detect geodetestlab: prefer system-installed, fall back to venv
@@ -339,8 +340,14 @@ geodetestlab-setup:
 		$(PYTHON) -m venv $(GEODETESTLAB_VENV); \
 	fi
 	@$(GEODETESTLAB_PIP) install --upgrade pip
-	@$(GEODETESTLAB_PIP) install -e $(GEODETESTLAB_CLI)
-	@$(GEODETESTLAB_PIP) install pytest
+	@# [dev] brings the pytest plugins (cov, asyncio, timeout) pyproject's addopts require.
+	@$(GEODETESTLAB_PIP) install -e "$(GEODETESTLAB_CLI)[dev]"
+	@# The Python client runner needs geode_client importable from this venv.
+	@if [ -f "$(GEODE_CLIENT_PYTHON_DIR)/setup.py" ]; then \
+		$(GEODETESTLAB_PIP) install -e "$(GEODE_CLIENT_PYTHON_DIR)" "grpcio>=1.80.0"; \
+	else \
+		echo "note: $(GEODE_CLIENT_PYTHON_DIR) not found; the Python client runner will report the client as unavailable"; \
+	fi
 	@echo "geodetestlab-cli setup complete"
 
 # Install geodetestlab-cli to user environment via pipx (for local development)
