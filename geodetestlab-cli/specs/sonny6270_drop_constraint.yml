@@ -3,6 +3,8 @@
 # image of DROP INDEX: the row is removed from the session graph's catalog (a missing name is 42002; IF
 # EXISTS makes it a no-op), the constraint stops being enforced at once, and a dropped constraint stays
 # dropped after a restart while a sibling constraint on the same label keeps enforcing.
+# SONNY-6720: DROP GRAPH removes every index and constraint row scoped to the graph (saved): a graph
+# re-created under the name starts with none, across a restart; other graphs' rows stay.
 version: '1.0'
 name: SONNY-6270 DROP CONSTRAINT drops the constraint
 description: DROP CONSTRAINT removes the constraint, durably
@@ -276,5 +278,271 @@ tests:
     - '"status_class":"42002"'
     stdout_not_contains:
     - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-create-graphs
+  description: create the two graphs of the DROP GRAPH section
+  args:
+  - query
+  - -g
+  - default
+  - '-'
+  stdin: |
+    CREATE GRAPH IF NOT EXISTS dg1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-create-keep-graph
+  description: second graph
+  args:
+  - query
+  - -g
+  - default
+  - '-'
+  stdin: |
+    CREATE GRAPH IF NOT EXISTS dg2
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-keep-index
+  description: dg2 gets a definition that must survive
+  args:
+  - query
+  - -g
+  - dg2
+  - '-'
+  stdin: |
+    CREATE INDEX dg_keep ON K (k) USING btree
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-index
+  description: dg1 gets an index
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    CREATE INDEX dg_idx FOR (n:P) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-net-index
+  description: dg1 gets a name-keyed advanced index
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    CREATE INDEX dg_net ON N (addr) USING network_cidr
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-constraint
+  description: dg1 gets a UNIQUE constraint
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    CREATE CONSTRAINT dg_u FOR (n:P) REQUIRE n.id IS UNIQUE
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-node
+  description: dg1 stores a node
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    CREATE (:P {id: 1, k: 1})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-enforced
+  description: the constraint enforces in dg1
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    CREATE (:P {id: 1, k: 2})
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"23505"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-net-twin-refused
+  description: the network index name is taken in dg2 while dg1 holds it
+  args:
+  - query
+  - -g
+  - dg2
+  - '-'
+  stdin: |
+    CREATE INDEX dg_net ON N (addr) USING network_cidr
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '"status_class":"42P07"'
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-drop-graph
+  description: DROP GRAPH dg1
+  args:
+  - query
+  - -g
+  - default
+  - '-'
+  stdin: |
+    DROP GRAPH dg1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+  restart_server: true
+- name: dg-recreate
+  description: the graph is created again under the same name
+  args:
+  - query
+  - -g
+  - default
+  - '-'
+  stdin: |
+    CREATE GRAPH dg1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-no-indexes
+  description: the new dg1 lists none of the old indexes
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - dg_idx
+    - dg_net
+  tags:
+  - regression
+- name: dg-no-constraints
+  description: nor the old constraint
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    SHOW CONSTRAINTS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    stdout_not_contains:
+    - dg_u
+  tags:
+  - regression
+- name: dg-not-enforced
+  description: the old UNIQUE does not enforce against the new graph
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    CREATE (:P {id: 1})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-not-enforced-2
+  description: a duplicate is accepted
+  args:
+  - query
+  - -g
+  - dg1
+  - '-'
+  stdin: |
+    CREATE (:P {id: 1})
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-net-name-free
+  description: the dropped graph freed the network index name for dg2
+  args:
+  - query
+  - -g
+  - dg2
+  - '-'
+  stdin: |
+    CREATE INDEX dg_net ON N (addr) USING network_cidr
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - regression
+- name: dg-keep-listed
+  description: dg2 still lists its own index
+  args:
+  - query
+  - -g
+  - dg2
+  - '-'
+  stdin: |
+    SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - dg_keep
   tags:
   - regression
