@@ -1,0 +1,736 @@
+# Graph-scoped index and constraint catalogs (SONNY-1319) and the DROP INDEX
+# naming / not-found rules (SONNY-6294).
+#
+# SONNY-1319 (the bug): the index and constraint catalogs were engine-global,
+# keyed <label>:<name> with no graph column. So
+#   - CREATE INDEX IF NOT EXISTS ix ... in graph B was a silent no-op when
+#     graph A already had `ix` (the index never existed in B),
+#   - a plain same-named CREATE INDEX in B returned 42P07,
+#   - SHOW INDEXES in a fresh graph listed other graphs' indexes, and
+#   - DROP INDEX in one graph removed the same-named index of EVERY graph
+#     (a cross-tenant availability vector under one-graph-per-tenant).
+#   CREATE CONSTRAINT / SHOW CONSTRAINTS had the same global scope.
+#
+# SONNY-6294 (the bug): one index name on two labels of a graph made DROP INDEX
+# nondeterministic (which label's row went depended on hash order), and a
+# missing index or constraint reached clients as GQLSTATE 58000 (system
+# error) rather than an invalid-reference code.
+#
+# What this spec proves, black-box over the QUIC wire against `geode serve`:
+#   * every catalog statement is scoped to the session graph: SHOW INDEXES /
+#     SHOW CONSTRAINTS list only that graph's rows, IF NOT EXISTS in a second
+#     graph creates that graph's own row, DROP in one graph leaves the other's;
+#   * a name is one object per graph, across labels (42P07 index, 42710
+#     constraint) and DROP of such a name is deterministic;
+#   * a missing index or constraint is 42002, not 58000;
+#   * the per-graph scoping survives a (graceful) restart: rows are saved with
+#     their graph and re-hydrated into the right graph.
+# Unique-constraint ENFORCEMENT is tracked separately (SONNY-2846/3358) and is
+# not asserted here.
+#
+# CANARY: REQ=REQ-SONNY-1319-GRAPH-SCOPED-CATALOG; FEATURE="IndexCatalog"; ASPECT=GraphScope; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny1319_graph_scoped_catalog.yml; OWNER=storage; UPDATED=2026-11-17
+
+version: '1.0'
+name: Graph-scoped index/constraint catalogs and DROP INDEX rules (SONNY-1319, SONNY-6294)
+description: Index and constraint catalogs are per graph; DROP INDEX is deterministic and not-found is 42002; scoping survives restart
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: create-graph-g1
+  description: Create graph g1 (CREATE GRAPH runs in a request of its own)
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g1_1319
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - setup
+- name: create-graph-g2
+  description: Create graph g2; the default graph stays untouched
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g2_1319
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - setup
+- name: g1-create-shared-index
+  description: g1 creates an index named ix_shared on Item.k
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; CREATE INDEX ix_shared FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-show-lists-shared-index
+  description: g1 lists ix_shared
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '{"name":"ix_shared","type":"btree","table":"Item","columns":"k"}'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-show-is-empty
+  description: "SHOW INDEXES in a fresh graph lists no other graph's index (was: listed ix_shared)"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+    stdout_not_contains:
+    - ix_shared
+  tags:
+  - catalog
+  - sonny1319
+- name: default-show-is-empty
+  description: SHOW INDEXES in the default graph does not list g1's index either
+  args:
+  - query
+  - '-'
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - ix_shared
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-if-not-exists-creates
+  description: "CREATE INDEX IF NOT EXISTS in g2 registers g2's own ix_shared (was: silent no-op)"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; CREATE INDEX IF NOT EXISTS ix_shared FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-show-lists-own-index
+  description: g2 now lists ix_shared (the IF NOT EXISTS really created it)
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '{"name":"ix_shared","type":"btree","table":"Item","columns":"k"}'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-if-not-exists-again-noop
+  description: IF NOT EXISTS a second time in the same graph is a no-op
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; CREATE INDEX IF NOT EXISTS ix_shared FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-plain-duplicate-refused
+  description: A plain same-named CREATE INDEX in the SAME graph is still 42P07
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; CREATE INDEX ix_shared FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 42P07
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-drop-shared
+  description: DROP INDEX in g1 removes g1's ix_shared
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; DROP INDEX ix_shared
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-show-after-drop
+  description: g1 no longer lists ix_shared
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - ix_shared
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-still-has-shared
+  description: "g2's same-named index survived g1's DROP (was: dropped in every graph)"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '{"name":"ix_shared","type":"btree","table":"Item","columns":"k"}'
+  tags:
+  - catalog
+  - sonny1319
+  - key
+- name: g1-drop-again-42002
+  description: DROP INDEX of a name the session graph lacks (g2 has it) is 42002, not 58000
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; DROP INDEX ix_shared
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42002'
+  tags:
+  - catalog
+  - sonny1319
+  - key
+- name: g1-drop-if-exists-noop
+  description: DROP INDEX IF EXISTS of the missing name is a clean no-op
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; DROP INDEX IF EXISTS ix_shared
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-still-has-shared-after-noop
+  description: g2's index is still there after g1's no-op
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_shared"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-recreate-plain
+  description: A plain same-named CREATE INDEX in g1 runs (g2 holds the name; was 42P07)
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; CREATE INDEX ix_shared FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-drop-shared
+  description: DROP INDEX in g2 removes g2's index only
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; DROP INDEX ix_shared
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-show-after-drop
+  description: g2 is empty again
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-keeps-recreated
+  description: g1's index survived g2's DROP
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_shared"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-create-constraint
+  description: g1 creates constraint uniq_k
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; CREATE CONSTRAINT uniq_k FOR (n:Item) REQUIRE n.k IS UNIQUE
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-show-constraint
+  description: g1 lists uniq_k
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW CONSTRAINTS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '{"name":"uniq_k","type":"UNIQUE","table":"Item","columns":"k"}'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-show-constraints-empty
+  description: "g2 lists no constraint (was: g1's)"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW CONSTRAINTS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+    stdout_not_contains:
+    - uniq_k
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-create-same-constraint
+  description: "g2 creates its own uniq_k (was: 42710 against g1's)"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; CREATE CONSTRAINT uniq_k FOR (n:Item) REQUIRE n.k IS UNIQUE
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-duplicate-constraint-42710
+  description: A second uniq_k in the same graph is refused 42710
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; CREATE CONSTRAINT uniq_k FOR (n:Item) REQUIRE n.k IS UNIQUE
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42710'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-constraint-if-not-exists
+  description: CREATE CONSTRAINT IF NOT EXISTS of an existing name is a no-op
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; CREATE CONSTRAINT IF NOT EXISTS uniq_k FOR (n:Item) REQUIRE n.k IS UNIQUE
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-drop-constraint
+  description: DROP CONSTRAINT in g1
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; DROP CONSTRAINT uniq_k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-constraint-gone
+  description: g1 has no uniq_k now
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW CONSTRAINTS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+  tags:
+  - catalog
+  - sonny1319
+- name: g2-constraint-survives
+  description: g2's uniq_k survived g1's DROP CONSTRAINT
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW CONSTRAINTS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"uniq_k"'
+  tags:
+  - catalog
+  - sonny1319
+  - key
+- name: g1-drop-constraint-42002
+  description: DROP CONSTRAINT of a name the session graph lacks is 42002 (was 58000)
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; DROP CONSTRAINT uniq_k
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42002'
+  tags:
+  - catalog
+  - sonny1319
+  - key
+- name: default-drop-index-42002
+  description: DROP INDEX of a name that exists nowhere is 42002 too
+  args:
+  - query
+  - '-'
+  stdin: DROP INDEX never_existed_1319
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42002'
+  tags:
+  - catalog
+  - sonny1319
+- name: g1-name-on-label-q
+  description: 'g1: ix_two on label Q'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; CREATE INDEX ix_two FOR (n:Q) ON (n.a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - sonny6294
+- name: g1-name-on-label-r-refused
+  description: 'g1: the same name on a second label is refused 42P07'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; CREATE INDEX ix_two FOR (n:R) ON (n.a)
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - 42P07
+  tags:
+  - catalog
+  - sonny1319
+  - sonny6294
+- name: g1-name-on-label-r-if-not-exists
+  description: 'g1: ...and IF NOT EXISTS is a no-op that does not add a second row'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; CREATE INDEX IF NOT EXISTS ix_two FOR (n:R) ON (n.a)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - sonny6294
+- name: g1-single-ix-two-row
+  description: SHOW INDEXES lists exactly one ix_two, on Q
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '{"name":"ix_two","type":"btree","table":"Q","columns":"a"}'
+    stdout_regex:
+    - ^(?:(?!ix_two).)*ix_two(?:(?!ix_two).)*$
+  tags:
+  - catalog
+  - sonny1319
+  - sonny6294
+- name: g1-drop-ix-two
+  description: 'DROP INDEX ix_two is deterministic: it removes the one object'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; DROP INDEX ix_two
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - sonny6294
+- name: g1-ix-two-gone
+  description: no ix_two row is left on any label
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - ix_two
+  tags:
+  - catalog
+  - sonny1319
+  - sonny6294
+- name: g1-drop-ix-two-again-42002
+  description: a second DROP says the index does not exist (42002)
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; DROP INDEX ix_two
+  expect:
+    exit_code: 1
+    stdout_contains:
+    - '42002'
+  tags:
+  - catalog
+  - sonny1319
+  - sonny6294
+- name: persist-g1-index
+  description: 'g1: ix_keep on Item.k (saved with its graph)'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; CREATE INDEX ix_keep FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: persist-g2-index
+  description: 'g2: ix_keep on Item.k'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; CREATE INDEX ix_keep FOR (n:Item) ON (n.k)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: graceful-restart
+  description: Graceful stop + start on the same data dir
+  type: bash
+  command: |
+    echo GRACEFUL_RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GRACEFUL_RESTART
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: after-restart-g1
+  description: g1 re-hydrates its own ix_keep (and still has its constraint-free state)
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_keep"'
+    stdout_not_contains:
+    - ix_two
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: after-restart-g2
+  description: g2 re-hydrates its own ix_keep and uniq_k
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_keep"'
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: after-restart-g2-constraint
+  description: g2's constraint survived the restart in g2 only
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; SHOW CONSTRAINTS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"uniq_k"'
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: after-restart-g1-no-constraint
+  description: g1 still has no constraint after the restart
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW CONSTRAINTS
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[]'
+    stdout_not_contains:
+    - uniq_k
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: after-restart-default-empty
+  description: the default graph lists neither ix_keep nor uniq_k
+  args:
+  - query
+  - '-'
+  stdin: SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - ix_keep
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: after-restart-drop-g2-only
+  description: DROP INDEX in g2 after the restart removes g2's row only
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g2_1319; DROP INDEX ix_keep
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: after-restart-g1-keeps
+  description: g1 still lists ix_keep
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g1_1319; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"ix_keep"'
+  tags:
+  - catalog
+  - sonny1319
+  - restart
+- name: teardown-g1
+  description: Drop test graph g1
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH g1_1319
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - teardown
+- name: teardown-g2
+  description: Drop test graph g2
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH g2_1319
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - catalog
+  - sonny1319
+  - teardown

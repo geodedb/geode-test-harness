@@ -1,0 +1,874 @@
+# EXPLAIN and PROFILE report the access path the executor really takes, and
+# name only real catalog indexes (SONNY-1335, SONNY-6276).
+#
+# SONNY-1335 (the bug): PROFILE put a NodeIndexScan operator named with the
+# literal "heuristic_index" in front of any query with a WHERE/FILTER equality
+# -- no catalog lookup -- so an UNINDEXED predicate profiled as an index scan,
+# and the planned PROFILE copied the plan's IndexSeek decision into the trace
+# whether or not the executor then seeked (an equality under an AND, a fulltext
+# index on the property) and never carried the index's name.
+#
+# SONNY-6276 (the bug): EXPLAIN still over-reported: it showed IndexSeek for an
+# index of ANY type (a fulltext index on the property), and for an equality
+# anywhere inside an AND chain, although the executor seeks only on a WHERE
+# that is one equality (or the inline {prop: v} map) over a btree/hash catalog
+# index on that label+property in the session graph. The response flag
+# U:HeuristicIndexSelection fired on every query with a WHERE equality.
+#
+# This spec runs real EXPLAIN / PROFILE statements over the QUIC wire against
+# `geode serve` and walks the same matrix as the zig regression tests
+# (tests/test_sonny1335_profile_access_path.zig,
+# tests/test_sonny6276_explain_access_path.zig), asserting for every query that
+# EXPLAIN and PROFILE agree:
+#   no index                      -> LabelScan, no IndexSeek, no index_name
+#   index on another property/label, fulltext index on the property
+#                                 -> still a scan
+#   btree index on label+property -> IndexSeek (EXPLAIN) and IndexSeek with
+#                                    index_name = the catalog name (PROFILE),
+#                                    for `WHERE n.p = v` and `{p: v}`
+#   the same equality under an AND-> scan (executor does not seek)
+#   after DROP INDEX              -> scan again
+# and that neither output ever carries "heuristic_index", a NodeIndexScan, or
+# the U:HeuristicIndexSelection flag. The tenant-bound / RLS (version 1
+# payload) arm needs a tenant-scoped session the CLI cannot bind; it stays
+# covered by the zig regression test (`zig build test-sonny1335-profile-access-path`).
+#
+# CANARY: REQ=REQ-SONNY-1335-EXPLAIN-PROFILE-ACCESS-PATH; FEATURE="EXPLAIN"; ASPECT=AccessPath; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny1335_explain_profile_access_path.yml; OWNER=storage; UPDATED=2026-11-17
+
+version: '1.0'
+name: EXPLAIN/PROFILE name the access path the executor takes (SONNY-1335, SONNY-6276)
+description: No fabricated heuristic_index; IndexSeek only where a btree/hash catalog index serves a single equality; EXPLAIN and PROFILE agree
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: create-graph
+  description: Create the probe graph
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g_plan_1335
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: seed
+  description: Three PlanProbe nodes and one Other node
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; CREATE (:PlanProbe {k: 1, note: 'n1', tag: 't1', body: 'alpha beta'}); CREATE (:PlanProbe {k: 2, note: 'n2', tag: 't2', body: 'gamma delta'}); CREATE (:PlanProbe {k: 3, note: 'n3', tag: 't3', body: 'alpha omega'}); CREATE (:Other {k: 9, note: 'n1'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: noidx-explain-where
+  description: "EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - noidx
+- name: noidx-profile-where
+  description: "PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - noidx
+- name: noidx-explain-inline
+  description: "EXPLAIN MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - noidx
+- name: noidx-profile-inline
+  description: "PROFILE MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - noidx
+- name: noidx-explain-and
+  description: "EXPLAIN MATCH (n:PlanProbe) WHERE n.k >= 0 AND n.note = 'n1' RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe) WHERE n.k >= 0 AND n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - noidx
+- name: noidx-profile-and
+  description: "PROFILE MATCH (n:PlanProbe) WHERE n.k >= 0 AND n.note = 'n1' RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe) WHERE n.k >= 0 AND n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - noidx
+- name: create-other-prop-index
+  description: btree index on a DIFFERENT property of the label
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; CREATE INDEX pp_tag FOR (n:PlanProbe) ON (n.tag)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: create-other-label-index
+  description: btree index on the SAME property of ANOTHER label
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; CREATE INDEX other_note FOR (n:Other) ON (n.note)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: otheridx-explain-where
+  description: "EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - otheridx
+- name: otheridx-profile-where
+  description: "PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - otheridx
+- name: create-fulltext-index
+  description: fulltext index on PlanProbe.body
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; CREATE INDEX pp_body FOR (n:PlanProbe) ON (n.body) USING fulltext
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: ftidx-explain-where
+  description: "EXPLAIN MATCH (n:PlanProbe) WHERE n.body = 'alpha beta' RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe) WHERE n.body = 'alpha beta' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - ftidx
+- name: ftidx-profile-where
+  description: "PROFILE MATCH (n:PlanProbe) WHERE n.body = 'alpha beta' RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe) WHERE n.body = 'alpha beta' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - ftidx
+- name: ftidx-explain-inline
+  description: "EXPLAIN MATCH (n:PlanProbe {body: 'alpha beta'}) RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe {body: 'alpha beta'}) RETURN n.k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - ftidx
+- name: ftidx-profile-inline
+  description: "PROFILE MATCH (n:PlanProbe {body: 'alpha beta'}) RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe {body: 'alpha beta'}) RETURN n.k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - ftidx
+- name: ftidx-profile-call
+  description: PROFILE of a CALL procedure names no made-up index
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE CALL geode.fts.search('pp_body', 'alpha')
+  expect:
+    exit_code: 0
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - ftidx
+- name: create-btree-index
+  description: btree index on PlanProbe.note
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; CREATE INDEX pp_note FOR (n:PlanProbe) ON (n.note)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: btree-explain-where
+  description: "EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"IndexSeek"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"LabelScan"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - btree
+- name: btree-profile-where
+  description: "PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: IndexSeek naming catalog index pp_note"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"IndexSeek"'
+    - '"index_name":"pp_note"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"LabelScan"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - btree
+  - key
+- name: btree-explain-inline
+  description: "EXPLAIN MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k: IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"IndexSeek"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"LabelScan"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - btree
+- name: btree-profile-inline
+  description: "PROFILE MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k: IndexSeek naming catalog index pp_note"
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"IndexSeek"'
+    - '"index_name":"pp_note"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"LabelScan"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - btree
+  - key
+- name: btree-explain-and
+  description: "EXPLAIN MATCH (n:PlanProbe) WHERE n.k >= 0 AND n.note = 'n1' RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe) WHERE n.k >= 0 AND n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - btree
+- name: btree-profile-and
+  description: "PROFILE MATCH (n:PlanProbe) WHERE n.k >= 0 AND n.note = 'n1' RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe) WHERE n.k >= 0 AND n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - btree
+- name: btree-show-indexes
+  description: SHOW INDEXES in the graph lists the btree index the profiles named (a fulltext index lives in the default graph)
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; SHOW INDEXES
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"name":"pp_note"'
+    - '"name":"pp_tag"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - btree
+- name: drop-btree-index
+  description: DROP INDEX pp_note
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; DROP INDEX pp_note
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: dropped-explain-where
+  description: "EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - dropped
+- name: dropped-profile-where
+  description: "PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - dropped
+- name: dropped-explain-inline
+  description: "EXPLAIN MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k: a scan, no IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - dropped
+- name: dropped-profile-inline
+  description: "PROFILE MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k: a scan, no index_name"
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe {note: 'n1'}) RETURN n.k"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - dropped
+- name: create-graph-2
+  description: A second graph that has the same label but no index
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g_plan_1335_b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: seed-2
+  description: a PlanProbe node in the second graph
+  args:
+  - query
+  - '-'
+  stdin: "USE GRAPH g_plan_1335_b; CREATE (:PlanProbe {k: 1, note: 'n1'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: create-btree-index-first-graph
+  description: re-create pp_note in the FIRST graph only
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; CREATE INDEX pp_note FOR (n:PlanProbe) ON (n.note)
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - setup
+- name: scoped-explain-first-graph
+  description: "EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: IndexSeek"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"IndexSeek"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"LabelScan"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - scoped
+- name: scoped-profile-first-graph
+  description: "PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k: IndexSeek naming catalog index pp_note"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335; PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"IndexSeek"'
+    - '"index_name":"pp_note"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"LabelScan"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - scoped
+  - key
+- name: scoped-explain-second-graph
+  description: "EXPLAIN in the second graph: the first graph's index is not evidence there (a scan)"
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335_b; EXPLAIN MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"kind":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"kind":"IndexSeek"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - scoped
+  - key
+- name: scoped-profile-second-graph
+  description: 'PROFILE in the second graph: a scan, no index_name'
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g_plan_1335_b; PROFILE MATCH (n:PlanProbe) WHERE n.note = 'n1' RETURN n.k
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"op":"LabelScan"'
+    stdout_not_contains:
+    - heuristic_index
+    - HeuristicIndexSelection
+    - NodeIndexScan
+    - '"op":"IndexSeek"'
+    - index_name
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - scoped
+  - key
+- name: teardown-1
+  description: Drop probe graph
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH g_plan_1335
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - teardown
+- name: teardown-2
+  description: Drop second probe graph
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH g_plan_1335_b
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - explain
+  - profile
+  - sonny1335
+  - sonny6276
+  - teardown

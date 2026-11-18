@@ -1,0 +1,230 @@
+# SONNY-6601: storage-layer atomicity residuals. Items 1-3 and 5 (half-failed adapter writes
+# joining a statement transaction, stale exact-index entries after an ALLOCATION failure
+# during a bulk insert, a poisoned shard after an auto-commit abort the engine cannot undo)
+# need injected allocation/IO failures and are covered by in-process store tests; item 6 is a
+# wire behaviour: over QUIC, a program that opens a transaction, mutates and rolls back in ONE
+# message (`START TRANSACTION; CREATE ...; ROLLBACK`) was refused with 25001 (and before that,
+# geode#830, committed the CREATE).
+#
+# This spec sends exactly such programs through the real server: each must succeed and leave
+# what a rollback (or, for the control, a commit) leaves, including the bulk-MERGE shape, and a
+# rolled-back key must be reusable afterwards.
+
+version: '1.0'
+name: SONNY-6601 QUIC START TRANSACTION ... ROLLBACK in one message
+description: Inline transaction control in a single QUIC message
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 240000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_ADMIN_PASSWORD: Correct Horse Battery Staple 42!
+      GEODE_ALLOW_TEST_AUDIT_KEYS: '1'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+default_timeout_ms: 120000
+tests:
+- name: seed
+  description: A K6601 node
+  args:
+  - query
+  - '-'
+  stdin: 'CREATE (:K6601 {v: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: create-rollback
+  description: 'One message: START TRANSACTION; CREATE (:Q6601 {i: 1}); CREATE (:Q6601 {i: 2}); ROLLBACK'
+  args:
+  - query
+  - '-'
+  stdin: 'START TRANSACTION; CREATE (:Q6601 {i: 1}); CREATE (:Q6601 {i: 2}); ROLLBACK'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: create-rollback-check
+  description: State after the program
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Q6601) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: merge-rollback
+  description: 'One message: START TRANSACTION; MERGE (:Q6601M {k: 1}); ROLLBACK'
+  args:
+  - query
+  - '-'
+  stdin: 'START TRANSACTION; MERGE (:Q6601M {k: 1}); ROLLBACK'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: merge-rollback-check
+  description: State after the program
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:Q6601M) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: delete-rollback
+  description: 'One message: START TRANSACTION; MATCH (n:K6601) DELETE n; ROLLBACK'
+  args:
+  - query
+  - '-'
+  stdin: START TRANSACTION; MATCH (n:K6601) DELETE n; ROLLBACK
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: delete-rollback-check
+  description: State after the program
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:K6601) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: set-rollback
+  description: 'One message: START TRANSACTION; MATCH (n:K6601) SET n.v = 2; ROLLBACK'
+  args:
+  - query
+  - '-'
+  stdin: START TRANSACTION; MATCH (n:K6601) SET n.v = 2; ROLLBACK
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: set-rollback-check
+  description: State after the program
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:K6601) WHERE n.v = 1 RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: create-commit
+  description: 'One message: START TRANSACTION; CREATE (:C6601); COMMIT'
+  args:
+  - query
+  - '-'
+  stdin: START TRANSACTION; CREATE (:C6601); COMMIT
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: create-commit-check
+  description: State after the program
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:C6601) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: bulk-merge-rollback
+  description: A simple MERGE (the bulk fast-path shape) inside START TRANSACTION ... ROLLBACK is also undone
+  args:
+  - query
+  - '-'
+  stdin: 'START TRANSACTION; MERGE (n:B6601 {k: 1}) ON CREATE SET n.x = 1; ROLLBACK'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - sonny738
+- name: bulk-merge-rollback-check
+  description: No B6601 node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:B6601) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - sonny738
+- name: rollback-then-recreate-same-key
+  description: The rolled-back key can be created afterwards (no stale index entry for the rolled-back node)
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:B6601 {k: 1}) ON CREATE SET n.x = 2; MATCH (n:B6601 {k: 1}) RETURN n.x AS x'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"x":2}]'
+  tags:
+  - storage
+  - sonny738
+- name: one-b6601
+  description: One node
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:B6601) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - sonny738

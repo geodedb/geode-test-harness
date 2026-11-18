@@ -1,0 +1,262 @@
+version: '1.0'
+name: SONNY-6424 writes after a checkpoint emptied the WAL survive SIGKILL
+description: |
+  SONNY-6424 (DATA LOSS), SONNY-6491 (items 1 and 2), SONNY-6473, SONNY-6632:
+  the write-ahead log's sequence anchor across a checkpoint.
+
+  A checkpoint empties the WAL; the sidecar `graph.wal.ckpt` is the only place
+  an empty log keeps its sequence number, and compaction used to delete it and
+  graph-storage's WalManager ignored `start_lsn`, so the next open numbered the
+  WAL from 0. Writes committed after that were then SKIPPED by recovery after a
+  crash (or only a torn tail replayed, answering DataCorruption). The same
+  checkpoint ordering window (SONNY-6491) wrote the manifest and truncated the
+  WAL BEFORE free.store and labels.dict were saved, so allocations and label
+  names assigned since the last save could be lost; and recovery replayed
+  batched page images in log order rather than LSN order (SONNY-6473).
+
+  Black-box: a real `geode serve` is cleanly stopped (SIGTERM: a full
+  checkpoint that empties every graph.wal; the spec asserts that on disk), is
+  restarted, takes new committed writes (a new label, a new relationship type,
+  new properties) and is then SIGKILLed (no shutdown, no checkpoint;
+  --persist-interval is huge, so the new writes are only in the WAL). After the
+  restart every committed write of every era must be there: the ones the
+  checkpoint made durable AND the ones logged after the checkpoint emptied the
+  log. Three eras and a second back-to-back kill (a second recovery over a log
+  that recovery itself checkpointed) are exercised.
+
+  The graph-storage internals that are not reachable from outside (a crash
+  between the manifest write and the free.store save, the WAL sidecar rewrite
+  count) stay covered by the graph-storage library tests.
+
+  CANARY: REQ=REQ-SONNY-6424-WAL-ANCHOR; FEATURE="CrashRecovery"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny6424_checkpoint_wal_anchor.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+  client:
+    timeout_ms: 30000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+tests:
+- name: era1-seed
+  description: 'Era 1: committed before the first clean shutdown.'
+  query: "UNWIND range(1, 21) AS i CREATE (:A6424 {i: i, v: 'a'})"
+  expected:
+    exit_code: 0
+
+- name: clean-stop-1
+  description: 'SIGTERM: the full checkpoint empties every WAL (asserted), then the harness restarts on the same data dir.'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -TERM -f "serve.*${GEODE_DATA_DIR}"
+    for i in $(seq 1 90); do
+      pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null; then echo SERVER_DID_NOT_STOP; exit 1; fi
+    n=$(find "${GEODE_DATA_DIR}" -path '*/wal/graph.wal' -size +0c | wc -l)
+    echo "CLEAN1_NONEMPTY_WALS_$n"
+    [ "$n" = 0 ] || { echo "WAL_NOT_EMPTIED_AFTER_CLEAN_SHUTDOWN"; exit 1; }
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CLEAN1_NONEMPTY_WALS_0
+
+- name: era1-survives-clean-restart
+  description: The checkpointed era is there after the clean restart.
+  query: MATCH (n:A6424) RETURN count(n) AS c, sum(n.i) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":20'
+    - '"s":210'
+
+- name: era2-new-label-and-relationship
+  description: 'Era 2: a NEW label, a NEW relationship type and new properties, logged after the checkpoint emptied the WAL.'
+  query: "UNWIND range(1, 11) AS i CREATE (:B6424 {i: i, v: 'b'})-[:LINK6424 {w: i}]->(:C6424 {i: i})"
+  expected:
+    exit_code: 0
+
+- name: era2-extra-property-on-era1
+  description: A committed update of an era-1 node, also only in the WAL.
+  query: "MATCH (n:A6424 {i: 1}) SET n.v = 'a-updated'"
+  expected:
+    exit_code: 0
+
+- name: sigkill-1
+  description: 'SIGKILL (no checkpoint) and restart: recovery must replay the era-2 records the emptied WAL began.'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo KILL1
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILL1
+
+- name: era1-and-era2-survive-kill-1
+  description: Both eras, the new labels and the relationships.
+  query: MATCH (a:A6424) RETURN count(a) AS c, sum(a.i) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":20'
+    - '"s":210'
+
+- name: era2-nodes-survive-kill-1
+  description: The WAL-only nodes of the new labels.
+  query: MATCH (b:B6424) RETURN count(b) AS c, sum(b.i) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":10'
+    - '"s":55'
+
+- name: era2-relationships-survive-kill-1
+  description: The WAL-only relationships, with their properties, through their (new) label and type.
+  query: MATCH (:B6424)-[r:LINK6424]->(:C6424) RETURN count(r) AS c, sum(r.w) AS w
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":10'
+    - '"w":55'
+
+- name: era2-update-survives-kill-1
+  description: The WAL-only property update of an era-1 node.
+  query: 'MATCH (n:A6424 {i: 1}) RETURN n.v AS v'
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"v":"a-updated"'
+
+- name: era3-writes
+  description: 'Era 3: more writes into the labels the recovery replayed.'
+  query: "UNWIND range(1, 8) AS i CREATE (:B6424 {i: i + 100, v: 'b3'})"
+  expected:
+    exit_code: 0
+
+- name: clean-stop-2
+  description: 'Second clean shutdown: the checkpoint empties the WALs again (asserted) over a log recovery had itself already checkpointed.'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -TERM -f "serve.*${GEODE_DATA_DIR}"
+    for i in $(seq 1 90); do
+      pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null; then echo SERVER_DID_NOT_STOP; exit 1; fi
+    n=$(find "${GEODE_DATA_DIR}" -path '*/wal/graph.wal' -size +0c | wc -l)
+    echo "CLEAN2_NONEMPTY_WALS_$n"
+    [ "$n" = 0 ] || { echo "WAL_NOT_EMPTIED_AFTER_CLEAN_SHUTDOWN"; exit 1; }
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CLEAN2_NONEMPTY_WALS_0
+
+- name: era3-writes-after-second-checkpoint
+  description: 'Era 4: committed after the second emptied WAL.'
+  query: "UNWIND range(1, 6) AS i CREATE (:D6424 {i: i, v: 'd'})"
+  expected:
+    exit_code: 0
+
+- name: sigkill-2
+  description: SIGKILL again.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo KILL2
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILL2
+
+- name: sigkill-3-back-to-back
+  description: A second SIGKILL straight after the recovery (a recovery over a log recovery just checkpointed and emptied).
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo KILL3
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILL3
+
+- name: all-eras-survive-a
+  description: Era 1.
+  query: MATCH (a:A6424) RETURN count(a) AS c, sum(a.i) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":20'
+    - '"s":210'
+
+- name: all-eras-survive-b
+  description: 'Era 2 and 3: 10 + 7 nodes of B6424.'
+  query: MATCH (b:B6424) RETURN count(b) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":17'
+
+- name: all-eras-survive-rel
+  description: Era 2 relationships.
+  query: MATCH (:B6424)-[r:LINK6424]->(:C6424) RETURN count(r) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":10'
+
+- name: all-eras-survive-d
+  description: Era 4, logged after the second emptied WAL.
+  query: MATCH (d:D6424) RETURN count(d) AS c, sum(d.i) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":5'
+    - '"s":15'
+
+- name: unlabeled-total
+  description: 'Unlabeled scan: 20 + 17 + 10 + 5 = 52 nodes.'
+  query: MATCH (n) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":52'

@@ -1,0 +1,321 @@
+version: '1.0'
+name: SONNY-6491 ORDER BY on an unseen label keeps label names and ids across a restart
+description: |
+  SONNY-6491 (follow-up regression found while fixing SONNY-6473): an ORDER BY
+  on a label no node has yet must not leave that label's name or id out of step
+  across a restart.
+
+  `MATCH (n:L) RETURN n.k ORDER BY n.k LIMIT m` starts a one-time background
+  build of the value-ordered index for (L, k) when none is registered. For a
+  label no node carried yet that build registered the name in shard 0's label
+  dictionary only, not through the engine, so the other 15 shards never learned
+  it and nothing made it durable (graph-storage writes labels.dict when the
+  engine assigns a new name). The name was lost on restart, and a later
+  `CREATE (:L)` found the id already in shard 0's dictionary and never
+  registered it either: nodes of later labels then carried a different id on
+  shard 0 than on the shards that never learned L.
+
+  Black-box (checkpoints effectively disabled: --persist-interval is a day):
+    (a) ORDER BY on an unseen label, CREATE (:L), SIGKILL, restart: L is
+        counted and listed by db.labels();
+    (b) ORDER BY on unseen L1, then nodes of five more new labels spread over
+        the shards, SIGKILL, restart: every node is found under its own label
+        and under no other (no label-id split), and the unlabeled scan agrees;
+    (c) the same ORDER BY-first / CREATE-second sequence on a clean (SIGTERM)
+        shutdown.
+
+  CANARY: REQ=REQ-SONNY-6491-ORDERBY-LABEL-INTERN; FEATURE="CrashRecovery"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny6491_orderby_unseen_label.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '86400000'
+  client:
+    timeout_ms: 120000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+default_timeout_ms: 120000
+
+tests:
+- name: orderby-unseen-label-a
+  description: The ORDER BY on a label no node has yet (it starts the ordered-index build for (Lob_a, k)).
+  query: MATCH (n:Lob_a) RETURN n.k ORDER BY n.k LIMIT 5
+  expected:
+    exit_code: 0
+
+- name: create-label-a
+  description: Then the first node of that label.
+  query: "CREATE (:Lob_a {tag: 'Lob_a', k: 1})"
+  expected:
+    exit_code: 0
+
+- name: orderby-unseen-label-1
+  description: ORDER BY on unseen L1 for case b.
+  query: MATCH (n:Lob1) RETURN n.k ORDER BY n.k LIMIT 5
+  expected:
+    exit_code: 0
+
+- name: create-label-1
+  description: First node of L1.
+  query: "CREATE (:Lob1 {tag: 'Lob1', k: 1})"
+  expected:
+    exit_code: 0
+
+- name: create-label-2-node-1
+  description: 'New label 2, node 1: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob2 {tag: 'Lob2', k: 1})"
+  expected:
+    exit_code: 0
+
+- name: create-label-2-node-2
+  description: 'New label 2, node 2: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob2 {tag: 'Lob2', k: 2})"
+  expected:
+    exit_code: 0
+
+- name: create-label-2-node-3
+  description: 'New label 2, node 3: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob2 {tag: 'Lob2', k: 3})"
+  expected:
+    exit_code: 0
+
+- name: create-label-3-node-1
+  description: 'New label 3, node 1: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob3 {tag: 'Lob3', k: 1})"
+  expected:
+    exit_code: 0
+
+- name: create-label-3-node-2
+  description: 'New label 3, node 2: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob3 {tag: 'Lob3', k: 2})"
+  expected:
+    exit_code: 0
+
+- name: create-label-3-node-3
+  description: 'New label 3, node 3: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob3 {tag: 'Lob3', k: 3})"
+  expected:
+    exit_code: 0
+
+- name: create-label-4-node-1
+  description: 'New label 4, node 1: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob4 {tag: 'Lob4', k: 1})"
+  expected:
+    exit_code: 0
+
+- name: create-label-4-node-2
+  description: 'New label 4, node 2: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob4 {tag: 'Lob4', k: 2})"
+  expected:
+    exit_code: 0
+
+- name: create-label-4-node-3
+  description: 'New label 4, node 3: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob4 {tag: 'Lob4', k: 3})"
+  expected:
+    exit_code: 0
+
+- name: create-label-5-node-1
+  description: 'New label 5, node 1: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob5 {tag: 'Lob5', k: 1})"
+  expected:
+    exit_code: 0
+
+- name: create-label-5-node-2
+  description: 'New label 5, node 2: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob5 {tag: 'Lob5', k: 2})"
+  expected:
+    exit_code: 0
+
+- name: create-label-5-node-3
+  description: 'New label 5, node 3: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob5 {tag: 'Lob5', k: 3})"
+  expected:
+    exit_code: 0
+
+- name: create-label-6-node-1
+  description: 'New label 6, node 1: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob6 {tag: 'Lob6', k: 1})"
+  expected:
+    exit_code: 0
+
+- name: create-label-6-node-2
+  description: 'New label 6, node 2: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob6 {tag: 'Lob6', k: 2})"
+  expected:
+    exit_code: 0
+
+- name: create-label-6-node-3
+  description: 'New label 6, node 3: one statement each so consecutive node slots land on different shards.'
+  query: "CREATE (:Lob6 {tag: 'Lob6', k: 3})"
+  expected:
+    exit_code: 0
+
+- name: sigkill-1
+  description: SIGKILL (no checkpoint) and restart.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -9 -f "serve.*${GEODE_DATA_DIR}"
+    sleep 1
+    echo KILL1
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - KILL1
+
+- name: after-kill-label-a-counted
+  description: 'Case a: the label created after the ORDER BY is counted.'
+  query: MATCH (n:Lob_a) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+
+- name: after-kill-label-a-listed
+  description: And listed by db.labels().
+  query: CALL db.labels() YIELD label RETURN label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"label":"Lob_a"'
+    - '"label":"Lob1"'
+    - '"label":"Lob6"'
+
+- name: after-kill-label-1-counted
+  description: 'Case b: L1.'
+  query: MATCH (n:Lob1) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+
+- name: after-kill-label-2-counted
+  description: 'Case b: label 2 keeps its three nodes.'
+  query: MATCH (n:Lob2) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":3'
+
+- name: after-kill-label-3-counted
+  description: 'Case b: label 3 keeps its three nodes.'
+  query: MATCH (n:Lob3) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":3'
+
+- name: after-kill-label-4-counted
+  description: 'Case b: label 4 keeps its three nodes.'
+  query: MATCH (n:Lob4) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":3'
+
+- name: after-kill-label-5-counted
+  description: 'Case b: label 5 keeps its three nodes.'
+  query: MATCH (n:Lob5) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":3'
+
+- name: after-kill-label-6-counted
+  description: 'Case b: label 6 keeps its three nodes.'
+  query: MATCH (n:Lob6) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":3'
+
+- name: after-kill-no-label-id-split
+  description: No node answers under a label other than its own tag (a label-id split would).
+  query: MATCH (n) WHERE n.tag IS NOT NULL AND NOT n.tag IN labels(n) RETURN count(n) AS wrong
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"wrong":0'
+
+- name: after-kill-unlabeled-total
+  description: 'The unlabeled scan: 1 + 1 + 15 nodes.'
+  query: MATCH (n) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":17'
+
+- name: orderby-unseen-label-c
+  description: 'Case c: ORDER BY on another unseen label.'
+  query: MATCH (n:Lob_c) RETURN n.k ORDER BY n.k LIMIT 5
+  expected:
+    exit_code: 0
+
+- name: create-label-c
+  description: Then its first node.
+  query: "CREATE (:Lob_c {tag: 'Lob_c', k: 1})"
+  expected:
+    exit_code: 0
+
+- name: clean-stop
+  description: Clean SIGTERM shutdown and restart.
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -TERM -f "serve.*${GEODE_DATA_DIR}"
+    for i in $(seq 1 90); do
+      pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null; then echo SERVER_DID_NOT_STOP; exit 1; fi
+    n=$(find "${GEODE_DATA_DIR}" -path '*/wal/graph.wal' -size +0c | wc -l)
+    echo "CLEAN_NONEMPTY_WALS_$n"
+  timeout_ms: 90000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CLEAN
+
+- name: after-clean-label-c-counted
+  description: The label survives the clean shutdown too.
+  query: MATCH (n:Lob_c) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":1'
+
+- name: after-clean-labels-listed
+  description: db.labels() lists it.
+  query: CALL db.labels() YIELD label RETURN label
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"label":"Lob_c"'
+
+- name: after-clean-earlier-labels-intact
+  description: And the earlier labels are intact.
+  query: MATCH (n:Lob3) RETURN count(n) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":3'

@@ -1,0 +1,385 @@
+version: '1.0'
+name: 'SONNY-6290/6300/6531: backup/restore CLI surface is real (no object storage, validated --timeout, specific address errors)'
+description: |
+  Tickets: SONNY-6290 (docs/CLI documented `geode backup --dest s3://... --mode
+  ... --parent/--list` and restore from s3:// although the binary has no object
+  storage path; `backup create` silently ignored unknown options and, with --local,
+  turned `--output s3://bucket/x` into a local 's3:' directory and reported
+  success), SONNY-6300 item 3 (the CLI waited a hard-coded 30 s for the server's
+  answer; `--timeout <seconds>` is now accepted and validated by `restore --server`
+  and `backup create`), SONNY-6531 item 2 (CLI and backup CLI printed the generic
+  'Invalid server address format. Expected host:port' instead of the specific DSN
+  error that explains what is wrong with --server).
+
+  Every case is a real invocation of the built binary; no server is needed because
+  each of these is refused before any connection is made. The spec proves:
+    * the nonexistent command forms (backup --dest/--mode/--parent/--list, backup
+      create --dest/--mode/--parent, backup verify, backup schedule) fail closed
+      (exit 1 for an unknown subcommand, exit 2 for an unknown option) naming the
+      offending token, and write nothing;
+    * `backup create --output s3://..|https://..` is exit 2 'not supported' with
+      --local, with --server and without, creating no file or 's3:' directory;
+    * `restore s3://..|https://..` is a named failure (RemoteRestoreSourceNotSupported),
+      no success line, nothing created at the target;
+    * `restore` rejects extra arguments and unknown options (exit 2);
+    * the help texts list --timeout, state that geode has no object-storage path,
+      and the `backup` help lists only create/list/info/cleanup;
+    * --timeout 0, -5, abc and '' are exit 2 naming --timeout for both commands,
+      before a connection is attempted;
+    * a malformed --server (host with a space, unbalanced IPv6 bracket, port 0,
+      port 70000, non-numeric port) is reported with the specific DSN diagnostic
+      by `backup create`, `restore --server` and `query`, never the generic text.
+
+  CANARY: REQ=REQ-BACKUP-CLI-SURFACE-001; FEATURE="BackupCli"; ASPECT=CommandSurfaceFailsClosed; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6290_backup_cli_surface.yml; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true  # scratch servers + on-disk backup files; not meaningful to promote to multi-node
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+
+tests:
+- name: nonexistent-backup-command-forms-fail-closed
+  description: |
+    The command forms the old docs showed are not accepted and write nothing.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX); mkdir -p "$W/cwd" "$W/d"; cd "$W/cwd"
+    expect() { # <tag> <rc> <needle> -- cmd...
+      local tag="$1" want="$2" needle="$3"; shift 4
+      local out rc; out=$(timeout 30 "$@" 2>&1); rc=$?
+      [ "$rc" = "$want" ] || { echo "$out" | head -6; fail "$tag: rc=$rc want $want"; }
+      echo "$out" | grep -q -- "$needle" || { echo "$out" | head -6; fail "$tag: no '$needle'"; }
+      echo "REFUSED_$tag"
+    }
+    expect BACKUP_DEST 1 "Unknown backup subcommand '--dest'" -- "$BIN" backup --dest s3://bucket/geode --mode full
+    expect BACKUP_LIST 1 "Unknown backup subcommand '--list'" -- "$BIN" backup --list
+    expect BACKUP_VERIFY 1 "Unknown backup subcommand 'verify'" -- "$BIN" backup verify
+    expect BACKUP_SCHEDULE 1 "Unknown backup subcommand 'schedule'" -- "$BIN" backup schedule
+    expect CREATE_DEST 2 "unknown option '--dest'" -- "$BIN" backup create --local --data-dir "$W/d" --output "$W/x.backup" --dest s3://bucket/geode
+    expect CREATE_MODE 2 "unknown option '--mode'" -- "$BIN" backup create --local --data-dir "$W/d" --output "$W/x.backup" --mode incremental
+    expect CREATE_PARENT 2 "unknown option '--parent'" -- "$BIN" backup create --local --data-dir "$W/d" --output "$W/x.backup" --parent 123
+    expect S3_OUTPUT_LOCAL 2 "not supported" -- "$BIN" backup create --local --data-dir "$W/d" --output s3://bucket/geode/full.backup
+    expect S3_OUTPUT_SERVER 2 "not supported" -- "$BIN" backup create --server 127.0.0.1:1 --output s3://bucket/geode/full.backup
+    expect HTTPS_OUTPUT 2 "not supported" -- "$BIN" backup create --local --data-dir "$W/d" --output https://example.invalid/full.backup
+    expect RESTORE_S3 1 RemoteRestoreSourceNotSupported -- "$BIN" restore s3://bucket/geode/full.backup --data-dir "$W/target" --yes
+    expect RESTORE_HTTPS 1 RemoteRestoreSourceNotSupported -- "$BIN" restore https://example.invalid/full.backup --data-dir "$W/target" --yes
+    expect RESTORE_EXTRA_ARG 2 "unexpected argument" -- "$BIN" restore a.backup b.backup --data-dir "$W/target"
+    expect RESTORE_UNKNOWN_OPT 2 "unexpected argument '--from'" -- "$BIN" restore a.backup --data-dir "$W/target" --from s3://bucket/x
+    [ -z "$(ls -A "$W/cwd")" ] || fail "refused commands left files in cwd: $(ls -A "$W/cwd")"
+    [ "$(ls -A "$W" | sort | tr '\n' ' ')" = "cwd d " ] || fail "refused commands left files: $(ls -A "$W")"
+    [ -z "$(ls -A "$W/d")" ] || fail "refused commands wrote into the data dir"
+    echo "NOTHING_WRITTEN"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - REFUSED_BACKUP_DEST
+    - REFUSED_BACKUP_LIST
+    - REFUSED_BACKUP_VERIFY
+    - REFUSED_BACKUP_SCHEDULE
+    - REFUSED_CREATE_DEST
+    - REFUSED_CREATE_MODE
+    - REFUSED_CREATE_PARENT
+    - REFUSED_S3_OUTPUT_LOCAL
+    - REFUSED_S3_OUTPUT_SERVER
+    - REFUSED_HTTPS_OUTPUT
+    - REFUSED_RESTORE_S3
+    - REFUSED_RESTORE_HTTPS
+    - REFUSED_RESTORE_EXTRA_ARG
+    - REFUSED_RESTORE_UNKNOWN_OPT
+    - NOTHING_WRITTEN
+  tags: [backup, restore, sonny-6290, negative]
+
+- name: help-describes-only-the-real-surface
+  description: |
+    `backup` lists exactly create/list/info/cleanup; the help names --timeout and says there is no object-storage path.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    BK=$("$BIN" backup --help 2>&1)
+    for s in "create" "list" "info" "cleanup"; do echo "$BK" | grep -q "^  $s " || { echo "$BK"; fail "backup --help lacks $s"; }; done
+    echo "$BK" | grep -qiE "verify|schedule|s3://" && { echo "$BK"; fail "backup --help advertises a command that does not exist"; }
+    RS=$("$BIN" restore --help 2>&1)
+    echo "$RS" | grep -q -- "--timeout" || fail "restore --help lacks --timeout"
+    echo "$RS" | grep -q "no object-storage path" || fail "restore --help does not say there is no object-storage path"
+    echo "$RS" | grep -q -- "--data-dir" || fail "restore --help lacks --data-dir"
+    CR=$("$BIN" backup create --help 2>&1)
+    echo "$CR" | grep -q -- "--timeout" || fail "backup create --help lacks --timeout"
+    echo "$CR" | grep -q "does not write to object storage" || fail "backup create --help does not say no object storage"
+    echo "$CR" | grep -qE -- "--(dest|mode|parent)" && fail "backup create --help lists a nonexistent option"
+    CL=$("$BIN" backup cleanup --help 2>&1)
+    echo "$CL" | grep -q -- "--older-than" || fail "backup cleanup --help lacks --older-than"
+    echo "HELP_SURFACE_OK"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - HELP_SURFACE_OK
+  tags: [backup, restore, sonny-6290, help]
+
+- name: timeout-option-is-validated-before-any-connection
+  description: |
+    SONNY-6300 item 3: --timeout takes whole seconds >= 1; anything else is exit 2 naming --timeout and no file is written.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX); mkdir -p "$W/cwd"; cd "$W/cwd"
+    for v in 0 -5 abc ""; do
+      OUT=$("$BIN" restore --server 127.0.0.1:1 --yes --timeout "$v" 2>&1); RC=$?
+      [ "$RC" = 2 ] && echo "$OUT" | grep -q -- "--timeout" || { echo "$OUT"; fail "restore --timeout '$v': rc=$RC"; }
+      OUT=$("$BIN" backup create --output x.backup --server 127.0.0.1:1 --timeout "$v" 2>&1); RC=$?
+      [ "$RC" = 2 ] && echo "$OUT" | grep -q -- "--timeout" || { echo "$OUT"; fail "backup create --timeout '$v': rc=$RC"; }
+    done
+    [ -e x.backup ] && fail "a refused backup wrote x.backup"
+    # a valid value is accepted: the failure is the refused connection, not the option
+    OUT=$(timeout 60 "$BIN" backup create --output x.backup --server 127.0.0.1:1 --timeout 3 2>&1); RC=$?
+    echo "$OUT" | grep -q "takes whole seconds" && { echo "$OUT"; fail "--timeout 3 rejected"; }
+    [ "$RC" != 0 ] || fail "backup to a closed port reported success"
+    [ -e x.backup ] && fail "a failed remote backup left x.backup"
+    echo "TIMEOUT_VALIDATED"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - TIMEOUT_VALIDATED
+  tags: [backup, restore, sonny-6300, negative]
+
+- name: bad-server-address-names-what-is-wrong
+  description: |
+    SONNY-6531 item 2: a malformed --server gets the specific DSN diagnostic from backup create, restore --server and query, never the generic address text.
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX); mkdir -p "$W/cwd"; cd "$W/cwd"
+    check() { # <tag> <address> <needle>
+      local tag="$1" addr="$2" needle="$3" out rc
+      for cmd in "backup create --output $W/x.backup" "restore --yes" "query RETURN"; do
+        case "$cmd" in
+          query*) out=$(timeout 30 "$BIN" query "RETURN 1" --server "$addr" 2>&1); rc=$? ;;
+          *) out=$(timeout 30 "$BIN" $cmd --server "$addr" 2>&1); rc=$? ;;
+        esac
+        [ "$rc" != 0 ] || { echo "$out"; fail "$tag/${cmd%% *}: succeeded"; }
+        echo "$out" | grep -q "Invalid server address format" && { echo "$out"; fail "$tag/${cmd%% *}: generic address error"; }
+        echo "$out" | grep -q "$needle" || { echo "$out" | head -5; fail "$tag/${cmd%% *}: no '$needle'"; }
+      done
+      echo "ADDRESS_ERROR_$tag"
+    }
+    check SPACE_IN_HOST "a b:1" "the host must be a name, an IPv4 address or a bracketed IPv6 address"
+    check OPEN_BRACKET "[::1" "the host must be a name, an IPv4 address or a bracketed IPv6 address"
+    check PORT_ZERO "127.0.0.1:0" "port must be 1-65535"
+    check PORT_TOO_BIG "127.0.0.1:70000" "port must be 1-65535"
+    check PORT_NOT_A_NUMBER "localhost:abc" "port must be 1-65535"
+    [ -e "$W/x.backup" ] && fail "a refused backup wrote a file"
+    echo "ADDRESS_ERRORS_SPECIFIC"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - ADDRESS_ERROR_SPACE_IN_HOST
+    - ADDRESS_ERROR_OPEN_BRACKET
+    - ADDRESS_ERROR_PORT_ZERO
+    - ADDRESS_ERROR_PORT_TOO_BIG
+    - ADDRESS_ERROR_PORT_NOT_A_NUMBER
+    - ADDRESS_ERRORS_SPECIFIC
+  tags: [backup, cli, sonny-6531, negative]

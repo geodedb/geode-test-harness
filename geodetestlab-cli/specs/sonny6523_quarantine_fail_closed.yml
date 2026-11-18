@@ -1,0 +1,777 @@
+# A graph whose first-touch hydration failed is quarantined: every read and
+# every write fails closed, never "0" (SONNY-6523), and a graph dropped before a
+# restart can be created again afterwards (SONNY-6523 tombstone).
+#
+# The bug (item 1): when the hydration scan of a graph meets damaged pages the
+# graph is quarantined, but the quarantine was noted in a thread-local that only
+# the executor's statement gate consumed. The transport fast paths -- the
+# label-refcount count, count(*) / count(n), the filtered-count path, the write
+# fast paths -- answered from the resident products the failed hydration had
+# left partial: `MATCH (n:P) RETURN count(n)` answered 0 for a graph holding
+# 300 nodes. A silent wrong answer where an error belongs.
+#
+# This spec seeds a real `geode serve` (300 nodes, 40 relationships with a
+# property, an exact property index; a second graph with 40 nodes), stops it
+# gracefully (the shutdown checkpoint empties the WALs), then DAMAGES the
+# store on disk the way tests/test_sonny2409* does: every written page of every
+# shard's nodes.store is zeroed, labels.idx is emptied and the derived hydration
+# snapshots are removed, so the restart's hydration scan meets the damage. After
+# the restart each read and each write below must FAIL (exit non-zero with an
+# error status), none may answer -- a zero or empty answer included. DROP GRAPH
+# of the quarantined second graph still runs (it is how an operator removes
+# it), and the name can be created again after a further restart (the dropped
+# graph's name is not left tombstoned against CREATE GRAPH).
+#
+# Not covered here (in-process only, `zig build test-sonny6523-failed-create-count`
+# and `test-sonny6523-dropped-graph-restart`): a node create that fails part way
+# giving its slot back (needs an injected allocation/engine failure), the
+# replicated-Raft-apply write to a dropped graph name after a restart (needs a
+# cluster), and the relationship-property SET WAL volume.
+#
+# CANARY: REQ=REQ-SONNY-6523-QUARANTINE-FAIL-CLOSED; FEATURE="StorageIntegrity"; ASPECT=FailClosed; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6523_quarantine_fail_closed.yml; OWNER=storage; UPDATED=2026-11-17
+
+version: '1.0'
+name: Quarantined graph fails closed on every read and write (SONNY-6523)
+description: After a damaged-page hydration failure every count/scan/write errors instead of answering 0; DROP GRAPH still runs
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: create-graph-q
+  description: second graph that will be damaged too
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g6523q
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - setup
+- name: seed
+  description: 300 P nodes + 40 R relationships + an exact index in the default graph; 40 Q nodes in g6523q
+  type: bash
+  command: |2
+
+    set -eu
+    G="${GEODE_BINARY}"
+    B() { "$G" query --batch --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "${GEODE_ADMIN_PASSWORD}"; }
+    F="${GEODE_DATA_DIR}/seed6523.gql"
+    : > "$F"
+    i=0
+    while [ $i -lt 300 ]; do
+      w=gamma; [ $((i % 2)) -eq 0 ] && w=alpha
+      printf "CREATE (:P {name: 'p-%05d', i: %d, body: '%s delta'})\n" $i $i $w >> "$F"
+      i=$((i+1))
+    done
+    i=0
+    while [ $i -lt 40 ]; do
+      printf "MATCH (a:P {name: 'p-%05d'}), (b:P {name: 'p-%05d'}) CREATE (a)-[:R {w: %d}]->(b)\n" $i $((i+1)) $i >> "$F"
+      i=$((i+1))
+    done
+    printf "CREATE INDEX p_name FOR (n:P) ON (n.name)\n" >> "$F"
+    B < "$F" > "${GEODE_DATA_DIR}/seed6523.out" 2>&1
+    test "$(grep -c '"status_class":"00000"' "${GEODE_DATA_DIR}/seed6523.out")" -eq 341
+    F2="${GEODE_DATA_DIR}/seed6523b.gql"
+    : > "$F2"
+    printf "USE GRAPH g6523q\n" >> "$F2"
+    i=0
+    while [ $i -lt 40 ]; do printf "CREATE (:Q {i: %d})\n" $i >> "$F2"; i=$((i+1)); done
+    B < "$F2" > "${GEODE_DATA_DIR}/seed6523b.out" 2>&1
+    test "$(grep -c '"status_class":"00000"' "${GEODE_DATA_DIR}/seed6523b.out")" -eq 41
+    echo SEEDED
+  timeout_ms: 600000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SEEDED
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - setup
+- name: healthy-label-count
+  description: 'baseline: the label count answers 300 on the healthy store'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":300}]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - baseline
+- name: healthy-all-count
+  description: 'baseline: the unlabelled count answers 300 (the second graph is separate)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":300}]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - baseline
+- name: healthy-rel-count
+  description: 'baseline: the relationship count answers 40'
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[r:R]->() RETURN count(r) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":40}]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - baseline
+- name: stop-damage-restart
+  description: Stop gracefully (full checkpoint), zero every written nodes.store page, empty labels.idx, remove hydration snapshots, restart
+  type: bash
+  command: |2
+
+    set -eu
+    D="${GEODE_DATA_DIR}"
+    # stop the server gracefully: the shutdown checkpoint empties the WALs
+    pkill -TERM -f "serve .*--data-dir ${D}" || true
+    for i in $(seq 1 120); do
+      pgrep -f "serve .*--data-dir ${D}" >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f "serve .*--data-dir ${D}" >/dev/null; then echo SERVER_DID_NOT_STOP; exit 1; fi
+    python3 - "$D" <<'PY'
+    import os, sys
+    PAGE, HDR = 8192, 32
+    root = sys.argv[1]
+    zeroed = 0
+    snaps = 0
+    for dp, dn, fn in os.walk(root):
+        for f in fn:
+            p = os.path.join(dp, f)
+            if "/__geode_security" in p or "/graphs/__geode_security" in p:
+                continue
+            if f == "labels.idx":
+                open(p, "wb").close()
+            elif f.startswith("hydration_") and f.endswith(".snap"):
+                os.remove(p); snaps += 1
+            elif f == "nodes.store":
+                size = os.path.getsize(p)
+                with open(p, "r+b") as fh:
+                    page = 0
+                    while (page + 1) * PAGE <= size:
+                        fh.seek(page * PAGE)
+                        if fh.read(HDR).strip(b"\0"):
+                            fh.seek(page * PAGE)
+                            fh.write(b"\0" * PAGE)
+                            zeroed += 1
+                        page += 1
+    print("ZEROED_PAGES=%d SNAPSHOTS_REMOVED=%d" % (zeroed, snaps))
+    if zeroed == 0:
+        sys.exit(3)
+    PY
+    echo DAMAGED
+  timeout_ms: 300000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - DAMAGED
+    stdout_regex:
+    - ZEROED_PAGES=[1-9]
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - damage
+  - restart
+- name: after-damage-read-label-count
+  description: 'after-damage: `MATCH (n:P) RETURN count(n) AS c` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) RETURN count(n) AS c
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-all-count
+  description: 'after-damage: `MATCH (n) RETURN count(n) AS c` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) RETURN count(n) AS c
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-all-count-star
+  description: 'after-damage: `MATCH (n) RETURN count(*) AS c` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) RETURN count(*) AS c
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-rel-count-typed
+  description: 'after-damage: `MATCH ()-[r:R]->() RETURN count(r) AS c` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[r:R]->() RETURN count(r) AS c
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-rel-count-any
+  description: 'after-damage: `MATCH ()-[r]->() RETURN count(r) AS c` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH ()-[r]->() RETURN count(r) AS c
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-filtered-count
+  description: 'after-damage: `MATCH (n:P) WHERE n.i >= 0 RETURN count(n) AS c` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) WHERE n.i >= 0 RETURN count(n) AS c
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-exact-seek
+  description: "after-damage: `MATCH (n:P) WHERE n.name = 'p-00007' RETURN n.i AS i` fails closed (exit != 0), never answers (0 included)"
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) WHERE n.name = 'p-00007' RETURN n.i AS i
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-inline-seek
+  description: "after-damage: `MATCH (n:P {name: 'p-00008'}) RETURN n.i AS i` fails closed (exit != 0), never answers (0 included)"
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (n:P {name: 'p-00008'}) RETURN n.i AS i"
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-ordered-limit
+  description: 'after-damage: `MATCH (n:P) RETURN n.name AS name ORDER BY n.name LIMIT 3` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) RETURN n.name AS name ORDER BY n.name LIMIT 3
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-label-scan
+  description: 'after-damage: `MATCH (n:P) RETURN n.name AS name` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) RETURN n.name AS name
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-all-scan
+  description: 'after-damage: `MATCH (n) RETURN n.name AS name` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n) RETURN n.name AS name
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-edge-prop
+  description: 'after-damage: `MATCH (a:P)-[r:R]->(b) RETURN r.w AS w` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (a:P)-[r:R]->(b) RETURN r.w AS w
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-read-max-agg
+  description: 'after-damage: `MATCH (n:P) RETURN max(n.i) AS m` fails closed (exit != 0), never answers (0 included)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) RETURN max(n.i) AS m
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+    - '"rows":[]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - read
+  - after-damage
+  - key
+- name: after-damage-write-fast-create
+  description: "after-damage: `CREATE (:P {name: 'new-1', i: 1000})` is refused"
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (:P {name: 'new-1', i: 1000})"
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - write
+  - after-damage
+  - key
+- name: after-damage-write-merge
+  description: "after-damage: `MERGE (:P {name: 'p-00003'})` is refused"
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (:P {name: 'p-00003'})"
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - write
+  - after-damage
+  - key
+- name: after-damage-write-merge-new
+  description: "after-damage: `MERGE (:P {name: 'new-3'})` is refused"
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (:P {name: 'new-3'})"
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - write
+  - after-damage
+  - key
+- name: after-damage-write-batch-merge
+  description: "after-damage: `/*+BATCH*/ MERGE (:P {name: 'new-4'}); MERGE (:P {name: 'new-5'})` is refused"
+  args:
+  - query
+  - '-'
+  stdin: "/*+BATCH*/ MERGE (:P {name: 'new-4'}); MERGE (:P {name: 'new-5'})"
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - write
+  - after-damage
+  - key
+- name: after-damage-write-edge-create
+  description: "after-damage: `MATCH (a:P {name: 'p-00001'}), (b:P {name: 'p-00002'}) CREATE (a)-[:R {w: 99}]->(b)` is refused"
+  args:
+  - query
+  - '-'
+  stdin: "MATCH (a:P {name: 'p-00001'}), (b:P {name: 'p-00002'}) CREATE (a)-[:R {w: 99}]->(b)"
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - write
+  - after-damage
+  - key
+- name: after-damage-write-set
+  description: "after-damage: `MATCH (n:P) WHERE n.name = 'p-00004' SET n.i = 7` is refused"
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:P) WHERE n.name = 'p-00004' SET n.i = 7
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - write
+  - after-damage
+  - key
+- name: after-damage-write-exec-create
+  description: "after-damage: `CREATE (n:P {name: 'new-6'}) RETURN n.name AS name` is refused"
+  args:
+  - query
+  - '-'
+  stdin: "CREATE (n:P {name: 'new-6'}) RETURN n.name AS name"
+  expect:
+    exit_code:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    stdout_not_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - write
+  - after-damage
+  - key
+- name: drop-quarantined-graph
+  description: DROP GRAPH of the quarantined second graph still runs
+  args:
+  - query
+  - '-'
+  stdin: DROP GRAPH g6523q
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - drop
+- name: restart-after-drop
+  description: restart after the drop
+  type: bash
+  command: |
+    echo GRACEFUL_RESTART
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - GRACEFUL_RESTART
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - restart
+- name: recreate-dropped-name
+  description: the dropped graph's name can be created again after a restart
+  args:
+  - query
+  - '-'
+  stdin: CREATE GRAPH g6523q
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - drop
+  - tombstone
+- name: recreated-graph-empty
+  description: the re-created graph is empty and usable
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g6523q; MATCH (n) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - drop
+  - tombstone
+- name: recreated-graph-write
+  description: and takes writes
+  args:
+  - query
+  - '-'
+  stdin: 'USE GRAPH g6523q; CREATE (:Q {i: 1})'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - drop
+  - tombstone
+- name: recreated-graph-count
+  description: which are visible
+  args:
+  - query
+  - '-'
+  stdin: USE GRAPH g6523q; MATCH (n:Q) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - storage
+  - quarantine
+  - sonny6523
+  - drop
+  - tombstone

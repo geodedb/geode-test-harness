@@ -1,0 +1,450 @@
+version: '1.0'
+name: 'SONNY-6289: backup cleanup deletes what it reports; backup info survives damaged headers'
+description: |
+  SONNY-6289: `geode backup cleanup` was a stub that printed 'Cleaned 0 backup
+  files' and 'Backup cleanup completed' with exit 0 and deleted nothing, and
+  `geode backup info` cast the header from an unaligned buffer and range-unchecked
+  enum/bool fields, so it crashed on every file and mis-printed damaged headers.
+
+  This spec drives the real binary over real backup files made by a real server
+  (`geode backup create --server`), whose header timestamps are then moved into
+  the past with a byte patch (offset 16, little-endian epoch ms) so that retention
+  has something to age out; headers are damaged by patching single bytes:
+    info:    a valid header prints 'Geode Backup v4'; each of encrypted=2,
+             compression=99, backup_type=7, a zeroed magic, an out-of-range
+             payload_len, a 20-byte truncation and a plain gzip file exits 1 with
+             'error:' and never prints a backup banner (no crash signal).
+    list:    a directory holding a damaged header still lists the good file.
+    cleanup: needs --dir and --older-than (exit 2); without --yes it is a dry run
+             that lists what it would delete and deletes nothing; with --yes it
+             deletes only old geode backups directly in --dir (not a non-backup
+             file, a subdirectory entry, or a symlink target outside), always
+             keeps the newest backup however old, reports each deletion, and
+             exits 1 (no 'Backup cleanup completed') when a deletion fails.
+
+  Run with GEODE_ADMIN_PASSWORD set to a policy-compliant passphrase, e.g.
+    GEODE_ADMIN_PASSWORD='Orbit Lantern Meadow Quartz 2026 Delta!'
+
+  CANARY: REQ=REQ-BACKUP-CLEANUP-001; FEATURE="BackupCleanup"; ASPECT=CleanupAndInfoBlackBox; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny6289_backup_cleanup_info.yml; OWNER=storage; UPDATED=2026-11-17
+
+single_node_only: true  # scratch servers + on-disk backup files; not meaningful to promote to multi-node
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: false
+  client:
+    timeout_ms: 30000
+
+tests:
+- name: fixture-real-backup-with-aged-copies
+  description: |
+    Takes one real server backup, then derives dated copies (9d, 8d, 1d old) and untouchable neighbours.
+  type: bash
+  timeout_ms: 240000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(mktemp -d /tmp/sonnyC.XXXXXX); KEEP=1
+    echo "$W" > /tmp/sonnyC_6289.path
+    start_server "$W/src" "$W/src.log" || exit 1
+    q "INSERT (:Doc {id: 1, title: 'cleanup fixture'})" >/dev/null
+    bk --output "$W/base.backup" | grep -q "Backup created successfully" || fail "base backup"
+    stop_server
+    settime() { # <file> <days ago>
+      python3 -I - "$1" "$2" <<'PYEOF'
+    import struct, sys, time
+    p, days = sys.argv[1], float(sys.argv[2])
+    b = bytearray(open(p, "rb").read())
+    ms = int(time.time() * 1000 - days * 86400 * 1000)
+    b[16:24] = struct.pack("<q", ms)
+    open(p, "wb").write(b)
+    PYEOF
+    }
+    D="$W/backups"; mkdir -p "$D/sub" "$W/outside"
+    for n in a:9 b:8 c:1; do
+      cp "$W/base.backup" "$D/full_${n%%:*}.backup"; settime "$D/full_${n%%:*}.backup" "${n##*:}"
+    done
+    echo "operator notes" > "$D/notes.txt"
+    cp "$W/base.backup" "$D/sub/full_inner.backup"; settime "$D/sub/full_inner.backup" 30
+    cp "$W/base.backup" "$W/outside/full_x.backup"; settime "$W/outside/full_x.backup" 30
+    ln -s "$W/outside/full_x.backup" "$D/full_link.backup"
+    "$BIN" backup info "$D/full_a.backup" 2>&1 | grep -q "Geode Backup v4" || fail "patched copy no longer a valid backup"
+    echo "FIXTURE_READY"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - FIXTURE_READY
+  tags: [backup, sonny-6289, setup]
+
+- name: backup-info-valid-and-damaged-headers
+  description: |
+    Valid header prints; every damaged header is a named error exit 1, never a crash or a banner.
+  type: bash
+  timeout_ms: 120000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(cat /tmp/sonnyC_6289.path); KEEP=1
+    OUT=$("$BIN" backup info "$W/base.backup" 2>&1); RC=$?
+    [ "$RC" = 0 ] || { echo "$OUT"; fail "valid info rc=$RC"; }
+    for s in "Geode Backup v4" "compression:   none" "Encrypted:     false"; do
+      echo "$OUT" | grep -q "$s" || { echo "$OUT"; fail "valid info lacks '$s'"; }
+    done
+    # the header, not the file name, says what a file is
+    cp "$W/base.backup" "$W/named.gz"
+    "$BIN" backup info "$W/named.gz" 2>&1 | grep -q "Geode Backup v4" || fail "info of a real backup named .gz"
+    damage() { # <tag> <offset> <byte hex>
+      cp "$W/base.backup" "$W/damaged.backup"
+      python3 -I - "$W/damaged.backup" "$2" "$3" <<'PYEOF'
+    import sys
+    p, off, val = sys.argv[1], int(sys.argv[2]), int(sys.argv[3], 16)
+    b = bytearray(open(p, "rb").read()); b[off] = val; open(p, "wb").write(b)
+    PYEOF
+      local out rc
+      out=$("$BIN" backup info "$W/damaged.backup" 2>&1); rc=$?
+      [ "$rc" = 1 ] || { echo "$out" | head -8; fail "$1: rc=$rc want 1 (>=128 is a crash)"; }
+      echo "$out" | grep -q "error:" || { echo "$out" | head; fail "$1: no 'error:'"; }
+      echo "$out" | grep -q "Geode Backup v" && fail "$1: printed a backup banner for a damaged header"
+      echo "DAMAGED_HEADER_$1_REFUSED"
+    }
+    damage ENCRYPTED_2 28 02
+    damage COMPRESSION_99 24 63
+    damage BACKUP_TYPE_7 8 07
+    damage MAGIC 0 00
+    damage PAYLOAD_LEN 35 7f
+    head -c 20 "$W/base.backup" > "$W/short.backup"
+    OUT=$("$BIN" backup info "$W/short.backup" 2>&1); RC=$?
+    [ "$RC" = 1 ] && echo "$OUT" | grep -q "error:" || { echo "$OUT"; fail "truncated header rc=$RC"; }
+    echo "DAMAGED_HEADER_TRUNCATED_REFUSED"
+    printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00' > "$W/plain.gz"
+    OUT=$("$BIN" backup info "$W/plain.gz" 2>&1); RC=$?
+    [ "$RC" = 1 ] && echo "$OUT" | grep -q "error:" && ! echo "$OUT" | grep -q "Geode Backup" || { echo "$OUT"; fail "gzip non-backup rc=$RC"; }
+    echo "DAMAGED_HEADER_GZIP_REFUSED"
+    # list over a directory holding one damaged and one good file
+    mkdir -p "$W/listdir"; cp "$W/base.backup" "$W/listdir/full_good.backup"
+    cp "$W/base.backup" "$W/listdir/full_bad.backup"
+    python3 -I - "$W/listdir/full_bad.backup" <<'PYEOF'
+    import sys
+    p = sys.argv[1]; b = bytearray(open(p, "rb").read()); b[24] = 99; open(p, "wb").write(b)
+    PYEOF
+    OUT=$("$BIN" backup list --dir "$W/listdir" 2>&1); RC=$?
+    [ "$RC" = 0 ] && echo "$OUT" | grep -q "full_good.backup" || { echo "$OUT"; fail "list with a damaged header rc=$RC"; }
+    echo "LIST_SURVIVES_DAMAGED_HEADER"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - DAMAGED_HEADER_ENCRYPTED_2_REFUSED
+    - DAMAGED_HEADER_COMPRESSION_99_REFUSED
+    - DAMAGED_HEADER_BACKUP_TYPE_7_REFUSED
+    - DAMAGED_HEADER_MAGIC_REFUSED
+    - DAMAGED_HEADER_PAYLOAD_LEN_REFUSED
+    - DAMAGED_HEADER_TRUNCATED_REFUSED
+    - DAMAGED_HEADER_GZIP_REFUSED
+    - LIST_SURVIVES_DAMAGED_HEADER
+  tags: [backup, sonny-6289, info]
+
+- name: backup-cleanup-refusals-and-dry-run
+  description: |
+    Argument errors are exit 2 naming the option; a dry run lists the plan and deletes nothing.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(cat /tmp/sonnyC_6289.path); KEEP=1; D="$W/backups"
+    refused() { # <tag> <needle> args...
+      local tag="$1" needle="$2"; shift 2
+      local out rc; out=$("$BIN" backup cleanup "$@" 2>&1); rc=$?
+      [ "$rc" = 2 ] || { echo "$out"; fail "$tag: rc=$rc want 2"; }
+      echo "$out" | grep -q -- "$needle" || { echo "$out"; fail "$tag: no $needle"; }
+      echo "$out" | grep -q "cleanup completed" && fail "$tag: printed a success line"
+      echo "CLEANUP_REFUSED_$tag"
+    }
+    refused NO_DIR --dir --older-than 2d
+    refused NO_AGE --older-than --dir "$D"
+    refused BAD_AGE --older-than --dir "$D" --older-than soon
+    refused TRAVERSAL --dir --dir "$D/../backups/.." --older-than 2d
+    for f in full_a.backup full_b.backup full_c.backup notes.txt; do [ -e "$D/$f" ] || fail "$f vanished after refusals"; done
+    OUT=$("$BIN" backup cleanup --dir "$D" --older-than 2d 2>&1); RC=$?
+    [ "$RC" = 0 ] || { echo "$OUT"; fail "dry run rc=$RC"; }
+    for s in "Would delete" "full_a.backup" "full_b.backup" "nothing was deleted" "--yes"; do
+      echo "$OUT" | grep -q -- "$s" || { echo "$OUT"; fail "dry run lacks '$s'"; }
+    done
+    echo "$OUT" | grep -q "Backup cleanup completed" && fail "dry run claims completion"
+    echo "$OUT" | grep -q "Would delete .*full_c.backup" && fail "dry run would delete the newest backup"
+    echo "$OUT" | grep -q "Kept .*full_c.backup (the newest backup)" || { echo "$OUT"; fail "dry run does not say the newest backup is kept"; }
+    for f in full_a.backup full_b.backup full_c.backup notes.txt full_link.backup sub/full_inner.backup; do [ -e "$D/$f" ] || fail "dry run deleted $f"; done
+    echo "CLEANUP_DRY_RUN_DELETES_NOTHING"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CLEANUP_REFUSED_NO_DIR
+    - CLEANUP_REFUSED_NO_AGE
+    - CLEANUP_REFUSED_BAD_AGE
+    - CLEANUP_REFUSED_TRAVERSAL
+    - CLEANUP_DRY_RUN_DELETES_NOTHING
+  tags: [backup, sonny-6289, cleanup]
+
+- name: backup-cleanup-yes-deletes-old-keeps-newest
+  description: |
+    --yes removes the two old backups only; non-backup files, subdirectories and symlink targets survive; the newest backup is kept however old; a failed deletion is exit 1.
+  type: bash
+  timeout_ms: 60000
+  command: |
+    set -u
+    unset GEODE_DATA_DIR  # a scratch server must never see the managed server's data dir
+    export GEODE_ALLOW_INSECURE_TLS=1
+    BIN="${GEODE_BINARY:-geode}"
+    PW="${GEODE_ADMIN_PASSWORD:?set a policy-compliant GEODE_ADMIN_PASSWORD}"
+    CTLS="${GEODE_CLIENT_TLS:---insecure-tls-skip-verify}"
+    SPIDS=""
+    SERVER_TLS_ARGS=""
+    if [ -n "${GEODE_TEST_CA_CERT:-}" ] && [ -f "${GEODE_TEST_CA_CERT}" ]; then
+      CERT_DIR=$(dirname "${GEODE_TEST_CA_CERT}")
+      if [ -f "${CERT_DIR}/leaf.crt" ] && [ -f "${CERT_DIR}/leaf.key" ]; then
+        SERVER_TLS_ARGS="--cert ${CERT_DIR}/leaf.crt --key ${CERT_DIR}/leaf.key"
+      fi
+    fi
+    free_port() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+    # start_server <data dir> <log file> [extra env assignments...]: sets PORT, SPID
+    start_server() {
+      local dir="$1" log="$2"; shift 2
+      PORT=$(free_port)
+      env "$@" GEODE_ALLOW_NO_AUTH=1 GEODE_DISABLE_AUDIT=1 GEODE_ADMIN_PASSWORD="$PW" \
+        nohup "$BIN" serve --data-dir "$dir" --log-level warn --listen "127.0.0.1:${PORT}" \
+        ${SERVER_TLS_ARGS} > "$log" 2>&1 < /dev/null &
+      SPID=$!
+      SPIDS="$SPIDS $SPID"
+      local i
+      for i in $(seq 1 150); do
+        if timeout 5 "$BIN" query "RETURN 1 AS x" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$SPID" 2>/dev/null || break
+        sleep 0.3
+      done
+      echo "SCRATCH_SERVER_FAILED_TO_START"; tail -30 "$log"; return 1
+    }
+    stop_server() {
+      kill -TERM "$SPID" 2>/dev/null
+      local i
+      for i in $(seq 1 150); do kill -0 "$SPID" 2>/dev/null || return 0; sleep 0.1; done
+      kill -9 "$SPID" 2>/dev/null
+    }
+    q() { timeout 90 "$BIN" query "$1" --server "127.0.0.1:${PORT}" ${CTLS} -U geode -P "$PW" 2>&1; }
+    # first integer in the "c" column of a count query
+    cnt() { q "$1" | grep -o '"rows":\[{"c":[0-9]*}' | grep -o '[0-9]*}$' | tr -d '}'; }
+    # backup/restore against the scratch server on $PORT
+    bk() { "$BIN" backup create --server "127.0.0.1:${PORT}" ${CTLS} --user geode --password "$PW" "$@" 2>&1; }
+    cleanup() {
+      for p in $SPIDS; do kill -9 "$p" 2>/dev/null; done
+      if [ -n "${W:-}" ] && [ -z "${KEEP:-}" ]; then case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac; fi
+    }
+    trap cleanup EXIT
+    fail() { echo "FAIL: $*"; exit 1; }
+
+    W=$(cat /tmp/sonnyC_6289.path); KEEP=1; D="$W/backups"
+    OUT=$("$BIN" backup cleanup --dir "$D" --older-than 2d --yes 2>&1); RC=$?
+    [ "$RC" = 0 ] || { echo "$OUT"; fail "cleanup --yes rc=$RC"; }
+    echo "$OUT" | grep -q "Deleted" || { echo "$OUT"; fail "no Deleted line"; }
+    echo "$OUT" | grep -q "deleted 2" || { echo "$OUT"; fail "did not report 2 deletions"; }
+    echo "$OUT" | grep -q "Cleaned 0 backup files" && fail "stub message"
+    [ -e "$D/full_a.backup" ] && fail "full_a.backup survived"
+    [ -e "$D/full_b.backup" ] && fail "full_b.backup survived"
+    for f in full_c.backup notes.txt sub/full_inner.backup; do [ -e "$D/$f" ] || fail "cleanup removed $f"; done
+    [ -e "$W/outside/full_x.backup" ] || fail "cleanup followed a symlink out of --dir"
+    echo "CLEANUP_DELETED_OLD_ONLY"
+    OUT=$("$BIN" backup cleanup --dir "$D" --older-than 1s --yes 2>&1); RC=$?
+    [ "$RC" = 0 ] || { echo "$OUT"; fail "second cleanup rc=$RC"; }
+    echo "$OUT" | grep -q "deleted 0" || { echo "$OUT"; fail "second cleanup deleted something"; }
+    echo "$OUT" | grep -q "newest" || { echo "$OUT"; fail "no newest-kept note"; }
+    [ -e "$D/full_c.backup" ] || fail "the newest backup was deleted"
+    echo "CLEANUP_KEEPS_NEWEST"
+    if [ "$(id -u)" != 0 ]; then
+      RO="$W/ro"; mkdir -p "$RO"
+      for n in 1:9 2:8 3:0; do cp "$W/base.backup" "$RO/full_${n%%:*}.backup"; done
+      python3 -I - "$RO" <<'PYEOF'
+    import os, struct, sys, time
+    d = sys.argv[1]
+    for name, days in (("full_1.backup", 9), ("full_2.backup", 8), ("full_3.backup", 0)):
+        p = os.path.join(d, name); b = bytearray(open(p, "rb").read())
+        b[16:24] = struct.pack("<q", int(time.time() * 1000 - days * 86400 * 1000)); open(p, "wb").write(b)
+    PYEOF
+      chmod 0500 "$RO"
+      OUT=$("$BIN" backup cleanup --dir "$RO" --older-than 1d --yes 2>&1); RC=$?
+      chmod 0700 "$RO"
+      [ "$RC" = 1 ] || { echo "$OUT"; fail "failed deletion rc=$RC want 1"; }
+      echo "$OUT" | grep -qi "failed" || { echo "$OUT"; fail "failed deletion not reported"; }
+      echo "$OUT" | grep -q "Backup cleanup completed" && fail "claimed success after a failed deletion"
+      echo "CLEANUP_FAILED_DELETION_IS_EXIT_1"
+    else
+      echo "CLEANUP_FAILED_DELETION_IS_EXIT_1 (skipped: running as root)"
+    fi
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - CLEANUP_DELETED_OLD_ONLY
+    - CLEANUP_KEEPS_NEWEST
+    - CLEANUP_FAILED_DELETION_IS_EXIT_1
+  tags: [backup, sonny-6289, cleanup]
+
+- name: cleanup-fixture
+  description: |
+    Removes the shared fixture.
+  type: bash
+  timeout_ms: 30000
+  command: |2
+
+    W=$(cat /tmp/sonnyC_6289.path 2>/dev/null || true)
+    [ -d "$W/ro" ] && chmod 0700 "$W/ro"
+    case "$W" in /tmp/sonnyC.*) rm -rf "$W" ;; esac
+    rm -f /tmp/sonnyC_6289.path
+    echo "FIXTURE_REMOVED"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - FIXTURE_REMOVED
+  tags: [cleanup]

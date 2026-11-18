@@ -1,0 +1,151 @@
+version: '1.0'
+name: SONNY-2409 a zeroed page header fails reads closed (ChecksumMismatch)
+description: |
+  SONNY-2409 (and SONNY-6473 item 2, SONNY-6640): a damaged store page must fail
+  a read closed, never read as a fresh (empty) page.
+
+  graph-storage's pager skipped its CRC32C when a page's 32-byte header was all
+  zero, so damage elsewhere in the page went undetected, and an all-zero page
+  below the high-water mark read as a page nobody had written. Reads that hit
+  such a page returned partial data (or, in the adapter, an engine read error
+  was turned into "absent": SONNY-6640). Every read must instead fail with a
+  typed corruption error and no partial result; a COUNT may answer the full
+  count because it is served from the durable live-node counts.
+
+  Black-box: seed a graph, stop the server cleanly, zero the 32-byte header of
+  every written page of the data graph's nodes.store (the body, and so the
+  CRC input, stays), restart, and read. The derived indexes (hydration
+  snapshots) are kept, so the count is served from them.
+
+  CANARY: REQ=REQ-SONNY-2409-ZEROED-PAGE-FAIL-CLOSED; FEATURE="StorageIntegrity"; ASPECT=Regression; STATUS=TESTED; TEST=geodetestlab/specs/sonny2409_zeroed_page_header.yml; OWNER=storage; UPDATED=2026-11-17
+
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 120000
+    cleanup: false
+    args:
+    - --log-level
+    - info
+    - --persist-interval
+    - '600000'
+  client:
+    timeout_ms: 120000
+    format: json
+
+invariants:
+- type: server_running
+
+single_node_only: true
+
+default_timeout_ms: 120000
+
+tests:
+- name: seed
+  description: 300 nodes of one label, each with a property (several node and property pages).
+  query: "UNWIND range(1, 301) AS i CREATE (:Person2409 {name: 'person-x', n: i})"
+  expected:
+    exit_code: 0
+
+- name: baseline-labeled-read
+  description: Before the damage the labeled read returns the data.
+  query: MATCH (p:Person2409) RETURN count(p) AS c, sum(p.n) AS s
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":300'
+    - '"s":45150'
+
+- name: clean-stop-and-damage
+  description: 'Stop cleanly (SIGTERM: a full checkpoint, nothing in flight), then damage the files, then restart on them.'
+  type: bash
+  command: |
+    set -e
+    : "${GEODE_DATA_DIR:?}"
+    pkill -TERM -f "serve.*${GEODE_DATA_DIR}"
+    for i in $(seq 1 90); do
+      pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null || break
+      sleep 1
+    done
+    if pgrep -f "serve.*${GEODE_DATA_DIR}" >/dev/null; then echo SERVER_DID_NOT_STOP; exit 1; fi
+    python3 -I - <<'PY'
+    import os, glob, sys
+    d = os.environ["GEODE_DATA_DIR"]
+    PAGE, HDR = 8192, 32
+    fname, mode, invalidate = 'nodes.store', 'header', False
+    tops = {}
+    for p in glob.glob(os.path.join(d, "*", "graphs", "*", fname)):
+        top = p.split(os.sep)[len(d.split(os.sep))]
+        tops[top] = tops.get(top, 0) + os.path.getsize(p)
+    if not tops:
+        sys.exit("no %s under the data dir" % fname)
+    top = max(tops, key=tops.get)        # the graph holding the data (the security graph is tiny)
+    n = 0
+    for p in glob.glob(os.path.join(d, top, "graphs", "*", fname)):
+        with open(p, "r+b") as f:
+            for pg in range(os.path.getsize(p) // PAGE):
+                f.seek(pg * PAGE)
+                if f.read(HDR) == b"\0" * HDR:
+                    continue                 # never written
+                f.seek(pg * PAGE)
+                f.write(b"\0" * (HDR if mode == "header" else PAGE))
+                n += 1
+    inv = 0
+    if invalidate:
+        for p in glob.glob(os.path.join(d, top, "**", "hydration_*.snap"), recursive=True):
+            os.remove(p); inv += 1
+        for p in glob.glob(os.path.join(d, top, "**", "labels.idx"), recursive=True):
+            open(p, "wb").close(); inv += 1
+    if n == 0:
+        sys.exit("no written page found to damage")
+    print("DAMAGED_%d_PAGES_INVALIDATED_%d" % (n, inv))
+    PY
+  timeout_ms: 150000
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - DAMAGED_
+
+- name: after-header-damage-count-still-served
+  description: A count is served from the durable live-node counts, not from the damaged records.
+  query: MATCH (p:Person2409) RETURN count(p) AS c
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - '"c":300'
+
+- name: after-header-damage-labeled-read-fails-closed
+  description: 'A labeled read that touches the damaged pages is refused: 58000 ChecksumMismatch, no partial result.'
+  query: MATCH (p:Person2409) RETURN p.name AS n
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    - ChecksumMismatch
+    stdout_not_contains:
+    - person-x
+
+- name: after-header-damage-unlabeled-read-fails-closed
+  description: The unlabeled scan (it reads the engine directly) is refused too.
+  query: MATCH (p) RETURN p.name AS n
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    - ChecksumMismatch
+    stdout_not_contains:
+    - person-x
+
+- name: after-header-damage-property-filter-fails-closed
+  description: A property-filtered read does not turn the read error into "no match".
+  query: MATCH (p:Person2409) WHERE p.n = 7 RETURN p.name AS n
+  expected:
+    exit_code: 1
+    stdout_contains:
+    - '58000'
+    stdout_not_contains:
+    - person-x

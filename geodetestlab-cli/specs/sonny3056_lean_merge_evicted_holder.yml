@@ -1,0 +1,454 @@
+# Lean index mode: MERGE matches a holder that is no longer resident (SONNY-3056).
+#
+# The bug: in lean index mode (GEODE_INDEX_MERGE_KEYS_ONLY=1) only registered
+# MERGE keys are put in MERGE's property index. A key is registered by the
+# first MERGE on it; nodes written before that carry the key unindexed. The
+# registration backfilled the index from the RESIDENT nodes only (the bounded
+# node cache), so a holder that had been evicted had no entry, the lookup
+# trusted the miss, and MERGE created a DUPLICATE node instead of matching it.
+#
+# This spec starts a real `geode serve` with the lean mode on and a tiny node
+# cache (GEODE_NODE_CACHE_ENTRIES=32, so 300 nodes cannot all be resident),
+# writes 300 nodes per label with plain CREATE (the key `k`/`u`/`w` is not
+# registered), then MERGEs keys of nodes written long before -- most of them
+# evicted by now -- through (a) the executor's MERGE with RETURN, (b) the
+# server's bulk-MERGE fast path (a lone `MERGE ... ON CREATE SET`), and (c) a
+# MERGE on a key first registered through a different label. Every MERGE of an
+# existing key must match it: node counts do not grow and the matched node is
+# the original (its `t` property). A genuinely new key creates exactly one
+# node, then matches. After a SIGKILL + restart (a cold cache, key registry
+# re-read from its sidecar) MERGE still matches.
+#
+# CANARY: REQ=REQ-SONNY-3056-LEAN-MERGE-BACKFILL; FEATURE="MergeIdempotency"; ASPECT=EvictedHolder; STATUS=TESTED; TEST=geodetestlab-cli/specs/sonny3056_lean_merge_evicted_holder.yml; OWNER=storage; UPDATED=2026-11-17
+
+version: '1.0'
+name: Lean-mode MERGE matches an evicted holder (SONNY-3056)
+description: With GEODE_INDEX_MERGE_KEYS_ONLY=1 and a tiny node cache, MERGE on a late-registered key never duplicates an evicted holder
+cli:
+  binary: ./zig-out/bin/geode
+  server:
+    enabled: true
+    port:
+    data_dir:
+    startup_timeout_ms: 60000
+    cleanup: true
+    args:
+    - --log-level
+    - warn
+    env:
+      GEODE_INDEX_MERGE_KEYS_ONLY: '1'
+      GEODE_NODE_CACHE_ENTRIES: '32'
+  client:
+    timeout_ms: 30000
+    tls_verify: false
+    format: json
+tests:
+- name: seed-t
+  description: 300 plain CREATEs of :T nodes on one connection (key k is not a registered MERGE key)
+  type: bash
+  command: |
+    set -eu
+    i=0; while [ $i -lt 300 ]; do echo "CREATE (:T {k: $i, t: 't$i'})"; i=$((i+1)); done > "${GEODE_DATA_DIR}/seed_t.gql"
+    "${GEODE_BINARY}" query --batch --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "${GEODE_ADMIN_PASSWORD}" < "${GEODE_DATA_DIR}/seed_t.gql" > "${GEODE_DATA_DIR}/seed_t.out" 2>&1
+    test "$(grep -c "status_class\":\"00000" "${GEODE_DATA_DIR}/seed_t.out")" -eq 300
+    echo SEEDED_T
+  timeout_ms: 300000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SEEDED_T
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - setup
+- name: count-t-before
+  description: 300 T nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:T) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":300}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+- name: merge-t-0
+  description: '(a) MERGE the very first (long evicted) holder: matched, not duplicated'
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:T {k: 0}) RETURN n.t AS t'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"t":"t0"}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - executor
+  - key
+- name: merge-t-1
+  description: (a) MERGE another early holder
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:T {k: 1}) RETURN n.t AS t'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"t":"t1"}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - executor
+  - key
+- name: merge-t-150
+  description: (a) MERGE a middle holder
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:T {k: 150}) RETURN n.t AS t'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"t":"t150"}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - executor
+  - key
+- name: count-t-after
+  description: 'still exactly 300 T nodes (was 303: three duplicates)'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:T) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":300}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+- name: merge-t-new
+  description: (a) a genuinely new key creates one node
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:T {k: 100000}) RETURN n.t AS t'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"t":null}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - executor
+- name: merge-t-new-again
+  description: (a) ...and the second MERGE of it matches (count of matches is 1)
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:T {k: 100000}) RETURN count(n) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - executor
+- name: count-t-final
+  description: 301 T nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:T) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":301}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+- name: seed-u
+  description: 300 plain CREATEs of :U nodes on one connection (key u is not a registered MERGE key)
+  type: bash
+  command: |
+    set -eu
+    i=0; while [ $i -lt 300 ]; do echo "CREATE (:U {u: $i, t: 'u$i'})"; i=$((i+1)); done > "${GEODE_DATA_DIR}/seed_u.gql"
+    "${GEODE_BINARY}" query --batch --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "${GEODE_ADMIN_PASSWORD}" < "${GEODE_DATA_DIR}/seed_u.gql" > "${GEODE_DATA_DIR}/seed_u.out" 2>&1
+    test "$(grep -c "status_class\":\"00000" "${GEODE_DATA_DIR}/seed_u.out")" -eq 300
+    echo SEEDED_U
+  timeout_ms: 300000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SEEDED_U
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - setup
+- name: bulk-merge-u-0
+  description: '(b) bulk-MERGE fast path (lone MERGE ... ON CREATE SET) on an evicted holder: no duplicate'
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:U {u: 0}) ON CREATE SET n.t = 'fresh'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - bulk
+  - key
+- name: bulk-merge-u-2
+  description: (b) ... and on another evicted holder
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:U {u: 2}) ON CREATE SET n.t = 'fresh'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - bulk
+  - key
+- name: count-u-after
+  description: still exactly 300 U nodes (a duplicate would make 301/302)
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":300}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+- name: u-0-original
+  description: the matched node is the original, its ON CREATE SET did not run
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:U {u: 0}) RETURN count(n) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - bulk
+- name: u-0-not-fresh
+  description: no node carries the ON CREATE value
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U) WHERE n.t = 'fresh' RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":0}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - bulk
+- name: seed-w
+  description: 300 plain CREATEs of :W nodes on one connection (key w is not a registered MERGE key)
+  type: bash
+  command: |
+    set -eu
+    i=0; while [ $i -lt 300 ]; do echo "CREATE (:W {w: 'v$i', t: 'w$i'})"; i=$((i+1)); done > "${GEODE_DATA_DIR}/seed_w.gql"
+    "${GEODE_BINARY}" query --batch --server "${GEODE_SERVER_ADDRESS}" ${GEODE_CLIENT_TLS} -U geode -P "${GEODE_ADMIN_PASSWORD}" < "${GEODE_DATA_DIR}/seed_w.gql" > "${GEODE_DATA_DIR}/seed_w.out" 2>&1
+    test "$(grep -c "status_class\":\"00000" "${GEODE_DATA_DIR}/seed_w.out")" -eq 300
+    echo SEEDED_W
+  timeout_ms: 300000
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - SEEDED_W
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - setup
+- name: register-w-through-other-label
+  description: (c) the first MERGE on key w is on ANOTHER label
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:Other {w: 'x'})"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - registry
+- name: merge-w-0
+  description: '(c) MERGE on W by key w: the evicted holder is matched'
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:W {w: 'v0'}) RETURN count(n) AS c"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - registry
+  - key
+- name: count-w-after
+  description: still exactly 300 W nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:W) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":300}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+- name: sigkill-restart
+  description: 'SIGKILL + restart: a cold cache, the merge-key registry re-read from its sidecar'
+  type: bash
+  command: |
+    set -e
+    pkill -9 -f "serve .*--data-dir ${GEODE_DATA_DIR}"
+    sleep 1
+    echo CRASH_KILL_DONE
+  restart_server: true
+  expected:
+    exit_code: 0
+    stdout_contains:
+    - CRASH_KILL_DONE
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - restart
+  - crash
+- name: merge-t-3-after-restart
+  description: after the restart MERGE still matches an evicted holder
+  args:
+  - query
+  - '-'
+  stdin: 'MERGE (n:T {k: 3}) RETURN n.t AS t'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"t":"t3"}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - restart
+  - key
+- name: count-t-after-restart
+  description: T still has 301 nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:T) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":301}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+- name: merge-u-5-after-restart
+  description: after the restart a bulk MERGE matches too
+  args:
+  - query
+  - '-'
+  stdin: 'MATCH (n:U {u: 5}) RETURN count(n) AS c'
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":1}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - restart
+- name: bulk-merge-u-5-after-restart
+  description: bulk MERGE of u=5 after the restart
+  args:
+  - query
+  - '-'
+  stdin: "MERGE (n:U {u: 5}) ON CREATE SET n.t = 'fresh'"
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+  tags:
+  - merge
+  - lean
+  - sonny3056
+  - restart
+  - bulk
+- name: count-u-after-restart
+  description: U still has 300 nodes
+  args:
+  - query
+  - '-'
+  stdin: MATCH (n:U) RETURN count(n) AS c
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"status_class":"00000"'
+    - '"rows":[{"c":300}]'
+  tags:
+  - merge
+  - lean
+  - sonny3056
