@@ -324,16 +324,42 @@ tests:
   tags:
   - storage
   - sonny738
-- name: for-write-staged-buried-aggregate-refused
-  description: An aggregate inside a larger expression is refused 0A000 (not applied per element)
+- name: for-write-staged-buried-aggregate
+  description: 'SONNY-6717: an aggregate inside a larger expression is evaluated after aggregation'
   args:
   - query
   - '-'
-  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = 99 RETURN count(*) + 1 AS c
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = z.k RETURN count(*) + 1 AS c, sum(o.k) * 2 AS s
   expect:
-    exit_code: 1
+    exit_code: 0
     stdout_contains:
-    - '"status_class":"0A000"'
+    - '"rows":[{"c":3,"s":6}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-staged-group-by
+  description: 'SONNY-6717: GROUP BY groups across the elements'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = z.k RETURN o.seen AS g, count(*) AS c GROUP BY g ORDER BY g
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":1,"c":1},{"g":2,"c":1}]'
+  tags:
+  - storage
+  - sonny738
+- name: for-write-staged-having
+  description: 'SONNY-6717: HAVING filters the groups of the whole table'
+  args:
+  - query
+  - '-'
+  stdin: MATCH (z:W6587) WITH z FOR x IN [z.k] MATCH (o:W6587) WHERE o.k = 3 - x SET o.seen = z.k RETURN o.seen AS g, count(*) AS c GROUP BY g HAVING g > 1
+  expect:
+    exit_code: 0
+    stdout_contains:
+    - '"rows":[{"g":2,"c":1}]'
   tags:
   - storage
   - sonny738
