@@ -4,7 +4,7 @@ go 1.27.3
 
 require (
 	geodedb.com/geode v1.0.0
-	github.com/quic-go/quic-go v0.64.1
+	github.com/quic-go/quic-go v0.66.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

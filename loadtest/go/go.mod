@@ -2,7 +2,7 @@ module geodedb.com/geode-loadtest
 
 go 1.27.3
 
-require geodedb.com/geode v0.2.1
+require geodedb.com/geode v0.2.2
 
 require (
 	github.com/quic-go/quic-go v0.63.0 // indirect
