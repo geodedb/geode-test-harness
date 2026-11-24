@@ -1,6 +1,6 @@
 module geodedb.com/concurrent-tx-test
 
-go 1.27.3
+go 1.27.4
 
 require geodedb.com/geode v0.2.1
 
